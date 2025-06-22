@@ -2,9 +2,12 @@
 # including the high-fidelity planner and the closed-loop executor thread. 
 import time
 import math
+import statistics
+import datetime
 import numpy as np
 from scipy.signal import savgol_filter
 from typing import Sequence, Union
+from pathlib import Path
 
 try:
     import ik_solver
@@ -278,7 +281,11 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
         utils.trajectory_state["thread"] = None
 
 
-def _closed_loop_executor_thread(joint_path: list[list[float]], frequency: int):
+def _closed_loop_executor_thread(
+    joint_path: list[list[float]],
+    frequency: int,
+    diagnostics: bool = True,
+):
     """
     Executes a pre-planned joint-space trajectory using a real-time, closed-loop
     proportional controller to ensure path accuracy. This is the primary executor
@@ -287,6 +294,7 @@ def _closed_loop_executor_thread(joint_path: list[list[float]], frequency: int):
     Args:
         joint_path: The dense list of target joint angle configurations.
         frequency: The target execution frequency for the control loop (e.g., 200 Hz).
+        diagnostics: Whether to generate and save timing and error charts.
     """
     print(f"[Pi CLC] Starting Closed-Loop Executor at {frequency} Hz for a path with {len(joint_path)} steps.")
     
@@ -294,6 +302,17 @@ def _closed_loop_executor_thread(joint_path: list[list[float]], frequency: int):
         time_step = 1.0 / frequency
         start_time = time.monotonic()
         
+        # -----------------------------
+        #   Telemetry Buffers
+        # -----------------------------
+        _loop_durations: list[float] = []          # total cycle duration
+        _read_durations: list[float] = []          # SYNC-READ latency
+        _compute_durations: list[float] = []       # control law & conversions
+        _write_durations: list[float] = []         # SYNC-WRITE latency
+
+        # Per-joint error accumulators (abs radians per cycle)
+        _abs_errors_per_joint: list[list[float]] = [[] for _ in range(utils.NUM_LOGICAL_JOINTS)]
+
         # We need a mapping from logical joint index back to the physical servos to command.
         # This is the reverse of the logic in set_servo_positions.
         # This could be pre-calculated, but is clear here for now.
@@ -310,12 +329,17 @@ def _closed_loop_executor_thread(joint_path: list[list[float]], frequency: int):
         for i, target_q_step in enumerate(joint_path):
             deadline = start_time + (i + 1) * time_step
             
+            # Capture start for this iteration
+            iter_start = time.perf_counter()
+
             # --- Stop Check ---
             if utils.trajectory_state["should_stop"]:
                 print("[Pi CLC] Stop signal received, halting execution.")
                 break
 
             # --- Feedback (Read) ---
+            read_t0 = time.perf_counter()
+
             # Use a fixed but small timeout to ensure full packets arrive; setting
             # too low leads to intermittent Sync Read failures.
             per_cycle_timeout = max(0.01, time_step * 0.8)
@@ -324,19 +348,24 @@ def _closed_loop_executor_thread(joint_path: list[list[float]], frequency: int):
                 timeout_s=per_cycle_timeout,
                 poll_delay_s=0.0,
             )
-            if raw_positions is None:
-                print("[Pi CLC] WARNING: Failed to read servo feedback. Stopping path.")
-                break
+            _read_durations.append(time.perf_counter() - read_t0)
 
             # --- Control Law (Calculate Error and Correction) ---
             commands_for_sync_write = []
             
+            compute_t0 = time.perf_counter()
+
             for logical_joint_index, target_angle_rad in enumerate(target_q_step):
                 # This logic mirrors set_servo_positions to find the target physical angle.
                 angle_with_master_offset = target_angle_rad + utils.LOGICAL_JOINT_MASTER_OFFSETS_RAD[logical_joint_index]
                 target_physical_angle_rad = angle_with_master_offset
-                if logical_joint_index == 0:
-                    target_physical_angle_rad *= 2.0
+
+                # NOTE: Previous versions applied a *2 scaling here to compensate for a
+                # 2:1 belt gear ratio on the J1 (base) joint. The current hardware is
+                # direct-drive (1:1), so this extra scaling would cause the base to
+                # rotate twice as far as commanded during closed-loop execution,
+                # leading to exaggerated Y-axis motion.  The scaling has therefore
+                # been removed.
 
                 # For each physical servo associated with this logical joint...
                 for physical_servo_config_index in logical_to_physical_map[logical_joint_index]:
@@ -352,6 +381,9 @@ def _closed_loop_executor_thread(joint_path: list[list[float]], frequency: int):
 
                     # 2. Calculate the error
                     error_rad = target_physical_angle_rad - actual_physical_angle_rad
+                    
+                    # Collect telemetry: absolute error per logical joint
+                    _abs_errors_per_joint[logical_joint_index].append(abs(error_rad))
                     
                     # 3. Calculate the corrected command
                     # Commanded Angle = Target + Kp * Error
@@ -374,11 +406,20 @@ def _closed_loop_executor_thread(joint_path: list[list[float]], frequency: int):
                     # because the path is timed by the closed-loop executor itself.
                     commands_for_sync_write.append((servo_id, final_servo_pos_value, 4095, 0))
 
+            _compute_durations.append(time.perf_counter() - compute_t0)
+
             # --- Actuation (Write) ---
             if commands_for_sync_write:
+                write_t0 = time.perf_counter()
                 servo_protocol.sync_write_goal_pos_speed_accel(commands_for_sync_write)
+                _write_durations.append(time.perf_counter() - write_t0)
+            else:
+                _write_durations.append(0.0)
 
             # --- Timing ---
+            iter_elapsed = time.perf_counter() - iter_start  # Actual compute + IO time for this cycle
+            _loop_durations.append(iter_elapsed)
+
             sleep_time = deadline - time.monotonic()
             if sleep_time > 0:
                 time.sleep(sleep_time)
@@ -392,6 +433,105 @@ def _closed_loop_executor_thread(joint_path: list[list[float]], frequency: int):
 
     finally:
         print("[Pi CLC] Closed-Loop Executor thread finished.")
+
+        # Print timing statistics if we collected any samples
+        if '_loop_durations' in locals() and _loop_durations:
+            fmt = lambda xs: (statistics.mean(xs) * 1000.0, max(xs) * 1000.0)
+
+            avg_ms, max_ms = fmt(_loop_durations)
+            read_avg, read_max = fmt(_read_durations)
+            comp_avg, comp_max = fmt(_compute_durations)
+            write_avg, write_max = fmt(_write_durations)
+
+            overruns = [d for d in _loop_durations if d > time_step]
+            overrun_pct = (len(overruns) / len(_loop_durations)) * 100.0
+
+            print(
+                f"[Pi CLC] Timing summary: total avg={avg_ms:.2f} ms (max {max_ms:.2f}), "
+                f"read avg={read_avg:.2f} (max {read_max:.2f}), "
+                f"compute avg={comp_avg:.2f} (max {comp_max:.2f}), "
+                f"write avg={write_avg:.2f} (max {write_max:.2f}), "
+                f"overruns {len(overruns)}/{len(_loop_durations)} ({overrun_pct:.1f}%)"
+            )
+
+            # --- Error statistics ---
+            joint_stats = []
+            for j_idx, errs in enumerate(_abs_errors_per_joint):
+                if errs:
+                    mean_err = statistics.mean(errs)
+                    max_err = max(errs)
+                    joint_stats.append(f"J{j_idx+1}: mean {math.degrees(mean_err):.2f}°, max {math.degrees(max_err):.2f}°")
+            if joint_stats:
+                print("[Pi CLC] Tracking error summary → " + "; ".join(joint_stats))
+
+            # ------------------
+            # Optional Charts
+            # ------------------
+            if diagnostics:
+                try:
+                    import matplotlib
+                    matplotlib.use("Agg")  # headless backend
+                    import matplotlib.pyplot as plt
+
+                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    out_dir = Path("diagnostics")
+                    out_dir.mkdir(exist_ok=True)
+
+                    # 1. Timing chart
+                    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+                    ax.plot([d * 1000 for d in _loop_durations], label="total")
+                    ax.plot([d * 1000 for d in _read_durations], label="read")
+                    ax.plot([d * 1000 for d in _compute_durations], label="compute")
+                    ax.plot([d * 1000 for d in _write_durations], label="write")
+                    ax.set_xlabel("Cycle index")
+                    ax.set_ylabel("Duration (ms)")
+                    ax.set_title("Closed-loop cycle timing")
+                    ax.legend()
+                    timing_path = out_dir / f"timing_{ts}.png"
+                    fig.tight_layout()
+                    fig.savefig(timing_path)
+                    plt.close(fig)
+
+                    # 2. Error chart per joint
+                    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+                    for j_idx, errs in enumerate(_abs_errors_per_joint):
+                        if errs:
+                            ax.plot([math.degrees(e) for e in errs], label=f"J{j_idx+1}")
+                    ax.set_xlabel("Cycle index")
+                    ax.set_ylabel("Abs error (deg)")
+                    ax.set_title("Tracking error per joint")
+                    ax.legend()
+                    error_path = out_dir / f"error_{ts}.png"
+                    fig.tight_layout()
+                    fig.savefig(error_path)
+                    plt.close(fig)
+
+                    # Additional Sync Read breakdown if available
+                    from arm_controller.servo_protocol import get_sync_profiles
+                    sync_profiles = get_sync_profiles()
+                    if sync_profiles:
+                        w_list, r_list, p_list = zip(*sync_profiles)
+
+                        fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+                        ax.plot([d * 1000 for d in w_list], label="write")
+                        ax.plot([d * 1000 for d in r_list], label="read")
+                        ax.plot([d * 1000 for d in p_list], label="parse")
+                        ax.set_xlabel("Cycle index")
+                        ax.set_ylabel("Duration (ms)")
+                        ax.set_title("Sync Read internal timing")
+                        ax.legend()
+                        sync_path = out_dir / f"sync_{ts}.png"
+                        fig.tight_layout()
+                        fig.savefig(sync_path)
+                        plt.close(fig)
+                        print(
+                            f"[Pi CLC] Diagnostics charts saved to {timing_path}, {error_path} and {sync_path}"
+                        )
+                    else:
+                        print(f"[Pi CLC] Diagnostics charts saved to {timing_path} and {error_path}")
+                except Exception as e:
+                    print(f"[Pi CLC] WARNING: Failed to generate diagnostics charts: {e}")
+
         # Clean up global state
         utils.trajectory_state["is_running"] = False
         utils.trajectory_state["should_stop"] = False

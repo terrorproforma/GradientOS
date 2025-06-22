@@ -36,6 +36,21 @@ SYNC_WRITE_DATA_LEN_PER_SERVO = 7
 SERVO_INSTRUCTION_SYNC_READ = 0x82
 
 
+# ---------------------------------------------------------------------------
+# Telemetry buffer for Sync Read profiling (write, read, parse durations in s)
+# ---------------------------------------------------------------------------
+
+_sync_profiles: list[tuple[float, float, float]] = []  # populated when diagnostics enabled
+
+
+def get_sync_profiles() -> list[tuple[float, float, float]]:
+    """Return and clear the collected Sync-Read timing tuples (seconds)."""
+    global _sync_profiles
+    out = _sync_profiles[:]
+    _sync_profiles.clear()
+    return out
+
+
 def calculate_checksum(packet_data_for_sum: bytearray) -> int:
     """
     Calculates the Feetech checksum for a given packet.
@@ -609,6 +624,7 @@ def sync_read_positions(
     servo_ids: list[int],
     timeout_s: float | None = None,
     poll_delay_s: float = 0.0,
+    diagnostics: bool = True,
 ) -> dict[int, int] | None:
     """
     Reads the present position of multiple servos using a single 'SYNC READ' command.
@@ -622,6 +638,7 @@ def sync_read_positions(
         poll_delay_s (float): Optional delay inserted after issuing the SYNC READ before attempting
                               to read the responses. This can sometimes improve reliability on slow
                               links. Defaults to 0 (no delay).
+        diagnostics (bool): Whether to collect timing data for diagnostics.
 
     Returns:
         dict[int, int]: A dictionary mapping servo_id to its raw position. This may be a partial
@@ -656,6 +673,7 @@ def sync_read_positions(
     checksum_data = packet[2:-1] # From Broadcast_ID to last servo ID
     packet[-1] = calculate_checksum(checksum_data)
 
+
     # --- Send Command and Process Responses ---
     try:
         # Optionally override the serial timeout for this call
@@ -664,8 +682,11 @@ def sync_read_positions(
             original_timeout = utils.ser.timeout
             utils.ser.timeout = timeout_s
 
+        # --- WRITE ---
+        write_start = time.perf_counter()
         utils.ser.reset_input_buffer()
         utils.ser.write(packet)
+        write_dur = time.perf_counter() - write_start
 
         # Allow a brief delay for servos to respond if requested
         if poll_delay_s > 0.0:
@@ -674,14 +695,17 @@ def sync_read_positions(
         positions = {}
         expected_ids = set(servo_ids)
         
-        # Each servo sends an 8-byte status packet
-        bytes_to_read = num_servos * 8
+        # --- READ ---
+        bytes_to_read = num_servos * 8  # Each servo sends an 8-byte status packet
+        read_start = time.perf_counter()
         response_data = utils.ser.read(bytes_to_read)
+        read_dur = time.perf_counter() - read_start
 
         if len(response_data) < bytes_to_read:
             print(f"[Pi SyncRead] WARNING: Timed out. Expected {bytes_to_read} bytes, but got {len(response_data)}. Parsing partial data.")
 
-        # Parse the buffer for valid packets
+        # --- PARSE ---
+        parse_start = time.perf_counter()
         for i in range(0, len(response_data) - 7): # Iterate with a sliding window
             # Look for the header
             if response_data[i] == SERVO_HEADER and response_data[i+1] == SERVO_HEADER:
@@ -715,6 +739,12 @@ def sync_read_positions(
         # After parsing all we could, report which servos didn't respond
         if len(expected_ids) > 0:
             print(f"[Pi SyncRead] Did not receive valid responses for IDs: {list(expected_ids)}")
+
+        parse_dur = time.perf_counter() - parse_start
+
+        if diagnostics:
+            # Telemetry: store timings for diagnostics (in seconds)
+            _sync_profiles.append((write_dur, read_dur, parse_dur))
 
         return positions
 
