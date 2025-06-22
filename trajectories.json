@@ -1,0 +1,123 @@
+{
+  "example": {
+    "description": "The example trajectory from the user. A sequence of point-to-point moves with pauses.",
+    "loop": true,
+    "moves": [
+      { "command": "home", "duration": 2.0 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_relative", "vector": [0.0, 0.2, -0.3], "speed_multiplier": 1.0 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_relative", "vector": [0.0, 0.0, 0.3], "speed_multiplier": 1.0 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_relative", "vector": [0.0, -0.2, 0.0], "speed_multiplier": 1.0 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_relative", "vector": [0.0, 0.0, -0.2], "speed_multiplier": 1.0 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_relative", "vector": [0.0, 0.2, 0.0], "speed_multiplier": 1.0 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "home" }
+    ]
+  },
+  "square_dance": {
+    "description": "A simple square pattern, demonstrating a mix of relative and absolute moves.",
+    "moves": [
+      { "command": "home" },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_relative", "vector": [0.1, 0.1, 0.0] },
+      { "command": "pause", "duration": 0.5 },
+      { "command": "move_relative", "vector": [0.0, -0.2, 0.0] },
+      { "command": "pause", "duration": 0.5 },
+      { "command": "move_relative", "vector": [-0.2, 0.0, 0.0] },
+      { "command": "pause", "duration": 0.5 },
+      { "command": "move_relative", "vector": [0.0, 0.2, 0.0] },
+      { "command": "pause", "duration": 0.5 },
+      { "command": "move_relative", "vector": [0.1, -0.1, 0.0] },
+      { "command": "home" }
+    ]
+  },
+  "boundary_check": {
+    "description": "A trajectory designed to push the arm to the boundaries of its workspace to test joint limits.",
+    "loop": false,
+    "moves": [
+      { "command": "home", "duration": 2.0 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.4, 0.0, 0.1], "speed_multiplier": 0.5 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [-0.4, 0.0, 0.1], "speed_multiplier": 0.5 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.0, 0.4, 0.2], "speed_multiplier": 0.5 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.0, -0.4, 0.2], "speed_multiplier": 0.5 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.1, 0.1, 0.5], "speed_multiplier": 0.5 },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "home", "duration": 3.0 }
+    ]
+  },
+  "arc_test": {
+    "description": "Draws a 90-degree arc in the XY plane.",
+    "loop": false,
+    "moves": [
+      { "command": "home" },
+      { "command": "move_absolute", "vector": [0.3, 0.0, 0.2] },
+      { "command": "pause", "duration": 1.0 },
+      {
+        "command": "move_arc",
+        "end_point": [0.0, 0.3, 0.2],
+        "center_point": [0.0, 0.0, 0.2]
+      },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "home" }
+    ]
+  },
+  "xy-square": {
+    "description": "A square pattern in the XY plane with a fixed orientation.",
+    "loop": true,
+    "orientation_euler_angles_deg": [0, 45, 0],
+    "moves": [
+      { "command": "move_absolute", "vector": [0.21, 0.27, 0.2] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.21, 0.27, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.35, 0.31, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.35, -0.20, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.21, -0.20, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.35, -0.20, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.35, 0.27, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.21, 0.27, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.21, 0.31, 0.2] },
+      { "command": "pause", "duration": 1.0 }
+    ]
+  },
+  "xy-square-highres": {
+    "description": "A square pattern in the XY plane with a fixed orientation.",
+    "loop": true,
+    "orientation_euler_angles_deg": [0, 45, 0],
+    "moves": [
+      { "command": "move_absolute", "vector": [0.21, 0.27, 0.2] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.21, 0.27, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.35, 0.31, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.35, -0.20, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.21, -0.20, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.35, -0.20, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.35, 0.27, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.21, 0.27, 0.04] },
+      { "command": "pause", "duration": 1.0 },
+      { "command": "move_absolute", "vector": [0.21, 0.31, 0.2] },
+      { "command": "pause", "duration": 1.0 }
+    ]
+  }
+} 

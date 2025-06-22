@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-selfcheck.json
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.dylib
+
+# Logs and data
+*.log
+performance_log.csv
+performance_charts.png
+trajectory_cache/
+
+# IDE and editor files
+.vscode/
+.idea/
