@@ -756,3 +756,138 @@ def sync_read_positions(
         if timeout_s is not None and original_timeout is not None:
             utils.ser.timeout = original_timeout
 
+def fast_sync_read_positions(
+    servo_ids: list[int],
+    timeout_s: float | None = None,
+    poll_delay_s: float = 0.0,
+    diagnostics: bool = True,
+) -> dict[int, int] | None:
+    """
+    Reads the present position of multiple servos using a single 'SYNC READ' command.
+    This is significantly faster than reading one by one, enabling high-frequency feedback.
+    This implementation is designed to be robust against timeouts from individual servos.
+
+    Args:
+        servo_ids (list): A list of servo IDs to read from.
+        timeout_s (float | None): Optional per-call serial read timeout override in seconds. If None,
+                                  the existing serial timeout is preserved.
+        poll_delay_s (float): Optional delay inserted after issuing the SYNC READ before attempting
+                              to read the responses. This can sometimes improve reliability on slow
+                              links. Defaults to 0 (no delay).
+        diagnostics (bool): Whether to collect timing data for diagnostics.
+
+    Returns:
+        dict[int, int]: A dictionary mapping servo_id to its raw position. This may be a partial
+                        result if some servos did not respond.
+    """
+    if utils.ser is None or not utils.ser.is_open:
+        print("[Pi SyncRead] Serial port not initialized.")
+        return {}
+
+    num_servos = len(servo_ids)
+    if num_servos == 0:
+        return {}
+
+    # --- Construct the Sync Read Packet ---
+    # Packet: [0xFF, 0xFF, Broadcast_ID, Len, Instr, StartAddr, DataLen, ID1, ID2, ..., Checksum]
+    packet_len_field_value = num_servos + 4
+    
+    packet = bytearray(7 + num_servos + 1) # Header(2) + BcastID(1) + Len(1) + Instr(1) + Addr(1) + DataLen(1) + IDs(N) + Checksum(1)
+    packet[0] = SERVO_HEADER
+    packet[1] = SERVO_HEADER
+    packet[2] = SERVO_BROADCAST_ID
+    packet[3] = packet_len_field_value
+    packet[4] = SERVO_INSTRUCTION_SYNC_READ
+    packet[5] = SERVO_ADDR_PRESENT_POSITION # Start Address to read from (0x38)
+    packet[6] = 2 # Length of data to read per servo (Pos_L, Pos_H)
+
+    # Add all the servo IDs to the packet
+    for i, servo_id in enumerate(servo_ids):
+        packet[7 + i] = servo_id
+
+    # Calculate checksum on the instruction parameters
+    checksum_data = packet[2:-1] # From Broadcast_ID to last servo ID
+    packet[-1] = calculate_checksum(checksum_data)
+
+
+    # --- Send Command and Process Responses ---
+    try:
+        # Optionally override the serial timeout for this call
+        original_timeout = None
+        if timeout_s is not None:
+            original_timeout = utils.ser.timeout
+            utils.ser.timeout = timeout_s
+
+        # --- WRITE ---
+        write_start = time.perf_counter()
+        utils.ser.reset_input_buffer()
+        utils.ser.write(packet)
+        write_dur = time.perf_counter() - write_start
+
+        # Allow a brief delay for servos to respond if requested
+        if poll_delay_s > 0.0:
+            time.sleep(poll_delay_s)
+
+        positions = {}
+        expected_ids = set(servo_ids)
+        
+        # --- READ ---
+        bytes_to_read = num_servos * 8  # Each servo sends an 8-byte status packet
+        read_start = time.perf_counter()
+        response_data = utils.ser.read(bytes_to_read)
+        read_dur = time.perf_counter() - read_start
+
+        if len(response_data) < bytes_to_read:
+            print(f"[Pi SyncRead] WARNING: Timed out. Expected {bytes_to_read} bytes, but got {len(response_data)}. Parsing partial data.")
+
+        # --- PARSE ---
+        parse_start = time.perf_counter()
+        for i in range(0, len(response_data) - 7): # Iterate with a sliding window
+            # Look for the header
+            if response_data[i] == SERVO_HEADER and response_data[i+1] == SERVO_HEADER:
+                # Potential packet found, extract it
+                packet_candidate = response_data[i : i+8]
+                
+                response_id = packet_candidate[2]
+                if response_id not in expected_ids:
+                    # This could be a stray packet, just log it and continue searching
+                    # print(f"[Pi SyncRead] Found packet for unexpected ID {response_id}. Ignoring.")
+                    continue
+
+                # Error byte validation
+                if packet_candidate[4] != 0:
+                    print(f"[Pi SyncRead] Servo {response_id} reported error: {packet_candidate[4]}")
+                    continue # Skip this packet
+
+                # Checksum validation
+                expected_checksum = calculate_checksum(packet_candidate[2:7])
+                if expected_checksum != packet_candidate[7]:
+                    print(f"[Pi SyncRead] Checksum mismatch for servo {response_id}. Ignoring packet.")
+                    continue # Skip this packet
+                
+                # If we're here, the packet is valid
+                position = int.from_bytes(packet_candidate[5:7], byteorder='little', signed=True)
+                positions[response_id] = position
+                # Remove the ID from the set of servos we are still waiting for
+                expected_ids.discard(response_id)
+
+
+        # After parsing all we could, report which servos didn't respond
+        if len(expected_ids) > 0:
+            print(f"[Pi SyncRead] Did not receive valid responses for IDs: {list(expected_ids)}")
+
+        parse_dur = time.perf_counter() - parse_start
+
+        if diagnostics:
+            # Telemetry: store timings for diagnostics (in seconds)
+            _sync_profiles.append((write_dur, read_dur, parse_dur))
+
+        return positions
+
+    except Exception as e:
+        print(f"[Pi SyncRead] Error during Sync Read: {e}")
+        return {}
+    finally:
+        # Restore the previous serial timeout if we modified it
+        if timeout_s is not None and original_timeout is not None:
+            utils.ser.timeout = original_timeout

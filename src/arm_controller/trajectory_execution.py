@@ -325,6 +325,7 @@ def _closed_loop_executor_thread(
             5: [7]      # Logical J6 -> Physical Servo ID 60
         }
         all_physical_servo_ids = [utils.SERVO_IDS[i] for i in range(utils.NUM_PHYSICAL_SERVOS)]
+        PRIMARY_FB_IDS = [10, 20, 30, 40, 50, 60]
 
         for i, target_q_step in enumerate(joint_path):
             deadline = start_time + (i + 1) * time_step
@@ -344,11 +345,47 @@ def _closed_loop_executor_thread(
             # too low leads to intermittent Sync Read failures.
             per_cycle_timeout = max(0.01, time_step * 0.8)
             raw_positions = servo_protocol.sync_read_positions(
-                all_physical_servo_ids,
+                PRIMARY_FB_IDS,
                 timeout_s=per_cycle_timeout,
                 poll_delay_s=0.0,
             )
             _read_durations.append(time.perf_counter() - read_t0)
+
+            # ------------------------------------------------------------
+            #  Feedback synthesis for twin-motor joints
+            #  -----------------------------------------------------------
+            #  We only query one servo per twin-motor joint (20 & 30) to
+            #  save wire time.  The partner motors (21 & 31) rotate in the
+            #  opposite RAW direction, so we re-create a plausible raw
+            #  reading for them by:
+            #    1. converting the received RAW value → physical angle
+            #    2. converting that angle back → RAW using the partner's
+            #       mapping rules (direct vs inverted)
+            #  This keeps the downstream control law unchanged.
+
+            def _angle_to_raw(angle_rad: float, physical_idx: int) -> int:
+                """Convert a physical angle into a raw servo value (0-4095) using the
+                mapping rules held in utils.  Clamp to valid range."""
+                min_map_rad, max_map_rad = utils.EFFECTIVE_MAPPING_RANGES[physical_idx]
+                angle_clamped = max(min_map_rad, min(max_map_rad, angle_rad))
+                norm_val = (angle_clamped - min_map_rad) / (max_map_rad - min_map_rad)
+
+                if utils._is_servo_direct_mapping(physical_idx):
+                    raw = norm_val * 4095.0
+                else:
+                    raw = (1.0 - norm_val) * 4095.0
+
+                return int(round(max(0, min(4095, raw))))
+
+            # --- Joint 2 mirror (IDs 20 & 21) ---
+            if 20 in raw_positions and 21 not in raw_positions:
+                angle_rad_20 = servo_driver.servo_value_to_radians(raw_positions[20], 1)  # index of 20
+                raw_positions[21] = _angle_to_raw(angle_rad_20, 2)  # index of 21
+
+            # --- Joint 3 mirror (IDs 30 & 31) ---
+            if 30 in raw_positions and 31 not in raw_positions:
+                angle_rad_30 = servo_driver.servo_value_to_radians(raw_positions[30], 3)  # index of 30
+                raw_positions[31] = _angle_to_raw(angle_rad_30, 4)  # index of 31
 
             # --- Control Law (Calculate Error and Correction) ---
             commands_for_sync_write = []
