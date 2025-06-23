@@ -121,8 +121,7 @@ def print_help():
     print("  home                            : Send to a predefined 'home' pose.")
     print("  rest                            : Send to a predefined 'rest' pose.")
     print("\n  --- Cartesian Control (High-Level) ---")
-    print("  move_line,x,y,z[,v,a]           : Move tool tip to absolute XYZ (m) in a straight line.")
-    print("                                    v=velocity (m/s), a=acceleration (m/s^2).")
+    print("  move_line,x,y,z[,v,a,freq,closed] : Move tool tip (open loop if closed=false).")
     print("  move_line_rel,dx,dy,dz[,s]      : Alias for MOVE_LINE_RELATIVE (relative XYZ line move).")
     print("                                    s=speed multiplier (e.g., 0.5 for half speed).")
     print("  translate,dx,dy,dz              : (Legacy) Simple blocking relative translation.")
@@ -208,6 +207,7 @@ def main():
                 # Provide alias mapping for convenience
                 alias_map = {
                     "move_line_rel": "MOVE_LINE_RELATIVE",
+                    "move_line": "MOVE_LINE",  # ensure proper case
                 }
                 # Split only on the first comma to separate the command from its arguments
                 parts = user_input.split(',', 1)

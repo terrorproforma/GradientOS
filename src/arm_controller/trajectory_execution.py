@@ -574,3 +574,114 @@ def _closed_loop_executor_thread(
         utils.trajectory_state["should_stop"] = False
         utils.trajectory_state["thread"] = None
 
+
+def _open_loop_executor_thread(
+    joint_path: list[list[float]],
+    frequency: int,
+    diagnostics: bool = True,
+):
+    """High-speed *open-loop* executor.
+
+    • Pre-computes the raw Sync-Write payload for every step so the realtime
+      loop only needs to send the bytes.
+    • Collects basic timing statistics analogous to the closed-loop executor
+      (loop + write duration). Optionally saves a timing chart.
+    """
+
+    n_steps = len(joint_path)
+    print(f"[Pi OL] Starting Open-Loop Executor at {frequency} Hz ({n_steps} steps).")
+
+    # ----------------------------------------------
+    # Pre-allocate Sync-Write command buffers
+    # ----------------------------------------------
+    precomputed_cmds: list[list[tuple[int,int,int,int]]] = [
+        servo_driver.logical_q_to_syncwrite_tuple(q, 4095, 0) for q in joint_path
+    ]
+
+    # ----------------------------------------------
+    #  Timing buffers
+    # ----------------------------------------------
+    _loop_durations: list[float] = []
+    _write_durations: list[float] = []
+
+    time_step = 1.0 / frequency
+    start_time = time.monotonic()
+
+    try:
+        for i, cmd in enumerate(precomputed_cmds):
+            deadline = start_time + (i + 1) * time_step
+
+            loop_start = time.perf_counter()
+
+            # --- Actuation (WRITE) ---
+            w_t0 = time.perf_counter()
+            servo_protocol.sync_write_goal_pos_speed_accel(cmd)
+            _write_durations.append(time.perf_counter() - w_t0)
+
+            # --- Timing / sleep ---
+            iter_elapsed = time.perf_counter() - loop_start
+            _loop_durations.append(iter_elapsed)
+
+            sleep_t = deadline - time.monotonic()
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+            # No per-cycle printouts; we'll summarise at the end.
+
+            if utils.trajectory_state["should_stop"]:
+                print("[Pi OL] Stop signal received, halting execution.")
+                break
+
+        # Update global logical joint state
+        utils.current_logical_joint_angles_rad = joint_path[min(i, n_steps-1)]
+
+    finally:
+        # ----------------------------
+        #  Statistics & Diagnostics
+        # ----------------------------
+        if _loop_durations:
+            import statistics, math, datetime, matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            avg_ms = statistics.mean(_loop_durations) * 1000.0
+            max_ms = max(_loop_durations) * 1000.0
+            write_avg = statistics.mean(_write_durations) * 1000.0
+            write_max = max(_write_durations) * 1000.0
+
+            overruns = [d for d in _loop_durations if d > time_step]
+            overrun_pct = len(overruns) / len(_loop_durations) * 100.0
+
+            print(
+                f"[Pi OL] Timing summary: avg {avg_ms:.2f} ms (max {max_ms:.2f}), "
+                f"write avg {write_avg:.2f} (max {write_max:.2f}), "
+                f"overruns {len(overruns)}/{len(_loop_durations)} ({overrun_pct:.1f} %)"
+            )
+
+            if diagnostics:
+                try:
+                    from pathlib import Path
+                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    out_dir = Path("diagnostics")
+                    out_dir.mkdir(exist_ok=True)
+
+                    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+                    ax.plot([d * 1000 for d in _loop_durations], label="total loop")
+                    ax.plot([d * 1000 for d in _write_durations], label="write")
+                    ax.axhline(time_step * 1000, color="red", linestyle="--", label="deadline")
+                    ax.set_xlabel("Cycle index")
+                    ax.set_ylabel("Duration (ms)")
+                    ax.set_title("Open-loop cycle timing")
+                    ax.legend()
+                    fig.tight_layout()
+                    chart_path = out_dir / f"timing_ol_{ts}.png"
+                    fig.savefig(chart_path)
+                    plt.close(fig)
+                    print(f"[Pi OL] Timing chart saved to {chart_path}")
+                except Exception as e:
+                    print(f"[Pi OL] WARNING: Failed to generate diagnostics chart: {e}")
+
+        # Reset controller state flags
+        utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
+
+        print("[Pi OL] Open-Loop Executor finished.")
+

@@ -192,7 +192,15 @@ def handle_set_orientation_command(roll: float, pitch: float, yaw: float):
         print(f"[Pi IK] Orientational error: {np.rad2deg(np.linalg.norm(angle_rad)):.3f} degrees")
 
 
-def handle_move_profiled(target_x: float, target_y: float, target_z: float, velocity: float, acceleration: float, frequency: int = 150, use_smoothing: bool = True):
+def handle_move_profiled(target_x: float, 
+                         target_y: float, 
+                         target_z: float, 
+                         velocity: float, 
+                         acceleration: float, 
+                         frequency: int = 400, 
+                         use_smoothing: bool = True, 
+                         closed_loop: bool = False
+                         ):
     """
     Handles the 'MOVE_PROFILED' command. This is the core handler for all
     high-precision, profiled, non-blocking linear moves. It plans the full path,
@@ -208,6 +216,11 @@ def handle_move_profiled(target_x: float, target_y: float, target_z: float, velo
     initial_q = servo_driver.get_current_arm_state_rad(verbose=False)
     target_pos = np.array([target_x, target_y, target_z])
 
+    if closed_loop:
+        frequency = 400
+    else:
+        frequency = 1300
+
     # 2. Plan the entire move.
     joint_path = trajectory_execution._plan_smooth_move(
         start_q=initial_q,
@@ -218,23 +231,23 @@ def handle_move_profiled(target_x: float, target_y: float, target_z: float, velo
         use_smoothing=use_smoothing
     )
     
-    # 3. If planning was successful, execute the move using the closed-loop executor.
+    # 3. If planning was successful, choose executor
     if joint_path:
-        print("\n--- Starting Non-Blocking Closed-Loop Execution ---")
-        
-        utils.trajectory_state["is_running"] = True
-        utils.trajectory_state["should_stop"] = False
-        
-        # We run the closed-loop executor in a thread and return immediately.
+        executor_fn = (trajectory_execution._closed_loop_executor_thread
+                       if closed_loop
+                       else trajectory_execution._open_loop_executor_thread)
+
         executor_thread = threading.Thread(
-            target=trajectory_execution._closed_loop_executor_thread,
-            args=(joint_path, frequency)
+            target=executor_fn,
+            args=(joint_path, frequency),
+            daemon=True,
         )
         utils.trajectory_state["thread"] = executor_thread
+        utils.trajectory_state["is_running"] = True
+        utils.trajectory_state["should_stop"] = False
         executor_thread.start()
-        # The .join() call is removed to make this non-blocking.
-        
-        print("[Pi Smooth] Closed-loop move started in background.")
+        print("[Pi Smooth] Trajectory started "
+              f"({'closed' if closed_loop else 'open'} loop, background).")
     else:
         print("[Pi Smooth] ERROR: Move failed because path planning was unsuccessful.")
 

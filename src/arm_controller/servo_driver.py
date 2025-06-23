@@ -531,3 +531,58 @@ def get_servo_hardware_zero_offsets() -> list[int]:
             offsets[i] = 0 # Default to 0 on failure
             
     return offsets
+
+
+# ============================================================================
+# Helper for high-frequency executors
+# ============================================================================
+
+def logical_q_to_syncwrite_tuple(logical_joint_angles_rad: list[float],
+                                 speed: int = 4095,
+                                 accel: int = 0) -> list[tuple[int,int,int,int]]:
+    """Converts 6 logical joint angles to a list of (id, raw, speed, accel) tuples
+    ready for *sync_write_goal_pos_speed_accel*.
+
+    This is a stripped-down version of *set_servo_positions* that does **not**
+    touch global state and does **not** perform any I/O.  It is intended for use
+    by very high-frequency open-loop executors where we cannot afford the extra
+    overhead of rebuilding this logic each cycle.
+    """
+    if len(logical_joint_angles_rad) != utils.NUM_LOGICAL_JOINTS:
+        raise ValueError(f"Expected {utils.NUM_LOGICAL_JOINTS} logical joint angles, got {len(logical_joint_angles_rad)}")
+
+    # Pre-compute per-cycle acceleration register value (same mapping as main API)
+    accel_reg = 0
+    if accel > 0:
+        accel_reg = int(round(accel / utils.ACCELERATION_SCALE_FACTOR))
+        accel_reg = max(1, min(254, accel_reg))
+    # Clamp speed once
+    speed_val = int(max(0, min(4095, speed)))
+
+    logical_to_physical_map = {
+        0: [0],     # J1 -> ID 10
+        1: [1, 2],  # J2 -> IDs 20,21
+        2: [3, 4],  # J3 -> IDs 30,31
+        3: [5],     # J4 -> ID 40
+        4: [6],     # J5 -> ID 50
+        5: [7],     # J6 -> ID 60
+    }
+
+    cmd_list: list[tuple[int,int,int,int]] = []
+
+    for logical_idx, angle_rad in enumerate(logical_joint_angles_rad):
+        angle_with_offset = angle_rad + utils.LOGICAL_JOINT_MASTER_OFFSETS_RAD[logical_idx]
+
+        for physical_idx in logical_to_physical_map[logical_idx]:
+            servo_id = utils.SERVO_IDS[physical_idx]
+
+            # Clamp & map to raw
+            min_map, max_map = utils.EFFECTIVE_MAPPING_RANGES[physical_idx]
+            angle_for_norm = max(min_map, min(max_map, angle_with_offset))
+            norm = (angle_for_norm - min_map) / (max_map - min_map)
+            raw = norm * 4095.0 if utils._is_servo_direct_mapping(physical_idx) else (1.0 - norm) * 4095.0
+            raw_int = int(round(max(0, min(4095, raw))))
+
+            cmd_list.append((servo_id, raw_int, speed_val, accel_reg))
+
+    return cmd_list
