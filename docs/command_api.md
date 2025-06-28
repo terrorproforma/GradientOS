@@ -51,10 +51,43 @@ This module contains a `handle_...` function for every high-level action the rob
     -   `degrees`: (float, required) The angle to rotate in degrees.
 
 #### `SET_ORIENTATION`
--   **Syntax:** `SET_ORIENTATION,roll,pitch,yaw`
--   **Description:** A simple, un-profiled move to set the tool to a specific orientation, keeping the tool's position constant. This is a **blocking**, single-point IK move.
+-   **Syntax (basic):** `SET_ORIENTATION,roll,pitch,yaw`
+-   **Syntax (advanced):** `SET_ORIENTATION,roll,pitch,yaw,[duration_s],[closed_loop]`
+-   **Description:** Smoothly re-orients the tool tip to the given absolute Euler angles **while strictly maintaining its Cartesian position** throughout the motion.  Internally the controller interpolates the rotation, solves IK for every step (to enforce the position lock), and plays the trajectory at high frequency.
 -   **Parameters:**
-    -   `roll, pitch, yaw`: (float, required) The absolute target orientation in degrees, using the `xyz` Euler sequence.
+    -   `roll, pitch, yaw` (float, required): Target orientation in degrees, XYZ Euler order.
+    -   `duration_s` (float, optional): Desired motion duration in seconds (≥ 0.1 s). Defaults to `1.0` for a gentle re-orientation.
+    -   `closed_loop` (bool, optional): If `true`, executes in 400 Hz closed-loop mode for maximum accuracy; otherwise runs open-loop at 1300 Hz (default).
+-   **Blocking:** Yes — the command returns only after the orientation move has finished.
+
+##### Effect of `duration_s`
+
+| duration_s | Execution Mode | Frequency | Interpolation Steps | Feel of Motion | Typical Use-Case |
+|------------|----------------|-----------|---------------------|----------------|------------------|
+| **0.25**   | Open-loop      | 1300 Hz   | 325                 | Very brisk     | Small touch-ups, dynamic demos |
+| **0.50**   | Open-loop      | 1300 Hz   | 650                 | Fast           | Quick pick-and-place |
+| **1.00**   | Open-loop      | 1300 Hz   | 1300                | Smooth         | Default, safe around people |
+| **2.00**   | Open-loop      | 1300 Hz   | 2600                | Slow & gentle  | Precision assembly, filming |
+| **0.25**   | Closed-loop    | 400 Hz    | 100                 | Quick, precise | Rapid calibration |
+| **0.50**   | Closed-loop    | 400 Hz    | 200                 | Moderate       | High-accuracy pick-and-place |
+| **1.00**   | Closed-loop    | 400 Hz    | 400                 | Very smooth    | Fine alignment tasks |
+| **2.00**   | Closed-loop    | 400 Hz    | 800                 | Ultra smooth   | Slow-mo camera shots, teaching |
+
+##### Command Examples
+
+```text
+# Default (1 s, open-loop)
+SET_ORIENTATION,0,30,0
+
+# Twice as slow (2 s, open-loop)
+SET_ORIENTATION,0,30,0,2
+
+# Very fast (0.25 s, open-loop)
+SET_ORIENTATION,0,30,0,0.25
+
+# Smooth and high-accuracy (1.5 s, closed-loop)
+SET_ORIENTATION,0,30,0,1.5,true
+```
 
 ### State & Utility Commands
 

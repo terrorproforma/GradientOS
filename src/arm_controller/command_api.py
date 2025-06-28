@@ -132,63 +132,139 @@ def handle_rotate_command(axis: str, angle_deg: float):
         print(f"[Pi IK] Positional distance from target: {np.linalg.norm(final_position - target_position):.6f} m")
 
 
-def handle_set_orientation_command(roll: float, pitch: float, yaw: float):
+def handle_set_orientation_command(
+    roll: float,
+    pitch: float,
+    yaw: float,
+    *,
+    closed_loop: bool = False,
+    duration_s: float = 2.0,
+):
     """
-    Handles the 'SET_ORIENTATION' command.
-    Performs a simple, blocking, single-point IK move to set the end effector
-    to a specific absolute orientation, while maintaining its position.
+    Handles the `SET_ORIENTATION` command.
+
+    This command **smoothly re-orients** the tool tip to the specified absolute
+    Euler angles **while keeping its Cartesian position fixed**.  Internally it:
+
+    1.  Interpolates between the current and target orientations with a SLERP
+        curve (density chosen from `duration_s` × execution frequency).
+    2.  Solves IK in a single batched call for every intermediate pose, so the
+        position constraint is enforced at all times.
+    3.  Executes the resulting joint path either:
+        • **Open-loop** at 1300 Hz  (default, high-speed)
+        • **Closed-loop** at 400 Hz (`closed_loop=True`, high-precision)
+
+    Because the path is pre-planned, the function is *blocking*: it only
+    returns after the motion (≈ `duration_s`) has finished.
+
+    Parameters
+    ----------
+    roll, pitch, yaw : float
+        Absolute tool orientation in degrees, XYZ intrinsic Euler order.
+    closed_loop : bool, optional
+        Run the high-precision closed-loop executor at 400 Hz instead of the
+        high-speed open-loop executor.  Default `False`.
+    duration_s : float, optional
+        Desired motion duration (≥ 0.1 s).  Controls the smoothness/speed by
+        scaling the number of interpolation steps.  Default `1.0`.
     """
     print(f"[Pi IK] Received SET_ORIENTATION command: Roll={roll}, Pitch={pitch}, Yaw={yaw} degrees")
 
-    # 1. Get current state
+    # 1. Get current state (joint angles and full pose).
     initial_angles = utils.current_logical_joint_angles_rad
-
-    # 2. Get the current position using FK, as we want to maintain it.
-    current_position = ik_solver.get_fk(initial_angles)
-    if current_position is None:
+    current_pose_matrix = ik_solver.get_fk_matrix(initial_angles)
+    if current_pose_matrix is None:
         print("[Pi IK] ERROR: Failed to calculate current pose using FK.")
         return
 
-    # 3. Create the target orientation matrix from the provided Euler angles (roll, pitch, yaw)
+    current_position = current_pose_matrix[:3, 3]
+    current_orientation = current_pose_matrix[:3, :3]
+
+    # 2. Build the target orientation matrix from Euler angles (XYZ intrinsic).
     try:
-        # The 'xyz' sequence means the rotations are applied in the order of Roll (X), then Pitch (Y), then Yaw (Z)
         target_orientation = R.from_euler('xyz', [roll, pitch, yaw], degrees=True).as_matrix()
     except Exception as e:
         print(f"[Pi IK] ERROR: Failed to create orientation matrix from Euler angles: {e}")
         return
-        
-    # 4. Use the current position as the target position
-    target_position = current_position
+
     print(f"[Pi IK] Target EE Orientation Matrix:\n{np.round(target_orientation, 2)}")
-    print(f"[Pi IK] Maintaining EE Position at: {np.round(target_position, 4)}")
+    print(f"[Pi IK] Maintaining EE Position at: {np.round(current_position, 4)}")
 
-    # 5. Use IK to find the new joint angles
-    new_logical_joint_angles = ik_solver.solve_ik(
-        target_position=target_position,
-        target_orientation_matrix=target_orientation,
-        initial_joint_angles=initial_angles
-    )
+    # ------------------------------------------------------------------
+    # 3. Generate an orientation-only path that keeps the tool-tip fixed.
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
+    #   3. Determine execution parameters
+    # ------------------------------------------------------------
+    frequency_hz = 400 if closed_loop else 1300  # Align with other commands
 
-    if new_logical_joint_angles is None:
-        print("[Pi IK] ERROR: IK solver failed to find a solution for the specified orientation.")
+    # Use caller-provided duration (default 1 s) to scale interpolation density.
+    duration_s = max(0.1, duration_s)  # clamp to sane minimum
+    NUM_STEPS = max(2, int(duration_s * frequency_hz))
+
+    try:
+        # Use spherical linear interpolation (SLERP) between current and target orientation
+        from scipy.spatial.transform import Slerp  # local import to avoid polluting global namespace
+
+        rot_start = R.from_matrix(current_orientation)
+        rot_end = R.from_matrix(target_orientation)
+
+        key_rots = R.concatenate([rot_start, rot_end])
+        key_times = [0, 1]
+        slerp = Slerp(key_times, key_rots)
+        times = np.linspace(0, 1, NUM_STEPS)
+        interpolated_rots = slerp(times)
+        orientation_matrices = [r.as_matrix() for r in interpolated_rots]
+    except Exception as e:
+        print(f"[Pi IK] ERROR: Failed to build SLERP interpolation: {e}")
         return
 
-    print(f"[Pi IK] IK Solution Found (deg): {np.round(np.rad2deg(new_logical_joint_angles), 2)}")
+    # Build constant-position list matching orientation list
+    path_positions = [current_position] * NUM_STEPS
 
-    # 6. Command servos
-    servo_driver.set_servo_positions(new_logical_joint_angles, utils.DEFAULT_SERVO_SPEED, utils.DEFAULT_SERVO_ACCELERATION_DEG_S2)
-    print("[Pi IK] Sent new positions to servos for orientation change.")
+    # ------------------------------------------------------------------
+    # 4. Solve IK for the entire path in one batched call.
+    # ------------------------------------------------------------------
+    joint_path = ik_solver.solve_ik_path_batch(
+        path_points=path_positions,
+        initial_joint_angles=initial_angles,
+        target_orientations=orientation_matrices,
+    )
 
-    # 7. Verification
-    final_pose_matrix = ik_solver.get_fk_matrix(new_logical_joint_angles)
+    if joint_path is None:
+        print("[Pi IK] ERROR: IK solver failed to find a solution for the orientation path.")
+        return
+
+    # ------------------------------------------------------------------
+    # 5. Execute the joint path (blocking) using the selected executor.
+    # ------------------------------------------------------------------
+    if closed_loop:
+        trajectory_execution._closed_loop_executor_thread(
+            joint_path=joint_path,
+            frequency=frequency_hz,
+            diagnostics=False,
+        )
+    else:
+        trajectory_execution._open_loop_executor_thread(
+            joint_path=joint_path,
+            frequency=frequency_hz,
+            diagnostics=False,
+        )
+
+    # ------------------------------------------------------------------
+    # 6. Final verification (optional, quick FK check).
+    # ------------------------------------------------------------------
+    final_pose_matrix = ik_solver.get_fk_matrix(joint_path[-1])
     if final_pose_matrix is not None:
         final_position = final_pose_matrix[:3, 3]
         final_orientation = final_pose_matrix[:3, :3]
-        # Compare final orientation to target
+
+        # Compare orientation error
         orient_error_matrix = np.transpose(target_orientation) @ final_orientation
         angle_rad, _, _ = R.from_matrix(orient_error_matrix).as_rotvec()
+
         print(f"[Pi IK] Verification -> Final Pos: {np.round(final_position, 4)}")
-        print(f"[Pi IK] Positional error: {np.linalg.norm(final_position - target_position):.6f} m")
+        print(f"[Pi IK] Positional error: {np.linalg.norm(final_position - current_position):.6f} m")
         print(f"[Pi IK] Orientational error: {np.rad2deg(np.linalg.norm(angle_rad)):.3f} degrees")
 
 

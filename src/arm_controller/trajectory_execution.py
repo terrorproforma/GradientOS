@@ -8,6 +8,8 @@ import numpy as np
 from scipy.signal import savgol_filter
 from typing import Sequence, Union
 from pathlib import Path
+import os
+import csv
 
 try:
     import ik_solver
@@ -203,6 +205,29 @@ def _plan_high_fidelity_trajectory(cartesian_points: list, start_q: list[float],
         return None
     
     print(f"[Pi Plan HF] Batch IK solving complete. Took {(t_end_ik - t_start_ik) * 1000:.2f} ms")
+
+    # ------------------------------------------------------------------
+    # Optional Diagnostics: Save IK plan to CSV for later analysis
+    # ------------------------------------------------------------------
+    try:
+        if os.environ.get("MINI_ARM_IK_LOG", "0") == "1":
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            from pathlib import Path
+            out_dir = Path("diagnostics")
+            out_dir.mkdir(exist_ok=True)
+            csv_file = out_dir / f"ik_plan_{ts}.csv"
+            with open(csv_file, "w", newline="") as fp:
+                writer = csv.writer(fp)
+                header = [
+                    "idx", "target_x", "target_y", "target_z",
+                    *[f"J{i+1}_rad" for i in range(len(joint_trajectory[0]))]
+                ]
+                writer.writerow(header)
+                for idx, (pt, q) in enumerate(zip(cartesian_points, joint_trajectory)):
+                    writer.writerow([idx, *pt, *q])
+            print(f"[Pi Plan HF] Diagnostics CSV saved → {csv_file}")
+    except Exception as e:
+        print(f"[Pi Plan HF] WARNING: Failed to write diagnostics CSV: {e}")
 
     # 3. Post-process the trajectory (unwrap and smooth).
     unwrapped_joint_trajectory = _unwrap_joint_trajectory(joint_trajectory)
