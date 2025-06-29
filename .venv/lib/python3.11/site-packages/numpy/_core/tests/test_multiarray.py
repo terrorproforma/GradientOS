@@ -31,6 +31,7 @@ from numpy._core.tests._locales import CommaDecimalPointLocale
 from numpy.exceptions import AxisError, ComplexWarning
 from numpy.lib.recfunctions import repack_fields
 from numpy.testing import (
+    BLAS_SUPPORTS_FPE,
     HAS_REFCOUNT,
     IS_64BIT,
     IS_PYPY,
@@ -3363,6 +3364,11 @@ class TestMethods:
     @pytest.mark.parametrize("dtype", [np.half, np.double, np.longdouble])
     @pytest.mark.skipif(IS_WASM, reason="no wasm fp exception support")
     def test_dot_errstate(self, dtype):
+        # Some dtypes use BLAS for 'dot' operation and
+        # not all BLAS support floating-point errors.
+        if not BLAS_SUPPORTS_FPE and dtype == np.double:
+            pytest.skip("BLAS does not support FPE")
+
         a = np.array([1, 1], dtype=dtype)
         b = np.array([-np.inf, np.inf], dtype=dtype)
 
@@ -7316,6 +7322,12 @@ class TestMatmul(MatmulCommon):
 
         r3 = np.matmul(args[0].copy(), args[1].copy())
         assert_equal(r1, r3)
+
+        # matrix matrix, issue 29164
+        if [len(args[0].shape), len(args[1].shape)] == [2, 2]:
+            out_f = np.zeros((r2.shape[0] * 2, r2.shape[1] * 2), order='F')
+            r4 = np.matmul(*args, out=out_f[::2, ::2])
+            assert_equal(r2, r4)
 
     def test_matmul_object(self):
         import fractions

@@ -16,19 +16,21 @@ This module contains a `handle_...` function for every high-level action the rob
 ### Motion Commands
 
 #### `MOVE_LINE`
--   **Syntax:** `MOVE_LINE,x,y,z,[velocity],[acceleration]`
+-   **Syntax:** `MOVE_LINE,x,y,z,[velocity],[acceleration],[closed_loop]`
 -   **Description:** Plans and executes a high-precision, closed-loop, straight-line move to an absolute Cartesian position. The tool's orientation is locked to match its orientation at the start of the move. This command is **non-blocking**.
 -   **Parameters:**
     -   `x, y, z`: (float, required) The absolute target coordinates in meters.
     -   `velocity`: (float, optional) The maximum velocity for the move in meters/sec. Defaults to `DEFAULT_PROFILE_VELOCITY`.
     -   `acceleration`: (float, optional) The acceleration and deceleration for the move in meters/sec^2. Defaults to `DEFAULT_PROFILE_ACCELERATION`.
+    -   `closed_loop`: (bool, optional) Set to `false`, `open`, or `off` to execute in high-speed open-loop mode. Defaults to `true` (closed-loop).
 
 #### `MOVE_LINE_RELATIVE`
--   **Syntax:** `MOVE_LINE_RELATIVE,dx,dy,dz,[speed_multiplier]`
+-   **Syntax:** `MOVE_LINE_RELATIVE,dx,dy,dz,[speed_multiplier],[closed_loop]`
 -   **Description:** Plans and executes a high-precision, closed-loop, straight-line move relative to the robot's current position. The tool's orientation is locked. This command is **non-blocking**.
 -   **Parameters:**
     -   `dx, dy, dz`: (float, required) The relative distance to move in meters.
     -   `speed_multiplier`: (float, optional) A multiplier for the default velocity and acceleration. Defaults to `1.0`.
+    -   `closed_loop`: (bool, optional) Set to `false`, `open`, or `off` to execute in high-speed open-loop mode. Defaults to `true` (closed-loop).
 
 #### `RUN_TRAJECTORY`
 -   **Syntax:** `RUN_TRAJECTORY,name,[use_cache]`
@@ -119,8 +121,4 @@ SET_ORIENTATION,0,30,0,1.5,true
 
 #### `GET_ALL_POSITIONS`
 -   **Syntax:** `GET_ALL_POSITIONS`
--   **Description:** Requests the current raw position (0-4095) of all physical servos. The controller replies with a UDP packet in the format `"ALL_POS_DATA,id1,pos1,id2,pos2,..."`.
-
-#### `RESET_OFFSETS`
--   **Syntax:** `RESET_OFFSETS`
--   **Description:** A utility command to reset the hardware `Position Correction` register on **all servos** back to `0`. This is useful for clearing out old calibration data and starting from a clean slate. This is a destructive operation written to the servos' EEPROM. 
+-   **Description:** Requests the current raw position (0-4095) of all physical servos. The controller replies with a UDP packet in the format `

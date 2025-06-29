@@ -524,7 +524,7 @@ class Style:
                 if not word:
                     raise errors.StyleSyntaxError("color expected after 'on'")
                 try:
-                    Color.parse(word) is None
+                    Color.parse(word)
                 except ColorParseError as error:
                     raise errors.StyleSyntaxError(
                         f"unable to parse {word!r} as background color; {error}"
@@ -643,6 +643,29 @@ class Style:
         style._hash = self._hash
         style._null = False
         style._meta = self._meta
+        return style
+
+    @lru_cache(maxsize=128)
+    def clear_meta_and_links(self) -> "Style":
+        """Get a copy of this style with link and meta information removed.
+
+        Returns:
+            Style: New style object.
+        """
+        if self._null:
+            return NULL_STYLE
+        style: Style = self.__new__(Style)
+        style._ansi = self._ansi
+        style._style_definition = self._style_definition
+        style._color = self._color
+        style._bgcolor = self._bgcolor
+        style._attributes = self._attributes
+        style._set_attributes = self._set_attributes
+        style._link = None
+        style._link_id = ""
+        style._hash = None
+        style._null = False
+        style._meta = None
         return style
 
     def update_link(self, link: Optional[str] = None) -> "Style":

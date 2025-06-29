@@ -2,6 +2,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import os
 from ikfast_solver.ikfast_wrapper import IKFastSolver
+from arm_controller import utils
 
 # --- Configuration ---
 # Define the translation offset from the final joint (wrist) to the tool tip.
@@ -41,11 +42,17 @@ def _find_closest_solution(solutions, current_joint_angles):
     if solutions.ndim == 1:
         return solutions
 
-    # Calculate distances without a loop for performance
-    distances = np.linalg.norm(solutions - current_joint_angles, axis=1)
+    # Before computing distances make every candidate continuous w.r.t current
+    continuous_solutions = np.array([
+        _wrap_to_prev(current_joint_angles, sol) for sol in solutions
+    ])
+
+    # Euclidean distance in joint space (all differences already shortest)
+    distances = np.linalg.norm(continuous_solutions - current_joint_angles, axis=1)
     best_solution_idx = np.argmin(distances)
             
-    return solutions[best_solution_idx]
+    # Return the wrapped version so the caller already gets a continuous vector
+    return continuous_solutions[best_solution_idx]
 
 def solve_ik(target_position, target_orientation_matrix=None, initial_joint_angles=None):
     """
@@ -80,6 +87,11 @@ def solve_ik(target_position, target_orientation_matrix=None, initial_joint_angl
     target_wrist_orientation_flat = target_rotation.flatten()
     
     solutions = IK_SOLVER.solve_ik(target_wrist_position, target_wrist_orientation_flat, initial_joint_angles)
+
+    # IK solver already chooses nearest solution if an initial guess is provided, but joint angles
+    # can still jump by ±2π.  Re-wrap to stay close to the seed.
+    if solutions is not None and initial_joint_angles is not None:
+        solutions = _wrap_to_prev(np.asarray(initial_joint_angles, dtype=float), np.asarray(solutions, dtype=float))
 
     return solutions
 
@@ -220,13 +232,61 @@ def solve_ik_path_batch(path_points, initial_joint_angles=None, target_orientati
         poses_batch[i, 3:] = target_rotation.flatten()
 
     # Call the new batch solver in the wrapper
-    solutions = IK_SOLVER.solve_ik_path(poses_batch, start_angles_np)
+    joint_solutions = IK_SOLVER.solve_ik_path(poses_batch, start_angles_np)
 
-    return solutions
+    # --- Optional Diagnostics Logging ---
+    if joint_solutions is not None and os.environ.get("MINI_ARM_IK_LOG", "0") == "1":
+        try:
+            import csv, datetime
+            from pathlib import Path
+
+            session_id = utils.trajectory_state.get('diagnostics_session_id')
+            folder_type = utils.trajectory_state.get('diagnostics_folder_type', 'ik_plans') # fallback
+
+            if session_id:
+                out_dir = Path(f"diagnostics/{folder_type}/{session_id}")
+                csv_file = out_dir / "ik_plan.csv"
+            else:
+                session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_dir = Path(f"diagnostics/{folder_type}")
+                csv_file = out_dir / f"ik_plan_{session_id}.csv"
+
+            out_dir.mkdir(parents=True, exist_ok=True)
+            with open(csv_file, "w", newline="") as fp:
+                writer = csv.writer(fp)
+                header = ["idx", "target_x", "target_y", "target_z", *[f"J{i+1}_rad" for i in range(len(joint_solutions[0]))]]
+                writer.writerow(header)
+                for idx, (pt, q) in enumerate(zip(path_points, joint_solutions)):
+                    writer.writerow([idx, *pt, *q])
+            print(f"[IK Solver] Diagnostics CSV saved -> {csv_file}")
+        except Exception as e:
+            print(f"[IK Solver] WARNING: Failed to write diagnostics CSV: {e}")
+
+    return joint_solutions
 
 # Note: A parallel implementation is not provided as the C++ IKFast solver
 # is extremely fast, making the overhead of process creation often slower
 # than sequential execution.
+
+# ---------------------------------------------------------------
+# Angle-wrapping helpers (for revolute/continuous joints)
+# ---------------------------------------------------------------
+
+_TWO_PI = 2.0 * np.pi
+
+
+def _shortest_angular_distance(a, b):
+    """Return the signed smallest angular difference a→b (both rad)."""
+    diff = (b - a + np.pi) % _TWO_PI - np.pi
+    return diff
+
+
+def _wrap_to_prev(prev, angles):
+    """Shift each element of *angles* by ±2π so it is <π from prev."""
+    wrapped = angles.copy()
+    deltas = _shortest_angular_distance(prev, wrapped)
+    wrapped = prev + deltas
+    return wrapped
 
 if __name__ == '__main__':
     # Example usage and test of the new IK solver

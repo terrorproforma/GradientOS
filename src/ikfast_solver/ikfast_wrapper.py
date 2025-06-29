@@ -1,7 +1,15 @@
 import numpy as np
-# The 'ikfast_pybind' module is the C++ extension built by scikit-build-core.
-# We use an absolute import to ensure we get the installed package.
-from . import ikfast_pybind
+# When installed normally the compiled extension lives as
+# `ikfast_solver.ikfast_pybind`.  In *editable* mode the build backend can
+# leave the `.so` at the top-level site-packages directory instead, causing a
+# relative import to fail.  Try the relative name first, then fall back to an
+# absolute import so developers do not see mysterious `ImportError`.
+
+try:
+    from . import ikfast_pybind  # type: ignore
+except ImportError:
+    import importlib
+    ikfast_pybind = importlib.import_module("ikfast_pybind")
 
 class IKFastSolver:
     """

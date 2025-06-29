@@ -208,17 +208,14 @@ def main():
                 elif command == "MOVE_LINE":
                     try:
                         x, y, z = map(float, parts[1:4])
-                        v = float(parts[4]) if len(parts) > 4 and parts[4].strip() != "" else utils.DEFAULT_PROFILE_VELOCITY
-                        a = float(parts[5]) if len(parts) > 5 and parts[5].strip() != "" else utils.DEFAULT_PROFILE_ACCELERATION
-                        f = int(parts[6]) if len(parts) > 6 and parts[6].strip() != "" else 500
-                        # closed-loop flag: interpret "false|0|no" (case-insensitive) as False, everything else → True
+                        v = float(parts[4]) if len(parts) > 4 else utils.DEFAULT_PROFILE_VELOCITY
+                        a = float(parts[5]) if len(parts) > 5 else utils.DEFAULT_PROFILE_ACCELERATION
                         closed_loop = True
-                        if len(parts) > 7 and parts[7].strip() != "":
-                            closed_loop = parts[7].strip().lower() not in {"false", "0", "no"}
-
-                        command_api.handle_move_line(x, y, z, v, a, frequency=f, closed_loop=closed_loop)
+                        if len(parts) > 6 and parts[6].strip() != "":
+                            closed_loop = parts[6].strip().lower() not in {"false", "0", "no", "open", "off"}
+                        command_api.handle_move_line(x, y, z, v, a, closed_loop)
                     except (ValueError, IndexError):
-                        print("[Controller] Error: Invalid MOVE_LINE command. Use 'MOVE_LINE,x,y,z,[v],[a],[freq],[closed_loop]'.")
+                        print("[Controller] Error: Invalid MOVE_LINE command. Use 'MOVE_LINE,x,y,z,[v],[a],[closed_loop]'.")
 
                 elif command == "MOVE_LINE_RELATIVE":
                     if len(parts) < 4:
@@ -244,7 +241,10 @@ def main():
                     # Call the handler outside the parsing try-block so that any
                     # runtime errors inside the motion planner don't get caught
                     # and mis-reported as a command-format error.
-                    command_api.handle_move_line_relative(dx, dy, dz, speed_multiplier)
+                    closed_loop = True
+                    if len(parts) > 5 and parts[5].strip() != "":
+                        closed_loop = parts[5].strip().lower() not in {"false", "0", "no", "open", "off"}
+                    command_api.handle_move_line_relative(dx, dy, dz, speed_multiplier, closed_loop)
 
                 elif command == "MOVE_PROFILED":
                     print("[Controller] WARNING: The 'MOVE_PROFILED' command is deprecated. Please use 'MOVE_LINE' for clearer intent.")

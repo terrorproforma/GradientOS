@@ -5,6 +5,7 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import threading
+import datetime
 
 try:
     import ik_solver
@@ -139,6 +140,7 @@ def handle_set_orientation_command(
     *,
     closed_loop: bool = False,
     duration_s: float = 2.0,
+    diagnostics: bool = False,
 ):
     """
     Handles the `SET_ORIENTATION` command.
@@ -190,6 +192,15 @@ def handle_set_orientation_command(
     print(f"[Pi IK] Target EE Orientation Matrix:\n{np.round(target_orientation, 2)}")
     print(f"[Pi IK] Maintaining EE Position at: {np.round(current_position, 4)}")
 
+    # --- 3. Set up diagnostics session if enabled ---
+    session_id = None
+    if os.environ.get("MINI_ARM_IK_LOG", "0") == "1" or diagnostics:
+        # Use a consistent timestamp for all diagnostics in this session
+        session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        utils.trajectory_state['diagnostics_session_id'] = session_id
+        # The IK logger will use this to place the plan in the correct subfolder
+        utils.trajectory_state['diagnostics_folder_type'] = "closed_loop" if closed_loop else "open_loop"
+
     # ------------------------------------------------------------------
     # 3. Generate an orientation-only path that keeps the tool-tip fixed.
     # ------------------------------------------------------------------
@@ -239,17 +250,17 @@ def handle_set_orientation_command(
     # 5. Execute the joint path (blocking) using the selected executor.
     # ------------------------------------------------------------------
     if closed_loop:
-        trajectory_execution._closed_loop_executor_thread(
-            joint_path=joint_path,
-            frequency=frequency_hz,
-            diagnostics=False,
-        )
+        target_func = trajectory_execution._closed_loop_executor_thread
     else:
-        trajectory_execution._open_loop_executor_thread(
-            joint_path=joint_path,
-            frequency=frequency_hz,
-            diagnostics=False,
-        )
+        target_func = trajectory_execution._open_loop_executor_thread
+    
+    executor_thread = threading.Thread(
+        target=target_func,
+        kwargs={'joint_path': joint_path, 'frequency': frequency_hz, 'diagnostics': diagnostics}
+    )
+
+    executor_thread.start()
+    executor_thread.join() # Block until the move is finished
 
     # ------------------------------------------------------------------
     # 6. Final verification (optional, quick FK check).
@@ -267,6 +278,11 @@ def handle_set_orientation_command(
         print(f"[Pi IK] Positional error: {np.linalg.norm(final_position - current_position):.6f} m")
         print(f"[Pi IK] Orientational error: {np.rad2deg(np.linalg.norm(angle_rad)):.3f} degrees")
 
+    # --- Clean up diagnostics session ---
+    if session_id:
+        del utils.trajectory_state['diagnostics_session_id']
+        del utils.trajectory_state['diagnostics_folder_type']
+
 
 def handle_move_profiled(target_x: float, 
                          target_y: float, 
@@ -275,7 +291,8 @@ def handle_move_profiled(target_x: float,
                          acceleration: float, 
                          frequency: int = 400, 
                          use_smoothing: bool = True, 
-                         closed_loop: bool = False
+                         closed_loop: bool = False,
+                         diagnostics: bool = False
                          ):
     """
     Handles the 'MOVE_PROFILED' command. This is the core handler for all
@@ -292,10 +309,20 @@ def handle_move_profiled(target_x: float,
     initial_q = servo_driver.get_current_arm_state_rad(verbose=False)
     target_pos = np.array([target_x, target_y, target_z])
 
+    diagnostics_enabled = os.environ.get("MINI_ARM_IK_LOG", "0") == "1" or diagnostics
+
+    # --- Set up diagnostics session if enabled ---
+    if diagnostics_enabled:
+        session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        utils.trajectory_state['diagnostics_session_id'] = session_id
+        utils.trajectory_state['diagnostics_folder_type'] = "closed_loop" if closed_loop else "open_loop"
+
     if closed_loop:
         frequency = 400
     else:
-        frequency = 1300
+        # With diagnostics, the open-loop executor reads feedback and is much slower.
+        # We must plan the trajectory at the slower rate to ensure the move duration is correct.
+        frequency = 400 if diagnostics_enabled else 1300
 
     # 2. Plan the entire move.
     joint_path = trajectory_execution._plan_smooth_move(
@@ -315,7 +342,8 @@ def handle_move_profiled(target_x: float,
 
         executor_thread = threading.Thread(
             target=executor_fn,
-            args=(joint_path, frequency),
+            # Pass diagnostics flag to the executor thread
+            kwargs={'joint_path': joint_path, 'frequency': frequency, 'diagnostics': diagnostics_enabled},
             daemon=True,
         )
         utils.trajectory_state["thread"] = executor_thread
@@ -656,20 +684,37 @@ def handle_get_position(sock: 'socket.socket', addr: tuple):
             print(f"[Pi] Error sending FK_FAILED error to {addr}: {e}")
 
 
-def handle_move_line(target_x: float, target_y: float, target_z: float, velocity: float, acceleration: float):
-    """
-    Handles the 'MOVE_LINE' command. This is the new standard for a non-blocking,
-    high-precision, closed-loop linear move. It's an alias for handle_move_profiled.
-    """
-    handle_move_profiled(target_x, target_y, target_z, velocity, acceleration)
+def handle_move_line(target_x: float, target_y: float, target_z: float, velocity: float, acceleration: float, closed_loop: bool = True):
+    """Convenience wrapper that calls the main profiled move handler, defaulting to closed-loop."""
+    handle_move_profiled(
+        target_x, target_y, target_z, velocity, acceleration,
+        closed_loop=closed_loop,
+        use_smoothing=True,
+        diagnostics=False
+    )
 
-def handle_move_line_relative(dx: float, dy: float, dz: float, speed: float):
-    """
-    Handles the 'MOVE_LINE_RELATIVE' command. This is the new standard for a
-    non-blocking, high-precision, closed-loop relative move. It's an alias for
-    handle_move_profiled_relative.
-    """
-    handle_move_profiled_relative(dx, dy, dz, speed)
+def handle_move_line_relative(dx: float, dy: float, dz: float, speed: float = 1.0, closed_loop: bool = True):
+    """Convenience wrapper that calls the main profiled move handler, defaulting to closed-loop."""
+    current_q = servo_driver.get_current_arm_state_rad(verbose=False)
+    if current_q is None:
+        print("[Pi Smooth] ERROR: Cannot start relative move, failed to get current position.")
+        return
+        
+    start_pos = ik_solver.get_fk(current_q)
+    if start_pos is None:
+        print("[Pi Smooth] ERROR: Cannot start relative move, failed to get start position.")
+        return
+        
+    target_pos = start_pos + np.array([dx, dy, dz])
+    
+    handle_move_profiled(
+        target_pos[0], target_pos[1], target_pos[2],
+        velocity=utils.DEFAULT_PROFILE_VELOCITY * speed,
+        acceleration=utils.DEFAULT_PROFILE_ACCELERATION,
+        closed_loop=closed_loop,
+        use_smoothing=True,
+        diagnostics=False
+    )
 
 
 def handle_wait_for_idle():

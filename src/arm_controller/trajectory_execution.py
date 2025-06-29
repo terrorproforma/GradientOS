@@ -206,29 +206,6 @@ def _plan_high_fidelity_trajectory(cartesian_points: list, start_q: list[float],
     
     print(f"[Pi Plan HF] Batch IK solving complete. Took {(t_end_ik - t_start_ik) * 1000:.2f} ms")
 
-    # ------------------------------------------------------------------
-    # Optional Diagnostics: Save IK plan to CSV for later analysis
-    # ------------------------------------------------------------------
-    try:
-        if os.environ.get("MINI_ARM_IK_LOG", "0") == "1":
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            from pathlib import Path
-            out_dir = Path("diagnostics")
-            out_dir.mkdir(exist_ok=True)
-            csv_file = out_dir / f"ik_plan_{ts}.csv"
-            with open(csv_file, "w", newline="") as fp:
-                writer = csv.writer(fp)
-                header = [
-                    "idx", "target_x", "target_y", "target_z",
-                    *[f"J{i+1}_rad" for i in range(len(joint_trajectory[0]))]
-                ]
-                writer.writerow(header)
-                for idx, (pt, q) in enumerate(zip(cartesian_points, joint_trajectory)):
-                    writer.writerow([idx, *pt, *q])
-            print(f"[Pi Plan HF] Diagnostics CSV saved → {csv_file}")
-    except Exception as e:
-        print(f"[Pi Plan HF] WARNING: Failed to write diagnostics CSV: {e}")
-
     # 3. Post-process the trajectory (unwrap and smooth).
     unwrapped_joint_trajectory = _unwrap_joint_trajectory(joint_trajectory)
     
@@ -255,6 +232,46 @@ def _plan_high_fidelity_trajectory(cartesian_points: list, start_q: list[float],
         final_joint_trajectory = unwrapped_joint_trajectory
         
     print("[Pi Plan HF] Path post-processing complete.")
+
+    # ------------------------------
+    # Diagnostics: save smoothed joint path
+    # ------------------------------
+    if os.environ.get("MINI_ARM_IK_LOG", "0") == "1":
+        try:
+            import csv, datetime
+            from pathlib import Path
+
+            session_id = utils.trajectory_state.get('diagnostics_session_id')
+            folder_type = utils.trajectory_state.get('diagnostics_folder_type', 'open_loop')
+
+            if session_id:
+                out_dir = Path(f"diagnostics/{folder_type}/{session_id}")
+            else:
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_dir = Path(f"diagnostics/{folder_type}/{ts}")
+                out_dir.mkdir(parents=True, exist_ok=True)
+            csv_file = out_dir / "joint_path.csv"
+
+            with open(csv_file, "w", newline="") as fp:
+                writer = csv.writer(fp)
+                header = [f"J{i+1}_rad" for i in range(len(final_joint_trajectory[0]))]
+                writer.writerow(header)
+                writer.writerows(final_joint_trajectory)
+            print(f"[Pi Plan HF] Smoothed joint path CSV saved -> {csv_file}")
+
+            # Auto-generate comparison plots using the existing utility
+            try:
+                from diagnostics import plot_ik_plan as plot_util
+
+                ik_csv = out_dir / "ik_plan.csv"
+                csv_to_plot = ik_csv if ik_csv.exists() else csv_file  # Fall back to smoothed path only
+
+                plot_util.main(csv_to_plot)
+            except Exception as e:
+                print(f"[Pi Plan HF] WARNING: Failed to auto-generate plots: {e}")
+        except Exception as e:
+            print(f"[Pi Plan HF] WARNING: Failed to write joint_path.csv: {e}")
+
     return final_joint_trajectory
 
 
@@ -304,6 +321,158 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
         utils.trajectory_state["is_running"] = False
         utils.trajectory_state["should_stop"] = False
         utils.trajectory_state["thread"] = None
+
+
+def _open_loop_executor_thread(
+    joint_path: list[list[float]],
+    frequency: int,
+    diagnostics: bool = True,
+):
+    """High-speed *open-loop* executor.
+
+    • Pre-computes the raw Sync-Write payload for every step so the realtime
+      loop only needs to send the bytes.
+    • Collects basic timing statistics analogous to the closed-loop executor
+      (loop + write duration). Optionally saves a timing chart.
+    """
+
+    if diagnostics and frequency > 400:
+        print(f"[Pi OL] WARNING: Diagnostics enabled. Capping frequency from {frequency} Hz to 400 Hz due to feedback overhead.")
+        frequency = 400
+
+    n_steps = len(joint_path)
+    print(f"[Pi OL] Starting Open-Loop Executor at {frequency} Hz ({n_steps} steps).")
+
+    # ----------------------------------------------
+    # Pre-allocate Sync-Write command buffers
+    # ----------------------------------------------
+    precomputed_cmds: list[list[tuple[int,int,int,int]]] = [
+        servo_driver.logical_q_to_syncwrite_tuple(q, 4095, 0) for q in joint_path
+    ]
+
+    # ----------------------------------------------
+    #  Timing buffers
+    # ----------------------------------------------
+    _loop_durations: list[float] = []
+    _write_durations: list[float] = []
+    _abs_errors_per_joint: list[list[float]] = [[] for _ in range(utils.NUM_LOGICAL_JOINTS)]
+
+    time_step = 1.0 / frequency
+    start_time = time.monotonic()
+
+    try:
+        for i, cmd in enumerate(precomputed_cmds):
+            deadline = start_time + (i + 1) * time_step
+
+            loop_start = time.perf_counter()
+
+            # --- Actuation (WRITE) ---
+            w_t0 = time.perf_counter()
+            servo_protocol.sync_write_goal_pos_speed_accel(cmd)
+            _write_durations.append(time.perf_counter() - w_t0)
+
+            # --- Timing / sleep ---
+            iter_elapsed = time.perf_counter() - loop_start
+            _loop_durations.append(iter_elapsed)
+
+            sleep_t = deadline - time.monotonic()
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+            # No per-cycle printouts; we'll summarise at the end.
+
+            if diagnostics:
+                # For diagnostics, read back the position to calculate tracking error.
+                # This adds overhead and is NOT part of a true open-loop system.
+                actual_q = servo_driver.get_current_arm_state_rad(verbose=False)
+                target_q = joint_path[i]
+                for j_idx in range(utils.NUM_LOGICAL_JOINTS):
+                    error = target_q[j_idx] - actual_q[j_idx]
+                    _abs_errors_per_joint[j_idx].append(abs(error))
+
+            if utils.trajectory_state["should_stop"]:
+                print("[Pi OL] Stop signal received, halting execution.")
+                break
+
+        # Update global logical joint state
+        utils.current_logical_joint_angles_rad = joint_path[min(i, n_steps-1)]
+
+    finally:
+        # ----------------------------
+        #  Statistics & Diagnostics
+        # ----------------------------
+        if _loop_durations:
+            import statistics, math, datetime, matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            avg_ms = statistics.mean(_loop_durations) * 1000.0
+            max_ms = max(_loop_durations) * 1000.0
+            write_avg = statistics.mean(_write_durations) * 1000.0
+            write_max = max(_write_durations) * 1000.0
+
+            overruns = [d for d in _loop_durations if d > time_step]
+            overrun_pct = len(overruns) / len(_loop_durations) * 100.0
+
+            print(
+                f"[Pi OL] Timing summary: avg {avg_ms:.2f} ms (max {max_ms:.2f}), "
+                f"write avg {write_avg:.2f} (max {write_max:.2f}), "
+                f"overruns {len(overruns)}/{len(_loop_durations)} ({overrun_pct:.1f} %)"
+            )
+
+            if diagnostics:
+                try:
+                    session_id = utils.trajectory_state.get('diagnostics_session_id')
+                    
+                    if session_id:
+                        # A session is active; save charts into the session folder.
+                        out_dir = Path(f"diagnostics/open_loop/{session_id}")
+                    else:
+                        # No session; save with a unique timestamp in the parent folder.
+                        session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        out_dir = Path("diagnostics/open_loop")
+                    out_dir.mkdir(exist_ok=True, parents=True)
+
+                    # --- Joint Error Chart ---
+                    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+                    for j_idx, errs in enumerate(_abs_errors_per_joint):
+                        if errs:
+                            ax.plot([math.degrees(e) for e in errs], label=f"J{j_idx+1}")
+                    ax.set_xlabel("Cycle index")
+                    ax.set_ylabel("Abs error (deg)")
+                    ax.set_title("Open-Loop Tracking Error per Joint")
+                    ax.legend(ncol=3)
+                    error_path = out_dir / "error.png"
+                    fig.tight_layout()
+                    fig.savefig(error_path)
+                    plt.close(fig)
+
+                    # --- Timing Chart ---
+                    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
+                    ax.plot([d * 1000 for d in _loop_durations], label="total loop")
+                    ax.plot([d * 1000 for d in _write_durations], label="write")
+                    ax.axhline(time_step * 1000, color="red", linestyle="--", label="deadline")
+                    ax.set_xlabel("Cycle index")
+                    ax.set_ylabel("Duration (ms)")
+                    ax.set_title("Open-loop cycle timing")
+                    ax.legend()
+                    chart_path = out_dir / "timing.png"
+                    fig.tight_layout()
+                    fig.savefig(chart_path)
+                    plt.close(fig)
+
+                    print(f"[Pi OL] Charts saved → {out_dir}")
+                except Exception as e:
+                    print(f"[Pi OL] WARNING: Failed to generate diagnostics chart: {e}")
+
+        # Reset controller state flags
+        utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
+
+        print("[Pi OL] Open-Loop Executor finished.")
+        # Clean up session keys if they exist
+        if 'diagnostics_session_id' in utils.trajectory_state:
+            del utils.trajectory_state['diagnostics_session_id']
+        if 'diagnostics_folder_type' in utils.trajectory_state:
+            del utils.trajectory_state['diagnostics_folder_type']
 
 
 def _closed_loop_executor_thread(
@@ -535,9 +704,16 @@ def _closed_loop_executor_thread(
                     matplotlib.use("Agg")  # headless backend
                     import matplotlib.pyplot as plt
 
-                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    out_dir = Path("diagnostics")
-                    out_dir.mkdir(exist_ok=True)
+                    session_id = utils.trajectory_state.get('diagnostics_session_id')
+                    
+                    if session_id:
+                        # A session is active; save charts into the session folder.
+                        out_dir = Path(f"diagnostics/closed_loop/{session_id}")
+                    else:
+                        # No session; save with a unique timestamp in the parent folder.
+                        session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        out_dir = Path("diagnostics/closed_loop")
+                    out_dir.mkdir(exist_ok=True, parents=True)
 
                     # 1. Timing chart
                     fig, ax = plt.subplots(1, 1, figsize=(10, 4))
@@ -549,7 +725,7 @@ def _closed_loop_executor_thread(
                     ax.set_ylabel("Duration (ms)")
                     ax.set_title("Closed-loop cycle timing")
                     ax.legend()
-                    timing_path = out_dir / f"timing_{ts}.png"
+                    timing_path = out_dir / "timing.png"
                     fig.tight_layout()
                     fig.savefig(timing_path)
                     plt.close(fig)
@@ -563,7 +739,7 @@ def _closed_loop_executor_thread(
                     ax.set_ylabel("Abs error (deg)")
                     ax.set_title("Tracking error per joint")
                     ax.legend()
-                    error_path = out_dir / f"error_{ts}.png"
+                    error_path = out_dir / "error.png"
                     fig.tight_layout()
                     fig.savefig(error_path)
                     plt.close(fig)
@@ -582,131 +758,21 @@ def _closed_loop_executor_thread(
                         ax.set_ylabel("Duration (ms)")
                         ax.set_title("Sync Read internal timing")
                         ax.legend()
-                        sync_path = out_dir / f"sync_{ts}.png"
+                        sync_path = out_dir / "sync.png"
                         fig.tight_layout()
                         fig.savefig(sync_path)
                         plt.close(fig)
-                        print(
-                            f"[Pi CLC] Diagnostics charts saved to {timing_path}, {error_path} and {sync_path}"
-                        )
+                        print(f"[Pi CLC] Diagnostics charts saved to {out_dir}")
                     else:
                         print(f"[Pi CLC] Diagnostics charts saved to {timing_path} and {error_path}")
                 except Exception as e:
                     print(f"[Pi CLC] WARNING: Failed to generate diagnostics charts: {e}")
 
         # Clean up global state
-        utils.trajectory_state["is_running"] = False
-        utils.trajectory_state["should_stop"] = False
-        utils.trajectory_state["thread"] = None
-
-
-def _open_loop_executor_thread(
-    joint_path: list[list[float]],
-    frequency: int,
-    diagnostics: bool = True,
-):
-    """High-speed *open-loop* executor.
-
-    • Pre-computes the raw Sync-Write payload for every step so the realtime
-      loop only needs to send the bytes.
-    • Collects basic timing statistics analogous to the closed-loop executor
-      (loop + write duration). Optionally saves a timing chart.
-    """
-
-    n_steps = len(joint_path)
-    print(f"[Pi OL] Starting Open-Loop Executor at {frequency} Hz ({n_steps} steps).")
-
-    # ----------------------------------------------
-    # Pre-allocate Sync-Write command buffers
-    # ----------------------------------------------
-    precomputed_cmds: list[list[tuple[int,int,int,int]]] = [
-        servo_driver.logical_q_to_syncwrite_tuple(q, 4095, 0) for q in joint_path
-    ]
-
-    # ----------------------------------------------
-    #  Timing buffers
-    # ----------------------------------------------
-    _loop_durations: list[float] = []
-    _write_durations: list[float] = []
-
-    time_step = 1.0 / frequency
-    start_time = time.monotonic()
-
-    try:
-        for i, cmd in enumerate(precomputed_cmds):
-            deadline = start_time + (i + 1) * time_step
-
-            loop_start = time.perf_counter()
-
-            # --- Actuation (WRITE) ---
-            w_t0 = time.perf_counter()
-            servo_protocol.sync_write_goal_pos_speed_accel(cmd)
-            _write_durations.append(time.perf_counter() - w_t0)
-
-            # --- Timing / sleep ---
-            iter_elapsed = time.perf_counter() - loop_start
-            _loop_durations.append(iter_elapsed)
-
-            sleep_t = deadline - time.monotonic()
-            if sleep_t > 0:
-                time.sleep(sleep_t)
-            # No per-cycle printouts; we'll summarise at the end.
-
-            if utils.trajectory_state["should_stop"]:
-                print("[Pi OL] Stop signal received, halting execution.")
-                break
-
-        # Update global logical joint state
-        utils.current_logical_joint_angles_rad = joint_path[min(i, n_steps-1)]
-
-    finally:
-        # ----------------------------
-        #  Statistics & Diagnostics
-        # ----------------------------
-        if _loop_durations:
-            import statistics, math, datetime, matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-
-            avg_ms = statistics.mean(_loop_durations) * 1000.0
-            max_ms = max(_loop_durations) * 1000.0
-            write_avg = statistics.mean(_write_durations) * 1000.0
-            write_max = max(_write_durations) * 1000.0
-
-            overruns = [d for d in _loop_durations if d > time_step]
-            overrun_pct = len(overruns) / len(_loop_durations) * 100.0
-
-            print(
-                f"[Pi OL] Timing summary: avg {avg_ms:.2f} ms (max {max_ms:.2f}), "
-                f"write avg {write_avg:.2f} (max {write_max:.2f}), "
-                f"overruns {len(overruns)}/{len(_loop_durations)} ({overrun_pct:.1f} %)"
-            )
-
-            if diagnostics:
-                try:
-                    from pathlib import Path
-                    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    out_dir = Path("diagnostics")
-                    out_dir.mkdir(exist_ok=True)
-
-                    fig, ax = plt.subplots(1, 1, figsize=(10, 4))
-                    ax.plot([d * 1000 for d in _loop_durations], label="total loop")
-                    ax.plot([d * 1000 for d in _write_durations], label="write")
-                    ax.axhline(time_step * 1000, color="red", linestyle="--", label="deadline")
-                    ax.set_xlabel("Cycle index")
-                    ax.set_ylabel("Duration (ms)")
-                    ax.set_title("Open-loop cycle timing")
-                    ax.legend()
-                    fig.tight_layout()
-                    chart_path = out_dir / f"timing_ol_{ts}.png"
-                    fig.savefig(chart_path)
-                    plt.close(fig)
-                    print(f"[Pi OL] Timing chart saved to {chart_path}")
-                except Exception as e:
-                    print(f"[Pi OL] WARNING: Failed to generate diagnostics chart: {e}")
-
-        # Reset controller state flags
         utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
-
-        print("[Pi OL] Open-Loop Executor finished.")
+        # Clean up session keys if they exist
+        if 'diagnostics_session_id' in utils.trajectory_state:
+            del utils.trajectory_state['diagnostics_session_id']
+        if 'diagnostics_folder_type' in utils.trajectory_state:
+            del utils.trajectory_state['diagnostics_folder_type']
 

@@ -132,8 +132,8 @@ def main() -> None:
     # Save CSV
     # ------------------------------------------------------------------
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path("diagnostics")
-    out_dir.mkdir(exist_ok=True)
+    out_dir = Path("diagnostics/ik_path")
+    out_dir.mkdir(exist_ok=True, parents=True)
     csv_path = out_dir / f"ik_log_{ts}.csv"
     with open(csv_path, "w", newline="") as fp:
         writer = csv.writer(fp)

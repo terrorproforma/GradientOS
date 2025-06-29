@@ -4,6 +4,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <cstdlib>  // getenv
+#include <string>
 
 namespace py = pybind11;
 
@@ -34,6 +36,11 @@ int find_closest_solution_index(
         double dist_sq = 0.0;
         for (size_t j = 0; j < num_joints; ++j) {
             double diff = solvalues[j] - current_angles_ptr[j];
+            // wrap to shortest distance
+            if (diff > M_PI)
+                diff -= 2 * M_PI;
+            else if (diff < -M_PI)
+                diff += 2 * M_PI;
             dist_sq += diff * diff;
         }
 
@@ -43,6 +50,28 @@ int find_closest_solution_index(
         }
     }
     return best_idx;
+}
+
+
+// ---------------------------------------------------------------------------
+// Runtime-configurable joint-step limit
+// ---------------------------------------------------------------------------
+static double get_max_step_rad()
+{
+    static double cached = []() {
+        const char* env = std::getenv("MINI_ARM_IK_MAX_STEP");
+        if (env != nullptr) {
+            try {
+                double v = std::stod(std::string(env));
+                if (v > 0.0)
+                    return v;
+            } catch (...) {
+                // fall through to default
+            }
+        }
+        return 0.1; // default radian limit per joint per step
+    }();
+    return cached;
 }
 
 
@@ -86,15 +115,46 @@ py::object solve_ik_py(
             }
             return all_sols_py;
         } else {
-            // Return only the closest solution
-            int best_idx = find_closest_solution_index(solutions, initial_joint_angles_py.cast<py::array_t<double>>());
-            
+            // Return only the closest solution that respects a maximum step constraint
+            const double MAX_STEP_RAD = get_max_step_rad();
+
+            int best_idx = find_closest_solution_index(
+                solutions,
+                initial_joint_angles_py.cast<py::array_t<double>>()
+            );
+
+            if (best_idx < 0) {
+                return py::none(); // No solutions at all
+            }
+
+            // Retrieve the best solution values into a temporary vector first
+            std::vector<double> best_sol_values(num_joints);
+            std::vector<double> freevals(std::max<size_t>(nfree, 1));
+            solutions.GetSolution(best_idx).GetSolution(best_sol_values.data(), freevals.data());
+
+            // Fetch the seed (initial angles) for step-size comparison
+            auto seed_buf = initial_joint_angles_py.cast<py::array_t<double>>().request();
+            const double* seed_ptr = static_cast<double*>(seed_buf.ptr);
+
+            // Verify every joint moves less than MAX_STEP_RAD
+            for (size_t j = 0; j < num_joints; ++j) {
+                double diff = best_sol_values[j] - seed_ptr[j];
+                // Wrap to shortest distance
+                if (diff > M_PI)
+                    diff -= 2 * M_PI;
+                else if (diff < -M_PI)
+                    diff += 2 * M_PI;
+
+                if (std::abs(diff) > MAX_STEP_RAD) {
+                    return py::none(); // Violation → let caller decide
+                }
+            }
+
+            // Copy validated solution into NumPy array for return
             py::array_t<double> best_sol_py(num_joints);
             auto best_sol_buf = best_sol_py.request();
             double* best_sol_ptr = static_cast<double*>(best_sol_buf.ptr);
-            std::vector<double> freevals(std::max<size_t>(nfree, 1));
-            
-            solutions.GetSolution(best_idx).GetSolution(best_sol_ptr, freevals.data());
+            std::memcpy(best_sol_ptr, best_sol_values.data(), num_joints * sizeof(double));
             return best_sol_py;
         }
     } catch (const std::exception& e) {
@@ -154,6 +214,10 @@ py::object solve_ik_batch_py(
             double dist_sq = 0.0;
             for(size_t k=0; k < num_joints; ++k) {
                 double diff = solvalues[k] - current_joint_angles[k];
+                if (diff > M_PI)
+                    diff -= 2 * M_PI;
+                else if (diff < -M_PI)
+                    diff += 2 * M_PI;
                 dist_sq += diff * diff;
             }
             if (min_dist_sq < 0 || dist_sq < min_dist_sq) {
@@ -162,7 +226,24 @@ py::object solve_ik_batch_py(
             }
         }
         
-        // Copy best solution to output and update current angles
+        // Wrap chosen solution to be within ±π of current angles before copying
+        for(size_t k=0; k < num_joints; ++k) {
+            double diff = best_sol_values[k] - current_joint_angles[k];
+            if (diff > M_PI)
+                best_sol_values[k] -= 2 * M_PI;
+            else if (diff < -M_PI)
+                best_sol_values[k] += 2 * M_PI;
+        }
+
+        // --- Max step guard: abort if any joint exceeds the allowed increment ---
+        const double MAX_STEP_RAD = get_max_step_rad();
+        for(size_t k = 0; k < num_joints; ++k) {
+            double step = std::abs(best_sol_values[k] - current_joint_angles[k]);
+            if (step > MAX_STEP_RAD) {
+                return py::none(); // Signal failure so Python can fall back
+            }
+        }
+
         memcpy(solutions_batch_ptr + i * num_joints, best_sol_values.data(), num_joints * sizeof(double));
         memcpy(current_joint_angles.data(), best_sol_values.data(), num_joints * sizeof(double));
     }
