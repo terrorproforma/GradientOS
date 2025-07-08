@@ -1,0 +1,10 @@
+ansitable-0.11.4.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+ansitable-0.11.4.dist-info/LICENSE,sha256=niCzY_CzbIMKuUZlUkGimjrKp0vkLAtcwFmoSuSKrdw,1068
+ansitable-0.11.4.dist-info/METADATA,sha256=CCvVpWyGD6rXnbpIrx1HHsTLyDvdDRDGx6UAX_CeFBY,28186
+ansitable-0.11.4.dist-info/RECORD,,
+ansitable-0.11.4.dist-info/WHEEL,sha256=PZUExdf71Ui_so67QXpySuHtCi3-J3wvF4ORK6k_S8U,91
+ansitable-0.11.4.dist-info/top_level.txt,sha256=2AA7Bc_r6rKqEDnKQdo4GCBL8mRXJlxF5TQXHL6jzwY,10
+ansitable/__init__.py,sha256=d97j_S29dVWnRwmWC1N_eTwJgfToRMITJnoivZYQWaU,150
+ansitable/__pycache__/__init__.cpython-311.pyc,,
+ansitable/__pycache__/table.cpython-311.pyc,,
+ansitable/table.py,sha256=X7vindwBGCZ68MMLLw-_87PpAQiEc2ZAL2-MT_a6H14,51876

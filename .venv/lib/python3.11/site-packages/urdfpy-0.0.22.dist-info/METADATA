@@ -1,0 +1,41 @@
+Metadata-Version: 2.1
+Name: urdfpy
+Version: 0.0.22
+Summary: URDF parser and manipulator for Python
+Home-page: https://github.com/mmatl/urdfpy
+Author: Matthew Matl
+Author-email: matthewcmatl@gmail.com
+License: MIT License
+Keywords: robotics ros urdf robots parser
+Platform: UNKNOWN
+Classifier: Development Status :: 4 - Beta
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python
+Classifier: Programming Language :: Python :: 2.7
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Natural Language :: English
+Classifier: Topic :: Scientific/Engineering
+Requires-Dist: lxml
+Requires-Dist: networkx (==2.2)
+Requires-Dist: numpy
+Requires-Dist: pillow
+Requires-Dist: pycollada (==0.6)
+Requires-Dist: pyrender (>=0.1.20)
+Requires-Dist: scipy
+Requires-Dist: six
+Requires-Dist: trimesh
+Provides-Extra: dev
+Requires-Dist: flake8 ; extra == 'dev'
+Requires-Dist: pre-commit ; extra == 'dev'
+Requires-Dist: pytest ; extra == 'dev'
+Requires-Dist: pytest-cov ; extra == 'dev'
+Requires-Dist: tox ; extra == 'dev'
+Provides-Extra: docs
+Requires-Dist: sphinx ; extra == 'docs'
+Requires-Dist: sphinx-rtd-theme ; extra == 'docs'
+Requires-Dist: sphinx-automodapi ; extra == 'docs'
+
+URDF parser and manipulator for Python
+
+

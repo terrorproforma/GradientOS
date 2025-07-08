@@ -1,0 +1,9 @@
+[submodule "src/numeric_solver/quik"]
+	path = src/numeric_solver/quik
+	url = https://github.com/steffanlloyd/quik.git
+[submodule "src/numeric_solver/trac_ik"]
+	path = src/numeric_solver/trac_ik
+	url = https://bitbucket.org/traclabs/trac_ik.git
+[submodule "utilities/urdf2dh"]
+	path = utilities/urdf2dh
+	url = https://github.com/takeshiD/urdf2dh.git

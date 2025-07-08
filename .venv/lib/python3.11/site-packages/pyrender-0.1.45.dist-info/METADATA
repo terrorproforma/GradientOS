@@ -1,0 +1,43 @@
+Metadata-Version: 2.1
+Name: pyrender
+Version: 0.1.45
+Summary: Easy-to-use Python renderer for 3D visualization
+Home-page: https://github.com/mmatl/pyrender
+Author: Matthew Matl
+Author-email: matthewcmatl@gmail.com
+License: MIT License
+Keywords: rendering graphics opengl 3d visualization pbr gltf
+Platform: UNKNOWN
+Classifier: Development Status :: 4 - Beta
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: POSIX :: Linux
+Classifier: Operating System :: MacOS :: MacOS X
+Classifier: Programming Language :: Python :: 2.7
+Classifier: Programming Language :: Python :: 3.5
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Natural Language :: English
+Classifier: Topic :: Scientific/Engineering
+Requires-Dist: freetype-py
+Requires-Dist: imageio
+Requires-Dist: networkx
+Requires-Dist: numpy
+Requires-Dist: Pillow
+Requires-Dist: pyglet (>=1.4.10)
+Requires-Dist: PyOpenGL (==3.1.0)
+Requires-Dist: scipy
+Requires-Dist: six
+Requires-Dist: trimesh
+Provides-Extra: dev
+Requires-Dist: flake8 ; extra == 'dev'
+Requires-Dist: pre-commit ; extra == 'dev'
+Requires-Dist: pytest ; extra == 'dev'
+Requires-Dist: pytest-cov ; extra == 'dev'
+Requires-Dist: tox ; extra == 'dev'
+Provides-Extra: docs
+Requires-Dist: sphinx ; extra == 'docs'
+Requires-Dist: sphinx-rtd-theme ; extra == 'docs'
+Requires-Dist: sphinx-automodapi ; extra == 'docs'
+
+A simple implementation of Physically-Based Rendering (PBR) in Python. Compliant with the glTF 2.0 standard.
+
+

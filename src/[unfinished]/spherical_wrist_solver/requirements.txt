@@ -1,0 +1,4 @@
+numpy 
+spatialmath-python
+matplotlib
+urdfpy

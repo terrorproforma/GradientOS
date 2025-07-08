@@ -1,0 +1,167 @@
+<?xml version="1.0"?>
+
+<robot name="mini_6dof_arm_spherical">
+
+  <!-- ############################################################
+       LINKS
+       ############################################################ -->
+
+  <!-- base, L1, L2, L3 ─ unchanged   -->
+  <link name="base">
+    <visual  ><origin xyz="0 0 0" rpy="0 0 0"/>
+              <geometry><mesh filename="stl-files/base.stl"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/>
+              <geometry><mesh filename="stl-files/base.stl"/></geometry></collision>
+    <inertial><origin xyz="0 0 0" rpy="0 0 0"/>
+              <mass value="0.191955"/>
+              <inertia ixx="1.841e-4" ixy="3.5e-11" ixz="8.1195e-5"
+                       iyy="2.948e-4" iyz="-7.4e-11"  izz="2.374e-4"/></inertial>
+  </link>
+
+  <link name="L1">   <!-- identical to original -->
+    <visual   ><origin xyz="0 0 0" rpy="0 0 0"/>
+               <geometry><mesh filename="stl-files/L1.stl"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/>
+               <geometry><mesh filename="stl-files/L1.stl"/></geometry></collision>
+    <inertial ><origin xyz="0 0 0" rpy="0 0 0"/>
+               <mass value="0.103485"/>
+               <inertia ixx="1.136e-4" ixy="-1.8e-11" ixz="1.6e-11"
+                        iyy="1.087e-4" iyz="1.3797e-6" izz="1.5099e-5"/></inertial>
+  </link>
+
+  <link name="L2">   <!-- identical to original -->
+    <visual   ><origin xyz="0 0 0" rpy="0 0 0"/>
+               <geometry><mesh filename="stl-files/L2.stl"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/>
+               <geometry><mesh filename="stl-files/L2.stl"/></geometry></collision>
+    <inertial ><origin xyz="0 0 0" rpy="0 0 0"/>
+               <mass value="0.148586"/>
+               <inertia ixx="1.87e-3"  ixy="-1.852e-9" ixz="-5.8291e-7"
+                        iyy="1.853e-3" iyz="-5.4339e-6" izz="3.1532e-5"/></inertial>
+  </link>
+
+
+  <link name="L3">   <!-- identical to original -->
+    <visual   ><origin xyz="0 0 0" rpy="0 0 0"/>
+               <geometry><mesh filename="stl-files/L3.stl"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/>
+               <geometry><mesh filename="stl-files/L3.stl"/></geometry></collision>
+    <inertial ><origin xyz="0 0 0" rpy="0 0 0"/>
+               <mass value="0.19883"/>
+               <inertia ixx="5.208e-4" ixy="1.562e-4" ixz="-7.821e-4"
+                        iyy="2.074e-3" iyz="6.7509e-5" izz="1.679e-3"/></inertial>
+  </link>
+
+  <!-- L4: mesh shifted –0.05515 m so the *visual* still lines up  -->
+  <link name="L4">
+    <visual   ><origin xyz="-0.05515 0 0" rpy="0 0 0"/><!-- restored -->
+               <geometry><mesh filename="stl-files/L4.stl"/></geometry></visual>
+    <collision><origin xyz="-0.05515 0 0" rpy="0 0 0"/><!-- restored -->
+               <geometry><mesh filename="stl-files/L4.stl"/></geometry></collision>
+    <inertial ><origin xyz="-0.05515 0 0" rpy="0 0 0"/><!-- inertia restored -->
+               <mass value="0.105559"/>
+               <inertia ixx="1.5212e-5" ixy="1.5024e-6" ixz="-1.4847e-7"
+                        iyy="1.272e-4" iyz="1.924e-9"  izz="1.322e-4"/></inertial>
+  </link>
+
+  <!-- L5: no mesh offset; wrist link will carry +0.0773 m -->
+  <link name="L5">
+    <visual   ><origin xyz="0 0 0" rpy="0 0 0"/><!-- updated -->
+               <geometry><mesh filename="stl-files/L5.stl"/></geometry></visual>
+    <collision><origin xyz="0 0 0" rpy="0 0 0"/><!-- updated -->
+               <geometry><mesh filename="stl-files/L5.stl"/></geometry></collision>
+    <inertial ><origin xyz="-0 0 0" rpy="0 0 0"/>
+               <mass value="0.156359"/>
+               <inertia ixx="6.9948e-5" ixy="1.022e-4" ixz="-3.9923e-5"
+                        iyy="6.747e-4" iyz="3.5287e-6" izz="7.044e-4"/></inertial>
+  </link>
+
+  <!-- wrist link unchanged; tool_link moved further out 0.0773 -->
+  <link name="wrist">
+    <visual   ><origin xyz="0.0773 0 0" rpy="0 0 0"/><!-- updated -->
+               <geometry><mesh filename="stl-files/wrist.stl"/></geometry></visual>
+    <collision><origin xyz="0.0773 0 0" rpy="0 0 0"/><!-- updated -->
+               <geometry><mesh filename="stl-files/wrist.stl"/></geometry></collision>
+    <inertial ><origin xyz=" 0.0773 0 0" rpy="0 0 0"/>
+               <mass value="0.018493"/>
+               <inertia ixx="4.58648e-7" ixy="2.945e-15" ixz="2.201555e-6"
+                        iyy="4.6282102e-5" iyz="1.069e-14" izz="4.6049763e-5"/></inertial>
+  </link>
+
+  <link name="flange"/>
+
+  <link name="tool_link"/>
+
+  <!-- ############################################################
+       JOINTS (edits marked with ★)
+       ############################################################ -->
+
+  <joint name="joint1" type="revolute">
+    <parent link="base"/>
+    <child  link="L1"/>
+    <origin xyz="0 0 0.0843" rpy="0 0 0"/>
+    <axis  xyz="0 0 1"/>
+    <limit lower="-3.1416" upper="3.1416" effort="1.9123" velocity="5.4542"/>
+  </joint>
+
+  <joint name="joint2" type="revolute">
+    <parent link="L1"/>
+    <child  link="L2"/>
+    <origin xyz="0 0 0.04315" rpy="0 0 0"/>
+    <axis  xyz="0 1 0"/>
+    <limit lower="-1.5708" upper="1.5708" effort="1.9123" velocity="5.4542"/>
+  </joint>
+
+
+  <joint name="joint3" type="revolute">
+     <parent link="L2"/>
+     <child  link="L3"/>
+     <origin xyz="0 0 0.19715" rpy="0 0 0"/><!-- back to original -->
+     <axis  xyz="0 1 0"/>
+     <limit lower="-1.5708" upper="1.5708" effort="1.9123" velocity="5.4542"/>
+  </joint>
+
+  <!-- joint4 origin moved +0.05515 m (x) to the new wrist centre -->
+  <joint name="joint4" type="revolute">
+    <parent link="L3"/>
+    <child  link="L4"/>
+    <!-- 0.176556 + 0.05515 = 0.231706 ★  - original was : 0.231706 0 0.0455 -->
+    <origin xyz="0.231706 0 0.0455" rpy="0 0 0"/><!-- restored -->
+    <axis  xyz="1 0 0"/>
+    <limit lower="-3.1416" upper="3.1416" effort="1.9123" velocity="5.4542"/>
+  </joint>
+
+  <!-- joint5 now *shares the exact same origin* as joint4 -->
+  <joint name="joint5" type="revolute">
+    <parent link="L4"/>
+    <child  link="L5"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/><!-- ★ -->
+    <axis  xyz="0 1 0"/>
+    <limit lower="-3.1416" upper="0" effort="1.9123" velocity="5.4542"/>
+  </joint>
+
+  <!-- joint6 origin collapsed to zero as well -->
+  <joint name="joint6" type="revolute">
+    <parent link="L5"/>
+    <child  link="wrist"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/><!-- ★ -->
+    <axis  xyz="1 0 0"/>
+    <limit lower="-3.1416" upper="3.1416" effort="1.9123" velocity="5.4542"/>
+  </joint>
+
+  <joint name="fixed_flange" type="fixed">
+    <parent link="wrist"/>
+    <child  link="flange"/>
+    <!-- physical flange thickness -->
+    <origin xyz="0.1033 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- tool link now sits exactly at the flange face -->
+  <joint name="fixed_tool" type="fixed">
+    <parent link="flange"/>
+    <child  link="tool_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+  
+
+</robot>

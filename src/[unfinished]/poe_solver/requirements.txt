@@ -1,0 +1,10 @@
+# Core numerical library
+numpy>=1.23
+
+# URDF parsing (urdfpy 0.0.22 requires networkx==2.2)
+urdfpy==0.0.22
+# networkx is pulled in automatically at the compatible version (2.2)
+
+# Build-time dependencies for the Python extension module
+pybind11>=2.11
+cmake>=3.22 
