@@ -395,23 +395,12 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False):
     print(f"[Pi Trajectory] Received RUN_TRAJECTORY for '{trajectory_name}' (Use Cache: {use_cache})")
 
     # --- 1. Load Trajectory Definition ---
-    trajectories_file_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "trajectories.json"))
-    if not os.path.exists(trajectories_file_path):
-        print(f"[Pi Trajectory] ERROR: File not found: {trajectories_file_path}")
-        return
+    trajectory = _load_trajectory_by_name(trajectory_name)
 
-    try:
-        with open(trajectories_file_path, 'r') as f:
-            all_trajectories = json.load(f)
-    except Exception as e:
-        print(f"[Pi Trajectory] ERROR: Failed to load or parse trajectories.json: {e}")
-        return
-
-    if trajectory_name not in all_trajectories:
+    if trajectory is None:
         print(f"[Pi Trajectory] ERROR: Trajectory '{trajectory_name}' not found.")
         return
 
-    trajectory = all_trajectories[trajectory_name]
     moves = trajectory.get("moves", [])
     should_loop = trajectory.get("loop", False)
     # NEW: Parse orientation lock from trajectory file
@@ -471,7 +460,16 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False):
                 t_start_plan = time.monotonic()
                 vector = np.array(move_cmd.get("vector", [0,0,0]))
                 speed_mult = move_cmd.get("speed_multiplier", 1.0)
-                
+
+                # Per-move orientation override
+                move_orient_euler = move_cmd.get("orientation_euler_deg")
+                per_move_orientation_matrix = None
+                if move_orient_euler is not None:
+                    try:
+                        per_move_orientation_matrix = R.from_euler('xyz', move_orient_euler, degrees=True).as_matrix()
+                    except Exception as e:
+                        print(f"[Pi Plan] WARNING: Invalid per-move Euler orientation: {e}. Ignoring.")
+
                 start_pos = ik_solver.get_fk(current_q)
                 if start_pos is None:
                     print(f"[Pi Trajectory] ERROR: Could not get start position for relative move. Aborting plan.")
@@ -479,9 +477,11 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False):
                     break
                 
                 target_pos = start_pos + vector
+                forced_orient = per_move_orientation_matrix if per_move_orientation_matrix is not None else target_orientation_matrix
+
                 joint_path = trajectory_execution._plan_linear_move(
                     current_q, target_pos, utils.DEFAULT_PROFILE_VELOCITY * speed_mult, utils.DEFAULT_PROFILE_ACCELERATION, 100, True,
-                    forced_orientation=target_orientation_matrix
+                    forced_orientation=forced_orient
                 )
                 
                 if joint_path:
@@ -497,10 +497,20 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False):
                 t_start_plan = time.monotonic()
                 target_pos = np.array(move_cmd.get("vector", [0,0,0]))
                 speed_mult = move_cmd.get("speed_multiplier", 1.0)
-                
+
+                move_orient_euler = move_cmd.get("orientation_euler_deg")
+                per_move_orientation_matrix = None
+                if move_orient_euler is not None:
+                    try:
+                        per_move_orientation_matrix = R.from_euler('xyz', move_orient_euler, degrees=True).as_matrix()
+                    except Exception as e:
+                        print(f"[Pi Plan] WARNING: Invalid per-move Euler orientation: {e}. Ignoring.")
+
+                forced_orient = per_move_orientation_matrix if per_move_orientation_matrix is not None else target_orientation_matrix
+
                 joint_path = trajectory_execution._plan_linear_move(
                     current_q, target_pos, utils.DEFAULT_PROFILE_VELOCITY * speed_mult, utils.DEFAULT_PROFILE_ACCELERATION, 100, True,
-                    forced_orientation=target_orientation_matrix
+                    forced_orientation=forced_orient
                 )
                     
                 if joint_path:
@@ -730,4 +740,139 @@ def handle_wait_for_idle():
         print("[Controller] Move complete. Resuming.")
     else:
         print("[Controller] No move is currently running.")
+
+# -----------------------------------------------------------------------------
+# Recording subsystem: PLAN_TRAJECTORY / REC_POS / END_TRAJECTORY
+# -----------------------------------------------------------------------------
+
+# Holds intermediate state while a user is interactively recording a trajectory.
+_recording_state = {
+    "is_recording": False,
+    "points": [],  # list of dicts: {"position": [...], "orientation_euler_deg": [...]}
+    "start_time": None,
+}
+
+RECORDED_TRAJ_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "recorded_trajectories"))
+
+
+def _ensure_record_dir_exists():
+    """Create the recorded_trajectories directory if it does not already exist."""
+    try:
+        os.makedirs(RECORDED_TRAJ_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"[Recorder] ERROR: Could not create directory {RECORDED_TRAJ_DIR}: {e}")
+
+
+def handle_plan_trajectory_start():
+    """Initiate a new recording session."""
+    if _recording_state["is_recording"]:
+        print("[Recorder] WARNING: Already recording. Send END_TRAJECTORY first if you want to start a new one.")
+        return
+
+    _recording_state["is_recording"] = True
+    _recording_state["points"].clear()
+    _recording_state["start_time"] = datetime.datetime.now()
+    print("[Recorder] *** Recording mode ENABLED. Use REC_POS to add way-points, END_TRAJECTORY,<name> to finish. ***")
+
+
+def handle_record_position():
+    """Record the current end-effector pose (position + orientation)."""
+    if not _recording_state["is_recording"]:
+        print("[Recorder] ERROR: Not currently recording. Send PLAN_TRAJECTORY first.")
+        return
+
+    # Query current joint angles and FK
+    current_q = servo_driver.get_current_arm_state_rad(verbose=False)
+    pose_matrix = ik_solver.get_fk_matrix(current_q)
+    if pose_matrix is None:
+        print("[Recorder] ERROR: FK failed – cannot record point.")
+        return
+
+    position = pose_matrix[:3, 3].tolist()
+    # Convert orientation matrix → XYZ intrinsic Euler degrees for human-friendly storage
+    orientation_euler_deg = R.from_matrix(pose_matrix[:3, :3]).as_euler('xyz', degrees=True).tolist()
+
+    _recording_state["points"].append({
+        "position": [round(p, 4) for p in position],
+        "orientation_euler_deg": [round(o, 2) for o in orientation_euler_deg],
+    })
+    print(f"[Recorder] Way-point #{len(_recording_state['points'])} recorded: Pos={position}, EulerDeg={orientation_euler_deg}")
+
+
+def handle_end_trajectory(traj_name: str):
+    """Finalize the recording and dump to JSON file under recorded_trajectories/."""
+    if not _recording_state["is_recording"]:
+        print("[Recorder] ERROR: Not currently recording – nothing to end.")
+        return
+
+    if not traj_name:
+        print("[Recorder] ERROR: Trajectory name required. Use END_TRAJECTORY,<name>.")
+        return
+
+    if len(_recording_state["points"]) == 0:
+        print("[Recorder] WARNING: No points recorded – nothing will be saved.")
+        _recording_state["is_recording"] = False
+        return
+
+    _ensure_record_dir_exists()
+
+    file_path = os.path.join(RECORDED_TRAJ_DIR, f"{traj_name}.json")
+    if os.path.exists(file_path):
+        print(f"[Recorder] WARNING: File {file_path} already exists – it will be overwritten.")
+
+    # Build moves list – for now we store as move_absolute steps with 1 s pauses between
+    moves = []
+    for i, p in enumerate(_recording_state["points"]):
+        moves.append({
+            "command": "move_absolute",
+            "vector": p["position"],
+            "orientation_euler_deg": p["orientation_euler_deg"],
+        })
+        if i < len(_recording_state["points"]) - 1:
+            moves.append({"command": "pause", "duration": 1.0})
+
+    traj_dict = {
+        "description": f"Recorded on {_recording_state['start_time'].strftime('%Y-%m-%d %H:%M:%S')}",
+        "loop": False,
+        "orientation_euler_angles_deg": None,  # kept for future use
+        "moves": moves,
+    }
+
+    try:
+        with open(file_path, "w") as f:
+            json.dump(traj_dict, f, indent=2)
+        print(f"[Recorder] Trajectory saved to {file_path} (total moves: {len(moves)})")
+    except Exception as e:
+        print(f"[Recorder] ERROR: Failed to write file {file_path}: {e}")
+
+    # Reset state
+    _recording_state["is_recording"] = False
+    _recording_state["points"].clear()
+
+# -----------------------------------------------------------------------------
+# Utility: load trajectory file (default + recorded)
+# -----------------------------------------------------------------------------
+
+def _load_trajectory_by_name(name: str):
+    """Return trajectory dict by checking recorded_trajectories first, then trajectories.json."""
+    # 1) Recorded folder
+    recorded_path = os.path.join(RECORDED_TRAJ_DIR, f"{name}.json")
+    if os.path.exists(recorded_path):
+        try:
+            with open(recorded_path, "r") as f:
+                print(f"[Pi Trajectory] Loading recorded trajectory: {recorded_path}")
+                return json.load(f)
+        except Exception as e:
+            print(f"[Pi Trajectory] ERROR: Could not load recorded trajectory {recorded_path}: {e}")
+
+    # 2) Built-in trajectories.json
+    fallback_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "trajectories.json"))
+    try:
+        with open(fallback_path, "r") as f:
+            all_traj = json.load(f)
+            return all_traj.get(name)
+    except Exception as e:
+        print(f"[Pi Trajectory] ERROR: Could not load fallback trajectories.json: {e}")
+
+    return None
 

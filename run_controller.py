@@ -183,6 +183,25 @@ def main():
                 elif command == "WAIT_FOR_IDLE":
                     command_api.handle_wait_for_idle()
 
+                # ------------------------------------------------------------------
+                # NEW: Recording commands (trajectory recorder)
+                # ------------------------------------------------------------------
+                elif command == "PLAN_TRAJECTORY":
+                    command_api.handle_plan_trajectory_start()
+
+                elif command == "REC_POS":
+                    command_api.handle_record_position()
+
+                elif command == "END_TRAJECTORY":
+                    try:
+                        traj_name = parts[1].strip()
+                        command_api.handle_end_trajectory(traj_name)
+                    except IndexError:
+                        print("[Controller] Error: Invalid END_TRAJECTORY command. Use 'END_TRAJECTORY,name'.")
+
+                # ------------------------------------------------------------------
+                # Standard Command Handling continues
+                # ------------------------------------------------------------------
                 elif command == "TRANSLATE":
                     try:
                         dx, dy, dz = map(float, parts[1:4])
@@ -210,9 +229,10 @@ def main():
                         x, y, z = map(float, parts[1:4])
                         v = float(parts[4]) if len(parts) > 4 else utils.DEFAULT_PROFILE_VELOCITY
                         a = float(parts[5]) if len(parts) > 5 else utils.DEFAULT_PROFILE_ACCELERATION
-                        closed_loop = True
+                        # Default to OPEN loop unless the user specifies 'true', 'closed', 'yes', etc.
+                        closed_loop = False
                         if len(parts) > 6 and parts[6].strip() != "":
-                            closed_loop = parts[6].strip().lower() not in {"false", "0", "no", "open", "off"}
+                            closed_loop = parts[6].strip().lower() in {"true", "1", "yes", "closed", "on"}
                         command_api.handle_move_line(x, y, z, v, a, closed_loop)
                     except (ValueError, IndexError):
                         print("[Controller] Error: Invalid MOVE_LINE command. Use 'MOVE_LINE,x,y,z,[v],[a],[closed_loop]'.")
@@ -241,9 +261,10 @@ def main():
                     # Call the handler outside the parsing try-block so that any
                     # runtime errors inside the motion planner don't get caught
                     # and mis-reported as a command-format error.
-                    closed_loop = True
+                    # Default to OPEN loop unless the user specifies 'true', 'closed', 'yes', etc.
+                    closed_loop = False
                     if len(parts) > 5 and parts[5].strip() != "":
-                        closed_loop = parts[5].strip().lower() not in {"false", "0", "no", "open", "off"}
+                        closed_loop = parts[5].strip().lower() in {"true", "1", "yes", "closed", "on"}
                     command_api.handle_move_line_relative(dx, dy, dz, speed_multiplier, closed_loop)
 
                 elif command == "MOVE_PROFILED":

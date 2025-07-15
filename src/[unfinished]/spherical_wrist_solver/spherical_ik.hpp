@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include "ik_poe.hpp"
+#include <iostream>
 
 #ifndef M_PI
 #   define M_PI 3.14159265358979323846
@@ -49,6 +50,18 @@ struct Solution { Vec6 q; };
 class SphericalIK
 {
 public:
+    SphericalIK() {
+        std::cout << "POE constants:" << std::endl;
+        for(int i=0; i<N; ++i) {
+            std::cout << "POE[" << i << "]: ";
+            for(double val : POE[i]) std::cout << val << " ";
+            std::cout << std::endl;
+        }
+        std::cout << "M_HOME:" << std::endl;
+        for(double val : M_HOME) std::cout << val << " ";
+        std::cout << std::endl;
+    }
+
     /* FK ---------------------------------------------------------------- */
     Mat4 fk(const Vec6& q) const
     {
@@ -109,25 +122,39 @@ public:
         Eigen::Vector3d z5{POE[4][3],POE[4][4],POE[4][5]};
         Eigen::Vector3d z6{POE[5][3],POE[5][4],POE[5][5]};
 
-        /* ---- wrist centre ------------------------------------------- */
-        Eigen::Vector3d p_wc = p06 - d6*(R06*z6.normalized());
+        /* ---- wrist centre (generalized for arbitrary tool offset) --- */
+        Mat4 M; std::copy(M_HOME.begin(), M_HOME.end(), M.data());
+        Eigen::Matrix3d R_home = M.topLeftCorner<3,3>();
+        Eigen::Vector3d tool_pos_home = M.topRightCorner<3,1>();
+        Eigen::Vector3d p_wc_home{POE[5][0], POE[5][1], POE[5][2]};
+        Eigen::Vector3d vec_tool = R_home.transpose() * (p_wc_home - tool_pos_home);
+        Eigen::Vector3d p_wc = p06 + R06 * vec_tool;
+
+        std::cout << "Target p06: " << p06.transpose() << std::endl;
+        std::cout << "Computed p_wc: " << p_wc.transpose() << std::endl;
 
         /* ---- θ1 ------------------------------------------------------ */
         double theta1 = std::atan2(p_wc.y(),p_wc.x());
+        std::cout << "theta1: " << theta1 << std::endl;
 
         /* ---- rotate into frame {1} ---------------------------------- */
         Eigen::Matrix3d R01 = Eigen::AngleAxisd(theta1,z1).toRotationMatrix();
         Eigen::Vector3d r1  = R01.transpose()*(p_wc - p2);
         double px=r1.x(), pz=r1.z();
+        std::cout << "px, pz: " << px << " " << pz << std::endl;
 
         /* ---- elbow geometry ----------------------------------------- */
         double L2 = (p3-p2).norm();
-        Eigen::Vector3d d34_1 = R01.transpose()*(p4-p3);
+        Eigen::Vector3d d34_1 = p4 - p3;  // FIXED: no rotation applied
         double a=d34_1.x(), b=d34_1.z();
         double L3 = std::hypot(a,b);
         double gamma = std::atan2(b,a);             // *** CHANGED ***
 
         double cosB = (px*px+pz*pz-L2*L2-L3*L3)/(2*L2*L3);
+        std::cout << "L2, L3: " << L2 << " " << L3 << std::endl;
+        std::cout << "gamma: " << gamma << std::endl;
+        std::cout << "cosB: " << cosB << std::endl;
+
         if(std::fabs(cosB)>1.0) return sols;
         double sinB = std::sqrt(1.0-cosB*cosB);
 
@@ -139,6 +166,7 @@ public:
             double theta2 = std::atan2(px,pz)       // *** CHANGED ***
                            - std::atan2(L3*std::sin(B),
                                         L2+L3*std::cos(B));
+            std::cout << "sgn: " << sgn << " B: " << B << " theta3: " << theta3 << " theta2: " << theta2 << std::endl;
 
             /* ---- wrist ------------------------------------------------ */
             Vec6 q123; q123<<theta1,theta2,theta3,0,0,0;

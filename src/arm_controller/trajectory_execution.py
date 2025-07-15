@@ -112,7 +112,14 @@ def _unwrap_joint_trajectory(joint_trajectory: JointTraj) -> list[list[float]]:
     return unwrapped_trajectory
 
 
-def _plan_linear_move(start_q: list[float], target_pos: np.ndarray, velocity: float, acceleration: float, frequency: int, use_smoothing: bool, forced_orientation: np.ndarray =None) -> list | None:
+def _plan_linear_move(start_q: list[float],
+                      target_pos: np.ndarray,
+                      velocity: float,
+                      acceleration: float,
+                      frequency: int,
+                      use_smoothing: bool,
+                      forced_orientation: np.ndarray = None,
+                      interpolate_orientation: bool = True) -> list | None:
     """
     Plans a smooth, orientation-locked, straight-line joint-space trajectory.
     This function generates a linear Cartesian path and then calls the high-fidelity
@@ -127,6 +134,7 @@ def _plan_linear_move(start_q: list[float], target_pos: np.ndarray, velocity: fl
         use_smoothing: Whether to apply a Savitzky-Golay filter to the final path.
         forced_orientation: A 3x3 rotation matrix to lock the orientation to. 
                               If None, orientation is locked to the start pose.
+        interpolate_orientation: Whether to interpolate the orientation along the path.
 
     Returns:
         A list of lists representing the dense joint-space trajectory, or None on failure.
@@ -145,18 +153,43 @@ def _plan_linear_move(start_q: list[float], target_pos: np.ndarray, velocity: fl
         print("[Pi Plan] ERROR: Trajectory planner failed to generate a path.")
         return None
 
-    # 3. Plan the joint-space path from the Cartesian points using the new high-fidelity planner
+    # --- Orientation Handling ---
+    orientations_list = None
+    if forced_orientation is not None and interpolate_orientation:
+        # Build SLERP from start orientation (derived from start_q) to forced_orientation
+        initial_pose_mx = ik_solver.get_fk_matrix(start_q)
+        if initial_pose_mx is not None:
+            start_orientation_mx = initial_pose_mx[:3, :3]
+            try:
+                from scipy.spatial.transform import Rotation as _R, Slerp as _Slerp
+                key_rots = _R.concatenate([_R.from_matrix(start_orientation_mx), _R.from_matrix(forced_orientation)])
+                key_times = [0, 1]
+                slerp = _Slerp(key_times, key_rots)
+                times = np.linspace(0, 1, len(ideal_cartesian_points))
+                interpolated_rots = slerp(times)
+                orientations_list = [r.as_matrix() for r in interpolated_rots]
+            except Exception as e:
+                print(f"[Pi Plan] WARNING: Failed to interpolate orientation: {e}. Reverting to fixed orientation.")
+                orientations_list = [forced_orientation] * len(ideal_cartesian_points)
+        else:
+            orientations_list = [forced_orientation] * len(ideal_cartesian_points)
+
     final_joint_trajectory = _plan_high_fidelity_trajectory(
-        cartesian_points=ideal_cartesian_points, 
-        start_q=start_q, 
+        cartesian_points=ideal_cartesian_points,
+        start_q=start_q,
         use_smoothing=use_smoothing,
-        forced_orientation=forced_orientation
+        forced_orientation=forced_orientation if orientations_list is None else None,
+        orientations_list=orientations_list,
     )
 
     return final_joint_trajectory
 
 
-def _plan_high_fidelity_trajectory(cartesian_points: list, start_q: list[float], use_smoothing: bool = True, forced_orientation: np.ndarray = None) -> list | None:
+def _plan_high_fidelity_trajectory(cartesian_points: list,
+                                   start_q: list[float],
+                                   use_smoothing: bool = True,
+                                   forced_orientation: np.ndarray = None,
+                                   orientations_list: list[np.ndarray] | None = None) -> list | None:
     """
     Takes a list of Cartesian points and plans a complete, smoothed joint-space trajectory.
     This is the core planning function, which solves IK for every point on the path.
@@ -167,27 +200,25 @@ def _plan_high_fidelity_trajectory(cartesian_points: list, start_q: list[float],
         use_smoothing: Whether to apply a Savitzky-Golay filter to the final path.
         forced_orientation: A 3x3 rotation matrix to lock the orientation to. 
                               If None, orientation is locked to the start pose.
+        orientations_list: A list of 3x3 rotation matrices to use for orientation interpolation.
+                           If None, orientation is locked to the start pose.
 
     Returns:
         The final, dense list of joint angle solutions, or None on failure.
     """
     print(f"[Pi Plan HF] Planning high-fidelity trajectory for {len(cartesian_points)} points.")
     
-    # 1. Determine target orientation for the entire path.
-    target_orientation = None
-    if forced_orientation is not None:
-        target_orientation = forced_orientation
-    else:
-        # Fallback to locking orientation to the start of the move.
-        initial_pose_matrix = ik_solver.get_fk_matrix(start_q)
-        if initial_pose_matrix is None:
-            print("[Pi Plan HF] ERROR: FK failed on start_q. Cannot determine orientation lock.")
-            return None
-        target_orientation = initial_pose_matrix[:3, :3]
-
-    # Create a list of orientations for the batch solver. This is required by the current
-    # `solve_ik_path_batch` function signature.
-    orientations_list = [target_orientation] * len(cartesian_points)
+    # Determine orientations for each path point
+    if orientations_list is None:
+        if forced_orientation is not None:
+            target_orientation = forced_orientation
+        else:
+            initial_pose_matrix = ik_solver.get_fk_matrix(start_q)
+            if initial_pose_matrix is None:
+                print("[Pi Plan HF] ERROR: FK failed on start_q. Cannot determine orientation lock.")
+                return None
+            target_orientation = initial_pose_matrix[:3, :3]
+        orientations_list = [target_orientation] * len(cartesian_points)
 
     # 2. Solve IK for the entire path in one batch call for maximum performance.
     t_start_ik = time.monotonic()

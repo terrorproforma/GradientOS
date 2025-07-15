@@ -129,7 +129,10 @@ def print_help():
     print("  translate,dx,dy,dz              : (Legacy) Simple blocking relative translation.")
     print("  rotate,axis,angle               : (Legacy) Simple blocking rotation (axis='x,y,z', angle=deg).")
     print("\n  --- Trajectory & State Control ---")
-    print("  run_trajectory,name[,yes]       : Execute a named trajectory from trajectories.json. Add ',yes' to use cache.")
+    print("  run_trajectory,name[,yes]       : Execute a named trajectory from trajectories.json or recorded folder.")
+    print("  plan_trajectory                 : Start recording mode (teach-by-demo).")
+    print("  rec_pos                         : Record current pose (FK) as way-point during recording.")
+    print("  end_trajectory,name             : Finalise recording and save to recorded_trajectories/name.json.")
     print("  test_square                     : Executes a high-fidelity square movement test.")
     print("  stop                            : Gracefully stops the current high-level move or trajectory.")
     print("  wait_for_idle                   : Blocks until the current move is finished.")
@@ -226,6 +229,18 @@ def main():
                 
                 send_command(full_command)
                 
+            elif user_input.startswith(("plan_trajectory", "rec_pos", "end_trajectory")):
+                # Recorder commands are passthrough but need correct casing
+                # Special case: END_TRAJECTORY may include a name arg; preserve after comma
+                parts = user_input.split(',', 1)
+                base = parts[0].upper()
+                if len(parts) > 1:
+                    cmd_str = f"{base},{parts[1]}"
+                else:
+                    cmd_str = base
+                send_command(cmd_str)
+                continue
+
             else:
                 try:
                     # Check if it's a raw joint command with no command name

@@ -24,6 +24,7 @@ from scipy.spatial.transform import Rotation
 np.set_printoptions(suppress=True, precision=6, floatmode='fixed')  # nicer print
 
 from numeric_solver.numeric_k import MiniArmKinematics
+from numeric_k import compute_ref_rot, user_to_ee_quat, ee_to_user_euler  # Import the new standalone functions
 
 # ---------------------------------------------------------------------------
 # Locate and load the CSV file containing the DH table
@@ -55,6 +56,11 @@ DH = np.genfromtxt(CSV_PATH, delimiter=",", skip_header=1, usecols=D_H_NUMERIC_C
 
 kin = MiniArmKinematics.from_dh(DH, [0] * DH.shape[0])
 
+# Compute the reference rotation matrix using the new standalone function
+# This is done once after creating the kinematics instance to get the zero-pose orientation
+ref_rot = compute_ref_rot(kin)
+print("\nComputed Reference Rotation Matrix:\n", np.round(ref_rot, 6))
+
 q = np.zeros(6)
 T = kin.fk(q)
 
@@ -68,16 +74,33 @@ position = T_clean[:3, 3]
 rotation_matrix = T_clean[:3, :3]
 euler_angles = Rotation.from_matrix(rotation_matrix).as_euler('xyz', degrees=True)
 
+# New: Convert the end effector rotation to user Euler using the standalone function
+# This demonstrates the output conversion, which should give [0,0,0] for zero pose without gimbal lock issues
+user_euler = ee_to_user_euler(rotation_matrix, ref_rot)
+print("\nUser-Friendly Orientation (Roll, Pitch, Yaw degrees):", np.round(user_euler, 4))
+
 print("\nWorld Coordinates at Zero-Angle Pose:")
 print(f"  Position (X, Y, Z):      {position}")
 print(f"  Orientation (Roll, Pitch, Yaw): {np.round(euler_angles, 4)} degrees")
 
 
 print("\n--- IK Test ---")
-quat = np.array([0, 0, 0, 1], float)
-pos = np.array([0.4, 0.0, 0.25], float)
+# Test the input conversion function
+# Define a user Euler input (here, [0,0,0] to match the zero pose and test round-trip)
+# Detailed explanation: This converts user Euler to a quaternion for IK input.
+# Step 1: Create input array with dtype=float.
+# Step 2: Call user_to_ee_quat with ref_rot.
+# Step 3: Use the resulting quat in IK to verify it solves correctly (should match zero angles).
+user_euler_input = np.array([0.0, 0.0, 0.0], dtype=float)
+print("\n--- Testing Input Conversion ---\nUser Euler Input (degrees):", user_euler_input)
+quat_from_user = user_to_ee_quat(user_euler_input, ref_rot)
+print("Converted Quaternion [x, y, z, w]:", np.round(quat_from_user, 6))
+
+# Use the converted quaternion in IK (replaces hard-coded quat)
+pos = np.array([0.4, 0.0, 0.25], dtype=float)
+q_star, e_star, iters, reason = kin.ik(quat_from_user, pos, q)
+
 # IK output clean
-q_star, e_star, iters, reason = kin.ik(quat, pos, q)
 q_star_clean = np.where(np.abs(q_star) < 1e-10, 0, np.round(q_star, 6))
 e_star_clean = np.where(np.abs(e_star) < 1e-10, 0, np.round(e_star, 6))
 print("IK Target Position: ", pos)

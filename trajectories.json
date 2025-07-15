@@ -5,7 +5,7 @@
     "moves": [
       { "command": "home", "duration": 2.0 },
       { "command": "pause", "duration": 1.0 },
-      { "command": "move_relative", "vector": [0.0, 0.2, -0.3], "speed_multiplier": 1.0 },
+      { "command": "move_line_relative", "vector": [0.0, 0.2, -0.3], "speed_multiplier": 1.0 },
       { "command": "pause", "duration": 1.0 },
       { "command": "move_relative", "vector": [0.0, 0.0, 0.3], "speed_multiplier": 1.0 },
       { "command": "pause", "duration": 1.0 },

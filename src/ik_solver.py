@@ -1,27 +1,42 @@
+"""ik_solver.py – High-level kinematics API
+
+This module exposes **solver-agnostic** helper functions:
+    solve_ik(...)        – inverse kinematics (position + orientation)
+    get_fk_matrix(...)   – full 4×4 pose of the tool tip
+    get_fk(...)          – convenience: only tool-tip XYZ
+
+Internally we can plug in several different solver back-ends.  Selection is
+done **at import time** via the environment variable ``MINI_ARM_SOLVER``.
+
+    "ikfast"   – the original IKFast C++ wrapper (default)
+    "numeric"  – the QuIK numeric solver (via ``numeric_wrapper.py``)
+    "trac"     – placeholder for future TRAC-IK integration
+
+The goal: callers’ code never changes – you just switch the env-var or call
+``set_backend()`` at runtime *before* the first IK/FK call.
+"""
+
+from __future__ import annotations
+
+import os
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-import os
-from ikfast_solver.ikfast_wrapper import IKFastSolver
-from arm_controller import utils
 
-# --- Configuration ---
-# Define the translation offset from the final joint (wrist) to the tool tip.
-# This is a 3-element vector [x, y, z] in meters.
-# For example, if your tool extends 12cm along the wrist's Z-axis:
-END_EFFECTOR_OFFSET = np.array([0.180, 0.0, 0.0]) 
+# -----------------------------------------------------------
+# END-EFFECTOR OFFSET (tool-tip with respect to wrist frame)
+# -----------------------------------------------------------
+# This vector is expressed **in the world frame when the robot is at its
+# zero-angle pose**.  In that pose the numeric (QuIK) solver’s positive Z-axis
+# aligns with +X_world, so an offset of +x means +z in the EE frame.
+# Keep everything in metres.
+END_EFFECTOR_OFFSET = np.array([0.180, 0.0, 0.0], dtype=float)
 
-# --- Global IKFast Solver Initialization ---
-# This creates a single, reusable instance of the solver.
-# The C++ library is built only once when this module is first imported.
-try:
-    IK_SOLVER = IKFastSolver()
-    NUM_JOINTS = IK_SOLVER.num_joints
-    print(f"[IK Solver] IKFast solver initialized successfully for {NUM_JOINTS} joints.")
-except (RuntimeError, OSError) as e:
-    print(f"--- [IK Solver] FATAL ERROR ---")
-    print(f"Failed to initialize the IKFast solver: {e}")
-    IK_SOLVER = None
-    NUM_JOINTS = 6 # Default fallback
+# NOTE: the old constant above has been replaced – see top-of-file comment.
+
+# Placeholder; real solver object (IKFastSolver instance or numeric IKSolver)
+# is assigned inside the backend-specific initialisers so that legacy code
+# that still refers to ``IK_SOLVER`` continues to work.
+IK_SOLVER = None  # type: ignore
 
 def _find_closest_solution(solutions, current_joint_angles):
     """
@@ -54,88 +69,150 @@ def _find_closest_solution(solutions, current_joint_angles):
     # Return the wrapped version so the caller already gets a continuous vector
     return continuous_solutions[best_solution_idx]
 
-def solve_ik(target_position, target_orientation_matrix=None, initial_joint_angles=None):
-    """
-    Solves inverse kinematics for a given tool-tip pose using the C++ IKFast solver.
-    This function compensates for the end-effector offset.
+# -----------------------------------------------------------
+# Backend selection helper – import the chosen solver only once
+# -----------------------------------------------------------
 
-    Args:
-        target_position (list or np.array): The target [x, y, z] position of the TOOL TIP.
-        target_orientation_matrix (list or np.array, optional): A 9-element list or 3x3 array for the tool's
-                                                              rotation matrix. If None, identity is used.
-        initial_joint_angles (list or np.array, optional): The current joint angles, used to select the closest solution.
+_BACKEND_NAME: str = os.getenv("MINI_ARM_SOLVER", "ikfast").lower()  # set ikfast as default
+# _BACKEND_NAME: str = os.getenv("MINI_ARM_SOLVER", "numeric").lower()   # set numeric as default
 
-    Returns:
-        list or None: The best joint angle solution in radians, or None if no solution is found.
-    """
-    if IK_SOLVER is None:
-        print("[IK Solver] Error: Solver is not initialized.")
-        return None
+# These module-level globals will be filled by the selected backend loader.
+_solve_ik_impl = None  # type: ignore
+_fk_matrix_impl = None  # type: ignore
+NUM_JOINTS = 6  # default until backend sets the real value
 
-    if target_orientation_matrix is None:
-        # Default to an identity matrix if no orientation is provided
-        target_rotation = np.identity(3)
+
+def _init_ikfast_backend():
+    """Initialise IKFast C++ back-end (original behaviour)."""
+    global _solve_ik_impl, _fk_matrix_impl, NUM_JOINTS
+
+    from ikfast_solver.ikfast_wrapper import IKFastSolver  # local import: heavy .so
+
+    try:
+        solver = IKFastSolver()
+        NUM_JOINTS = solver.num_joints
+        globals()["IK_SOLVER"] = solver  # expose for legacy helpers
+        print(f"[IK Solver] IKFast back-end initialised for {NUM_JOINTS} joints.")
+    except (RuntimeError, OSError) as e:
+        print("--- [IK Solver] FATAL ERROR – IKFast backend ---")
+        print(f"Failed to load IKFast: {e}")
+        solver = None
+        globals()["IK_SOLVER"] = None
+
+    def _ikfast_solve_ik(target_position, target_orientation_matrix, initial_joint_angles):
+        if solver is None:
+            return None
+
+        # fall back to identity if orientation omitted
+        target_rotation = (
+            np.identity(3)
+            if target_orientation_matrix is None
+            else np.array(target_orientation_matrix).reshape(3, 3)
+        )
+
+        rotated_offset = target_rotation.dot(END_EFFECTOR_OFFSET)
+        wrist_position = np.array(target_position) - rotated_offset
+
+        pose_rot_flat = target_rotation.flatten()
+        sol = solver.solve_ik(wrist_position, pose_rot_flat, initial_joint_angles)
+        return sol
+
+    def _ikfast_fk_matrix(joint_angles):
+        if solver is None:
+            return None
+
+        wrist_t, wrist_r = solver.compute_fk(joint_angles)
+        wrist_matrix = np.eye(4)
+        wrist_matrix[:3, :3] = wrist_r.reshape(3, 3)
+        wrist_matrix[:3, 3] = wrist_t
+
+        offset_matrix = np.eye(4)
+        offset_matrix[:3, 3] = END_EFFECTOR_OFFSET
+        return wrist_matrix.dot(offset_matrix)
+
+    _solve_ik_impl = _ikfast_solve_ik
+    _fk_matrix_impl = _ikfast_fk_matrix
+
+
+def _init_numeric_backend():
+    """Initialise QuIK numeric back-end (python/pybind)."""
+    global _solve_ik_impl, _fk_matrix_impl, NUM_JOINTS
+
+    from numeric_solver.numeric_wrapper import (
+        numeric_fk,
+        numeric_ik,
+        init_numeric_solver,
+    )
+
+    # Lazy initialisation – path to DH CSV via env var or default location
+    dh_path = os.getenv("MINI_ARM_DH_CSV", "mini-6dof-arm/dh_params.csv")
+    try:
+        kin, solver = init_numeric_solver(dh_path)
+        NUM_JOINTS = kin.num_joints if hasattr(kin, "num_joints") else 6
+        globals()["IK_SOLVER"] = solver  # expose numeric IKSolver for future use
+        print(f"[IK Solver] Numeric (QuIK) back-end initialised for {NUM_JOINTS} joints.")
+    except Exception as e:
+        print("--- [IK Solver] FATAL ERROR – Numeric backend ---")
+        print(f"Failed to load numeric solver: {e}")
+        kin = solver = None
+        globals()["IK_SOLVER"] = None
+
+    def _numeric_solve_ik(target_position, target_orientation_matrix, initial_joint_angles):
+        if solver is None:
+            return None
+
+        # Expect orientation as 3×3 matrix or flat 9.
+        target_rotation = (
+            np.identity(3)
+            if target_orientation_matrix is None
+            else np.array(target_orientation_matrix).reshape(3, 3)
+        )
+
+        # QuIK solver already accepts tool-frame pose directly – **do not** subtract offset.
+        quat = R.from_matrix(target_rotation).as_quat()
+        sol, _, _, _ = numeric_ik(quat, np.asarray(target_position, dtype=float), initial_joint_angles)
+        return sol
+
+    def _numeric_fk_matrix(joint_angles):
+        if kin is None:
+            return None
+        return numeric_fk(joint_angles)
+
+    _solve_ik_impl = _numeric_solve_ik
+    _fk_matrix_impl = _numeric_fk_matrix
+
+
+def _init_backend():
+    if _BACKEND_NAME == "ikfast":
+        _init_ikfast_backend()
+    elif _BACKEND_NAME == "numeric":
+        _init_numeric_backend()
+    elif _BACKEND_NAME == "trac":
+        raise NotImplementedError("TRAC-IK backend not yet integrated.")
     else:
-        target_rotation = np.array(target_orientation_matrix).reshape(3, 3)
+        raise ValueError(f"Unknown MINI_ARM_SOLVER backend '{_BACKEND_NAME}'")
 
-    # To find the wrist pose, we transform the offset vector by the target rotation
-    # and subtract it from the target tool tip position.
-    rotated_offset = target_rotation.dot(END_EFFECTOR_OFFSET)
-    target_wrist_position = np.array(target_position) - rotated_offset
-    
-    # The new wrapper takes numpy arrays directly
-    target_wrist_orientation_flat = target_rotation.flatten()
-    
-    solutions = IK_SOLVER.solve_ik(target_wrist_position, target_wrist_orientation_flat, initial_joint_angles)
 
-    # IK solver already chooses nearest solution if an initial guess is provided, but joint angles
-    # can still jump by ±2π.  Re-wrap to stay close to the seed.
-    if solutions is not None and initial_joint_angles is not None:
-        solutions = _wrap_to_prev(np.asarray(initial_joint_angles, dtype=float), np.asarray(solutions, dtype=float))
+# Initialise the chosen backend immediately so NUM_JOINTS is correct.
+_init_backend()
 
-    return solutions
+# -----------------------------------------------------------
+# Public, solver-independent API
+# -----------------------------------------------------------
+
+
+def solve_ik(*, target_position, target_orientation_matrix=None, initial_joint_angles=None):
+    """Solver-agnostic wrapper – dispatches to selected backend and returns joint angles or None."""
+    return _solve_ik_impl(target_position, target_orientation_matrix, initial_joint_angles)
+
 
 def get_fk_matrix(active_joint_angles):
-    """
-    Calculates the forward kinematics to find the 4x4 transformation matrix of the TOOL TIP.
-    
-    Args:
-        active_joint_angles (list or np.array): The current active joint angles in radians.
+    """Return 4×4 tool-tip pose (world frame) for *active_joint_angles* or None on failure."""
+    return _fk_matrix_impl(active_joint_angles)
 
-    Returns:
-        np.array: The 4x4 transformation matrix, or None on failure.
-    """
-    if IK_SOLVER is None:
-        print("[IK Solver] Error: Solver is not initialized.")
-        return None
-
-    # Get the FK of the wrist from the C++ solver
-    wrist_translation, wrist_rotation = IK_SOLVER.compute_fk(active_joint_angles)
-    
-    # Assemble the 4x4 transformation matrix for the wrist
-    wrist_matrix = np.eye(4)
-    wrist_matrix[:3, :3] = wrist_rotation.reshape(3, 3)
-    wrist_matrix[:3, 3] = wrist_translation
-    
-    # Create a transformation matrix for the end-effector offset
-    offset_matrix = np.eye(4)
-    offset_matrix[:3, 3] = END_EFFECTOR_OFFSET
-    
-    # Combine the wrist matrix and the offset matrix to get the final tool tip pose
-    tool_tip_matrix = wrist_matrix.dot(offset_matrix)
-    
-    return tool_tip_matrix
 
 def get_fk(active_joint_angles):
-    """
-    Calculates the forward kinematics to find just the end-effector position.
-
-    Args:
-        active_joint_angles (list or np.array): The current active joint angles.
-
-    Returns:
-        np.array: The [x, y, z] position, or None on failure.
-    """
+    """Convenience: return just XYZ position from ``get_fk_matrix``."""
     fk_matrix = get_fk_matrix(active_joint_angles)
     if fk_matrix is not None:
         return fk_matrix[:3, 3]
@@ -160,7 +237,7 @@ def solve_ik_path_sequential(path_points, initial_joint_angles=None, target_orie
     Returns:
         list or None: A list of joint angle solutions for the path.
     """
-    if IK_SOLVER is None:
+    if _solve_ik_impl is None:
         return None
 
     if target_orientations and len(target_orientations) != len(path_points):
@@ -203,7 +280,7 @@ def solve_ik_path_batch(path_points, initial_joint_angles=None, target_orientati
     Returns:
         list or None: A list of joint angle solutions for the path.
     """
-    if IK_SOLVER is None:
+    if _solve_ik_impl is None:
         return None
 
     num_poses = len(path_points)
