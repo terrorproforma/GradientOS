@@ -1,26 +1,45 @@
+# .gitignore
+
 # Python
+# ----------------------------------------------------------------
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 .Python
 env/
 venv/
+.venv/
 pip-selfcheck.json
-
-# Build artifacts
+*.egg-info/
 build/
 dist/
-*.egg-info/
+
+# Large binaries and installers
+# ----------------------------------------------------------------
+*.run
 *.so
 *.dylib
+*.dll
+*.exe
 
 # Logs and data
+# ----------------------------------------------------------------
 *.log
 performance_log.csv
 performance_charts.png
 trajectory_cache/
 
-# IDE and editor files
+# IDE and Editor files
+# ----------------------------------------------------------------
 .vscode/
 .idea/
+
+# OS-generated files
+# ----------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

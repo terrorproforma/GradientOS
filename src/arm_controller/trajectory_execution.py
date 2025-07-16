@@ -10,6 +10,7 @@ from typing import Sequence, Union
 from pathlib import Path
 import os
 import csv
+import threading
 
 try:
     import ik_solver
@@ -335,10 +336,16 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
                     servo_driver.set_servo_positions(step['target_q'], step['speed'], 0)
                     # Update global state immediately
                     utils.current_logical_joint_angles_rad = step['target_q']
-                    time.sleep(step['duration'])
+                    # Make joint_move interruptible with correct timing
+                    end_time = time.monotonic() + step['duration']
+                    while not utils.trajectory_state["should_stop"] and time.monotonic() < end_time:
+                        time.sleep(0.01)  # Check for stop every 10 ms
                 elif step['type'] == 'pause':
                     print(f"[Pi Execute] Pausing for {step['duration']} seconds.")
-                    time.sleep(step['duration'])
+                    # Make pause interruptible with correct timing
+                    end_time = time.monotonic() + step['duration']
+                    while not utils.trajectory_state["should_stop"] and time.monotonic() < end_time:
+                        time.sleep(0.01)  # Check for stop every 10 ms
             
             if not should_loop:
                 execution_loop_active = False
@@ -348,9 +355,9 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
 
     finally:
         print("[Pi Trajectory] Executor thread finished.")
-        # Clean up global state
+        # Clean up global state, but DO NOT reset the should_stop flag.
+        # The stop flag should persist until a new motion command clears it.
         utils.trajectory_state["is_running"] = False
-        utils.trajectory_state["should_stop"] = False
         utils.trajectory_state["thread"] = None
 
 
@@ -495,15 +502,13 @@ def _open_loop_executor_thread(
                 except Exception as e:
                     print(f"[Pi OL] WARNING: Failed to generate diagnostics chart: {e}")
 
-        # Reset controller state flags
-        utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
-
+        # If this executor thread is the one registered in trajectory_state, clear it
+        if utils.trajectory_state.get("thread") is threading.current_thread():
+            utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
+            # Clean up session keys
+            utils.trajectory_state.pop('diagnostics_session_id', None)
+            utils.trajectory_state.pop('diagnostics_folder_type', None)
         print("[Pi OL] Open-Loop Executor finished.")
-        # Clean up session keys if they exist
-        if 'diagnostics_session_id' in utils.trajectory_state:
-            del utils.trajectory_state['diagnostics_session_id']
-        if 'diagnostics_folder_type' in utils.trajectory_state:
-            del utils.trajectory_state['diagnostics_folder_type']
 
 
 def _closed_loop_executor_thread(
@@ -694,7 +699,7 @@ def _closed_loop_executor_thread(
         utils.current_logical_joint_angles_rad = joint_path[-1]
 
     finally:
-        print("[Pi CLC] Closed-Loop Executor thread finished.")
+        print("[Pi CLC] Closed-Loop Executor thread finished a segment.")
 
         # Print timing statistics if we collected any samples
         if '_loop_durations' in locals() and _loop_durations:
@@ -799,11 +804,26 @@ def _closed_loop_executor_thread(
                 except Exception as e:
                     print(f"[Pi CLC] WARNING: Failed to generate diagnostics charts: {e}")
 
-        # Clean up global state
-        utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
-        # Clean up session keys if they exist
-        if 'diagnostics_session_id' in utils.trajectory_state:
-            del utils.trajectory_state['diagnostics_session_id']
-        if 'diagnostics_folder_type' in utils.trajectory_state:
-            del utils.trajectory_state['diagnostics_folder_type']
+        # If this executor thread is the one registered in trajectory_state, clear it
+        if utils.trajectory_state.get("thread") is threading.current_thread():
+            utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
+            utils.trajectory_state.pop('diagnostics_session_id', None)
+            utils.trajectory_state.pop('diagnostics_folder_type', None)
+
+
+def _execute_joint_path(joint_path: list[list[float]], frequency: int):
+    """Executes a pre-computed joint path synchronously (blocking).
+
+    Current implementation chooses the **open-loop** executor for speed.
+    It runs in the *current* thread so the caller remains blocking, which
+    is appropriate for the step-by-step `_trajectory_executor_thread`.
+
+    Parameters
+    ----------
+    joint_path : list[list[float]]
+        Dense list of joint configurations.
+    frequency : int
+        Execution frequency in Hz.
+    """
+    _open_loop_executor_thread(joint_path, frequency, diagnostics=False)
 

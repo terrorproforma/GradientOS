@@ -7,6 +7,9 @@ from scipy.spatial.transform import Rotation as R
 import threading
 import datetime
 
+# --- Global State for Motion Control ---
+# The motion_stopped Event has been removed to use the native trajectory_state flag.
+
 try:
     import ik_solver
 except ImportError:
@@ -23,6 +26,7 @@ def handle_translate_command(dx: float, dy: float, dz: float):
     Performs a simple, blocking, single-point IK move relative to the current
     pose while keeping orientation locked.
     """
+    utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     print(f"[Pi IK] Received TRANSLATE command: dx={dx}, dy={dy}, dz={dz}")
 
     # 1. Get current logical joint angles from our global state
@@ -77,6 +81,7 @@ def handle_rotate_command(axis: str, angle_deg: float):
     Performs a simple, blocking, single-point IK move to rotate the end effector
     around a specified axis of the base frame.
     """
+    utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     print(f"[Pi IK] Received ROTATE command: axis={axis}, angle={angle_deg} degrees")
 
     # 1. Get current state
@@ -170,6 +175,7 @@ def handle_set_orientation_command(
         Desired motion duration (≥ 0.1 s).  Controls the smoothness/speed by
         scaling the number of interpolation steps.  Default `1.0`.
     """
+    utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     print(f"[Pi IK] Received SET_ORIENTATION command: Roll={roll}, Pitch={pitch}, Yaw={yaw} degrees")
 
     # 1. Get current state (joint angles and full pose).
@@ -299,6 +305,7 @@ def handle_move_profiled(target_x: float,
     high-precision, profiled, non-blocking linear moves. It plans the full path,
     then starts the closed-loop executor in a background thread.
     """
+    utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     print(f"[Pi Smooth] Received MOVE_PROFILED command to [{target_x}, {target_y}, {target_z}]")
     
     if utils.trajectory_state["is_running"]:
@@ -361,6 +368,7 @@ def handle_move_profiled_relative(dx: float, dy: float, dz: float, speed: float 
     Handles the 'MOVE_PROFILED_RELATIVE' command. Calculates the absolute
     target position and then calls the main `handle_move_profiled` handler.
     """
+    utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     print(f"[Pi Smooth] Received MOVE_PROFILED_RELATIVE command: dX={dx}, dY={dy}, dZ={dz}, SpeedMultiplier={speed}")
 
     # 1. Get current position
@@ -388,10 +396,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False):
     from a JSON file, plans all the constituent moves, and then starts the
     trajectory executor thread to run the full sequence.
     """
-    if utils.trajectory_state["is_running"]:
-        print("[Pi Trajectory] ERROR: Cannot start new trajectory, one is already running. Send 'STOP' first.")
-        return
-
+    utils.trajectory_state["should_stop"] = False # Reset stop flag for a new trajectory run
     print(f"[Pi Trajectory] Received RUN_TRAJECTORY for '{trajectory_name}' (Use Cache: {use_cache})")
 
     # --- 1. Load Trajectory Definition ---
@@ -444,6 +449,10 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False):
         
         planning_succeeded = True
         for i, move_cmd in enumerate(moves):
+            if utils.trajectory_state["should_stop"]:
+                print("[Pi Plan] Stop detected – aborting trajectory planning.")
+                planning_succeeded = False
+                break
             command = move_cmd.get("command")
             print(f"[Pi Plan] Planning Command {i+1}/{len(moves)}: {command}...")
 
@@ -600,14 +609,22 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False):
 
 def handle_stop_command():
     """
-    Handles the 'STOP' command by setting the global 'should_stop' flag.
-    The running motion thread will detect this flag and exit cleanly.
+    Stops any currently running motion by setting a global flag and sending
+    an immediate brake command to the servos.
     """
-    if utils.trajectory_state["is_running"]:
-        print("[Pi Control] STOP command received. Signaling trajectory to stop...")
-        utils.trajectory_state["should_stop"] = True
+    print("[Controller] Received STOP command. Halting all motion.")
+    # Set the flag to stop any high-level trajectory loops
+    utils.trajectory_state["should_stop"] = True
+
+    # Also send an immediate brake command to the physical servos
+    # by commanding them to their current position with zero speed.
+    current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
+    if current_angles:
+        print(f"[Controller] Sending immediate brake command to current position: {np.round(current_angles, 2)}")
+        # Use speed 0 and max acceleration to act as a hard stop
+        servo_driver.set_servo_positions(current_angles, speed=0, accel=100)
     else:
-        print("[Pi Control] STOP command received, but no trajectory is running.")
+        print("[Controller] WARNING: Could not get current position to send brake command.")
 
 
 def handle_move_to_position_absolute(x: float, y: float, z: float):
@@ -616,6 +633,7 @@ def handle_move_to_position_absolute(x: float, y: float, z: float):
     Performs a simple, blocking, single-point IK move to an absolute position
     with no orientation constraint.
     """
+    utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     print(f"[Pi IK] Received MOVE command: x={x}, y={y}, z={z}")
 
     # 1. Get current logical joint angles from our global state
@@ -696,6 +714,7 @@ def handle_get_position(sock: 'socket.socket', addr: tuple):
 
 def handle_move_line(target_x: float, target_y: float, target_z: float, velocity: float, acceleration: float, closed_loop: bool = True):
     """Convenience wrapper that calls the main profiled move handler, defaulting to closed-loop."""
+    utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     handle_move_profiled(
         target_x, target_y, target_z, velocity, acceleration,
         closed_loop=closed_loop,
@@ -705,6 +724,7 @@ def handle_move_line(target_x: float, target_y: float, target_z: float, velocity
 
 def handle_move_line_relative(dx: float, dy: float, dz: float, speed: float = 1.0, closed_loop: bool = True):
     """Convenience wrapper that calls the main profiled move handler, defaulting to closed-loop."""
+    utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     current_q = servo_driver.get_current_arm_state_rad(verbose=False)
     if current_q is None:
         print("[Pi Smooth] ERROR: Cannot start relative move, failed to get current position.")

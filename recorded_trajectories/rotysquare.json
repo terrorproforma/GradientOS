@@ -1,0 +1,377 @@
+{
+  "description": "Recorded on 2025-07-16 15:36:06",
+  "loop": false,
+  "orientation_euler_angles_deg": null,
+  "moves": [
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.3947,
+        0.099,
+        0.3433
+      ],
+      "orientation_euler_deg": [
+        -0.91,
+        3.4,
+        -0.34
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.3959,
+        0.1005,
+        0.3332
+      ],
+      "orientation_euler_deg": [
+        -0.64,
+        31.3,
+        -0.32
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.3969,
+        0.0992,
+        0.3289
+      ],
+      "orientation_euler_deg": [
+        0.09,
+        0.62,
+        29.64
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.3982,
+        0.0991,
+        0.318
+      ],
+      "orientation_euler_deg": [
+        0.87,
+        31.31,
+        30.56
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.3987,
+        0.0994,
+        0.3062
+      ],
+      "orientation_euler_deg": [
+        -0.84,
+        31.54,
+        -0.34
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.4009,
+        0.1008,
+        0.2947
+      ],
+      "orientation_euler_deg": [
+        -2.02,
+        30.87,
+        -31.03
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.4054,
+        0.1043,
+        0.2792
+      ],
+      "orientation_euler_deg": [
+        -2.45,
+        0.91,
+        -30.02
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.4073,
+        0.1064,
+        0.2687
+      ],
+      "orientation_euler_deg": [
+        -0.74,
+        1.41,
+        0.18
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.4068,
+        0.1065,
+        0.2564
+      ],
+      "orientation_euler_deg": [
+        -0.85,
+        31.42,
+        -0.43
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.2212,
+        0.2928,
+        0.0488
+      ],
+      "orientation_euler_deg": [
+        -2.89,
+        31.6,
+        -3.48
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.1175,
+        0.2785,
+        0.0032
+      ],
+      "orientation_euler_deg": [
+        -115.2,
+        84.74,
+        -115.36
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.2071,
+        0.2698,
+        0.0058
+      ],
+      "orientation_euler_deg": [
+        -121.8,
+        81.37,
+        -121.96
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.1998,
+        0.0694,
+        -0.0015
+      ],
+      "orientation_euler_deg": [
+        -129.92,
+        79.33,
+        -130.09
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.0935,
+        0.0623,
+        0.0088
+      ],
+      "orientation_euler_deg": [
+        -131.76,
+        76.49,
+        -131.84
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.0926,
+        0.2555,
+        0.0017
+      ],
+      "orientation_euler_deg": [
+        -129.88,
+        75.05,
+        -130.09
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.1805,
+        0.2387,
+        -0.0026
+      ],
+      "orientation_euler_deg": [
+        -123.05,
+        85.18,
+        -123.38
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.1763,
+        0.2109,
+        0.0013
+      ],
+      "orientation_euler_deg": [
+        -15.79,
+        60.73,
+        -14.17
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.2986,
+        0.1824,
+        0.0126
+      ],
+      "orientation_euler_deg": [
+        -40.11,
+        64.02,
+        -35.63
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.276,
+        -0.2977,
+        0.004
+      ],
+      "orientation_euler_deg": [
+        -39.81,
+        71.58,
+        -34.71
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.0754,
+        -0.2815,
+        -0.0044
+      ],
+      "orientation_euler_deg": [
+        -25.23,
+        74.44,
+        -20.44
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.3261,
+        0.0119,
+        -0.0007
+      ],
+      "orientation_euler_deg": [
+        -79.64,
+        83.38,
+        -75.06
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1.0
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.496,
+        0.0004,
+        0.3497
+      ],
+      "orientation_euler_deg": [
+        -0.09,
+        2.77,
+        0.04
+      ]
+    }
+  ]
+}
