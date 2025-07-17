@@ -5,6 +5,7 @@ import time
 import traceback
 import sys
 import os
+import numpy as np # Added for gripper angle conversion
 
 # Add the 'src' directory to the Python path to allow importing the arm_controller package
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
@@ -42,7 +43,21 @@ def main():
     # Homing Routine: Read servo positions to synchronize our internal state.
     # This prevents dangerous movements if the arm isn't at zero when the script starts.
     utils.current_logical_joint_angles_rad = servo_driver.get_current_arm_state_rad()
-    
+    # If gripper is present, also get its initial state
+    if utils.gripper_present:
+        # Use the generic and robust word-reading function
+        raw_pos = servo_protocol.read_servo_register_word(
+            utils.SERVO_ID_GRIPPER, 
+            utils.SERVO_ADDR_PRESENT_POSITION
+        )
+        if raw_pos is not None:
+            try:
+                gripper_config_index = utils.SERVO_IDS.index(utils.SERVO_ID_GRIPPER)
+                utils.current_gripper_angle_rad = servo_driver.raw_to_angle_rad(raw_pos, gripper_config_index)
+                print(f"[Controller] Initial gripper angle: {np.rad2deg(utils.current_gripper_angle_rad):.1f} degrees")
+            except (ValueError, IndexError):
+                print("[Controller] WARNING: Could not determine initial gripper angle.")
+
     # --- UDP Server Setup ---
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -101,8 +116,8 @@ def main():
                     try:
                         joint_num = int(parts[1])  # Expect 1-6 now
 
-                        if not (1 <= joint_num <= utils.NUM_LOGICAL_JOINTS):
-                            print("[Controller] Error: Joint number must be 1-6.")
+                        if not (1 <= joint_num <= utils.NUM_LOGICAL_JOINTS or joint_num == 7): # 7 is for gripper
+                            print("[Controller] Error: Joint number must be 1-6 for arm, or 7 for gripper.")
                             continue
 
                         # Map logical joint numbers to their physical servo IDs
@@ -113,6 +128,7 @@ def main():
                             4: [40],      # Wrist roll
                             5: [50],      # Wrist pitch
                             6: [60],      # Wrist yaw
+                            7: [utils.SERVO_ID_GRIPPER], # Gripper
                         }
 
                         servos_to_zero = joint_to_servo_ids[joint_num]
@@ -180,8 +196,38 @@ def main():
                 elif command == "GET_POSITION":
                     command_api.handle_get_position(sock, addr)
                 
+                elif command == "GET_STATUS":
+                    reply = f"STATUS,gripper_present,{utils.gripper_present}"
+                    sock.sendto(reply.encode("utf-8"), addr)
+
+                elif command == "GET_JOINT_ANGLES":
+                    arm_deg = np.rad2deg(utils.current_logical_joint_angles_rad)
+                    reply = "JOINT_ANGLES," + ",".join(f"{deg:.2f}" for deg in arm_deg)
+                    if utils.gripper_present:
+                        gripper_deg = np.rad2deg(utils.current_gripper_angle_rad)
+                        reply += f",{gripper_deg:.2f}"
+                    sock.sendto(reply.encode("utf-8"), addr)
+
+                elif command == "REFRESH_LIMITS":
+                    servo_driver.set_servo_angle_limits_from_urdf()
+
                 elif command == "WAIT_FOR_IDLE":
                     command_api.handle_wait_for_idle()
+
+                # ------------------------------------------------------------------
+                # NEW: Gripper Commands
+                # ------------------------------------------------------------------
+                elif command == "SET_GRIPPER":
+                    try:
+                        angle_deg = float(parts[1])
+                        speed = int(parts[2]) if len(parts) > 2 else 100
+                        accel = int(parts[3]) if len(parts) > 3 else 0
+                        command_api.handle_set_gripper_state(angle_deg, speed, accel)
+                    except (ValueError, IndexError):
+                        print("[Controller] Error: Invalid SET_GRIPPER command. Use 'SET_GRIPPER,angle_deg,[speed],[accel]'.")
+                
+                elif command == "GET_GRIPPER_STATE":
+                    command_api.handle_get_gripper_state(sock, addr)
 
                 # ------------------------------------------------------------------
                 # NEW: Recording commands (trajectory recorder)
@@ -297,13 +343,22 @@ def main():
                 # Default case for raw joint angles
                 else:
                     try:
-                        if len(parts) >= utils.NUM_LOGICAL_JOINTS:
-                            joint_angles = [float(p) for p in parts[:utils.NUM_LOGICAL_JOINTS]]
-                            speed = int(float(parts[utils.NUM_LOGICAL_JOINTS])) if len(parts) > utils.NUM_LOGICAL_JOINTS else utils.DEFAULT_SERVO_SPEED
-                            accel = float(parts[utils.NUM_LOGICAL_JOINTS + 1]) if len(parts) > utils.NUM_LOGICAL_JOINTS + 1 else utils.DEFAULT_SERVO_ACCELERATION_DEG_S2
-                            servo_driver.set_servo_positions(joint_angles, speed, accel)
+                        num_angles = len(parts)
+                        if num_angles < 6:
+                            print(f"[Controller] Error: Too few angles in command '{message}'")
                         else:
-                            print(f"[Controller] Error: Unknown command '{message}'")
+                            angles = [float(p) for p in parts[:min(num_angles, 7)]]
+                            arm_angles = angles[:6]
+                            gripper_rad = angles[6] if len(angles) == 7 else None
+
+                            speed_index = min(num_angles, 7)
+                            speed = int(float(parts[speed_index])) if len(parts) > speed_index else utils.DEFAULT_SERVO_SPEED
+                            accel_index = speed_index + 1
+                            accel = float(parts[accel_index]) if len(parts) > accel_index else utils.DEFAULT_SERVO_ACCELERATION_DEG_S2
+
+                            servo_driver.set_servo_positions(arm_angles, speed, accel)
+                            if gripper_rad is not None:
+                                command_api.handle_set_gripper_state(np.rad2deg(gripper_rad), speed, accel)
                     except ValueError:
                         print(f"[Controller] Error: Could not parse joint angle command '{message}'")
 

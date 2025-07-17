@@ -9,33 +9,51 @@ from . import servo_protocol
 
 def initialize_servos():
     """
-    Initializes the serial connection to the servos and sets their default PID gains.
-    This function must be called once at application startup.
+    Initializes the serial connection to the servos, checks for their presence,
+    and sets their default PID gains. This function must be called once at application startup.
     """
     print("[Pi] Initializing servos...")
     try:
         utils.ser = serial.Serial(utils.SERIAL_PORT, utils.BAUD_RATE, timeout=0.1)
         print(f"[Pi] Serial port {utils.SERIAL_PORT} opened successfully at {utils.BAUD_RATE} baud.")
         
-        # On startup, immediately read and display the hardware zero offsets for verification.
-        print("[Pi] Reading stored hardware zero offsets from all servos...")
-        offsets = get_servo_hardware_zero_offsets()
-        for i, offset in enumerate(offsets):
-            print(f"[Pi]   - Servo {utils.SERVO_IDS[i]}: Offset = {offset}")
-
-        # Set default PID gains for all servos upon initialization
-        # These are EEPROM values, so they will persist.
-        # Ensure EEPROM is writable (typically it is for PID unless explicitly locked by other means).
-        # Register 0x37 (WRITE_LOCK) is 0 by default (writable).
-        print("[Pi] Setting default PID gains for all servos...")
-        all_pid_set_successfully = True
+        # --- Check for presence of each servo, including the gripper ---
+        print("[Pi] Pinging all configured servos...")
+        present_servo_ids = []
         for s_id in utils.SERVO_IDS:
+            if servo_protocol.ping(s_id):
+                print(f"[Pi]   - Servo {s_id}: PRESENT")
+                present_servo_ids.append(s_id)
+            else:
+                print(f"[Pi]   - Servo {s_id}: ABSENT")
+        
+        # Check specifically for the gripper and set the global flag
+        if utils.SERVO_ID_GRIPPER in present_servo_ids:
+            utils.gripper_present = True
+            print(f"[Pi] Gripper (ID {utils.SERVO_ID_GRIPPER}) is present.")
+        else:
+            utils.gripper_present = False
+            print(f"[Pi] Gripper (ID {utils.SERVO_ID_GRIPPER}) is ABSENT.")
+        
+        # On startup, immediately read and display the hardware zero offsets for verification.
+        print("[Pi] Reading stored hardware zero offsets from present servos...")
+        # Only read from servos that are actually connected
+        offsets = get_servo_hardware_zero_offsets(servo_ids_to_check=present_servo_ids)
+        for i, offset in enumerate(offsets):
+            # The index i corresponds to the index in present_servo_ids
+            print(f"[Pi]   - Servo {present_servo_ids[i]}: Offset = {offset}")
+
+        # Set default PID gains for all PRESENT servos upon initialization
+        print("[Pi] Setting default PID gains for present servos...")
+        all_pid_set_successfully = True
+        # Only configure servos that responded to ping
+        for s_id in present_servo_ids:
             if not set_servo_pid_gains(s_id, utils.DEFAULT_KP, utils.DEFAULT_KI, utils.DEFAULT_KD):
                 all_pid_set_successfully = False
             time.sleep(0.05) # Give a bit more time after each servo's PID set
         
         if all_pid_set_successfully:
-            print("[Pi] Default PID gains set for all servos.")
+            print("[Pi] Default PID gains set for all present servos.")
         else:
             print("[Pi] WARNING: Failed to set PID gains for one or more servos.")
             print("[Pi] Check servo connections and power.")
@@ -51,6 +69,44 @@ def initialize_servos():
         print("  5. Reboot your Pi.")
         exit() # Exit if we can't open the serial port
     print("[Pi] Servos initialized.")
+
+
+def set_single_servo_position_rads(servo_id: int, position_rad: float, speed: int, accel: int):
+    """
+    Commands a single servo to a specified position in radians using the
+    efficient SYNC_WRITE protocol, consistent with how the main arm is controlled.
+    """
+    if utils.ser is None:
+        print("[Pi] Serial port not initialized, cannot set single servo position.")
+        return
+
+    try:
+        config_index = utils.SERVO_IDS.index(servo_id)
+    except ValueError:
+        print(f"[Pi] ERROR: Servo ID {servo_id} not found in configuration.")
+        return
+
+    # Convert the high-level acceleration value to the 1-byte register value.
+    accel_reg_val = 0
+    if accel > 0:
+        # Note: The 'accel' param here is the register value (0-254)
+        accel_reg_val = int(round(accel / utils.ACCELERATION_SCALE_FACTOR))
+        accel_reg_val = max(1, min(254, accel_reg_val))
+
+    # Convert the desired angle into a raw servo value.
+    raw_pos_value = angle_to_raw(position_rad, config_index)
+
+    # Clamp the speed value.
+    clamped_speed = int(max(0, min(4095, speed)))
+
+    # Build the command tuple in the format the sync write function expects.
+    command_tuple = (servo_id, raw_pos_value, clamped_speed, accel_reg_val)
+
+    # Call the sync write function with a list containing just our single command.
+    servo_protocol.sync_write_goal_pos_speed_accel([command_tuple])
+    
+    print(f"[Pi] Commanded single servo {servo_id} to {position_rad:.2f} rad ({raw_pos_value}) "
+          f"with Speed={clamped_speed}, AccelReg={accel_reg_val}")
 
 
 def set_servo_positions(logical_joint_angles_rad: list[float], speed_value: int, acceleration_value_deg_s2: float):
@@ -145,6 +201,10 @@ def set_servo_positions(logical_joint_angles_rad: list[float], speed_value: int,
             final_servo_pos_value = int(round(raw_servo_value))
             final_servo_pos_value = max(0, min(4095, final_servo_pos_value))
 
+            # --- IMPORTANT: Only command servos that are present ---
+            if current_physical_servo_id not in servo_protocol.get_present_servo_ids():
+                continue # Skip this servo if it wasn't detected at startup
+
             # Add command data for this servo to the list for Sync Write
             commands_for_sync_write.append((
                 current_physical_servo_id, 
@@ -206,6 +266,50 @@ def servo_value_to_radians(servo_value: int, physical_servo_config_index: int) -
     return angle_rad
 
 
+def angle_to_raw(angle_rad: float, physical_servo_config_index: int) -> int:
+    """
+    Converts a physical angle in radians to a raw servo value (0-4095).
+    This is the core conversion logic used by both single and sync servo writes.
+    """
+    min_map_rad, max_map_rad = utils.EFFECTIVE_MAPPING_RANGES[physical_servo_config_index]
+
+    # Clamp the angle to the effective mapping range before normalization
+    angle_for_norm = max(min_map_rad, min(max_map_rad, angle_rad))
+    
+    normalized_value = (angle_for_norm - min_map_rad) / (max_map_rad - min_map_rad)
+
+    # Apply mapping direction
+    if utils._is_servo_direct_mapping(physical_servo_config_index):
+        raw_servo_value = normalized_value * 4095.0
+    else: 
+        raw_servo_value = (1.0 - normalized_value) * 4095.0
+    
+    final_servo_pos_value = int(round(raw_servo_value))
+    return max(0, min(4095, final_servo_pos_value))
+
+
+def raw_to_angle_rad(raw_value: int, physical_servo_config_index: int) -> float:
+    """
+    Converts a raw servo value (0-4095) to a physical angle in radians.
+    This is the inverse of angle_to_raw.
+    """
+    if raw_value is None:
+        return 0.0
+
+    servo_value = max(0, min(4095, raw_value))
+    min_map_rad, max_map_rad = utils.EFFECTIVE_MAPPING_RANGES[physical_servo_config_index]
+    
+    is_direct = utils._is_servo_direct_mapping(physical_servo_config_index)
+    
+    if is_direct:
+        normalized = servo_value / 4095.0
+    else:
+        normalized = 1.0 - (servo_value / 4095.0)
+        
+    angle = normalized * (max_map_rad - min_map_rad) + min_map_rad
+    return angle
+
+
 def set_servo_pid_gains(servo_id: int, kp: int, ki: int, kd: int) -> bool:
     """
     Sets the Kp, Ki, and Kd PID gains for a specific servo.
@@ -251,285 +355,292 @@ def set_servo_pid_gains(servo_id: int, kp: int, ki: int, kd: int) -> bool:
 
 def set_servo_angle_limits_from_urdf():
     """
-    Sets the min/max angle limits in each servo's EEPROM based on `URDF_JOINT_LIMITS`.
-    This is a crucial safety feature to prevent the arm from damaging itself.
-    This operation requires unlocking the servo EEPROM for writing.
+    Sets the angle limits (min and max) for each physical servo based on the
+    values defined in `utils.URDF_JOINT_LIMITS`. This ensures the servos
+    respect the motion boundaries defined for the kinematic model.
     """
-    print("[Pi] Setting hardware angle limits for all servos from URDF config...")
-    
-    # Define register addresses from documentation
-    SERVO_ADDR_MIN_ANGLE_LIMIT = 0x09
-    SERVO_ADDR_MAX_ANGLE_LIMIT = 0x0B
-    SERVO_ADDR_WRITE_LOCK = 0x37
+    print("[Pi] Setting servo angle limits from URDF configuration...")
+    if utils.ser is None or not utils.ser.is_open:
+        print("[Pi] Error: Serial port not available for setting angle limits.")
+        return
 
-    all_limits_set_successfully = True
-    for i in range(utils.NUM_PHYSICAL_SERVOS):
-        servo_id = utils.SERVO_IDS[i]
-        min_urdf_rad, max_urdf_rad = utils.URDF_JOINT_LIMITS[i]
-
-        # Convert URDF radian limits to raw servo values (0-4095)
-        # This conversion must be the inverse of `servo_value_to_radians`
-        min_map_rad, max_map_rad = utils.EFFECTIVE_MAPPING_RANGES[i]
-        
-        # --- Min Angle Conversion ---
-        norm_min = (min_urdf_rad - min_map_rad) / (max_map_rad - min_map_rad)
-        if utils._is_servo_direct_mapping(i):
-            raw_min = norm_min * 4095.0
-        else:
-            raw_min = (1.0 - norm_min) * 4095.0
-        
-        # --- Max Angle Conversion ---
-        norm_max = (max_urdf_rad - min_map_rad) / (max_map_rad - min_map_rad)
-        if utils._is_servo_direct_mapping(i):
-            raw_max = norm_max * 4095.0
-        else:
-            raw_max = (1.0 - norm_max) * 4095.0
-
-        # The raw values might be inverted (e.g., min > max), so we must order them correctly.
-        final_min_raw = int(round(min(raw_min, raw_max)))
-        final_max_raw = int(round(max(raw_min, raw_max)))
-
-        # Clamp to the servo's absolute possible range
-        final_min_raw = max(0, min(4095, final_min_raw))
-        final_max_raw = max(0, min(4095, final_max_raw))
-
-        print(f"[Pi] Servo {servo_id}: Setting HW limits. URDF(rad): [{min_urdf_rad:.2f}, {max_urdf_rad:.2f}] -> RAW: [{final_min_raw}, {final_max_raw}]")
-
-        # --- Write to Servo ---
-        # 1. Unlock EEPROM
-        if not servo_protocol.write_servo_register_byte(servo_id, SERVO_ADDR_WRITE_LOCK, 0):
-            print(f"[Pi] Failed to unlock EEPROM for servo {servo_id}. Skipping limit set.")
-            all_limits_set_successfully = False
+    all_limits_set = True
+    # Iterate through all configured servos.
+    for config_index, servo_id in enumerate(utils.SERVO_IDS):
+        # --- IMPORTANT: Only configure servos that are present ---
+        if servo_id not in servo_protocol.get_present_servo_ids():
+            print(f"[Pi] Skipping angle limits for absent servo {servo_id}")
             continue
-        time.sleep(0.01)
 
-        # 2. Write Min Angle Limit
-        if not servo_protocol.write_servo_register_word(servo_id, SERVO_ADDR_MIN_ANGLE_LIMIT, final_min_raw):
-            print(f"[Pi] Failed to set MIN angle limit for servo {servo_id}")
-            all_limits_set_successfully = False
-        time.sleep(0.01)
+        min_limit_rad, max_limit_rad = utils.URDF_JOINT_LIMITS[config_index]
 
-        # 3. Write Max Angle Limit
-        if not servo_protocol.write_servo_register_word(servo_id, SERVO_ADDR_MAX_ANGLE_LIMIT, final_max_raw):
-            print(f"[Pi] Failed to set MAX angle limit for servo {servo_id}")
-            all_limits_set_successfully = False
-        time.sleep(0.01)
+        # Convert the radian limits to raw servo values (0-4095)
+        min_raw_limit = angle_to_raw(min_limit_rad, config_index)
+        max_raw_limit = angle_to_raw(max_limit_rad, config_index)
 
-        # 4. Lock EEPROM
-        if not servo_protocol.write_servo_register_byte(servo_id, SERVO_ADDR_WRITE_LOCK, 1):
-            print(f"[Pi] WARNING: Failed to re-lock EEPROM for servo {servo_id}.")
-        time.sleep(0.02) # Extra delay after lock
+        # The registers expect the smaller value first, but our mapping might invert this.
+        # e.g., for an inverted servo, a positive angle (max_limit_rad) corresponds to a
+        # smaller raw value.
+        final_min_raw = min(min_raw_limit, max_raw_limit)
+        final_max_raw = max(min_raw_limit, max_raw_limit)
 
-    if all_limits_set_successfully:
-        print("[Pi] Hardware angle limits set for all servos.")
+        print(f"[Pi] -> Servo {servo_id}: Rad Limits [{min_limit_rad:.2f}, {max_limit_rad:.2f}] "
+              f"-> Raw Limits [{final_min_raw}, {final_max_raw}]")
+
+        # Write the limits to the servo's EEPROM registers
+        if not servo_protocol.write_servo_angle_limits(servo_id, final_min_raw, final_max_raw):
+            all_limits_set = False
+            print(f"[Pi] Error: Failed to set angle limits for servo {servo_id}")
+        time.sleep(0.02) # Small delay after writing to a servo's EEPROM
+
+    if all_limits_set:
+        print("[Pi] All servo angle limits set successfully.")
     else:
-        print("[Pi] WARNING: Failed to set hardware angle limits for one or more servos.")
+        print("[Pi] WARNING: Failed to set angle limits for one or more servos.")
 
 
 def get_current_arm_state_rad(verbose: bool = True) -> list[float]:
     """
-    Reads the current position of all logical joints by polling the physical servos.
+    Reads the current position of each of the 6 logical joints by querying the
+    physical servos and averaging/mapping them as required.
 
-    This function uses the efficient `sync_read_positions` protocol command
-    to get feedback from all servos in a single transaction, making it suitable
-    for high-frequency state updates.
+    This is a "read-only" operation that does not change any state but provides
+    the current snapshot of the arm's configuration.
 
     Args:
-        verbose (bool, optional): Whether to print debug information. Defaults to True.
+        verbose (bool): If True, prints detailed debug information.
 
     Returns:
-        list[float]: A list of the 6 current logical joint angles in radians.
+        list[float]: A list of 6 joint angles in radians.
     """
     if verbose:
-        print("[Pi] Reading current arm state from servos...")
+        print("[Pi] Getting current arm state...")
 
-    # ------------------------------------------------------------------
-    # Bulk feedback using Sync Read for better speed and determinism
-    # ------------------------------------------------------------------
-    all_servo_ids = utils.SERVO_IDS
-    raw_positions_dict = servo_protocol.sync_read_positions(all_servo_ids)
+    # Use a single SYNC READ for efficiency, targeting only the arm servos (not gripper)
+    arm_servo_ids = [sid for sid in utils.SERVO_IDS if sid != utils.SERVO_ID_GRIPPER]
     
-    # The hardware zero offset is no longer needed from the software side.
-    # Calibration is now handled directly on the servo hardware.
+    # --- IMPORTANT: Only read from servos that are present ---
+    present_arm_servo_ids = [sid for sid in arm_servo_ids if sid in servo_protocol.get_present_servo_ids()]
+    
+    raw_positions = servo_protocol.sync_read_positions(present_arm_servo_ids)
 
-    current_angles_rad = list(utils.current_logical_joint_angles_rad)  # Start with last known good state
+    if raw_positions is None:
+        print("[Pi] Sync Read failed. Falling back to individual reads.")
+        raw_positions = {}
+        for s_id in present_arm_servo_ids:
+            pos = servo_protocol.read_servo_position(s_id)
+            if pos is not None:
+                raw_positions[s_id] = pos
+            time.sleep(0.01)
 
-    # Mapping: which physical index (in utils.SERVO_IDS) is the authoritative
-    # feedback source for each logical joint.
-    logical_to_primary_physical_map = {
-        0: 0,  # J1 -> ID 10
-        1: 1,  # J2 -> ID 20
-        2: 3,  # J3 -> ID 30
-        3: 5,  # J4 -> ID 40
-        4: 6,  # J5 -> ID 50
-        5: 7,  # J6 -> ID 60
+    # Convert raw servo values to logical joint angles in radians
+    current_logical_angles_rad = [0.0] * utils.NUM_LOGICAL_JOINTS
+    
+    # Define the mapping from logical joints to their corresponding physical servo IDs
+    logical_to_physical_map = {
+        0: [10],
+        1: [20, 21],
+        2: [30, 31],
+        3: [40],
+        4: [50],
+        5: [60],
     }
 
-    for logical_idx, physical_idx in logical_to_primary_physical_map.items():
-        servo_id = utils.SERVO_IDS[physical_idx]
-        raw_pos = None if raw_positions_dict is None else raw_positions_dict.get(servo_id)
+    for logical_joint_index, physical_ids in logical_to_physical_map.items():
+        angles_for_this_joint = []
+        for servo_id in physical_ids:
+            if servo_id in raw_positions:
+                raw_pos = raw_positions[servo_id]
+                try:
+                    config_index = utils.SERVO_IDS.index(servo_id)
+                    angle_rad = raw_to_angle_rad(raw_pos, config_index)
+                    angles_for_this_joint.append(angle_rad)
+                except ValueError:
+                    if verbose:
+                        print(f"[Pi] Warning: Servo ID {servo_id} from logical map not found in main config.")
+            elif verbose:
+                # This case handles when a servo in the logical map wasn't in the sync read result
+                print(f"[Pi] Warning: No position data for servo {servo_id} (logical joint {logical_joint_index + 1})")
 
-        if raw_pos is not None:
-            # The raw position is now used directly, as software offsets are removed.
-            corrected_raw_pos = raw_pos
+        if angles_for_this_joint:
+            # Average the angles for joints with multiple servos
+            logical_angle = np.mean(angles_for_this_joint)
             
-            physical_angle_rad = servo_value_to_radians(corrected_raw_pos, physical_idx)
+            # Apply the master calibration offset in reverse to get the "true" logical angle
+            logical_angle -= utils.LOGICAL_JOINT_MASTER_OFFSETS_RAD[logical_joint_index]
+            
+            current_logical_angles_rad[logical_joint_index] = logical_angle
+        
+        elif verbose:
+            print(f"[Pi] Warning: Could not determine angle for logical joint {logical_joint_index + 1} as no associated servos responded.")
 
-            logical_angle_rad = physical_angle_rad
-
-            current_angles_rad[logical_idx] = logical_angle_rad
-            if verbose:
-                print(
-                    f"[Pi State] Logical J{logical_idx+1} (Servo {servo_id}): Raw={raw_pos}, Angle={logical_angle_rad:.3f} rad"
-                )
-        else:
-            if verbose:
-                print(
-                    f"[Pi State] FAILED to read feedback for servo {servo_id}. Using previous value for J{logical_idx+1}."
-                )
-
-    # Update global state with the newly read values
-    utils.current_logical_joint_angles_rad = current_angles_rad
+    # Update the global state with the newly read values
+    utils.current_logical_joint_angles_rad = current_logical_angles_rad
     
     if verbose:
-        print(f"[Pi] Arm state read. Angles (rad): {np.round(current_angles_rad, 3)}")
+        angles_deg = np.rad2deg(current_logical_angles_rad)
+        print(f"[Pi] Current logical angles (deg): {np.round(angles_deg, 2)}")
 
-    return current_angles_rad
+    return current_logical_angles_rad
 
 
 def set_current_position_as_hardware_zero(servo_id: int):
     """
-    Uses the servo's built-in 0x0B "Calibrate Middle" instruction to make the
-    *current* position the new centre (raw value ≈ 2048).  No software offsets
-    are stored or needed after this call.
+    Commands a servo to set its current physical position as its new zero point.
+    This value is written to the servo's EEPROM (Register 0x1F).
 
-    Args
-    ----
-    servo_id : int
-        Hardware ID of the servo to calibrate.
+    Args:
+        servo_id (int): The ID of the servo to calibrate.
     """
-    THEORETICAL_CENTER = 2048
-
-    print(f"--- Calibrating Servo {servo_id} (Calibrate-Middle 0x0B) ---")
-
-    # 1. Send the parameter-less 0x0B command.
-    if not servo_protocol.calibrate_servo_middle_position(servo_id):
-        print(f"[Pi] SET_ZERO FAILED: could not send Calibrate-Middle to {servo_id}.")
+    if utils.ser is None or not utils.ser.is_open:
+        print(f"[Pi] Serial port not open. Cannot set zero for servo {servo_id}.")
         return
-    print(f"[Pi] Servo {servo_id}: 0x0B command sent.")
 
-    # 2. Give EEPROM time to write, then re-enable torque by commanding 2048.
-    time.sleep(0.2)                      # allow EEPROM write to finish
-    servo_protocol.send_servo_command(servo_id, THEORETICAL_CENTER, 100)
-    time.sleep(0.1)                      # small pause after torque re-engage
+    # --- IMPORTANT: Only act on servos that are present ---
+    if servo_id not in servo_protocol.get_present_servo_ids():
+        print(f"[Pi] Cannot set zero for absent servo {servo_id}.")
+        return
 
-    # 3. Verify: the present-position read-back should now be ≈ 2048.
-    verified_pos = None
-    for attempt in range(3):
-        time.sleep(0.1)
-        verified_pos = servo_protocol.read_servo_position(servo_id)
-        if verified_pos is not None:
-            break
-        print(f"[Pi] Servo {servo_id}: read-back attempt {attempt+1} failed.")
+    print(f"[Pi] Reading current position of servo {servo_id} to use as zero offset...")
+    current_pos_raw = servo_protocol.read_servo_position(servo_id)
 
-    if verified_pos is not None and abs(verified_pos - THEORETICAL_CENTER) < 50:
-        print(f"[Pi] SET_ZERO SUCCESS: Servo {servo_id} now reports {verified_pos}.")
+    if current_pos_raw is not None:
+        # Step 1: Calculate the offset value for logging purposes only.
+        # The offset is the difference between the servo's current raw position reading
+        # and the ideal center value of 2048. This calculation is done here in the software
+        # so we can print it out for debugging and verification. However, the servo itself
+        # will perform a similar calculation internally when it receives the SET_ZERO command.
+        # We do not send this calculated offset to the servo; we just log it.
+        offset_value = current_pos_raw - 2048
+        
+        # Step 2: Clamp the offset value to a safe range for logging purposes only.
+        # The safe range is from -512 to 511, which is a signed 10-bit range. This is because
+        # the servo's POSITION_CORRECTION register (0x1F) is a 16-bit signed value, but typically
+        # only the lower 10 bits are used for fine-tuning the zero point. Clamping prevents
+        # extreme values that could indicate a problem (like a bad position read). Again, this
+        # clamping is just for our logging; the servo handles its own clamping internally.
+        clamped_offset = max(-512, min(511, offset_value))
+
+        # Step 3: Print the calculated offset for verification.
+        # This helps you see what the software thinks the offset should be, even though
+        # the servo will compute and store its own version when it receives the command.
+        print(f"[Pi] Current raw position is {current_pos_raw}. Calculated offset from center is {offset_value}.")
+
+        # Step 4: Send the SET_ZERO command to the servo.
+        # This command tells the servo to measure its own current position, calculate the offset
+        # from 2048, and store that offset in its EEPROM (non-volatile memory that remembers the value
+        # even after power is turned off). The servo will then use this offset for all future position
+        # calculations, treating the current physical position as 'zero'.
+        print(f"[Pi] Sending SET_ZERO command to servo {servo_id}...")
+
+        if servo_protocol.calibrate_servo_middle_position(servo_id):
+            # Step 5: Confirm success and wait for EEPROM write.
+            # If the command succeeds, the servo has updated its zero point. We wait 0.1 seconds
+            # to give the servo time to finish writing the new offset value to its EEPROM memory.
+            # This delay is important because EEPROM writes take a small amount of time, and trying
+            # to read or write to the servo too soon could cause errors.
+            print(f"[Pi] Servo {servo_id} has set its current position as the new zero point.")
+            time.sleep(0.1)
+        else:
+            print(f"[Pi] Failed to send SET_ZERO command to servo {servo_id}.")
     else:
-        print(f"[Pi] SET_ZERO WARNING: expected ≈2048, read {verified_pos}.")
+        # Step 6: Handle the case where reading the current position fails.
+        # If we cannot read the current position, we still try to send the SET_ZERO command.
+        # Many servos can handle the zeroing internally without needing the software to provide
+        # the offset value. This is a fallback to make the function more robust.
+        print(f"[Pi] Could not read current position of servo {servo_id}. Attempting direct Calibrate-Middle.")
+        if servo_protocol.calibrate_servo_middle_position(servo_id):
+            print(f"[Pi] Servo {servo_id} set zero successfully with Calibrate-Middle.")
+            time.sleep(0.1)
+        else:
+            print(f"[Pi] Failed to send Calibrate-Middle to servo {servo_id}.")
 
-    print(f"--- Calibration complete for Servo {servo_id} ---")
+    # Step 7: Refresh the angle limits after zeroing.
+    # After changing the zero point, the servo's understanding of its position range changes.
+    # We call this function to re-apply the angle limits from the URDF configuration file,
+    # ensuring the servo knows its new safe movement range. This is especially important for
+    # the gripper (servo ID 100) because its limits are different from the arm joints.
+    if servo_id == utils.SERVO_ID_GRIPPER:
+        print(f"[Pi] Refreshing gripper limits after zeroing...")
+        set_servo_angle_limits_from_urdf()  # This will re-apply limits for all, but that's fine
 
 
 def reinitialize_servo(servo_id: int):
     """
-    Re-applies critical settings (PID gains, angle limits) to a single servo.
-    This is useful after a factory reset to bring a servo back to a known-good state.
+    After a factory reset, a servo needs its essential operational parameters
+    (PID gains, angle limits) to be set again. This function does that for a
+    single servo.
 
     Args:
-        servo_id (int): The hardware ID of the servo to re-initialize.
+        servo_id (int): The ID of the servo to re-initialize.
     """
-    print(f"[Pi] Re-initializing servo {servo_id} with application defaults...")
-    
-    try:
-        # Find the configuration index for this servo ID
-        physical_servo_config_index = utils.SERVO_IDS.index(servo_id)
-    except ValueError:
-        print(f"[Pi] ERROR: Cannot re-initialize servo. ID {servo_id} not found in SERVO_IDS list.")
+    print(f"\n[Pi] --- Re-initializing Servo {servo_id} post-reset ---")
+    if utils.ser is None or not utils.ser.is_open:
+        print(f"[Pi] Error: Serial port not available for re-initialization.")
         return
 
-    # 1. Set default PID gains
-    print(f"[Pi]   - Setting PID gains for servo {servo_id}...")
-    pid_success = set_servo_pid_gains(servo_id, utils.DEFAULT_KP, utils.DEFAULT_KI, utils.DEFAULT_KD)
-    if not pid_success:
-        print(f"[Pi]   - WARNING: Failed to set PID gains for servo {servo_id}.")
-        # We can continue, but the servo might not be stable.
+    # --- IMPORTANT: Only act on servos that are present ---
+    if servo_id not in servo_protocol.get_present_servo_ids():
+        print(f"[Pi] Cannot re-initialize absent servo {servo_id}.")
+        return
 
-    time.sleep(0.05) # Small delay
+    # 1. Set PID Gains
+    print(f"[Pi] Setting default PID gains for servo {servo_id}...")
+    if not set_servo_pid_gains(servo_id, utils.DEFAULT_KP, utils.DEFAULT_KI, utils.DEFAULT_KD):
+        print(f"[Pi] WARNING: Failed to set PID gains for servo {servo_id}.")
+    else:
+        print(f"[Pi] PID gains set for servo {servo_id}.")
+    time.sleep(0.1)
 
     # 2. Set Angle Limits
-    print(f"[Pi]   - Setting angle limits for servo {servo_id}...")
-    SERVO_ADDR_MIN_ANGLE_LIMIT = 0x09
-    SERVO_ADDR_MAX_ANGLE_LIMIT = 0x0B
-    SERVO_ADDR_WRITE_LOCK = 0x37
+    try:
+        config_index = utils.SERVO_IDS.index(servo_id)
+        min_limit_rad, max_limit_rad = utils.URDF_JOINT_LIMITS[config_index]
 
-    min_urdf_rad, max_urdf_rad = utils.URDF_JOINT_LIMITS[physical_servo_config_index]
+        min_raw = angle_to_raw(min_limit_rad, config_index)
+        max_raw = angle_to_raw(max_limit_rad, config_index)
 
-    min_map_rad, max_map_rad = utils.EFFECTIVE_MAPPING_RANGES[physical_servo_config_index]
+        final_min = min(min_raw, max_raw)
+        final_max = max(min_raw, max_raw)
+
+        print(f"[Pi] Setting angle limits for servo {servo_id} to [{final_min}, {final_max}]...")
+        if not servo_protocol.write_servo_angle_limits(servo_id, final_min, final_max):
+            print(f"[Pi] WARNING: Failed to set angle limits for servo {servo_id}.")
+        else:
+            print(f"[Pi] Angle limits set for servo {servo_id}.")
+
+    except ValueError:
+        print(f"[Pi] ERROR: Servo ID {servo_id} not found in configuration. Cannot set angle limits.")
+    except Exception as e:
+        print(f"[Pi] An unexpected error occurred while setting angle limits for servo {servo_id}: {e}")
     
-    norm_min = (min_urdf_rad - min_map_rad) / (max_map_rad - min_map_rad)
-    if utils._is_servo_direct_mapping(physical_servo_config_index):
-        raw_min = norm_min * 4095.0
-    else:
-        raw_min = (1.0 - norm_min) * 4095.0
-    
-    norm_max = (max_urdf_rad - min_map_rad) / (max_map_rad - min_map_rad)
-    if utils._is_servo_direct_mapping(physical_servo_config_index):
-        raw_max = norm_max * 4095.0
-    else:
-        raw_max = (1.0 - norm_max) * 4095.0
-
-    final_min_raw = int(round(min(raw_min, raw_max)))
-    final_max_raw = int(round(max(raw_min, raw_max)))
-    final_min_raw = max(0, min(4095, final_min_raw))
-    final_max_raw = max(0, min(4095, final_max_raw))
-
-    print(f"[Pi]   - Servo {servo_id} HW limits RAW: [{final_min_raw}, {final_max_raw}]")
-
-    if not servo_protocol.write_servo_register_byte(servo_id, SERVO_ADDR_WRITE_LOCK, 0):
-        print(f"[Pi]   - FAILED to unlock EEPROM for servo {servo_id}. Aborting limit set.")
-        return # Can't proceed if EEPROM is locked
-
-    time.sleep(0.01)
-    servo_protocol.write_servo_register_word(servo_id, SERVO_ADDR_MIN_ANGLE_LIMIT, final_min_raw)
-    time.sleep(0.01)
-    servo_protocol.write_servo_register_word(servo_id, SERVO_ADDR_MAX_ANGLE_LIMIT, final_max_raw)
-    time.sleep(0.01)
-    if not servo_protocol.write_servo_register_byte(servo_id, SERVO_ADDR_WRITE_LOCK, 1):
-        print(f"[Pi]   - WARNING: Failed to re-lock EEPROM for servo {servo_id}.")
-    
-    print(f"[Pi] Re-initialization for servo {servo_id} complete.")
+    print(f"[Pi] --- Re-initialization for Servo {servo_id} complete ---")
 
 
-def get_servo_hardware_zero_offsets() -> list[int]:
+def get_servo_hardware_zero_offsets(servo_ids_to_check: list[int] | None = None) -> list[int]:
     """
-    Reads the hardware 'zero' offset from the EEPROM of each physical servo.
-    This value is what's set by the 'SET_ZERO' command. It can be positive or
-    negative and is added to the calculated position before sending it to the servo.
+    Reads the hardware zero offset value (Register 0x1F) from each servo.
+
+    Args:
+        servo_ids_to_check (list[int] | None): A specific list of servo IDs to query.
+            If None, queries all servos listed in `utils.SERVO_IDS`.
 
     Returns:
-        A list of 9 integer offset values, one for each physical servo.
+        list[int]: A list of the offset values read from the servos. Returns
+                   -1 for any servo that fails to respond.
     """
-    offsets = [0] * utils.NUM_PHYSICAL_SERVOS
-    for i, servo_id in enumerate(utils.SERVO_IDS):
-        # The position correction is stored as a signed word (2 bytes)
-        offset_val = servo_protocol.read_servo_register_signed_word(servo_id, utils.SERVO_ADDR_POSITION_CORRECTION)
-        
-        if offset_val is not None:
-            offsets[i] = offset_val
+    target_ids = servo_ids_to_check if servo_ids_to_check is not None else utils.SERVO_IDS
+    offsets = []
+    for s_id in target_ids:
+        offset = servo_protocol.read_servo_register_word(s_id, utils.SERVO_ADDR_POSITION_CORRECTION)
+        if offset is not None:
+            # The register is a signed 16-bit value, so we may need to handle negative numbers
+            if offset > 32767:
+                 offset -= 65536
+            offsets.append(offset)
         else:
-            print(f"[Pi] WARNING: Failed to read hardware zero offset for servo {servo_id}. Using 0.")
-            offsets[i] = 0 # Default to 0 on failure
-            
+            offsets.append(-1) # Indicate failure
+        time.sleep(0.01)
     return offsets
 
 
@@ -540,49 +651,37 @@ def get_servo_hardware_zero_offsets() -> list[int]:
 def logical_q_to_syncwrite_tuple(logical_joint_angles_rad: list[float],
                                  speed: int = 4095,
                                  accel: int = 0) -> list[tuple[int,int,int,int]]:
-    """Converts 6 logical joint angles to a list of (id, raw, speed, accel) tuples
-    ready for *sync_write_goal_pos_speed_accel*.
-
-    This is a stripped-down version of *set_servo_positions* that does **not**
-    touch global state and does **not** perform any I/O.  It is intended for use
-    by very high-frequency open-loop executors where we cannot afford the extra
-    overhead of rebuilding this logic each cycle.
     """
-    if len(logical_joint_angles_rad) != utils.NUM_LOGICAL_JOINTS:
-        raise ValueError(f"Expected {utils.NUM_LOGICAL_JOINTS} logical joint angles, got {len(logical_joint_angles_rad)}")
+    A pure-python utility that converts a set of logical joint angles into the
+    tuple format required by the `servo_protocol.sync_write_goal_pos_speed_accel`
+    function. This is used by the closed-loop executor for direct hardware control.
 
-    # Pre-compute per-cycle acceleration register value (same mapping as main API)
-    accel_reg = 0
-    if accel > 0:
-        accel_reg = int(round(accel / utils.ACCELERATION_SCALE_FACTOR))
-        accel_reg = max(1, min(254, accel_reg))
-    # Clamp speed once
-    speed_val = int(max(0, min(4095, speed)))
+    Args:
+        logical_joint_angles_rad: A list of 6 joint angles in radians.
+        speed: The speed for the move (0-4095).
+        accel: The acceleration register value (0-254).
 
+    Returns:
+        A list of tuples, where each tuple is (servo_id, position, speed, accel).
+    """
+    # This map needs to be kept in sync with the physical robot structure.
     logical_to_physical_map = {
-        0: [0],     # J1 -> ID 10
-        1: [1, 2],  # J2 -> IDs 20,21
-        2: [3, 4],  # J3 -> IDs 30,31
-        3: [5],     # J4 -> ID 40
-        4: [6],     # J5 -> ID 50
-        5: [7],     # J6 -> ID 60
+        0: [0], 1: [1, 2], 2: [3, 4], 3: [5], 4: [6], 5: [7],
     }
 
-    cmd_list: list[tuple[int,int,int,int]] = []
+    commands = []
+    for logical_idx, physical_indices in logical_to_physical_map.items():
+        # Apply the master offset for this logical joint
+        angle_with_offset = logical_joint_angles_rad[logical_idx] + utils.LOGICAL_JOINT_MASTER_OFFSETS_RAD[logical_idx]
 
-    for logical_idx, angle_rad in enumerate(logical_joint_angles_rad):
-        angle_with_offset = angle_rad + utils.LOGICAL_JOINT_MASTER_OFFSETS_RAD[logical_idx]
-
-        for physical_idx in logical_to_physical_map[logical_idx]:
+        for physical_idx in physical_indices:
             servo_id = utils.SERVO_IDS[physical_idx]
 
-            # Clamp & map to raw
-            min_map, max_map = utils.EFFECTIVE_MAPPING_RANGES[physical_idx]
-            angle_for_norm = max(min_map, min(max_map, angle_with_offset))
-            norm = (angle_for_norm - min_map) / (max_map - min_map)
-            raw = norm * 4095.0 if utils._is_servo_direct_mapping(physical_idx) else (1.0 - norm) * 4095.0
-            raw_int = int(round(max(0, min(4095, raw))))
+            # --- IMPORTANT: Only command servos that are present ---
+            if servo_id not in servo_protocol.get_present_servo_ids():
+                continue
 
-            cmd_list.append((servo_id, raw_int, speed_val, accel_reg))
+            raw_pos = angle_to_raw(angle_with_offset, physical_idx)
+            commands.append((servo_id, raw_pos, speed, accel))
 
-    return cmd_list
+    return commands

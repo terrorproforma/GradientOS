@@ -36,33 +36,54 @@ class HomePage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent = parent
-        layout = QVBoxLayout()
+        # Main layout to center all content vertically
+        main_layout = QVBoxLayout()
+        main_layout.setAlignment(Qt.AlignCenter)
+        self.setLayout(main_layout)
 
-        label = QLabel("Industrial Robot Controller - Home")
-        label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(label)
+        # --- Title Labels ---
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(5) # Compact spacing
+        
+        title_label = QLabel("Industrial Robot Controller")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("font-size: 24px; font-weight: bold; color: #FF6600;")
+        title_layout.addWidget(title_label)
 
         robot_label = QLabel("Robot: Gradient Zero")
         robot_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(robot_label)
+        robot_label.setStyleSheet("font-size: 14px; color: #CCCCCC;")
+        title_layout.addWidget(robot_label)
 
-        calib_btn = QPushButton("Calibration")
-        calib_btn.clicked.connect(self.parent.switch_to_calibration)
-        layout.addWidget(calib_btn)
+        main_layout.addLayout(title_layout)
 
-        tut_btn = QPushButton("Tutorials & Docs")
-        tut_btn.clicked.connect(self.parent.switch_to_tutorials)
-        layout.addWidget(tut_btn)
+        # Add a fixed spacer
+        main_layout.addSpacing(30)
 
+        # --- Button Grid for Navigation ---
+        button_grid = QGridLayout()
+        button_grid.setSpacing(15)
+
+        # Define buttons
         control_btn = QPushButton("Joint Control")
         control_btn.clicked.connect(self.parent.switch_to_control)
-        layout.addWidget(control_btn)
 
         real_control_btn = QPushButton("Real Robot Control")
         real_control_btn.clicked.connect(self.parent.switch_to_real_control)
-        layout.addWidget(real_control_btn)
 
-        self.setLayout(layout)
+        calib_btn = QPushButton("Calibration")
+        calib_btn.clicked.connect(self.parent.switch_to_calibration)
+
+        tut_btn = QPushButton("Tutorials & Docs")
+        tut_btn.clicked.connect(self.parent.switch_to_tutorials)
+
+        # Add buttons to grid layout
+        button_grid.addWidget(control_btn, 0, 0)
+        button_grid.addWidget(real_control_btn, 0, 1)
+        button_grid.addWidget(calib_btn, 1, 0)
+        button_grid.addWidget(tut_btn, 1, 1)
+        
+        main_layout.addLayout(button_grid)
 
 # class SimulationPage(QWidget):
 #     def __init__(self, parent=None):
@@ -237,32 +258,99 @@ class ControlPage(QWidget):
         self.deactivate_btn.setEnabled(False)
         layout.addWidget(self.deactivate_btn)
 
-        joints = ["Base", "Shoulder", "Elbow", "Wrist 1", "Wrist 2", "Wrist 3"]
+        joints = ["Base", "Shoulder", "Elbow", "Wrist 1", "Wrist 2", "Wrist 3", "Gripper"]
+        self.joints = joints
         self.sliders = {}
         self.value_labels = {}
-        for joint in joints:
-            hbox = QHBoxLayout()
-            j_label = QLabel(joint)
-            slider = QSlider(Qt.Horizontal)
-            slider.setRange(-180, 180)
-            slider.setValue(0)
-            slider.setEnabled(False)  # Disabled initially
-            value_label = QLabel("0°")
-            slider.valueChanged.connect(lambda val, vl=value_label, s=slider, j=joint: self.update_value(vl, val, s, j))
-            hbox.addWidget(j_label)
-            hbox.addWidget(slider)
-            hbox.addWidget(value_label)
-            layout.addLayout(hbox)
-            self.sliders[joint] = slider
-            self.value_labels[joint] = value_label
+        self.jog_combos = {}
 
-        apply_btn = QPushButton("Apply Positions")
-        apply_btn.clicked.connect(self.apply_positions)
+        for i, joint_name in enumerate(joints):
+            joint_layout = QGridLayout()
+            
+            # Label
+            j_label = QLabel(f"J{i+1}: {joint_name}")
+            joint_layout.addWidget(j_label, 0, 0, 1, 4)
+
+            # Slider
+            slider = QSlider(Qt.Horizontal)
+            # Set different ranges for arm joints vs gripper
+            if joint_name == "Gripper":
+                slider.setRange(0, 180)  # 0° (closed) to 180° (open)
+            else:
+                slider.setRange(-180, 180)
+            slider.setValue(0)
+            slider.setEnabled(False)
+            joint_layout.addWidget(slider, 1, 1, 1, 2)
+            self.sliders[joint_name] = slider
+
+            # Value Label
+            value_label = QLabel("0°")
+            joint_layout.addWidget(value_label, 1, 3)
+            self.value_labels[joint_name] = value_label
+            
+            # Connect slider value change to new handler that updates label and sends command
+            slider.valueChanged.connect(partial(self._handle_slider_change, joint_name=joint_name))
+            
+            # Jog Buttons and Increment Selector
+            jog_minus_btn = QPushButton("-")
+            jog_minus_btn.setObjectName("JogButton")
+            jog_plus_btn = QPushButton("+")
+            jog_plus_btn.setObjectName("JogButton")
+            
+            jog_combo = QComboBox()
+            jog_combo.addItems(["0.5", "1", "5", "10"])
+            self.jog_combos[joint_name] = jog_combo
+            
+            joint_layout.addWidget(jog_minus_btn, 1, 0)
+            joint_layout.addWidget(jog_plus_btn, 1, 4)
+            joint_layout.addWidget(QLabel("Step:"), 2, 0)
+            joint_layout.addWidget(jog_combo, 2, 1, 1, 3)
+
+            # Connect jog buttons to handler
+            jog_minus_btn.clicked.connect(partial(self.jog_joint, joint_name, -1))
+            jog_plus_btn.clicked.connect(partial(self.jog_joint, joint_name, 1))
+
+            layout.addLayout(joint_layout)
+
+
+        apply_btn = QPushButton("Apply All Positions")
+        apply_btn.clicked.connect(self.apply_all_positions)
         layout.addWidget(apply_btn)
 
-        zero_btn = QPushButton("Zero Joints")
+        zero_btn = QPushButton("Zero All Sliders")
         zero_btn.clicked.connect(self.reset_sliders)
         layout.addWidget(zero_btn)
+
+        # --- NEW: Calibration Box ---
+        calib_group_box = QGroupBox("Calibration Tools")
+        calib_layout = QGridLayout()
+
+        # Set Zero
+        calib_layout.addWidget(QLabel("SET_ZERO Joint #:"), 0, 0)
+        self.set_zero_input = QLineEdit("1")
+        self.set_zero_input.setToolTip("Enter 1-6 for arm joints, 7 for the gripper.")
+        calib_layout.addWidget(self.set_zero_input, 0, 1)
+        set_zero_btn = QPushButton("Set Current as Zero")
+        set_zero_btn.clicked.connect(self.send_set_zero)
+        calib_layout.addWidget(set_zero_btn, 0, 2)
+
+        # Factory Reset
+        calib_layout.addWidget(QLabel("FACTORY_RESET Servo ID:"), 1, 0)
+        self.factory_reset_input = QLineEdit("10")
+        calib_layout.addWidget(self.factory_reset_input, 1, 1)
+        factory_reset_btn = QPushButton("Factory Reset Servo")
+        factory_reset_btn.clicked.connect(self.send_factory_reset)
+        calib_layout.addWidget(factory_reset_btn, 1, 2)
+
+        # Refresh Limits
+        refresh_limits_btn = QPushButton("Refresh Servo Limits")
+        refresh_limits_btn.clicked.connect(self.send_refresh_limits)
+        calib_layout.addWidget(refresh_limits_btn, 2, 0, 1, 3)
+        
+        calib_group_box.setLayout(calib_layout)
+        layout.addWidget(calib_group_box)
+        # --- End Calibration Box ---
+
 
         back_btn = QPushButton("Back to Home")
         back_btn.clicked.connect(self.parent.switch_to_home)
@@ -298,6 +386,21 @@ class ControlPage(QWidget):
         self.timer.start(500)
         self.log_message("Live control activated")
 
+        # Sync sliders to current robot positions
+        self.parent.send_command("GET_JOINT_ANGLES")
+        response = self.parent.receive_data()
+        if response and response.startswith("JOINT_ANGLES,"):
+            parts = response.split(',')
+            for i, joint in enumerate(self.joints):
+                try:
+                    deg = float(parts[i+1])
+                    self.sliders[joint].setValue(int(deg))
+                    self.value_labels[joint].setText(f"{int(deg)}°")
+                except (IndexError, ValueError):
+                    self.log_message(f"Failed to sync {joint}")
+        else:
+            self.log_message("Failed to sync to current positions")
+
     def deactivate_live_control(self):
         self.live_active = False
         self.activate_btn.setStyleSheet("background-color: lime; color: black; font-weight: bold; font-size: 16px;")
@@ -310,19 +413,44 @@ class ControlPage(QWidget):
         self.status_label.hide()
         self.log_message("Live control deactivated")
 
-    def update_value(self, value_label, val, slider, joint):
-        value_label.setText(f"{val}°")
+    def _handle_slider_change(self, value, joint_name):
+        """
+        This slot is connected to the valueChanged signal of all joint sliders.
+        It updates the displayed angle and, if live control is active, sends
+        the appropriate command to the robot.
+        """
+        self.value_labels[joint_name].setText(f"{value}°")
         if self.live_active:
-            self.apply_positions()  # Send immediately on change
+            self.apply_all_positions()
+
+    def jog_joint(self, joint_name, direction):
+        """Handles the jog button clicks for a specific joint."""
+        slider = self.sliders[joint_name]
+        combo = self.jog_combos[joint_name]
+        
+        increment = float(combo.currentText())
+        current_value = slider.value()
+        new_value = current_value + (increment * direction)
+        
+        # Clamp to slider limits
+        new_value = max(slider.minimum(), min(slider.maximum(), new_value))
+        
+        slider.setValue(int(new_value))
+        
+        # If live control is active, send the command immediately
+        if self.live_active:
+            self.apply_all_positions()
 
     def reset_sliders(self):
         for joint in self.sliders:
             self.sliders[joint].setValue(0)
 
-    def apply_positions(self):
-        values = [self.sliders[joint].value() * (np.pi / 180) for joint in self.sliders]  # Convert to radians
+    def apply_all_positions(self):
+        """Sends the positions of all joints including gripper."""
+        values = [self.sliders[joint].value() * (np.pi / 180) for joint in self.joints]  # Convert to radians
         cmd = ",".join(map(str, values))
         self.parent.send_command(cmd)
+        self.log_message(f"Sent Joint Command: {cmd}")
 
     def log_message(self, msg):
         self.log.append(msg)
@@ -385,6 +513,10 @@ class ControlPage(QWidget):
         reply = QMessageBox.question(self, 'Confirm Factory Reset', 'Are you sure? This resets the servo to factory defaults.', QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.parent.send_command(f"FACTORY_RESET,{id_str}")
+
+    def send_refresh_limits(self):
+        self.parent.send_command("REFRESH_LIMITS")
+        self.log_message("Sent: REFRESH_LIMITS")
 
     def send_translate(self):
         input_str = self.translate_input.text()
@@ -462,6 +594,7 @@ class CalibrationPage(QWidget):
         set_zero_hbox = QHBoxLayout()
         set_zero_label = QLabel("SET_ZERO joint#")
         self.set_zero_input = QLineEdit("1")
+        self.set_zero_input.setToolTip("Enter 1-6 for arm joints, 7 for the gripper.")
         set_zero_btn = QPushButton("Set Zero")
         set_zero_btn.clicked.connect(self.send_set_zero)
         set_zero_hbox.addWidget(set_zero_label)
@@ -556,6 +689,37 @@ class RealControlPage(QWidget):
         ori_group_box.setLayout(ori_layout)
         left_controls_layout.addWidget(ori_group_box)
         
+        # --- NEW: Gripper Control ---
+        self.gripper_group_box = QGroupBox("Gripper")
+        gripper_layout = QGridLayout()
+
+        # Gripper slider
+        gripper_layout.addWidget(QLabel("Angle:"), 0, 0)
+        self.gripper_slider = QSlider(Qt.Horizontal)
+        self.gripper_slider.setRange(0, 180) # 0° (closed) to 180° (open)
+        self.gripper_slider.setValue(0)
+        self.gripper_slider.valueChanged.connect(self.update_gripper_label)
+        gripper_layout.addWidget(self.gripper_slider, 0, 1)
+        self.gripper_angle_label = QLabel("0°")
+        gripper_layout.addWidget(self.gripper_angle_label, 0, 2)
+        
+        # Gripper buttons
+        open_btn = QPushButton("Open")
+        open_btn.clicked.connect(self.open_gripper)
+        gripper_layout.addWidget(open_btn, 1, 0)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close_gripper)
+        gripper_layout.addWidget(close_btn, 1, 1)
+
+        set_gripper_btn = QPushButton("Set Angle")
+        set_gripper_btn.clicked.connect(self.set_gripper_from_slider)
+        gripper_layout.addWidget(set_gripper_btn, 1, 2)
+
+        self.gripper_group_box.setLayout(gripper_layout)
+        left_controls_layout.addWidget(self.gripper_group_box)
+        # --- End Gripper Control ---
+
         # Trajectory Planning
         traj_group_box = QGroupBox("Trajectory Planning")
         traj_layout = QVBoxLayout()
@@ -617,6 +781,7 @@ class RealControlPage(QWidget):
         # Robot State Display
         self.current_pos = [0.0, 0.0, 0.0]  # X, Y, Z
         self.current_ori = [0.0, 0.0, 0.0]  # Roll, Pitch, Yaw
+        self.current_gripper_deg = 0.0 # NEW: Gripper angle
         state_group_box = QGroupBox("Robot State")
         state_layout = QGridLayout()
         
@@ -640,9 +805,13 @@ class RealControlPage(QWidget):
         self.yaw_val_label = QLabel("0.0")
         state_layout.addWidget(self.yaw_val_label, 2, 3)
 
+        state_layout.addWidget(QLabel("Gripper:"), 3, 0)
+        self.gripper_val_label = QLabel("0.0°")
+        state_layout.addWidget(self.gripper_val_label, 3, 1)
+
         refresh_btn = QPushButton("Refresh Position")
         refresh_btn.clicked.connect(self.refresh_state)
-        state_layout.addWidget(refresh_btn, 3, 0, 1, 4)
+        state_layout.addWidget(refresh_btn, 4, 0, 1, 4)
 
         state_group_box.setLayout(state_layout)
         right_side_layout.addWidget(state_group_box)
@@ -688,6 +857,32 @@ class RealControlPage(QWidget):
         main_layout.addLayout(right_side_layout)
         self.setLayout(main_layout)
 
+        # Check for gripper presence on initialization
+        self.check_gripper_presence()
+
+    def check_gripper_presence(self):
+        """Sends GET_STATUS to the controller and enables/disables the gripper UI."""
+        self.parent.send_command("GET_STATUS")
+        response = self.parent.receive_data(timeout_seconds=1.0)
+        
+        gripper_present = False
+        if response and response.startswith("STATUS,gripper_present,"):
+            try:
+                status = response.split(',')[2]
+                if status.lower() == 'true':
+                    gripper_present = True
+            except IndexError:
+                pass # Stick with default of False
+
+        self.gripper_group_box.setEnabled(gripper_present)
+        if gripper_present:
+            self.log_message("Gripper detected and enabled.")
+        else:
+            self.log_message("Gripper not detected. UI controls disabled.")
+        
+        # Sync initial positions
+        self.refresh_state()
+
     def _create_jog_button(self, text, axis, direction, is_rotation=False):
         button = QPushButton(text)
         button.setFixedSize(100, 50)
@@ -727,6 +922,7 @@ class RealControlPage(QWidget):
         self.roll_val_label.setText(f"{self.current_ori[0]:.2f}")
         self.pitch_val_label.setText(f"{self.current_ori[1]:.2f}")
         self.yaw_val_label.setText(f"{self.current_ori[2]:.2f}")
+        self.gripper_val_label.setText(f"{self.current_gripper_deg:.1f}°")
 
     def refresh_state(self):
         self.parent.send_command("GET_POSITION")
@@ -750,10 +946,18 @@ class RealControlPage(QWidget):
                 self.log_message(f"Received: {candidate_response}") # Log everything
                 if candidate_response.startswith("CURRENT_POSE,"):
                     response = candidate_response
-                    break # Found the correct response
-            else:
-                # receive_data timed out
-                break
+                    # Don't break yet, we also want to look for gripper state
+                elif candidate_response.startswith("GRIPPER_STATE,"):
+                    try:
+                        parts = candidate_response.split(',')
+                        self.current_gripper_deg = float(parts[1])
+                        self.log_message(f"Gripper angle updated: {self.current_gripper_deg:.1f}°")
+                        # Update the gripper slider to match current position
+                        self.gripper_slider.blockSignals(True)  # Prevent triggering valueChanged
+                        self.gripper_slider.setValue(int(self.current_gripper_deg))
+                        self.gripper_slider.blockSignals(False)
+                    except (ValueError, IndexError):
+                        self.log_message("Error parsing gripper state response.")
 
         if response:
             try:
@@ -764,6 +968,10 @@ class RealControlPage(QWidget):
                 self.log_message("Error parsing position response.")
         else:
             self.log_message("Failed to get position from robot.")
+
+        # Also request gripper state
+        self.parent.send_command("GET_GRIPPER_STATE")
+        # The logic to parse the response is handled in the same loop above now.
         
         self.update_state_display()
 
@@ -788,6 +996,25 @@ class RealControlPage(QWidget):
         self.parent.send_command(cmd)
         self.log_message(f"Sent: {cmd}")
         self.log_message(f"Trajectory saved as '{name}'.")
+
+    def update_gripper_label(self, value):
+        self.gripper_angle_label.setText(f"{value}°")
+        # Send command immediately for live update
+        self.set_gripper_from_slider()
+
+    def set_gripper_from_slider(self):
+        angle = self.gripper_slider.value()
+        cmd = f"SET_GRIPPER,{angle}"
+        self.parent.send_command(cmd)
+        self.log_message(f"Sent: {cmd}")
+
+    def open_gripper(self):
+        # Set to maximum angle (180°) to open the gripper
+        self.gripper_slider.setValue(120)
+
+    def close_gripper(self):
+        # Set to minimum angle (0°) to close the gripper
+        self.gripper_slider.setValue(0)
 
     def send_command_from_inputs(self):
         cmd_parts = []
@@ -876,7 +1103,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Industrial Robot Controller")
-        self.setGeometry(100, 100, 800, 480)
+        self.setGeometry(100, 100, 1600, 480)
 
         # UDP Configuration
         self.PI_IP = "ai-pi.local"
@@ -902,14 +1129,12 @@ class MainWindow(QMainWindow):
         self.stacked_widget.addWidget(self.real_control)
         self.setCentralWidget(self.stacked_widget)
 
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
-        self.statusBar.showMessage("Robot State: Active")
+        self.statusBar().showMessage("Robot State: Active")
 
         estop_btn = QPushButton("EMERGENCY STOP")
         estop_btn.setStyleSheet("background-color: #CC0000; color: #FFFFFF;")
         estop_btn.clicked.connect(self.emergency_stop)
-        self.statusBar.addPermanentWidget(estop_btn)
+        self.statusBar().addPermanentWidget(estop_btn)
 
         print('Starting MainWindow init')
         print('UDP config done')
@@ -921,11 +1146,11 @@ class MainWindow(QMainWindow):
     def send_command(self, command_str):
         try:
             self.sock.sendto(command_str.encode("utf-8"), (self.PI_IP, self.UDP_PORT))
-            self.statusBar.showMessage(f"Sent: {command_str}")
+            self.statusBar().showMessage(f"Sent: {command_str}")
             if self.stacked_widget.currentWidget() == self.real_control:
                 self.real_control.log_message(f"Sent: {command_str}")
         except Exception as e:
-            self.statusBar.showMessage(f"Error sending: {e}")
+            self.statusBar().showMessage(f"Error sending: {e}")
 
     def receive_data(self, timeout_seconds=2.0):
         self.sock.settimeout(timeout_seconds)
@@ -936,16 +1161,16 @@ class MainWindow(QMainWindow):
             # intended robot. This is more robust against complex network configs.
             if server_addr[1] == self.UDP_PORT:
                 response = data.decode("utf-8").strip()
-                self.statusBar.showMessage(f"Received: {response}")
+                self.statusBar().showMessage(f"Received: {response}")
                 return response
             else:
-                self.statusBar.showMessage(f"Received from unexpected source: {server_addr}")
+                self.statusBar().showMessage(f"Received from unexpected source: {server_addr}")
                 return None
         except socket.timeout:
-            self.statusBar.showMessage("Timeout waiting for response")
+            self.statusBar().showMessage("Timeout waiting for response")
             return None
         except Exception as e:
-            self.statusBar.showMessage(f"Receive error: {e}")
+            self.statusBar().showMessage(f"Receive error: {e}")
             return None
         finally:
             self.sock.settimeout(None)
@@ -972,17 +1197,17 @@ class MainWindow(QMainWindow):
                 self.send_command("WAIT_FOR_IDLE")
                 time.sleep(0.2)
 
-            self.statusBar.showMessage("Square Test Complete")
+            self.statusBar().showMessage("Square Test Complete")
             if self.stacked_widget.currentWidget() == self.real_control:
                 self.real_control.log_message("Square Test Complete")
         except Exception as e:
-            self.statusBar.showMessage(f"Square Test Error: {e}")
+            self.statusBar().showMessage(f"Square Test Error: {e}")
             if self.stacked_widget.currentWidget() == self.real_control:
                 self.real_control.log_message(f"Square Test Error: {e}")
 
     def emergency_stop(self):
         self.send_command("STOP")  # Assuming STOP is the command for emergency
-        self.statusBar.showMessage("Emergency Stop Activated!")
+        self.statusBar().showMessage("Emergency Stop Activated!")
 
     def switch_to_home(self):
         self.stacked_widget.setCurrentIndex(0)
@@ -1015,6 +1240,8 @@ if __name__ == "__main__":
         background-color: #333333;
         border: 2px solid #FF6600;  /* Evangelion orange */
         padding: 5px;
+        min-width: 100px;
+        min-height: 50px; /* Reduced from 100px */
     }
     QPushButton:hover {
         background-color: #FF6600;
@@ -1040,9 +1267,11 @@ if __name__ == "__main__":
     QTableWidget::item {
         color: white;
     }
-    QPushButton {
-        min-width: 100px;
-        min-height: 100px;
+    QPushButton#JogButton {
+        min-width: 40px;
+        max-width: 40px;
+        min-height: 40px;
+        max-height: 40px;
     }
     """)
     window = MainWindow()

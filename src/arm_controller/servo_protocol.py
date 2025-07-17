@@ -23,6 +23,10 @@ DEFAULT_KD = 0
 SERVO_INSTRUCTION_CALIBRATE_MIDDLE = 0x0B
 SERVO_INSTRUCTION_RESET = 0x06
 SERVO_INSTRUCTION_RESTART = 0x08
+SERVO_INSTRUCTION_PING = 0x01
+SERVO_ADDR_WRITE_LOCK = 0x37
+SERVO_ADDR_MIN_ANGLE_LIMIT = 0x09
+SERVO_ADDR_MAX_ANGLE_LIMIT = 0x0B
 
 
 # Servo Sync Write Constants
@@ -34,6 +38,14 @@ SYNC_WRITE_START_ADDRESS = SERVO_ADDR_TARGET_ACCELERATION # 0x29
 SYNC_WRITE_DATA_LEN_PER_SERVO = 7
 # Servo Sync Read Constants
 SERVO_INSTRUCTION_SYNC_READ = 0x82
+
+
+# A simple in-memory cache for which servos were detected at startup
+_present_servo_ids: set[int] = set()
+
+def get_present_servo_ids() -> set[int]:
+    """Returns the set of servo IDs that responded to the initial ping."""
+    return _present_servo_ids
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +77,52 @@ def calculate_checksum(packet_data_for_sum: bytearray) -> int:
     """
     current_sum = sum(packet_data_for_sum)
     return (~current_sum) & 0xFF
+
+
+def ping(servo_id: int) -> bool:
+    """
+    Sends a PING instruction to a servo to check for its presence.
+
+    Args:
+        servo_id (int): The hardware ID of the servo to ping.
+
+    Returns:
+        bool: True if a valid status packet is received, False otherwise.
+    """
+    if utils.ser is None or not utils.ser.is_open:
+        return False
+
+    # PING Packet: [0xFF, 0xFF, ID, Length=2, Instr=0x01, Checksum]
+    # Length = (Num Instruction Parameters) + 2. Here: 0 params. 0+2=2.
+    ping_command = bytearray(6)
+    ping_command[0] = SERVO_HEADER
+    ping_command[1] = SERVO_HEADER
+    ping_command[2] = servo_id
+    ping_command[3] = 2  # Length
+    ping_command[4] = SERVO_INSTRUCTION_PING
+    
+    # Checksum for ping command (ID, Length, Instr)
+    ping_command[5] = calculate_checksum(ping_command[2:5])
+
+    try:
+        utils.ser.reset_input_buffer()
+        utils.ser.write(ping_command)
+        
+        # A successful ping should receive a status packet in response
+        # Status Packet: [0xFF, 0xFF, ID, Length=2, Error=0, Checksum]
+        # We'll just check if we get *any* valid response for the correct ID
+        response = utils.ser.read(6) # Read the expected status packet length
+
+        if len(response) == 6 and response[0] == 0xFF and response[1] == 0xFF and response[2] == servo_id:
+            # We have a response from the correct servo. Add to cache.
+            _present_servo_ids.add(servo_id)
+            return True
+            
+        return False
+
+    except Exception as e:
+        print(f"[Pi PING] Error during ping for servo {servo_id}: {e}")
+        return False
 
 
 def send_servo_command(servo_id: int, position_value: int, speed_value: int = None):
@@ -171,6 +229,46 @@ def send_servo_command(servo_id: int, position_value: int, speed_value: int = No
         print(f"[Pi] Error writing to serial for servo {servo_id}: {e}")
 
 
+def write_servo_angle_limits(servo_id: int, min_limit_raw: int, max_limit_raw: int) -> bool:
+    """
+    Writes the minimum and maximum angle limits to a servo's EEPROM.
+    This requires unlocking the EEPROM, writing the values, and re-locking it.
+
+    Args:
+        servo_id (int): The hardware ID of the target servo.
+        min_limit_raw (int): The raw minimum angle limit (0-4095).
+        max_limit_raw (int): The raw maximum angle limit (0-4095).
+
+    Returns:
+        bool: True if all steps were successful, False otherwise.
+    """
+    # 1. Unlock EEPROM
+    if not write_servo_register_byte(servo_id, SERVO_ADDR_WRITE_LOCK, 0):
+        print(f"[Pi LimitSet] FAILED to unlock EEPROM for servo {servo_id}.")
+        return False
+    time.sleep(0.01)
+
+    # 2. Write Min and Max Angle Limits
+    min_ok = write_servo_register_word(servo_id, SERVO_ADDR_MIN_ANGLE_LIMIT, min_limit_raw)
+    time.sleep(0.01)
+    max_ok = write_servo_register_word(servo_id, SERVO_ADDR_MAX_ANGLE_LIMIT, max_limit_raw)
+    time.sleep(0.01)
+
+    if not (min_ok and max_ok):
+        print(f"[Pi LimitSet] FAILED to write angle limits for servo {servo_id}.")
+        # Attempt to re-lock EEPROM even on failure for safety
+        write_servo_register_byte(servo_id, SERVO_ADDR_WRITE_LOCK, 1)
+        return False
+
+    # 3. Re-lock EEPROM
+    if not write_servo_register_byte(servo_id, SERVO_ADDR_WRITE_LOCK, 1):
+        # This is not a critical failure, but should be noted.
+        print(f"[Pi LimitSet] WARNING: Failed to re-lock EEPROM for servo {servo_id}.")
+
+    print(f"[Pi LimitSet] Successfully set angle limits for servo {servo_id} to [{min_limit_raw}, {max_limit_raw}]")
+    return True
+
+
 def set_servo_acceleration(servo_id: int, acceleration_value_deg_s2: float):
     """
     Constructs and sends a 'WRITE' packet to set a single servo's acceleration register.
@@ -214,6 +312,65 @@ def set_servo_acceleration(servo_id: int, acceleration_value_deg_s2: float):
     except Exception as e:
         print(f"[Pi] Error writing acceleration for servo {servo_id}: {e}")
 
+
+
+def read_servo_register_word(servo_id: int, register_address: int) -> int | None:
+    """
+    Constructs and sends a 'READ' packet to request 2 bytes (a word) from a
+    specific register address of a single servo.
+
+    Args:
+        servo_id (int): The hardware ID of the target servo.
+        register_address (int): The starting address of the register to read from.
+
+    Returns:
+        int | None: The 16-bit value read from the register, or None on failure.
+    """
+    if utils.ser is None or not utils.ser.is_open:
+        # This case is logged by the caller, so no print here to avoid noise.
+        return None
+
+    # Command Packet: [0xFF, 0xFF, ID, Length=4, Instr=0x02, Addr, BytesToRead=2, Checksum]
+    read_command = bytearray(8)
+    read_command[0] = SERVO_HEADER
+    read_command[1] = SERVO_HEADER
+    read_command[2] = servo_id
+    read_command[3] = 4  # Length
+    read_command[4] = SERVO_INSTRUCTION_READ
+    read_command[5] = register_address
+    read_command[6] = 2  # Number of bytes to read (word)
+    
+    read_command[7] = calculate_checksum(read_command[2:7])
+
+    try:
+        utils.ser.reset_input_buffer()
+        utils.ser.write(read_command)
+
+        # Expected response (Status Packet): [0xFF, 0xFF, ID, Length=4, Error, Param1(LSB), Param2(MSB), Checksum]
+        # Total response length = 8 bytes.
+        response = utils.ser.read(8)
+
+        if len(response) < 8:
+            return None # Timeout or short response
+            
+        # Verify header and ID
+        if not (response[0] == 0xFF and response[1] == 0xFF and response[2] == servo_id):
+            return None
+        
+        # Verify checksum
+        if response[7] != calculate_checksum(response[2:7]):
+            return None
+
+        # Check for hardware errors
+        if response[4] != 0:
+            return None
+
+        # Extract the 16-bit value (little-endian)
+        value = response[5] | (response[6] << 8)
+        return value
+
+    except Exception:
+        return None
 
 
 def read_servo_position(servo_id: int) -> int | None:

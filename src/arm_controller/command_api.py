@@ -18,6 +18,7 @@ except ImportError:
 
 from . import utils
 from . import servo_driver
+from . import servo_protocol
 from . import trajectory_execution
 
 def handle_translate_command(dx: float, dy: float, dz: float):
@@ -760,6 +761,222 @@ def handle_wait_for_idle():
         print("[Controller] Move complete. Resuming.")
     else:
         print("[Controller] No move is currently running.")
+
+# -----------------------------------------------------------------------------
+# Gripper Control
+# -----------------------------------------------------------------------------
+def handle_set_gripper_state(angle_deg: float, speed: int = 100, accel: int = 0):
+    """
+    Handles the 'SET_GRIPPER' command. Commands the gripper to a specific angle.
+    
+    Args:
+        angle_deg (float): The target angle for the gripper in degrees.
+        speed (int): The speed for the movement.
+        accel (int): The acceleration for the movement.
+    """
+    if not utils.gripper_present:
+        print("[Controller] Cannot set gripper state: Gripper is not present.")
+        return
+
+    print(f"[Controller] Setting gripper to {angle_deg} degrees.")
+    
+    # Convert degrees to radians for internal use and validation
+    angle_rad = np.deg2rad(angle_deg)
+
+    # Validate against gripper limits
+    min_rad, max_rad = utils.GRIPPER_LIMITS_RAD
+    if not (min_rad <= angle_rad <= max_rad):
+        print(f"[Controller] ERROR: Gripper angle {angle_deg}° is outside limits "
+              f"({np.rad2deg(min_rad):.1f}° to {np.rad2deg(max_rad):.1f}°).")
+        return
+
+    # Use the existing single-servo write function
+    servo_driver.set_single_servo_position_rads(
+        servo_id=utils.SERVO_ID_GRIPPER,
+        position_rad=angle_rad,
+        speed=speed,
+        accel=accel
+    )
+    # Update global state
+    utils.current_gripper_angle_rad = angle_rad
+
+
+def handle_get_gripper_state(sock: 'socket.socket', addr: tuple):
+    """
+    Handles the 'GET_GRIPPER_STATE' command. Reads the gripper's current
+    angle and sends it back to the client.
+    """
+    if not utils.gripper_present:
+        print("[Controller] Cannot get gripper state: Gripper is not present.")
+        try:
+            sock.sendto("ERROR,GRIPPER_NOT_PRESENT".encode("utf-8"), addr)
+        except Exception as e:
+            print(f"[Controller] Error sending GRIPPER_NOT_PRESENT error to {addr}: {e}")
+        return
+
+    print(f"[Controller] Received GET_GRIPPER_STATE from {addr}.")
+    
+    # Read the raw position from the servo
+    raw_pos = servo_protocol.read_servo_position(utils.SERVO_ID_GRIPPER)
+    
+    if raw_pos is not None:
+        # Convert raw position to angle in degrees
+        # This requires finding the correct config index for the gripper
+        try:
+            gripper_config_index = utils.SERVO_IDS.index(utils.SERVO_ID_GRIPPER)
+            angle_rad = servo_driver.raw_to_angle_rad(raw_pos, gripper_config_index)
+            angle_deg = np.rad2deg(angle_rad)
+            
+            # Update global state as well
+            utils.current_gripper_angle_rad = angle_rad
+
+            reply = f"GRIPPER_STATE,{angle_deg:.2f},{raw_pos}"
+            print(f"[Controller] Sending gripper state: {reply}")
+            sock.sendto(reply.encode("utf-8"), addr)
+        except ValueError:
+            print("[Controller] ERROR: Gripper servo ID not found in SERVO_IDS list.")
+            sock.sendto("ERROR,GRIPPER_ID_NOT_CONFIGURED".encode("utf-8"), addr)
+        except Exception as e:
+            print(f"[Controller] ERROR: Could not convert raw position to angle: {e}")
+            sock.sendto(f"ERROR,CONVERSION_FAILED".encode("utf-8"), addr)
+    else:
+        print("[Controller] ERROR: Failed to read gripper position.")
+        sock.sendto("ERROR,READ_FAILED".encode("utf-8"), addr)
+
+
+# -----------------------------------------------------------------------------
+# Real-time Cartesian Jogging
+# -----------------------------------------------------------------------------
+
+JOG_CONTROL_FREQUENCY_HZ = 100
+JOG_VELOCITY_TIMEOUT_S = 0.2  # If no command received in this time, stop
+
+def _jog_controller_thread():
+    """
+    This is the heart of the real-time jogging feature. It runs in a tight loop,
+    continuously calculating and commanding small IK movements based on the
+    latest velocity commands stored in the global trajectory_state.
+    """
+    print("[Jog] Jog controller thread started.")
+    
+    # Get initial state
+    q_current = servo_driver.get_current_arm_state_rad(verbose=False)
+    
+    last_loop_time = time.monotonic()
+    
+    while utils.trajectory_state.get("is_jogging"):
+        loop_start_time = time.monotonic()
+        dt = loop_start_time - last_loop_time
+        last_loop_time = loop_start_time
+
+        # --- Safety Timeout ---
+        # If we haven't received a velocity command recently, set velocities to zero.
+        time_since_last_cmd = time.monotonic() - utils.trajectory_state["last_jog_command_time"]
+        if time_since_last_cmd > JOG_VELOCITY_TIMEOUT_S:
+            utils.trajectory_state["jog_velocities"] = np.zeros(6, dtype=float)
+            # We don't exit the loop, just stop moving.
+
+        # 1. Get current pose from FK
+        current_pose_matrix = ik_solver.get_fk_matrix(q_current)
+        if current_pose_matrix is None:
+            print("[Jog] ERROR: FK failed during jog loop. Stopping.")
+            break
+        
+        current_position = current_pose_matrix[:3, 3]
+        current_orientation = current_pose_matrix[:3, :3]
+        
+        # 2. Get target velocities from global state
+        velocities = utils.trajectory_state["jog_velocities"]
+        linear_vel = velocities[:3]
+        angular_vel_rad_s = np.deg2rad(velocities[3:]) # Convert RPY rates to radians
+        
+        # 3. Calculate target pose for this time step
+        # Integrate linear velocity to get new position
+        target_position = current_position + linear_vel * dt
+        
+        # Integrate angular velocity to get new orientation
+        # Create a small rotation vector from angular velocity and time step
+        rotation_vector = angular_vel_rad_s * dt
+        # Convert the small rotation vector to a rotation matrix
+        delta_rotation = R.from_rotvec(rotation_vector).as_matrix()
+        # Apply the small rotation to the current orientation
+        target_orientation = delta_rotation @ current_orientation
+
+        # 4. Solve IK for the new target pose
+        q_target = ik_solver.solve_ik(
+            target_position,
+            target_orientation_matrix=target_orientation,
+            initial_joint_angles=q_current
+        )
+        
+        if q_target is not None:
+            # 5. Command servos to the new angles. Use high speed and zero acceleration
+            #    to make the motion as responsive as possible.
+            servo_driver.set_servo_positions(q_target, speed=800, accel=0)
+            q_current = q_target # Update our state for the next iteration's IK
+        else:
+            # If IK fails, we don't command anything and just try again next cycle.
+            # This can happen if the target is unreachable.
+            print("[Jog] WARNING: IK solution not found for step.")
+
+        # --- Maintain loop frequency ---
+        loop_duration = time.monotonic() - loop_start_time
+        sleep_time = (1.0 / JOG_CONTROL_FREQUENCY_HZ) - loop_duration
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+    print("[Jog] Jog controller thread stopped.")
+    # Ensure the thread reference is cleared upon exit
+    if utils.trajectory_state.get("thread") is threading.current_thread():
+        utils.trajectory_state["thread"] = None
+
+
+def handle_jog_start():
+    """Starts the real-time jogging mode."""
+    if utils.trajectory_state.get("is_running") or utils.trajectory_state.get("is_jogging"):
+        print("[Jog] ERROR: Another motion is already active. Cannot start jog mode.")
+        return
+
+    print("[Jog] Starting jog mode...")
+    utils.trajectory_state["is_jogging"] = True
+    utils.trajectory_state["last_jog_command_time"] = time.monotonic()
+    utils.trajectory_state["jog_velocities"] = np.zeros(6, dtype=float)
+
+    jog_thread = threading.Thread(target=_jog_controller_thread, daemon=True)
+    utils.trajectory_state["thread"] = jog_thread
+    jog_thread.start()
+
+
+def handle_jog_stop():
+    """Stops the real-time jogging mode."""
+    print("[Jog] Stopping jog mode...")
+    utils.trajectory_state["is_jogging"] = False # Signal the thread to exit
+
+    # Give the thread a moment to stop
+    thread = utils.trajectory_state.get("thread")
+    if thread and thread.is_alive():
+        thread.join(timeout=0.5)
+
+    # Hard stop the servos as a final safety measure
+    current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
+    if current_angles:
+        servo_driver.set_servo_positions(current_angles, speed=0, accel=100)
+    
+    print("[Jog] Jog mode stopped.")
+
+def handle_set_jog_velocity(vx, vy, vz, v_roll, v_pitch, v_yaw):
+    """
+    Updates the target velocities for the active jogging session.
+    This is expected to be called at a high frequency by the client.
+    """
+    if not utils.trajectory_state.get("is_jogging"):
+        return # Ignore if not in jog mode
+
+    utils.trajectory_state["jog_velocities"] = np.array(
+        [vx, vy, vz, v_roll, v_pitch, v_yaw], dtype=float
+    )
+    utils.trajectory_state["last_jog_command_time"] = time.monotonic()
+
 
 # -----------------------------------------------------------------------------
 # Recording subsystem: PLAN_TRAJECTORY / REC_POS / END_TRAJECTORY

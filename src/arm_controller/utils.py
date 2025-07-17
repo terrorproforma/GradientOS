@@ -12,12 +12,15 @@ BUFFER_SIZE = 1024 # Size of the UDP receive buffer in bytes
 NUM_LOGICAL_JOINTS = 6 # Number of controllable joints in the kinematic model
 
 # --- Servo Configuration ---
-NUM_PHYSICAL_SERVOS = 8 # Total number of physical servos (J1 is no longer doubled up)
-SERVO_IDS = [10, 20, 21, 30, 31, 40, 50, 60] # Hardware ID of each servo
+NUM_PHYSICAL_SERVOS = 9 # Total number of physical servos (J1 is no longer doubled up)
+SERVO_IDS = [10, 20, 21, 30, 31, 40, 50, 60, 100] # Hardware ID of each servo, 100 is gripper
 
 # IDs for the second motor on multi-servo joints
 SERVO_ID_JOINT_2_SECOND = 21
 SERVO_ID_JOINT_3_SECOND = 31
+
+# ID for the gripper servo
+SERVO_ID_GRIPPER = 100
 
 # --- Default Motion Parameters ---
 DEFAULT_SERVO_SPEED = 200 # Default speed for servos if not specified (0-4095)
@@ -55,13 +58,16 @@ LOGICAL_JOINT_MASTER_OFFSETS_RAD = [
 # Logical Joint Limits (radians) [min_limit, max_limit]
 # These are the effective limits for the 6 logical joints of the arm.
 LOGICAL_JOINT_LIMITS_RAD = [
-    [-1.5708, 1.5708], # Logical J1 (Base)
+    [-3.1416, 3.1416], # Logical J1 (Base)
     [-1.5708, 1.5708], # Logical J2 (Shoulder)
     [-1.5708, 1.5708], # Logical J3 (Elbow)
     [-3.1416, 3.1416], # Logical J4 (Wrist Roll)
     [-1.8326, 2.0944], # Logical J5 (Wrist Pitch)
     [-3.1416, 3.1416]  # Logical J6 (Wrist Yaw)
 ]
+
+# Gripper servo limits (radians)
+GRIPPER_LIMITS_RAD = [0, 3.1416]  # 0° (closed) to 90° (open)
 
 # URDF Joint Limits (radians) [min_limit, max_limit] - These are for the LOGICAL joints
 # but need to be consistent with the physical servo capabilities after all offsets.
@@ -75,7 +81,8 @@ URDF_JOINT_LIMITS = [ # Per PHYSICAL servo config index
     LOGICAL_JOINT_LIMITS_RAD[2], # Servo ID 31 (Logical J3, Servo 2) - Must match Servo ID 30
     LOGICAL_JOINT_LIMITS_RAD[3], # Servo ID 40 (Logical J4)
     LOGICAL_JOINT_LIMITS_RAD[4], # Servo ID 50 (Logical J5)
-    LOGICAL_JOINT_LIMITS_RAD[5]  # Servo ID 60 (Logical J6)
+    LOGICAL_JOINT_LIMITS_RAD[5], # Servo ID 60 (Logical J6)
+    GRIPPER_LIMITS_RAD           # Servo ID 100 (Gripper)
 ]
 
 # Effective Mapping Ranges: Assuming 0-4095 on servo maps to +/- PI radians from servo zero.
@@ -118,7 +125,12 @@ TRAJECTORY_CACHE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "
 trajectory_state = {
     "is_running": False,
     "should_stop": False,
-    "thread": None
+    "thread": None,
+    # --- New state for real-time jogging ---
+    "is_jogging": False,
+    # 6D vector: [vx, vy, vz, v_roll, v_pitch, v_yaw]
+    "jog_velocities": np.zeros(6, dtype=float),
+    "last_jog_command_time": 0.0,
 }
 
 
@@ -137,6 +149,10 @@ ser: 'serial.Serial | None' = None
 
 # Global state for the arm's last known logical joint angles (in radians)
 current_logical_joint_angles_rad = [0.0] * NUM_LOGICAL_JOINTS
+# NEW: Global state for the gripper's last known angle (in radians)
+current_gripper_angle_rad = 0.0
+# NEW: Flag to indicate if the gripper servo (ID 100) was detected on startup
+gripper_present = False
 
 # -----------------------------------------------------------------------------
 # Servo Orientation Mapping (RAW ↔︎ Angle)
@@ -158,7 +174,7 @@ current_logical_joint_angles_rad = [0.0] * NUM_LOGICAL_JOINTS
 
 # IDs whose raw value DECREASES when the joint rotates in the positive logical
 # direction.
-INVERTED_SERVO_IDS: set[int] = {10, 20, 30, 40, 50, 60}
+INVERTED_SERVO_IDS: set[int] = {10, 20, 30, 40, 50, 60, 100} # Assuming gripper (100) is inverse mapping
 
 def _is_servo_direct_mapping(physical_servo_config_index: int) -> bool:
     """
