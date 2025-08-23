@@ -9,6 +9,7 @@
 # The pages are switched by calling the switch_to_home, switch_to_editor, switch_to_simulation, switch_to_dashboard, switch_to_workflow, switch_to_welding, switch_to_control, and switch_to_real_control functions.
 
 import sys
+import argparse
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QStackedWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QTableWidget, QTableWidgetItem, QListWidget,
@@ -1175,7 +1176,7 @@ class RealControlPage(QWidget):
         self.parent.send_command(f"ROTATE,{input_str}")
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, pi_ip="ai-pi.local"):
         super().__init__()
         self.setWindowTitle("Industrial Robot Controller")
         self.setGeometry(50, 50, 1280, 800)
@@ -1200,7 +1201,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(estop_btn)
 
         # --- UDP Configuration ---
-        self.PI_IP = "ai-pi.local"
+        self.PI_IP = pi_ip
         self.UDP_PORT = 3000
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -1356,6 +1357,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Robot Arm UI')
+    parser.add_argument('--pi-ip', type=str, default='ai-pi.local',
+                        help='The IP address of the Raspberry Pi.')
+    args = parser.parse_args()
+
     app = QApplication(sys.argv)
     app.setFont(QFont('Courier New', 12))
     app.setStyleSheet("""
@@ -1406,7 +1412,7 @@ if __name__ == "__main__":
         max-height: 40px;
     }
     """)
-    window = MainWindow()
+    window = MainWindow(pi_ip=args.pi_ip)
     window.show()
     print('App created')
     print('Stylesheet set')

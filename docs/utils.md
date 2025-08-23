@@ -14,7 +14,7 @@ This file contains numerous blocks of constants that define the robot's physical
 
 *   **UDP Configuration:** Defines the IP, Port, and buffer size for the main command server.
 *   **Servo Configuration:** Contains critical hardware numbers, such as the number of logical joints vs. physical servos and the mapping of their hardware IDs. It also defines default motion parameters like `DEFAULT_PROFILE_VELOCITY` and the `CORRECTION_KP_GAIN` for the closed-loop controller.
-*   **Serial Port Configuration:** Defines the device path (`/dev/ttyAMA0`) and baud rate for the serial connection to the servos.
+*   **Serial Port Configuration:** Defines the default device path (`/dev/ttyAMA0`) and baud rate for the serial connection to the servos. The serial port can be overridden at runtime by using the `--serial-port` command-line argument when running `run_controller.py`. For example: `python run_controller.py --serial-port /dev/ttyUSB0`
 *   **Calibration Inputs (`LOGICAL_JOINT_MASTER_OFFSETS_RAD`):** Provides a high-level software offset for each joint to fine-tune the arm's zero position.
 *   **Joint Limits (`LOGICAL_JOINT_LIMITS_RAD`, `URDF_JOINT_LIMITS`):** Defines the safe range of motion for each joint. These values are used to program the hardware limits on the servos themselves.
 *   **Effective Mapping Ranges:** Defines the expected range of motion in radians for each servo, which is used in the radian-to-raw-value conversion.

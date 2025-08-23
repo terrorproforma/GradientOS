@@ -1,6 +1,7 @@
 import socket
 import time
 import math
+import argparse
 
 # =============================================================================
 #                              CONFIGURATION
@@ -266,6 +267,12 @@ def main():
     print("UDP client closed.")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Robot Arm UDP Client')
+    parser.add_argument('--pi-ip', type=str, default='ai-pi.local',
+                        help='The IP address of the Raspberry Pi.')
+    args = parser.parse_args()
+    PI_IP = args.pi_ip
+
     # Import numpy for the square test, but don't make it a hard requirement
     # for the whole script.
     try:
@@ -276,4 +283,5 @@ if __name__ == "__main__":
         def run_test_square_sequence():
             print("ERROR: Cannot run 'test_square' because numpy is not installed.")
 
-    main() 
+    main()
+ 

@@ -6,6 +6,7 @@ import traceback
 import sys
 import os
 import numpy as np # Added for gripper angle conversion
+import argparse
 
 # Add the 'src' directory to the Python path to allow importing the arm_controller package
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'src')))
@@ -23,7 +24,7 @@ except ImportError as e:
     sys.exit(1)
 
 
-def main():
+def main(serial_port):
     """
     Main entry point for the robot controller.
 
@@ -36,6 +37,10 @@ def main():
     5. Manages a simple calibration mode for streaming servo data.
     6. Ensures a graceful shutdown of the serial port on exit.
     """
+    # Update the serial port from the command line argument
+    if serial_port:
+        utils.SERIAL_PORT = serial_port
+
     # Initialize the hardware
     servo_driver.initialize_servos()
     servo_driver.set_servo_angle_limits_from_urdf()
@@ -412,5 +417,9 @@ def main():
             print("[Controller] Serial port closed.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Robot Arm Controller')
+    parser.add_argument('--serial-port', type=str, default='/dev/ttyAMA0',
+                        help='The serial port to connect to the robot arm.')
+    args = parser.parse_args()
+    main(args.serial_port)
 
