@@ -5,9 +5,163 @@ import serial
 import numpy as np
 import os
 import json
+import glob
+from typing import Iterable, Optional
 
 from . import utils
 from . import servo_protocol
+
+_CANDIDATE_PATTERNS: tuple[str, ...] = (
+    "/dev/serial/by-id/*",
+    "/dev/serial/by-path/*",
+    "/dev/ttyUSB*",
+    "/dev/ttyACM*",
+    "/dev/ttyAMA*",
+)
+
+
+def _is_serial_response_valid(response: object, servo_id: int) -> bool:
+    """Check whether the raw bytes returned from a probe look like a servo status packet."""
+    if not isinstance(response, (bytes, bytearray)):
+        return False
+    if len(response) != 6:
+        return False
+    return response[0] == 0xFF and response[1] == 0xFF and response[2] == servo_id
+
+
+def _ping_over_handle(handle: serial.Serial, servo_id: int) -> bool:
+    """Issue a single servo ping over an already-open serial handle."""
+    ping_command = bytearray(6)
+    ping_command[0] = servo_protocol.SERVO_HEADER
+    ping_command[1] = servo_protocol.SERVO_HEADER
+    ping_command[2] = servo_id
+    ping_command[3] = 2  # Length
+    ping_command[4] = servo_protocol.SERVO_INSTRUCTION_PING
+    ping_command[5] = servo_protocol.calculate_checksum(ping_command[2:5])
+
+    try:
+        handle.reset_input_buffer()
+    except Exception:
+        # Some drivers may not support reset_input_buffer; proceed anyway
+        pass
+
+    handle.write(ping_command)
+    response = handle.read(6)
+    return _is_serial_response_valid(response, servo_id)
+
+
+def _candidate_serial_devices() -> list[str]:
+    """
+    Enumerate potential serial device paths, preferring persistent /dev/serial/by-id names
+    and deduplicating symlink targets.
+    """
+    candidates: list[str] = []
+    seen_realpaths: set[str] = set()
+
+    for pattern in _CANDIDATE_PATTERNS:
+        for path in sorted(glob.glob(pattern)):
+            try:
+                realpath = os.path.realpath(path)
+            except OSError:
+                continue
+            if realpath in seen_realpaths:
+                continue
+            if not os.path.exists(realpath):
+                continue
+            seen_realpaths.add(realpath)
+            candidates.append(path)
+
+    # If list_ports reports additional USB serial devices we missed, append them
+    try:
+        from serial.tools import list_ports as _list_ports
+        for port in _list_ports.comports():
+            if not port.device:
+                continue
+            try:
+                realpath = os.path.realpath(port.device)
+            except OSError:
+                continue
+            if realpath in seen_realpaths:
+                continue
+            if not os.path.exists(realpath):
+                continue
+            seen_realpaths.add(realpath)
+            candidates.append(port.device)
+    except Exception:
+        # pyserial list_ports can fail on some minimal installations; ignore
+        pass
+
+    return candidates
+
+
+def _probe_serial_device(path: str, servo_ids: Iterable[int]) -> bool:
+    """
+    Attempt to open the given serial device and confirm a connected servo responds to ping.
+    Only overrides the configured serial port if a unique responsive device is found.
+    """
+    probe_ids = list(servo_ids)
+    if len(probe_ids) > 4:
+        probe_ids = probe_ids[:4]
+    if utils.SERVO_ID_GRIPPER not in probe_ids:
+        probe_ids.append(utils.SERVO_ID_GRIPPER)
+
+    try:
+        with serial.Serial(path, utils.BAUD_RATE, timeout=0.1) as handle:
+            # Allow adapter/TTL bridges a brief moment to initialize
+            time.sleep(0.05)
+            for _ in range(2):  # attempt each servo twice before giving up
+                for servo_id in probe_ids:
+                    if _ping_over_handle(handle, servo_id):
+                        return True
+            return False
+    except serial.SerialException as exc:
+        print(f"[Pi] Serial auto-detect skipped '{path}': {exc}")
+    except Exception as exc:
+        print(f"[Pi] Serial auto-detect encountered an unexpected error on '{path}': {exc}")
+    return False
+
+
+def _resolve_serial_port() -> Optional[str]:
+    """
+    Determine the most appropriate serial port to use for the servo bus.
+    Priority:
+      1. Explicit SERIAL_PORT environment variable (if the device exists)
+      2. Configured default (utils.SERIAL_PORT) if it exists
+      3. Auto-detected, responsive device (unique match)
+    """
+    env_override = os.environ.get("SERIAL_PORT")
+    if env_override:
+        if os.path.exists(env_override):
+            print(f"[Pi] Using serial port from environment override: {env_override}")
+            return env_override
+        else:
+            print(f"[Pi] Warning: SERIAL_PORT override '{env_override}' does not exist.")
+
+    if utils.SERIAL_PORT and os.path.exists(utils.SERIAL_PORT):
+        print(f"[Pi] Using configured serial port: {utils.SERIAL_PORT}")
+        return utils.SERIAL_PORT
+
+    candidates = _candidate_serial_devices()
+    if not candidates:
+        print("[Pi] Serial auto-detect found no candidate devices. Falling back to configured path.")
+        return utils.SERIAL_PORT
+
+    responsive = [path for path in candidates if _probe_serial_device(path, utils.SERVO_IDS)]
+
+    if len(responsive) == 1:
+        detected = responsive[0]
+        print(f"[Pi] Auto-detected servo serial port: {detected}")
+        return detected
+
+    if len(responsive) > 1:
+        print("[Pi] Warning: Multiple serial devices responded to servo pings:")
+        for path in responsive:
+            print(f"  - {path}")
+        print("[Pi] Please set SERIAL_PORT to the desired device. Falling back to configured path.")
+        return utils.SERIAL_PORT
+
+    print("[Pi] Serial auto-detect did not find a responsive device. Falling back to configured path.")
+    return utils.SERIAL_PORT
 
 def initialize_servos():
     """
@@ -15,6 +169,10 @@ def initialize_servos():
     and sets their default PID gains. This function must be called once at application startup.
     """
     print("[Pi] Initializing servos...")
+    resolved_port = _resolve_serial_port()
+    if resolved_port:
+        utils.SERIAL_PORT = resolved_port
+
     try:
         utils.ser = serial.Serial(utils.SERIAL_PORT, utils.BAUD_RATE, timeout=0.1)
         print(f"[Pi] Serial port {utils.SERIAL_PORT} opened successfully at {utils.BAUD_RATE} baud.")

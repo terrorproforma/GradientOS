@@ -16,7 +16,8 @@ WorkingDirectory=/home/pi/src/GradientOS
 Environment=PATH=/home/pi/src/GradientOS/.venv/bin:/home/pi/.local/bin:/home/pi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/home/pi/src/GradientOS/src
-Environment=SERIAL_PORT=/dev/ttyUSB0
+# Use for explicit serial port override instead of auto-detection
+# Environment=SERIAL_PORT=/dev/ttyUSB0
 
 ExecStart=/home/pi/src/GradientOS/run.sh
 

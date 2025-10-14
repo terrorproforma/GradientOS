@@ -60,6 +60,7 @@ For unattended deployments on Raspberry Pi, you can install the controller as a
    ```
 
 The unit runs `run.sh` which bootstraps the venv, exports `DATA_PATH` (defaulting to `data/gradient-robotics`), and honors a `SERIAL_PORT` environment override. Adjust those via a systemd drop-in under `/etc/systemd/system/arm-controller.service.d/override.conf` if you require custom paths or serial devices.
+If no override is provided, the controller will attempt to auto-detect a single responsive USB serial adapter and fall back to `/dev/ttyUSB0` when detection is ambiguous—check the logs for guidance when multiple adapters are present.
 
 
 # command CLI 
