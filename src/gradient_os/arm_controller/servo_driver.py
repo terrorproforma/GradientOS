@@ -352,6 +352,8 @@ def set_servo_positions(logical_joint_angles_rad: list[float], speed_value: int,
             # No extra sign inversion here—orientation differences are fully
             # captured by the direct/inverted mapping in utils._is_servo_direct_mapping.
             final_target_physical_angle_rad = target_physical_angle_rad
+            if logical_joint_index == 0:
+                final_target_physical_angle_rad *= 2.0
 
             # --- Convert Target Angle (Radians) to Raw Servo Value (0-4095) ---
             

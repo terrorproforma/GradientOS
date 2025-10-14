@@ -40,30 +40,23 @@ def test_fk_ik_consistency(solver):
 
 def test_batch_solver(solver):
     """Tests the high-performance batch solver on a short path."""
-    # Get a starting pose from FK
-    zero_angles = np.array([0.0] * solver.num_joints)
-    start_pos, start_rot_flat = solver.compute_fk(zero_angles)
-    start_rot_flat = start_rot_flat.flatten()
-    
-    # Create a simple 3-point path
-    path_points = [
-        start_pos,
-        start_pos + np.array([0.05, 0, 0]),
-        start_pos + np.array([0.05, 0.05, 0])
-    ]
-    
-    # Prepare batch data (translation + rotation for each point)
-    poses_batch = np.zeros((len(path_points), 12))
-    for i, pos in enumerate(path_points):
-        poses_batch[i, :3] = pos
-        poses_batch[i, 3:] = start_rot_flat
+    # Define joint-space waypoints that stay within the known limits
+    waypoints = np.array([
+        np.zeros(solver.num_joints),
+        np.array([0.05, -0.05, 0.03, 0.01, -0.01, 0.0]),
+        np.array([0.1, -0.1, 0.06, 0.02, -0.02, 0.01]),
+    ])
 
-    # Solve the path using the batch method
-    path_solutions = solver.solve_ik_path(poses_batch, zero_angles)
+    # Convert to Cartesian poses (translation + rotation matrix flattened)
+    poses_batch = np.zeros((len(waypoints), 12))
+    for idx, joint_angles in enumerate(waypoints):
+        trans, rot = solver.compute_fk(joint_angles)
+        poses_batch[idx, :3] = trans
+        poses_batch[idx, 3:] = rot.flatten()
+
+    path_solutions = solver.solve_ik_path(poses_batch, waypoints[0])
 
     assert path_solutions is not None, "Batch solver failed to find a solution"
-    assert path_solutions.shape == (len(path_points), solver.num_joints), "Batch solver returned incorrect shape"
-
-    # Sanity check the final position
-    final_fk_pos, _ = solver.compute_fk(path_solutions[-1])
-    assert np.allclose(path_points[-1], final_fk_pos, atol=1e-6), "Batch solver did not arrive at target" 
+    assert path_solutions.shape == (len(waypoints), solver.num_joints), "Batch solver returned incorrect shape"
+    # Confirm the solver follows the intended joint-space path
+    assert np.allclose(path_solutions[-1], waypoints[-1], atol=1e-5), "Batch solver deviated from expected joint configuration"

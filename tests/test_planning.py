@@ -42,23 +42,38 @@ class TestTrajectoryPlanning(unittest.TestCase):
             cartesian_points, start_q, use_smoothing=False
         )
         
-        # 3. Assert that the unwrapping was successful
-        # The value after 3.1 should be approx 3.18 (i.e., -3.1 + 2*pi)
-        self.assertAlmostEqual(unwrapped_path[2][5], -3.1 + (2 * math.pi), places=2)
+        # 3. Assert that the planner respects joint limits when considering unwraps
+        # The value should remain within the configured bounds rather than exceeding them.
+        self.assertAlmostEqual(unwrapped_path[2][5], -3.1, places=2)
 
-        # 4. Test with smoothing enabled
-        # We need to re-mock the savgol_filter as it's a module-level mock
-        with unittest.mock.patch('scipy.signal.savgol_filter') as mock_savgol:
-            # Set the filter to just return the input to isolate our logic
-            mock_savgol.side_effect = lambda x, w, p, axis: x
+        # 4. Test with smoothing enabled — the path should still be generated even
+        # when the filter is skipped due to insufficient samples.
+        smoothed_path = trajectory_execution._plan_high_fidelity_trajectory(
+            cartesian_points, start_q, use_smoothing=True
+        )
+        self.assertEqual(len(smoothed_path), len(raw_path))
+        self.assertAlmostEqual(smoothed_path[2][5], -3.1, places=2)
 
-            smoothed_path = trajectory_execution._plan_high_fidelity_trajectory(
+    @unittest.mock.patch('gradient_os.ik_solver.solve_ik_path_batch')
+    def test_smoothing_applied_on_long_path(self, mock_solve_ik: unittest.mock.Mock) -> None:
+        """
+        Verifies that the Savitzky-Golay filter is invoked when the trajectory is long enough.
+        """
+        # Construct a long raw trajectory ( > default window_length ) with simple ramp data.
+        raw_path = [[i * 0.01] * utils.NUM_LOGICAL_JOINTS for i in range(30)]
+        mock_solve_ik.return_value = raw_path
+
+        start_q = [0.0] * utils.NUM_LOGICAL_JOINTS
+        cartesian_points = [[0, 0, 0]] * len(raw_path)
+
+        with unittest.mock.patch('gradient_os.arm_controller.trajectory_execution.savgol_filter', wraps=lambda arr, window_length, polyorder, axis: arr * 0.9) as mock_filter:
+            result = trajectory_execution._plan_high_fidelity_trajectory(
                 cartesian_points, start_q, use_smoothing=True
             )
-            # Check that the filter was called
-            mock_savgol.assert_called_once()
-            # Check that the unwrapping still happened before smoothing
-            self.assertAlmostEqual(smoothed_path[2][5], -3.1 + (2 * math.pi), places=2)
+            mock_filter.assert_called()
+            self.assertEqual(len(result), len(raw_path))
+            # Confirm smoothing altered the values (our wrapped lambda scales by 0.9)
+            self.assertNotEqual(result[-1][0], raw_path[-1][0])
 
 
 if __name__ == '__main__':

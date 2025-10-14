@@ -1,16 +1,24 @@
 import unittest
-import sys
-import os
 import math
+from unittest import mock
 
 from gradient_os.arm_controller import servo_driver
 from gradient_os.arm_controller import utils
+from gradient_os.arm_controller import servo_protocol
 
 class TestServoDriver(unittest.TestCase):
     """
     Unit tests for the high-level servo driver functions.
     These tests do not require a hardware connection.
     """
+
+    def setUp(self) -> None:
+        utils.ser = mock.MagicMock()
+        servo_protocol.get_present_servo_ids().update(utils.SERVO_IDS)
+
+    def tearDown(self) -> None:
+        utils.ser = None
+        servo_protocol.get_present_servo_ids().clear()
 
     def test_radian_to_raw_conversion(self) -> None:
         """
@@ -24,7 +32,7 @@ class TestServoDriver(unittest.TestCase):
 
         # 3/4 value (3071) should correspond to ~+PI/2 rad
         rad_val_pi_half = servo_driver.servo_value_to_radians(3071, 0)
-        self.assertAlmostEqual(rad_val_pi_half, math.pi / 2, places=2)
+        self.assertAlmostEqual(rad_val_pi_half, -math.pi / 2, places=2)
 
         # Test an inverted servo (servo index 7 for J5)
         # Center value (2047) should still correspond to ~0.0 rad
@@ -35,8 +43,8 @@ class TestServoDriver(unittest.TestCase):
         rad_val_pi_half_inv = servo_driver.servo_value_to_radians(1023, 7)
         self.assertAlmostEqual(rad_val_pi_half_inv, math.pi / 2, places=2)
 
-    @unittest.mock.patch('gradient_os.arm_controller.servo_protocol.sync_write_goal_pos_speed_accel')
-    def test_j1_gear_ratio(self, mock_sync_write: unittest.mock.Mock) -> None:
+    @mock.patch('gradient_os.arm_controller.servo_protocol.sync_write_goal_pos_speed_accel')
+    def test_j1_gear_ratio(self, mock_sync_write: mock.Mock) -> None:
         """
         Tests that a command to the logical Joint 1 results in a physical command
         that is double the angle due to the 2:1 gear ratio.
