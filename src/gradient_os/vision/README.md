@@ -30,22 +30,22 @@ Install the Python packages:
 ```bash
 # Activate virtual environment with camera support
 cd /path/to/GradientOS
-source ./start-env.sh
+source ./start.sh
 
 # Or manually activate and set PYTHONPATH
 source .venv/bin/activate
 export PYTHONPATH="/usr/lib/python3/dist-packages:$(pwd)/src:$PYTHONPATH"
 
-# Install Python dependencies
-pip install -r requirements.txt
+# Install GradientOS (installs Python dependencies)
+pip install -e .
 ```
 
 #### Optional: AI/YOLO Dependencies
 
-To enable YOLO11 AI detection overlays in the MJPEG server, install the following packages (these are listed in `requirements.txt`, but you may need platform-specific wheels):
+To enable YOLO11 AI detection overlays in the MJPEG server, install the optional AI extra (platform-specific wheels may still be required):
 
 ```bash
-pip install ultralytics torch torchvision torchaudio
+pip install -e '.[ai]'
 ```
 
 Notes:
@@ -59,7 +59,7 @@ For camera functionality to work properly, you need to either:
 **Option 1: Use the activation script (recommended)**
 ```bash
 cd /path/to/GradientOS
-source ./start-env.sh
+source ./start.sh
 ```
 
 **Option 2: Manual environment setup**
@@ -75,7 +75,7 @@ Always install in this order:
 
 1. **System dependencies first**: `sudo apt install -y python3-libcamera python3-kms++`
 2. **Virtual environment**: Create/activate your Python virtual environment
-3. **Python dependencies**: `pip install -r requirements.txt`
+3. **Python dependencies**: `pip install -e .` *(append `.[ai]` if you want the YOLO stack)*
 4. **Environment setup**: Use activation script or set PYTHONPATH
 
 Key dependencies:
@@ -352,7 +352,7 @@ First, ensure your environment is properly set up:
 
 ```bash
 cd /path/to/GradientOS
-source ./start-env.sh
+source ./start.sh
 ```
 
 Then run the test script to verify camera functionality:

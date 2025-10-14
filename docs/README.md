@@ -7,6 +7,7 @@ This documentation provides a comprehensive overview of the Mini Arm Controller 
 ```bash
 git clone https://github.com/terrorproforma/GradientOS.git --verbose
 cd GradientOS
+./setup.sh        # Installs libcamera/Mesa dependencies (will use sudo)
 python3 -m venv .venv
 source ./start.sh   # Important: source, do not execute
 
@@ -28,7 +29,7 @@ Notes:
   - gradient-ui → python -m gradient_os.ui_start
   - gradient-controller → python -m gradient_os.run_controller
   - gradient-cli → python -m gradient_os.cli_controller
-- Always activate with `source ./start-env.sh`. Executing the script will not persist the environment.
+- Always activate with `source ./start.sh`. Executing the script will not persist the environment.
 
 `gradient-ui` can be run remotely and can connect to your pi or other board via UDP. `gradient-controller` must run locally on your pi or board connected to the motor controller. 
 

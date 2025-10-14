@@ -4,7 +4,7 @@
 # Ensure this script is sourced, not executed
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   echo "This script must be sourced so the environment persists in your current shell."
-  echo "Run: source ./start-env.sh"
+  echo "Run: source ./start.sh"
   exit 1
 fi
 

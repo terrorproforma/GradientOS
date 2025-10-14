@@ -13,9 +13,9 @@ This guide explains how to set up and run the UI (`ui_start.py`) on a Raspberry 
    source .venv/bin/activate
    ```
 
-2. Install required Python packages:
+2. Install GradientOS (installs the required Python packages):
    ```bash
-   pip install pyside6 pyqtgraph numpy
+   pip install -e .
    ```
 
 3. For OpenGL support (required for simulation page):
