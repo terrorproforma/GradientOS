@@ -28,16 +28,12 @@ These packages provide the low-level camera drivers and Python bindings that pic
 Install the Python packages:
 
 ```bash
-# Activate virtual environment with camera support
-cd /path/to/GradientOS
-source ./start.sh
+# Preferred: automated setup (system deps + project install)
+./setup.sh
 
-# Or manually activate and set PYTHONPATH
+# Manual steps if you maintain a custom venv
 source .venv/bin/activate
-export PYTHONPATH="/usr/lib/python3/dist-packages:$(pwd)/src:$PYTHONPATH"
-
-# Install GradientOS (installs Python dependencies)
-pip install -e .
+source ./start.sh   # ensures camera libs + project sources are on PYTHONPATH
 ```
 
 #### Optional: AI/YOLO Dependencies

@@ -7,12 +7,13 @@ This documentation provides a comprehensive overview of the Mini Arm Controller 
 ```bash
 git clone https://github.com/terrorproforma/GradientOS.git --verbose
 cd GradientOS
-./setup.sh        # Installs libcamera/Mesa dependencies (will use sudo)
-python3 -m venv .venv
-source ./start.sh   # Important: source, do not execute
 
-# Install in editable mode to register console scripts during development
-pip install -e .
+# Preferred: automated setup (system deps + uv env + project install)
+./setup.sh
+
+# Manual fallback (custom envs / troubleshooting):
+#   uv venv .venv
+#   source ./start.sh   # activates venv, adjusts PYTHONPATH, adds aliases only if needed
 ```
 
 The package provides command-line tools (available after activation and install):
