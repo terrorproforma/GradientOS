@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply min-h-screen bg-gradient-to-b from-slate-900 via-slate-950 to-black text-slate-100 font-sans antialiased;
+  }
+
+  #root {
+    @apply min-h-screen;
+  }
+}

@@ -25,6 +25,7 @@ dependencies = [
     "cycler==0.12.1",
     "decorator==5.2.1",
     "distlib==0.3.9",
+    "fastapi==0.115.0",
     "filelock==3.18.0",
     "fonttools==4.58.4",
     "freetype-py==2.5.1",
@@ -68,6 +69,7 @@ dependencies = [
     "requests==2.32.3",
     "scikit_build_core==0.11.5",
     "scipy==1.15.3",
+    "sse-starlette==2.0.0",
     "shiboken6==6.8.0.2",
     "six==1.17.0",
     "spatialmath-python==1.1.14",
@@ -77,6 +79,7 @@ dependencies = [
     "trimesh==4.6.13",
     "typing_extensions==4.14.0",
     "tzdata==2025.2",
+    "uvicorn[standard]==0.32.0",
     "urdfpy==0.0.22",
     "virtualenv==20.31.2",
 ]
@@ -86,6 +89,7 @@ gradient-ui = "gradient_os.ui_start:main"
 gradient-controller = "gradient_os.run_controller:main"
 gradient-cli = "gradient_os.cli_controller:main"
 gradient-vision = "gradient_os.vision.cli:main"
+gradient-api = "gradient_os.api.main:main"
 
 [project.optional-dependencies]
 ai = [
