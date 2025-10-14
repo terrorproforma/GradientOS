@@ -35,6 +35,33 @@ Notes:
 `gradient-ui` can be run remotely and can connect to your pi or other board via UDP. `gradient-controller` must run locally on your pi or board connected to the motor controller. 
 
 
+## Running as a systemd Service
+
+For unattended deployments on Raspberry Pi, you can install the controller as a systemd service using the helper scripts under `systemd/`.
+
+1. Ensure the project is provisioned (virtualenv created, dependencies installed) and that `run.sh` works when executed manually.
+2. Install the service:
+   ```bash
+   cd /home/pi/src/GradientOS/systemd
+   ./install.sh
+   ```
+   This copies `arm-controller.service` into `/etc/systemd/system/`, reloads systemd, enables the unit, and starts it.
+3. Check status and logs anytime with:
+   ```bash
+   ./status.sh
+   ```
+4. To restart or stop the controller without rebooting:
+   ```bash
+   ./restart.sh    # or ./stop.sh
+   ```
+5. When you no longer need the service, remove it cleanly:
+   ```bash
+   ./uninstall.sh
+   ```
+
+The unit runs `run.sh` which bootstraps the venv, exports `DATA_PATH` (defaulting to `data/gradient-robotics`), and honors a `SERIAL_PORT` environment override. Adjust those via a systemd drop-in under `/etc/systemd/system/arm-controller.service.d/override.conf` if you require custom paths or serial devices.
+
+
 # command CLI 
 The command-line interface, `gradient-cli`, for real-time control of the robot arm. The UI is built with the standard `curses` library for a lightweight, terminal-based experience.
 

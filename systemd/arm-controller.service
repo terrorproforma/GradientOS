@@ -1,0 +1,35 @@
+[Unit]
+Description=Gradient Robotics Arm Controller
+After=network.target
+
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+
+User=pi
+Group=pi
+
+WorkingDirectory=/home/pi/src/GradientOS
+
+Environment=PATH=/home/pi/src/GradientOS/.venv/bin:/home/pi/.local/bin:/home/pi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/pi/src/GradientOS/src
+Environment=SERIAL_PORT=/dev/ttyUSB0
+
+ExecStart=/home/pi/src/GradientOS/run.sh
+
+Restart=always
+RestartSec=15
+
+TimeoutStopSec=60
+
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/pi/src/GradientOS /home/pi/.cache /home/pi/.config
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
