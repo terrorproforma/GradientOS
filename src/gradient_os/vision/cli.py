@@ -11,7 +11,17 @@ import time
 from typing import Optional
 import threading
 
-from .camera_driver import PiCameraDriver, PICAMERA2_AVAILABLE, OPENCV_AVAILABLE
+from .camera_driver import (
+    PICAMERA2_AVAILABLE,
+    OPENCV_AVAILABLE,
+    BACKEND_AUTO,
+    BACKEND_PICAMERA,
+    BACKEND_USB,
+    available_backends,
+    create_camera_driver,
+    list_cameras_for_backend,
+    resolve_backend,
+)
 from .image_processor import ImageProcessor
 from .yolo_detector import YOLODetector
 
@@ -19,32 +29,109 @@ from .yolo_detector import YOLODetector
 logger = logging.getLogger(__name__)
 
 
-def list_cameras() -> int:
-    """List available cameras and return exit code."""
-    if not PICAMERA2_AVAILABLE:
-        print("❌ PiCamera2 not available. Install with: pip install picamera2")
+def _instantiate_driver(camera_id: int,
+                        resolution: tuple[int, int],
+                        framerate: int,
+                        backend_choice: Optional[str]):
+    """
+    Resolve the desired backend and create the corresponding camera driver.
+    """
+    try:
+        backend_name = resolve_backend(backend_choice)
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
+        return None, None
+
+    try:
+        driver = create_camera_driver(
+            backend_name,
+            camera_id=camera_id,
+            resolution=resolution,
+            framerate=framerate,
+        )
+        return driver, backend_name
+    except (RuntimeError, ImportError) as exc:
+        print(f"❌ {exc}")
+        return None, None
+
+
+def list_cameras(backend_choice: Optional[str]) -> int:
+    """List available cameras for the requested backend and return exit code."""
+    try:
+        if backend_choice in (None, BACKEND_AUTO):
+            backends = available_backends()
+            if not backends:
+                print("❌ No camera backend available. Install picamera2 (for Pi) or opencv-python (for USB webcams).")
+                return 1
+            exit_code = 1
+            for backend in backends:
+                cameras = list_cameras_for_backend(backend)
+                label = "PiCamera2" if backend == BACKEND_PICAMERA else "USB (OpenCV)"
+                print(f"{label} devices:")
+                if not cameras:
+                    print("  (none detected)")
+                    continue
+                exit_code = 0
+                for info in cameras:
+                    ident = info.get("id", "?")
+                    descriptor = info.get("name") or info.get("Model") or info
+                    res = info.get("resolution")
+                    fps = info.get("fps")
+                    extras = []
+                    if res:
+                        extras.append(f"{res[0]}x{res[1]}")
+                    if fps:
+                        extras.append(f"{fps:.1f}fps" if isinstance(fps, float) else f"{fps}fps")
+                    extra_str = f" ({', '.join(extras)})" if extras else ""
+                    print(f" - [{ident}] {descriptor}{extra_str}")
+            return exit_code
+
+        backend_name = resolve_backend(backend_choice)
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
         return 1
 
-    cameras = PiCameraDriver.list_cameras()
+    cameras = list_cameras_for_backend(backend_name)
+    human_label = "PiCamera2" if backend_name == BACKEND_PICAMERA else "USB (OpenCV)"
+    print(f"{human_label} devices:")
     if not cameras:
-        print("No cameras detected by libcamera/Picamera2.")
+        print("  (none detected)")
         return 1
 
-    print("Detected cameras:")
-    for index, info in enumerate(cameras):
-        print(f" - [{index}] {info}")
+    for info in cameras:
+        ident = info.get("id", "?")
+        descriptor = info.get("name") or info.get("Model") or info
+        res = info.get("resolution")
+        fps = info.get("fps")
+        extras = []
+        if res:
+            extras.append(f"{res[0]}x{res[1]}")
+        if fps:
+            extras.append(f"{fps:.1f}fps" if isinstance(fps, float) else f"{fps}fps")
+        extra_str = f" ({', '.join(extras)})" if extras else ""
+        print(f" - [{ident}] {descriptor}{extra_str}")
     return 0
 
 
-def test_init(camera_id: int, resolution: tuple[int, int], framerate: int) -> int:
+def test_init(camera_id: int,
+              resolution: tuple[int, int],
+              framerate: int,
+              backend_choice: Optional[str]) -> int:
     """Test camera initialization and capture a single image."""
-    if not PICAMERA2_AVAILABLE:
-        print("❌ PiCamera2 not available. Install with: pip install picamera2")
+    cam, backend_name = _instantiate_driver(camera_id, resolution, framerate, backend_choice)
+    if cam is None:
         return 1
 
-    cam = PiCameraDriver(camera_id=camera_id, resolution=resolution, framerate=framerate)
+    if backend_name == BACKEND_USB and not OPENCV_AVAILABLE:
+        print("❌ OpenCV not available. Install with: pip install opencv-python")
+        return 1
+
     if not cam.initialize():
         print("❌ Failed to initialize camera")
+        try:
+            cam.close()
+        except Exception:
+            pass
         return 1
 
     img = cam.capture_image()
@@ -58,18 +145,25 @@ def test_init(camera_id: int, resolution: tuple[int, int], framerate: int) -> in
     return 0
 
 
-def test_processing(camera_id: int, resolution: tuple[int, int], framerate: int) -> int:
+def test_processing(camera_id: int,
+                    resolution: tuple[int, int],
+                    framerate: int,
+                    backend_choice: Optional[str]) -> int:
     """Run a basic image processing pipeline on a captured frame."""
     if not OPENCV_AVAILABLE:
         print("❌ OpenCV not available. Install with: pip install opencv-python")
         return 1
-    if not PICAMERA2_AVAILABLE:
-        print("❌ PiCamera2 not available. Install with: pip install picamera2")
+
+    cam, _backend_name = _instantiate_driver(camera_id, resolution, framerate, backend_choice)
+    if cam is None:
         return 1
 
-    cam = PiCameraDriver(camera_id=camera_id, resolution=resolution, framerate=framerate)
     if not cam.initialize():
         print("❌ Failed to initialize camera")
+        try:
+            cam.close()
+        except Exception:
+            pass
         return 1
     img = cam.capture_image()
     cam.close()
@@ -93,10 +187,14 @@ def test_processing(camera_id: int, resolution: tuple[int, int], framerate: int)
     return 0
 
 
-def stream(camera_id: int, resolution: tuple[int, int], framerate: int, duration_s: Optional[int]) -> int:
+def stream(camera_id: int,
+           resolution: tuple[int, int],
+           framerate: int,
+           duration_s: Optional[int],
+           backend_choice: Optional[str]) -> int:
     """Stream frames and print FPS to the console. Stops after duration if provided."""
-    if not PICAMERA2_AVAILABLE or not OPENCV_AVAILABLE:
-        print("❌ Required libraries not available (picamera2/opencv)")
+    cam, _backend_name = _instantiate_driver(camera_id, resolution, framerate, backend_choice)
+    if cam is None:
         return 1
 
     frame_count = 0
@@ -111,9 +209,12 @@ def stream(camera_id: int, resolution: tuple[int, int], framerate: int, duration
             fps = frame_count / elapsed
             print(f"FPS: {fps:.1f}")
 
-    cam = PiCameraDriver(camera_id=camera_id, resolution=resolution, framerate=framerate)
     if not cam.initialize():
         print("❌ Failed to initialize camera")
+        try:
+            cam.close()
+        except Exception:
+            pass
         return 1
     if not cam.start_streaming(on_frame):
         print("❌ Failed to start streaming")
@@ -150,12 +251,19 @@ def mjpeg_server(host: str,
                  vflip: bool,
                  hflip: bool,
                  force_both: bool,
+                 backend_choice: Optional[str],
                  proc_cfg: Optional[dict] = None,
                  ai_cfg: Optional[dict] = None,
                  overlay_status: bool = True) -> int:
     """Serve MJPEG over HTTP. Auto-uses two cameras if available unless forced single."""
-    if not PICAMERA2_AVAILABLE:
-        print("❌ PiCamera2 not available. Install with: pip install picamera2")
+    if not OPENCV_AVAILABLE:
+        print("❌ OpenCV not available. Install with: pip install opencv-python")
+        return 1
+
+    try:
+        backend_name = resolve_backend(backend_choice)
+    except RuntimeError as exc:
+        print(f"❌ {exc}")
         return 1
 
     try:
@@ -166,8 +274,34 @@ def mjpeg_server(host: str,
         print(f"❌ Missing deps for HTTP server: {e}")
         return 1
 
-    available = PiCameraDriver.list_cameras() or []
-    use_both = force_both or (len(available) >= 2 and camera_id is None)
+    available: list[dict] = []
+    candidate_ids: list[int] = []
+
+    # Only enumerate cameras (which probes device indices) when we actually need to.
+    if force_both or camera_id is None:
+        available = list_cameras_for_backend(backend_name) or []
+        for info in available:
+            ident = info.get("id")
+            if isinstance(ident, int):
+                candidate_ids.append(ident)
+            else:
+                try:
+                    candidate_ids.append(int(ident))
+                except Exception:
+                    candidate_ids.append(len(candidate_ids))
+        if not candidate_ids:
+            candidate_ids = list(range(len(available)))
+        # If user supplied camera ID but also requested dual mode, make sure it is first.
+        if force_both and camera_id is not None and camera_id not in candidate_ids:
+            candidate_ids.insert(0, camera_id)
+    else:
+        candidate_ids = [camera_id]
+
+    use_both = False
+    if force_both:
+        use_both = True
+    elif camera_id is None and len(candidate_ids) >= 2:
+        use_both = True
     processor: Optional[ImageProcessor] = None
     if proc_cfg and proc_cfg.get("enable", False):
         try:
@@ -292,17 +426,34 @@ def mjpeg_server(host: str,
                                      b"</body></html>")
 
     # Start cameras
-    cams: list[Optional[PiCameraDriver]] = []
+    cams: list[Optional[object]] = []
     if use_both:
-        cam_indices = (0, 1)
-        for idx in cam_indices:
-            cam = PiCameraDriver(camera_id=idx, resolution=resolution, framerate=framerate)
-            if not cam.initialize():
-                print(f"[cam{idx}] Failed to initialize camera")
+        ids_to_use = candidate_ids[:2]
+        if len(ids_to_use) < 2:
+            ids_to_use.extend(range(len(ids_to_use), 2))
+        for display_idx, cam_index in enumerate(ids_to_use[:2]):
+            try:
+                cam = create_camera_driver(
+                    backend_name,
+                    camera_id=cam_index,
+                    resolution=resolution,
+                    framerate=framerate,
+                )
+            except (RuntimeError, ImportError) as exc:
+                print(f"[cam{display_idx}] {exc}")
                 cams.append(None)
                 continue
 
-            def make_cb(i: int):
+            if not cam.initialize():
+                print(f"[cam{display_idx}] Failed to initialize camera")
+                try:
+                    cam.close()
+                except Exception:
+                    pass
+                cams.append(None)
+                continue
+
+            def make_cb(slot: int):
                 def on_frame(frame):
                     try:
                         import cv2
@@ -318,23 +469,22 @@ def mjpeg_server(host: str,
                         frame_flipped = frame
                     frame_out = frame_flipped
                     # Optional image processing overlay
-                    if processor is not None and proc_cfg.get("object_detection", False):
+                    if processor is not None and proc_cfg and proc_cfg.get("object_detection", False):
                         try:
                             lower = proc_cfg.get("lower_hsv", (0, 50, 50))
                             upper = proc_cfg.get("upper_hsv", (10, 255, 255))
                             min_area = int(proc_cfg.get("min_area", 100))
                             objs = processor.detect_objects_by_color(frame_out, lower, upper, min_area=min_area)
                             frame_out = processor.draw_bounding_boxes(frame_out, objs)
-                            # Annotate count
                             try:
                                 color_name = proc_cfg.get("color_name", "red")
+                                import cv2
                                 cv2.putText(frame_out, f"Detect: {color_name}  HSV {lower}-{upper}  min_area={min_area}  count={len(objs)}",
                                             (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
                             except Exception:
                                 pass
                         except Exception:
                             pass
-                    # YOLO overlay if enabled
                     if yolo is not None:
                         res = yolo.detect(frame_out)
                         dets = res.get("boxes", [])
@@ -344,8 +494,7 @@ def mjpeg_server(host: str,
                         if masks_val:
                             frame_out = YOLODetector.draw_masks(frame_out, masks_val)
                         else:
-                            # Visual hint if seg weights are used but no masks present
-                            if isinstance(getattr(yolo, 'weights', ''), str) and 'seg' in ai_cfg.get('weights', ''):
+                            if isinstance(getattr(yolo, 'weights', ''), str) and ai_cfg and 'seg' in ai_cfg.get('weights', ''):
                                 try:
                                     import cv2
                                     cv2.putText(frame_out, "(no masks in result; try --conf 0.15 or --imgsz 640)", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 255, 255), 2)
@@ -354,7 +503,6 @@ def mjpeg_server(host: str,
                         if res.get("keypoints"):
                             frame_out = YOLODetector.draw_keypoints(frame_out, res["keypoints"])
                         if overlay_status:
-                            # Render YOLO status even with 0 detections
                             try:
                                 import cv2
                                 cv2.putText(frame_out, f"{model_label}: {len(dets)}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
@@ -362,7 +510,6 @@ def mjpeg_server(host: str,
                                 pass
                     else:
                         if overlay_status:
-                            # Indicate YOLO is not active/available
                             try:
                                 import cv2
                                 status = f"{model_label}: OFF"
@@ -378,11 +525,11 @@ def mjpeg_server(host: str,
                     if jpeg is None:
                         return
                     with latest_lock:
-                        latest_map[i] = jpeg
+                        latest_map[slot] = jpeg
                 return on_frame
 
-            if not cam.start_streaming(make_cb(idx)):
-                print(f"[cam{idx}] Failed to start streaming")
+            if not cam.start_streaming(make_cb(display_idx)):
+                print(f"[cam{display_idx}] Failed to start streaming")
                 try:
                     cam.close()
                 except Exception:
@@ -395,10 +542,30 @@ def mjpeg_server(host: str,
             return 1
     else:
         # Single camera
-        use_id = 0 if camera_id is None else camera_id
-        cam = PiCameraDriver(camera_id=use_id, resolution=resolution, framerate=framerate)
+        if camera_id is not None:
+            use_id = camera_id
+        elif candidate_ids:
+            use_id = candidate_ids[0]
+        else:
+            use_id = 0
+
+        try:
+            cam = create_camera_driver(
+                backend_name,
+                camera_id=use_id,
+                resolution=resolution,
+                framerate=framerate,
+            )
+        except (RuntimeError, ImportError) as exc:
+            print(f"❌ {exc}")
+            return 1
+
         if not cam.initialize():
             print('Failed to initialize camera')
+            try:
+                cam.close()
+            except Exception:
+                pass
             return 1
 
         def on_frame_single(frame):
@@ -432,7 +599,6 @@ def mjpeg_server(host: str,
                         pass
                 except Exception:
                     pass
-            # YOLO overlay single
             if yolo is not None:
                 res = yolo.detect(frame_out)
                 dets = res.get("boxes", [])
@@ -442,7 +608,7 @@ def mjpeg_server(host: str,
                 if masks_val:
                     frame_out = YOLODetector.draw_masks(frame_out, masks_val)
                 else:
-                    if isinstance(getattr(yolo, 'weights', ''), str) and 'seg' in ai_cfg.get('weights', ''):
+                    if isinstance(getattr(yolo, 'weights', ''), str) and ai_cfg and 'seg' in ai_cfg.get('weights', ''):
                         try:
                             import cv2
                             cv2.putText(frame_out, "(no masks in result; try --conf 0.15 or --imgsz 640)", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 255, 255), 2)
@@ -500,6 +666,12 @@ def mjpeg_server(host: str,
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="GradientOS Vision CLI")
+    parser.add_argument(
+        "--backend",
+        choices=[BACKEND_AUTO, BACKEND_PICAMERA, BACKEND_USB],
+        default=BACKEND_AUTO,
+        help="Camera backend to use (default: auto-detect).",
+    )
     # Subcommand is optional; default to 'stream' so users can just run the tool with sensible defaults
     subparsers = parser.add_subparsers(dest="command")
 
@@ -606,18 +778,20 @@ def main() -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format='%(asctime)s - %(levelname)s - %(message)s')
 
+    backend_choice = getattr(args, "backend", BACKEND_AUTO)
+
     if args.command == "list":
-        return list_cameras()
+        return list_cameras(backend_choice)
 
     resolution = (args.width, args.height)
 
     if args.command == "init":
-        return test_init(args.camera, resolution, args.fps)
+        return test_init(args.camera, resolution, args.fps, backend_choice)
     if args.command == "processing":
-        return test_processing(args.camera, resolution, args.fps)
+        return test_processing(args.camera, resolution, args.fps, backend_choice)
     if args.command == "stream":
         duration: Optional[int] = args.duration if hasattr(args, "duration") else 0
-        return stream(args.camera, resolution, args.fps, duration)
+        return stream(args.camera, resolution, args.fps, duration, backend_choice)
     if args.command == "mjpeg":
         # Build optional image processing config if sub-mode selected
         proc_cfg = None
@@ -692,6 +866,7 @@ def main() -> int:
             vflip=vflip,
             hflip=hflip,
             force_both=getattr(args, "both", False),
+            backend_choice=getattr(args, "backend", BACKEND_AUTO),
             proc_cfg=proc_cfg,
             ai_cfg=ai_cfg,
             overlay_status=not getattr(args, "no_overlay", False),
@@ -703,5 +878,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

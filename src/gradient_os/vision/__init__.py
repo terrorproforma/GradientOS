@@ -8,8 +8,28 @@ This module provides functionality for:
 - Camera calibration utilities
 """
 
-from .camera_driver import PiCameraDriver
+from .camera_driver import (
+    PiCameraDriver,
+    USBCameraDriver,
+    available_backends,
+    create_camera_driver,
+    list_cameras_for_backend,
+    BACKEND_AUTO,
+    BACKEND_PICAMERA,
+    BACKEND_USB,
+)
 from .image_processor import ImageProcessor
 from .cli import main as vision_cli_main
 
-__all__ = ['PiCameraDriver', 'ImageProcessor', 'vision_cli_main']
+__all__ = [
+    'PiCameraDriver',
+    'USBCameraDriver',
+    'ImageProcessor',
+    'vision_cli_main',
+    'available_backends',
+    'create_camera_driver',
+    'list_cameras_for_backend',
+    'BACKEND_AUTO',
+    'BACKEND_PICAMERA',
+    'BACKEND_USB',
+]

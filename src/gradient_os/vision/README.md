@@ -5,6 +5,7 @@ This module provides camera functionality and computer vision capabilities for t
 ## Features
 
 - **Pi Camera Driver**: Full control of Raspberry Pi cameras with picamera2
+- **USB Camera Driver**: Cross-platform UVC webcam support via OpenCV (macOS + Linux)
 - **Image Processing**: OpenCV-based image processing and computer vision
 - **Object Detection**: Color-based object detection and tracking
 - **Real-time Streaming**: Live camera streaming with callback support
@@ -22,6 +23,10 @@ sudo apt install -y python3-libcamera python3-kms++
 ```
 
 These packages provide the low-level camera drivers and Python bindings that picamera2 depends on.
+
+#### macOS / Desktop Linux (USB webcams)
+
+For USB webcams on macOS or standard Linux desktops, no extra system packages are required beyond a working webcam. Just ensure the Python OpenCV wheel (`opencv-python`) is installed in your environment.
 
 ### Python Dependencies
 
@@ -76,8 +81,9 @@ Always install in this order:
 
 Key dependencies:
 - `picamera2==0.3.30`: For Raspberry Pi camera control
-- `opencv-python==4.10.0.84`: For computer vision functionality
+- `opencv-python==4.10.0.84`: For computer vision functionality and USB webcam backend
 - System packages: `python3-libcamera`, `python3-kms++`
+- USB webcams: Select with `--backend usb` (no extra system packages required on macOS/Linux)
 
 ## Quick Start
 
@@ -93,12 +99,18 @@ pip install -e .
 
 Run the vision CLI (you can also use the module form shown below). With no subcommand, it defaults to streaming using full-sensor friendly 4:3 defaults (camera 0, 1280x960 @ 30 FPS) to maximize FOV:
 
+NOTE: The `--backend usb` option is position-sensitive, so it must come before any subcommand.
+
 ```bash
-gradient-vision            # Streams from camera 0 at 1280x960@30 (4:3 for full sensor FOV)
+gradient-vision            # Auto-detect backend (Pi first, else USB) and stream from camera 0 at 1280x960@30
+
+# Force USB webcam backend on macOS/Linux desktops
+gradient-vision --backend usb stream --camera 0 --width 1280 --height 720 --fps 30
 
 
 # List available cameras
-gradient-vision list
+gradient-vision list                    # Auto-detect backend
+gradient-vision --backend usb list      # Explicitly enumerate USB webcams
 
 # Test camera initialization and capture a single frame
 gradient-vision init --camera 0 --width 640 --height 480 --fps 30
@@ -144,7 +156,7 @@ gradient-vision mjpeg ai-pose --weights yolo11n-pose.pt --conf 0.25 --imgsz 640 
 
 
 # Enable verbose logs with -v
-gradient-vision list -v
+gradient-vision --backend auto list -v
 ```
 
 ### Using cameras with the telemetry recorder
@@ -215,10 +227,15 @@ python -m gradient_os.vision stream --camera 0 --width 640 --height 480 --fps 30
 ### Basic Camera Usage
 
 ```python
-from gradient_os.vision import PiCameraDriver
+from gradient_os.vision import create_camera_driver, BACKEND_AUTO
 
-# Initialize camera
-camera = PiCameraDriver(resolution=(640, 480), framerate=30)
+# Initialize whichever backend is available (Pi first, then USB)
+camera = create_camera_driver(
+    BACKEND_AUTO,
+    camera_id=0,
+    resolution=(640, 480),
+    framerate=30,
+)
 camera.initialize()
 
 # Capture an image
@@ -226,6 +243,17 @@ image = camera.capture_image()
 
 # Clean up
 camera.close()
+```
+
+For explicit USB usage you can also import `USBCameraDriver` directly:
+
+```python
+from gradient_os.vision import USBCameraDriver
+
+cam = USBCameraDriver(camera_id=0, resolution=(1280, 720), framerate=30)
+cam.initialize()
+frame = cam.capture_image()
+cam.close()
 ```
 
 ### Image Processing
