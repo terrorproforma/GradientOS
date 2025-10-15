@@ -9,8 +9,10 @@
 # The pages are switched by calling the switch_to_home, switch_to_tutorials,
 # switch_to_calibration, switch_to_control, and switch_to_real_control functions.
 
-import sys
 import argparse
+import socket
+import sys
+from contextlib import closing
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QStackedWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QTableWidget, QTableWidgetItem, QListWidget,
@@ -70,9 +72,9 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(estop_btn)
 
         # --- UDP Configuration ---
-        self.PI_IP = pi_ip
-        print(f"PI_IP is set to: {self.PI_IP}")
         self.UDP_PORT = 3000
+        self.PI_IP = self._select_initial_target(pi_ip)
+        print(f"PI_IP is set to: {self.PI_IP}")
         self.client = UdpClient(self.PI_IP, self.UDP_PORT)
         self.client.start()
         # Main thread dispatcher to process messages without blocking UI
@@ -361,6 +363,44 @@ class MainWindow(QMainWindow):
             widget.style().polish(widget)
         except Exception:
             pass
+
+    def _select_initial_target(self, configured_host: str) -> str:
+        """Prefer localhost/loopback if the controller is running locally."""
+        manual_override = configured_host and configured_host != "mini-arm.local"
+        if manual_override:
+            # Caller explicitly pointed us to a host; honour it but verify reachability.
+            return configured_host if self._probe_host(configured_host) else configured_host
+
+        candidates = ["127.0.0.1", "localhost"]
+        if configured_host:
+            candidates.append(configured_host)
+
+        for host in candidates:
+            if self._probe_host(host):
+                if host != configured_host:
+                    print(f"[UI] Autodetected controller at {host}; overriding default target.")
+                return host
+
+        return configured_host
+
+    def _probe_host(self, host: str, timeout: float = 0.25) -> bool:
+        """Send a GET_STATUS probe to the controller and confirm a STATUS reply."""
+        try:
+            addr_info = socket.getaddrinfo(host, self.UDP_PORT, socket.AF_UNSPEC, socket.SOCK_DGRAM)
+        except socket.gaierror:
+            return False
+
+        for family, socktype, proto, _canon, sockaddr in addr_info:
+            try:
+                with closing(socket.socket(family, socktype, proto)) as sock:
+                    sock.settimeout(timeout)
+                    sock.sendto(b"GET_STATUS", sockaddr)
+                    data, _ = sock.recvfrom(128)
+                    if data.startswith(b"STATUS"):
+                        return True
+            except (OSError, TimeoutError):
+                continue
+        return False
 
 def main():
     parser = argparse.ArgumentParser(description='Robot Arm UI')

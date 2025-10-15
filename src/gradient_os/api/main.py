@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 from contextlib import closing
@@ -43,7 +44,10 @@ def _probe_controller(timeout: float = 0.5) -> Tuple[bool, str]:
         except socket.timeout:
             return False, f"Timed out waiting for controller response at {host}:{port}"
         except OSError as exc:
-            return False, f"Socket error connecting to controller at {host}:{port}: {exc}"
+            return (
+                False,
+                f"Socket error connecting to controller at {host}:{port}: {exc}",
+            )
 
     text = data.decode("utf-8", errors="ignore")
     if text.startswith("STATUS"):
@@ -161,14 +165,17 @@ class TelemetryHub:
                     # If still full, skip this subscriber to avoid blocking.
                     continue
 
-    def _format_event(self, text: str) -> str:
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return text
-        return json.dumps(parsed)
+
+def _format_event(self, text: str) -> str:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    return json.dumps(parsed)
+
 
 telemetry_hub = TelemetryHub()
+logger = logging.getLogger("uvicorn.error")
 
 
 def create_app() -> FastAPI:
@@ -183,13 +190,26 @@ def create_app() -> FastAPI:
         allow_credentials=allow_credentials,
     )
 
+    @api.on_event("startup")
+    async def _log_controller_status() -> None:
+        ok, detail = await run_in_threadpool(_probe_controller)
+        host, port = _resolve_controller_endpoint()
+        if ok:
+            logger.info("Controller: %s:%s", host, port)
+        else:
+            logger.warning("Controller: %s:%s (%s)", host, port, detail)
+
     @api.get("/health", summary="Controller health probe")
     async def health():
         ok, detail = await run_in_threadpool(_probe_controller)
         if not ok:
             raise HTTPException(status_code=503, detail=detail)
         host, port = _resolve_controller_endpoint()
-        return {"status": "ok", "detail": detail, "controller": {"host": host, "port": port}}
+        return {
+            "status": "ok",
+            "detail": detail,
+            "controller": {"host": host, "port": port},
+        }
 
     @api.get("/monitor", summary="Subscribe to controller telemetry stream")
     async def monitor():
@@ -248,6 +268,8 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+
 def _resolve_cors_origins() -> list[str]:
     raw = os.environ.get("GRADIENT_API_CORS", "")
     if not raw:

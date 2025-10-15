@@ -25,6 +25,13 @@ gradient-vision       # Vision module CLI (cameras, processing, streaming)
 gradient-api          # FastAPI proxy that exposes REST/SSE telemetry
 ```
 
+Component extras:
+- Core (`gradient-controller`, `gradient-api`) are installed by default.
+- UI/CLI tooling requires the `ui` extra: `uv pip install -e .[ui]`.
+- Camera/vision tooling (including telemetry capture) lives behind the `vision` extra: `uv pip install -e .[vision]`.
+- Combine extras as needed, e.g. `uv pip install -e .[ui,vision,ai]` for full tooling.
+- Raspberry Pi camera support still needs the system `picamera2` stack (typically installed via `sudo apt install -y python3-libcamera python3-picamera2`).
+
 Notes:
 - If you prefer not to install console scripts yet, aliases are provided after activation:
   - gradient-vision → python -m gradient_os.vision
