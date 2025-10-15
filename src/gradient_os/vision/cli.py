@@ -365,6 +365,10 @@ def mjpeg_server(host: str,
                 self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
                 self.end_headers()
                 try:
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                try:
                     while True:
                         with latest_lock:
                             jpeg = latest_single
@@ -376,6 +380,10 @@ def mjpeg_server(host: str,
                         self.wfile.write(b'Content-Length: ' + str(len(jpeg)).encode() + b'\r\n\r\n')
                         self.wfile.write(jpeg)
                         self.wfile.write(b'\r\n')
+                        try:
+                            self.wfile.flush()
+                        except Exception:
+                            pass
                 except BrokenPipeError:
                     pass
                 except Exception:
@@ -389,6 +397,10 @@ def mjpeg_server(host: str,
                 self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
                 self.end_headers()
                 try:
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                try:
                     while True:
                         with latest_lock:
                             jpeg = latest_map.get(cam_idx)
@@ -400,6 +412,10 @@ def mjpeg_server(host: str,
                         self.wfile.write(b'Content-Length: ' + str(len(jpeg)).encode() + b'\r\n\r\n')
                         self.wfile.write(jpeg)
                         self.wfile.write(b'\r\n')
+                        try:
+                            self.wfile.flush()
+                        except Exception:
+                            pass
                 except BrokenPipeError:
                     pass
                 except Exception:
@@ -644,7 +660,11 @@ def mjpeg_server(host: str,
         cam.start_streaming(on_frame_single)
         cams = [cam]
 
-    server = ThreadedHTTPServer((host, port), Handler)
+    try:
+        server = ThreadedHTTPServer((host, port), Handler)
+    except OSError as exc:
+        print(f"❌ Failed to bind MJPEG server on {host}:{port} ({exc})")
+        return 1
     if use_both:
         print(f"Serving MJPEG (cam0=/cam0.mjpg, cam1=/cam1.mjpg) on http://{host}:{port}/")
     else:
