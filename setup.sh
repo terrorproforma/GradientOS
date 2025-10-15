@@ -49,15 +49,41 @@ done
 
 # --- Environment detection ---------------------------------------------------
 OS_NAME=$(uname -s)
-OS_ID=""; OS_ID_LIKE=""
+OS_ID=""; OS_ID_LIKE=""; OS_PRETTY=""
 if [[ -f /etc/os-release ]]; then
   # shellcheck disable=SC1091
-  source /etc/os-release
-  OS_ID=${ID:-}; OS_ID_LIKE=${ID_LIKE:-}
+  source /etc/os-release || true
+  OS_ID=${ID:-}; OS_ID_LIKE=${ID_LIKE:-}; OS_PRETTY=${PRETTY_NAME:-}
 fi
 IS_RASPI=false
-if [[ $OS_ID == "raspbian" || $OS_ID_LIKE == *"raspbian"* || $OS_ID_LIKE == *"rpi"* ]]; then
-  IS_RASPI=true
+
+# Check device-tree identifiers first (most reliable)
+if [[ -r /proc/device-tree/model ]]; then
+  if tr -d '\0' </proc/device-tree/model | grep -qi 'raspberry pi'; then
+    IS_RASPI=true
+  fi
+fi
+if ! $IS_RASPI && [[ -r /sys/firmware/devicetree/base/model ]]; then
+  if tr -d '\0' </sys/firmware/devicetree/base/model | grep -qi 'raspberry pi'; then
+    IS_RASPI=true
+  fi
+fi
+
+# Fall back to os-release heuristics when device-tree missing (e.g. inside chroots)
+if ! $IS_RASPI; then
+  case ${OS_ID} in
+    raspi*|raspbi*) IS_RASPI=true ;;
+  esac
+fi
+if ! $IS_RASPI; then
+  case ${OS_ID_LIKE} in
+    *raspi*|*raspbian*|*raspios*) IS_RASPI=true ;;
+  esac
+fi
+if ! $IS_RASPI && [[ -f /etc/os-release ]]; then
+  if grep -qiE 'raspberry ?pi|raspbian|raspios' /etc/os-release; then
+    IS_RASPI=true
+  fi
 fi
 
 # --- Collect choices ---------------------------------------------------------
