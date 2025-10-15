@@ -56,6 +56,9 @@ vision = [
     "pandas==2.3.0",
     "pillow==11.2.1",
 ]
+picamera = [
+    "picamera2==0.3.30 ; platform_system == \"Linux\"",
+]
 ai = [
     "ultralytics",
     "torch",
