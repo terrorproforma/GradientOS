@@ -97,6 +97,7 @@ want_ai=false
 want_datasets=false
 want_dev=false
 want_picamera=false
+want_web_ui=false
 
 if $QUIET; then
   say "Quiet mode enabled – installing core only."
@@ -126,6 +127,13 @@ else
   if ask_yes_no "Install developer tooling (pytest, pre-commit)?" n; then
     want_dev=true
   fi
+  if [[ -f web-ui/package.json ]]; then
+    if ask_yes_no "Install web UI frontend dependencies (npm install)?" n; then
+      want_web_ui=true
+    fi
+  else
+    say "web-ui directory not found; skipping frontend install prompt."
+  fi
 fi
 
 append_extra() {
@@ -154,6 +162,9 @@ if $want_datasets; then
 fi
 if $want_dev; then
   append_extra dev "dev (tests/tooling)"
+fi
+if $want_web_ui; then
+  SELECTED_DESC+=("web-ui (npm install)")
 fi
 
 headline "Selected Components"
@@ -253,5 +264,17 @@ fi
 headline "Installing Python packages"
 say "uv pip install -e .[$EXTRA_SPEC]"
 uv pip install -e ".[${EXTRA_SPEC}]"
+
+if $want_web_ui; then
+  headline "Installing web UI dependencies"
+  if command -v npm >/dev/null 2>&1; then
+    pushd web-ui >/dev/null
+    npm install
+    popd >/dev/null
+    say "web UI dependencies installed."
+  else
+    warn "npm not found on PATH; install Node.js/npm and run 'npm install' inside web-ui/ manually."
+  fi
+fi
 
 say "Setup complete. Activate with: source .venv/bin/activate"
