@@ -2,31 +2,79 @@
 # Install system-level dependencies required by GradientOS vision and UI components.
 set -euo pipefail
 
+OS_ID=""
+OS_ID_LIKE=""
+if [[ -f /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  OS_ID=${ID:-}
+  OS_ID_LIKE=${ID_LIKE:-}
+fi
+
 APT_GET=$(command -v apt-get || true)
-if [[ -z "$APT_GET" ]]; then
-  echo "apt-get not found. This script currently supports Debian/Ubuntu systems." >&2
-  exit 1
+
+should_install_apt="false"
+if [[ "${OS_ID}" == "raspbian" || "${OS_ID_LIKE}" == *"raspbian"* || "${OS_ID_LIKE}" == *"rpi"* ]]; then
+  should_install_apt="true"
 fi
 
-if [[ $EUID -ne 0 ]]; then
-  SUDO="sudo"
+if [[ "${should_install_apt}" == "true" ]]; then
+  if [[ -z "$APT_GET" ]]; then
+    echo "[setup] Expected apt-get for Raspberry Pi OS but it was not found." >&2
+    exit 1
+  fi
+
+  if [[ $EUID -ne 0 ]]; then
+    SUDO="sudo"
+  else
+    SUDO=""
+  fi
+
+  packages=(
+    python3-libcamera
+    python3-kms++
+    libgl1-mesa-glx
+    libgl1-mesa-dri
+    mesa-utils
+    libcap-dev
+    curl
+  )
+
+  set -x
+  $SUDO "$APT_GET" update
+  $SUDO "$APT_GET" install -y "${packages[@]}"
+  set +x
 else
-  SUDO=""
+  uname_out=$(uname -s)
+  case "${OS_ID}" in
+    ubuntu)
+      cat <<'EOF'
+[setup] Detected Ubuntu. Please install system dependencies manually:
+    sudo apt-get update
+    sudo apt-get install python3-libcamera python3-kms++ libgl1-mesa-glx \
+        libgl1-mesa-dri mesa-utils libcap-dev curl
+EOF
+      ;;
+    "")
+      if [[ "${uname_out}" == "Darwin" ]]; then
+        cat <<'EOF'
+[setup] Detected macOS. Please ensure you have the following packages/installations:
+    brew install python libomp
+    # libcamera is not available; vision components require a Pi.
+EOF
+      else
+        cat <<EOF
+[setup] Unsupported distribution (${uname_out}). Install equivalent packages manually.
+EOF
+      fi
+      ;;
+    *)
+      cat <<EOF
+[setup] '${OS_ID}' detected. Please install the libcamera/Mesa dependencies manually.
+EOF
+      ;;
+  esac
 fi
-
-packages=(
-  python3-libcamera
-  python3-kms++
-  libgl1-mesa-glx
-  libgl1-mesa-dri
-  mesa-utils
-  libcap-dev
-  curl
-)
-
-set -x
-$SUDO "$APT_GET" update
-$SUDO "$APT_GET" install -y "${packages[@]}"
 
 
 if ! command -v uv >/dev/null 2>&1; then
