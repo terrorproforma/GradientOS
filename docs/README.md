@@ -22,6 +22,7 @@ gradient-controller   # Main controller for UDP commands
 gradient-ui           # Graphical user interface
 gradient-cli          # Command-line interface
 gradient-vision       # Vision module CLI (cameras, processing, streaming)
+gradient-api          # FastAPI proxy that exposes REST/SSE telemetry
 ```
 
 Notes:
@@ -32,35 +33,37 @@ Notes:
   - gradient-cli → python -m gradient_os.cli_controller
 - Always activate with `source ./start.sh`. Executing the script will not persist the environment.
 
-`gradient-ui` can be run remotely and can connect to your pi or other board via UDP. `gradient-controller` must run locally on your pi or board connected to the motor controller. 
+`gradient-ui` can be run remotely and can connect to your pi or other board via UDP. `gradient-controller` must run locally on your pi or board connected to the motor controller. The HTTP proxy (`gradient-api`) fans out telemetry over Server-Sent Events and is typically co-hosted with the controller.
+
+## HTTP API & Web Monitor
+
+- Start the proxy manually once the environment is prepared:
+  ```bash
+  gradient-api --host 0.0.0.0 --port 8000
+  ```
+  With no `GRADIENT_API_CORS` set, the API allows requests from any origin. Override `GRADIENT_CONTROLLER_HOST`/`PORT` if the UDP controller runs elsewhere.
+- A React-based telemetry dashboard lives under `web-ui/`. During development:
+  ```bash
+  cd web-ui
+  npm install
+  npm run dev -- --host 0.0.0.0 --port 4000
+  ```
+  Visiting `http://<pi-ip>:4000` auto-fills the API endpoint to `http://<pi-ip>:8000`; click **Connect** to subscribe to the `/monitor` SSE stream.
+- For unattended setups, install the API as a systemd service using the helper scripts in `web-ui/systemd/` (mirrors the arm-controller tooling):
+  ```bash
+  cd web-ui/systemd
+  ./install.sh
+  # ./status.sh / ./restart.sh / ./stop.sh / ./uninstall.sh as needed
+  ```
+  The unit runs `gradient-api` from the repo virtualenv and binds to `0.0.0.0:8000` by default.
 
 
 ## Running as a systemd Service
 
-For unattended deployments on Raspberry Pi, you can install the controller as a systemd service using the helper scripts under `systemd/`.
-
-1. Ensure the project is provisioned (virtualenv created, dependencies installed) and that `run.sh` works when executed manually.
-2. Install the service:
-   ```bash
-   cd /home/pi/src/GradientOS/systemd
-   ./install.sh
-   ```
-   This copies `arm-controller.service` into `/etc/systemd/system/`, reloads systemd, enables the unit, and starts it.
-3. Check status and logs anytime with:
-   ```bash
-   ./status.sh
-   ```
-4. To restart or stop the controller without rebooting:
-   ```bash
-   ./restart.sh    # or ./stop.sh
-   ```
-5. When you no longer need the service, remove it cleanly:
-   ```bash
-   ./uninstall.sh
-   ```
-
-The unit runs `run.sh` which bootstraps the venv, exports `DATA_PATH` (defaulting to `data/gradient-robotics`), and honors a `SERIAL_PORT` environment override. Adjust those via a systemd drop-in under `/etc/systemd/system/arm-controller.service.d/override.conf` if you require custom paths or serial devices.
-If no override is provided, the controller will attempt to auto-detect a single responsive USB serial adapter and fall back to `/dev/ttyUSB0` when detection is ambiguous—check the logs for guidance when multiple adapters are present.
+For unattended deployments on Raspberry Pi, bundled systemd units live under
+`systemd/`. See `systemd/README.md` for installation scripts and details for
+both the controller (`systemd/controller/`) and the HTTP API proxy
+(`systemd/api/`).
 
 
 # command CLI 
