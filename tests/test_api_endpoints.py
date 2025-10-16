@@ -19,23 +19,45 @@ def patch_send(monkeypatch):
         ),
         "GET_JOINT_ANGLES": (True, "JOINT_ANGLES,1,2,3,4,5,6,7"),
         "GET_GRIPPER_STATE": (True, "GRIPPER_STATE,45.0,2048"),
+        "GET_ALL_POSITIONS": (
+            True,
+            "ALL_POS_DATA,10,2048,20,2050,21,2050",
+        ),
+        "GET_ORIENTATION": (
+            True,
+            "CURRENT_ORIENTATION,1,0,0,0,1,0,0,0,1",
+        ),
+        "GET_TRAJECTORIES": (True, "TRAJECTORIES,alpha,beta"),
     }
+    no_reply_commands = {
+        "PLAN_TRAJECTORY",
+        "REC_POS",
+        "END_TRAJECTORY,test",
+        "RUN_TRAJECTORY,alpha,false",
+    }
+    call_log = []
 
     def fake_send(command, timeout=0.5, expect_response=True):
+        call_log.append((command, timeout, expect_response))
+        if command in no_reply_commands:
+            if expect_response:
+                return False, f"unexpected response requested for {command}"
+            return True, ""
         return responses.get(command, (False, f"unexpected {command}"))
 
     monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
     monkeypatch.setattr(
         "gradient_os.api.main._probe_controller", lambda timeout=0.5: (True, "ok")
     )
-    yield
+    yield call_log
 
 
 @pytest.fixture
 def client(monkeypatch):
-    with patch_send(monkeypatch):
+    with patch_send(monkeypatch) as call_log:
         app = create_app()
         with TestClient(app) as client:
+            client.command_calls = call_log  # type: ignore[attr-defined]
             yield client
 
 
@@ -76,3 +98,53 @@ def test_info_gripper(client):
     resp = client.get("/info/gripper")
     assert resp.status_code == 200
     assert resp.json() == {"angle_deg": 45.0, "raw_position": 2048}
+
+
+def test_info_all_positions(client):
+    resp = client.get("/info/all-positions")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "servos": [
+            {"servo_id": 10, "raw_position": 2048},
+            {"servo_id": 20, "raw_position": 2050},
+            {"servo_id": 21, "raw_position": 2050},
+        ]
+    }
+
+
+def test_info_orientation(client):
+    resp = client.get("/info/orientation")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "matrix": [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    }
+
+
+def test_trajectory_plan_record_end(client):
+    resp = client.post("/trajectory/plan")
+    assert resp.status_code == 200
+    assert client.command_calls[-1] == ("PLAN_TRAJECTORY", 1.0, False)
+
+    resp = client.post("/trajectory/record")
+    assert resp.status_code == 200
+    assert client.command_calls[-1] == ("REC_POS", 1.0, False)
+
+    resp = client.post("/trajectory/end", json={"name": "test"})
+    assert resp.status_code == 200
+    assert client.command_calls[-1] == ("END_TRAJECTORY,test", 2.0, False)
+
+
+def test_trajectory_list(client):
+    resp = client.get("/trajectory/list")
+    assert resp.status_code == 200
+    assert resp.json() == {"trajectories": ["alpha", "beta"]}
+
+
+def test_trajectory_run(client):
+    resp = client.post("/trajectory/run", json={"name": "alpha"})
+    assert resp.status_code == 200
+    assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false", 2.0, False)

@@ -270,6 +270,24 @@ def create_app() -> FastAPI:
             "joints_deg": joint_vals,
         }
 
+    @api.get("/info/orientation", summary="Current end-effector orientation matrix")
+    async def info_orientation():
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_ORIENTATION", timeout=1.0)
+        parts = detail.split(",")
+        if not parts or parts[0] != "CURRENT_ORIENTATION" or len(parts) != 10:
+            raise HTTPException(status_code=502, detail=f"Malformed orientation reply: {detail}")
+        try:
+            matrix_values = list(map(float, parts[1:]))
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"Invalid orientation data: {exc}") from exc
+        return {
+            "matrix": [
+                matrix_values[0:3],
+                matrix_values[3:6],
+                matrix_values[6:9],
+            ]
+        }
+
     @api.get("/info/joints", summary="Current joint angles")
     async def info_joints():
         detail = await run_in_threadpool(_controller_call_or_503, "GET_JOINT_ANGLES")
@@ -300,6 +318,31 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=f"Invalid gripper data: {exc}") from exc
         return {"angle_deg": angle_deg, "raw_position": raw}
 
+    @api.get("/info/all-positions", summary="Raw servo positions")
+    async def info_all_positions():
+        detail = await run_in_threadpool(
+            _controller_call_or_503, "GET_ALL_POSITIONS", timeout=1.0
+        )
+        parts = detail.split(",")
+        if not parts or parts[0] != "ALL_POS_DATA" or len(parts) < 3:
+            raise HTTPException(status_code=502, detail=f"Malformed positions reply: {detail}")
+        if (len(parts) - 1) % 2 != 0:
+            raise HTTPException(status_code=502, detail=f"Unexpected positions payload: {detail}")
+        payload = []
+        for i in range(1, len(parts), 2):
+            servo_id = parts[i]
+            position = parts[i + 1]
+            try:
+                servo_id_int = int(servo_id)
+            except ValueError:
+                servo_id_int = servo_id  # fall back to raw string if malformed
+            try:
+                position_int: int | None = None if position == "FAIL" else int(position)
+            except ValueError:
+                position_int = None
+            payload.append({"servo_id": servo_id_int, "raw_position": position_int})
+        return {"servos": payload}
+
     @api.get("/monitor", summary="Subscribe to controller telemetry stream")
     async def monitor():
         token, queue = await telemetry_hub.register()
@@ -315,6 +358,67 @@ def create_app() -> FastAPI:
                 await telemetry_hub.unregister(token)
 
         return EventSourceResponse(event_generator(), ping=15)
+
+    @api.post("/trajectory/plan", summary="Begin recording a new trajectory")
+    async def trajectory_plan():
+        await run_in_threadpool(
+            _controller_call_or_503,
+            "PLAN_TRAJECTORY",
+            timeout=1.0,
+            expect_response=False,
+        )
+        return {"status": "ok"}
+
+    @api.post("/trajectory/record", summary="Record current pose into active trajectory")
+    async def trajectory_record():
+        await run_in_threadpool(
+            _controller_call_or_503, "REC_POS", timeout=1.0, expect_response=False
+        )
+        return {"status": "ok"}
+
+    @api.post("/trajectory/end", summary="Finish trajectory recording and save by name")
+    async def trajectory_end(payload: dict):
+        name = (payload or {}).get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(status_code=400, detail="Field 'name' is required.")
+        command = f"END_TRAJECTORY,{name.strip()}"
+        await run_in_threadpool(
+            _controller_call_or_503, command, timeout=2.0, expect_response=False
+        )
+        return {"status": "ok", "name": name.strip()}
+
+    @api.get("/trajectory/list", summary="List available recorded trajectories")
+    async def trajectory_list():
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_TRAJECTORIES")
+        parts = detail.split(",")
+        if not parts or parts[0] != "TRAJECTORIES":
+            raise HTTPException(status_code=502, detail=f"Malformed trajectory list: {detail}")
+        names = [name for name in parts[1:] if name]
+        return {"trajectories": names}
+
+    @api.post("/trajectory/run", summary="Execute a recorded trajectory")
+    async def trajectory_run(payload: dict):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body required.")
+        name = payload.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(status_code=400, detail="Field 'name' is required.")
+        use_cache = payload.get("use_cache", False)
+        loop_override = payload.get("loop_override")
+        parts = [name.strip()]
+        if isinstance(use_cache, bool):
+            parts.append("true" if use_cache else "false")
+        else:
+            parts.append("" if use_cache is None else str(use_cache))
+        if isinstance(loop_override, bool):
+            parts.append("true" if loop_override else "false")
+        elif loop_override is not None:
+            parts.append(str(loop_override))
+        command = "RUN_TRAJECTORY," + ",".join(parts)
+        await run_in_threadpool(
+            _controller_call_or_503, command, timeout=2.0, expect_response=False
+        )
+        return {"status": "ok"}
 
     return api
 

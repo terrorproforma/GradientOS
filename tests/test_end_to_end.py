@@ -74,8 +74,16 @@ class TestEndToEnd(unittest.TestCase):
 
         # 3. Send a MOVE_LINE command via UDP
         target_ip = utils.PI_IP
+        if target_ip == "0.0.0.0":
+            target_ip = "127.0.0.1"
         command = "MOVE_LINE,0.1,0.2,0.3,0.1,0.05"
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(1.0)
+            sock.sendto(b"GET_STATUS", (target_ip, utils.UDP_PORT))
+            try:
+                _resp, _ = sock.recvfrom(1024)
+            except socket.timeout:
+                self.fail("Controller did not respond to GET_STATUS")
             try:
                 sock.sendto(command.encode('utf-8'), (target_ip, utils.UDP_PORT))
             except OSError as exc:
@@ -85,7 +93,10 @@ class TestEndToEnd(unittest.TestCase):
                     sock.sendto(command.encode('utf-8'), (target_ip, utils.UDP_PORT))
                 else:
                     raise
-            time.sleep(0.5) # Give the command time to be processed
+            for _ in range(10):
+                if mock_sync_write.called:
+                    break
+                time.sleep(0.2)
 
         # 4. Assert that the controller attempted a sync write with servo commands
         self.assertTrue(mock_sync_write.called, "Controller never issued a sync write.")
