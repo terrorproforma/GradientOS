@@ -12,6 +12,9 @@ import URDFLoader, { type URDFRobot } from "urdf-loader";
 type ArmVisualizerProps = {
   joints?: number[];
   showBoundingBox: boolean;
+  selectionMode: boolean;
+  onPointSelected?: (point: { x: number; y: number; z: number }) => void;
+  previewPath?: Array<{ x: number; y: number; z: number }>;
 };
 
 const GRID_CELL_SIZE = 0.05; // 10 cm per square
@@ -34,10 +37,11 @@ export type ArmVisualizerHandle = {
 };
 
 export const ArmVisualizer = forwardRef(function ArmVisualizer(
-  { joints, showBoundingBox }: ArmVisualizerProps,
+  { joints, showBoundingBox, selectionMode, onPointSelected, previewPath }: ArmVisualizerProps,
   ref: ForwardedRef<ArmVisualizerHandle>,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
   const robotRef = useRef<URDFRobot | null>(null);
   const targetAnglesRef = useRef<number[] | null>(null);
   const currentAnglesRef = useRef<number[] | null>(null);
@@ -56,6 +60,12 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   const setBoundsVisibilityRef = useRef<((visible: boolean) => void) | null>(
     null,
   );
+  const selectionModeRef = useRef(selectionMode);
+  const onPointSelectedRef = useRef(onPointSelected);
+  const previewGroupRef = useRef<THREE.Group | null>(null);
+  const raycasterRef = useRef(new THREE.Raycaster());
+  const pointerRef = useRef(new THREE.Vector2());
+  const groundPlaneRef = useRef(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0));
 
   useEffect(() => {
     const container = containerRef.current;
@@ -65,6 +75,10 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color("#020617");
+    sceneRef.current = scene;
+    const raycaster = raycasterRef.current;
+    const pointer = pointerRef.current;
+    const groundPlane = groundPlaneRef.current;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -109,6 +123,32 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       0x1e293b,
     );
     scene.add(grid);
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!selectionModeRef.current) {
+        return;
+      }
+      const camera = cameraRef.current;
+      if (!camera) {
+        return;
+      }
+      event.preventDefault();
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      const intersection = new THREE.Vector3();
+      if (raycaster.ray.intersectPlane(groundPlane, intersection)) {
+        const callback = onPointSelectedRef.current;
+        if (callback) {
+          callback({
+            x: intersection.x,
+            y: Math.max(intersection.y, 0),
+            z: intersection.z,
+          });
+        }
+      }
+    };
 
     const loader = new URDFLoader();
     const assetBasePath = "/assets/mini-6dof-arm/";
@@ -534,9 +574,11 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     };
     animate();
 
+    renderer.domElement.addEventListener("pointerdown", handlePointerDown);
     window.addEventListener("resize", handleResize);
 
     return () => {
+      renderer.domElement.removeEventListener("pointerdown", handlePointerDown);
       window.removeEventListener("resize", handleResize);
       cancelAnimationFrame(animationFrameId);
       controls.dispose();
@@ -550,6 +592,25 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       }
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
+      }
+      const previewGroup = previewGroupRef.current;
+      if (previewGroup) {
+        previewGroup.traverse((object) => {
+          if ((object as THREE.Mesh).isMesh) {
+            const meshChild = object as THREE.Mesh;
+            meshChild.geometry.dispose();
+            if (Array.isArray(meshChild.material)) {
+              meshChild.material.forEach((mat) => mat.dispose());
+            } else {
+              (meshChild.material as THREE.Material).dispose();
+            }
+          } else if (object instanceof THREE.Line) {
+            object.geometry.dispose();
+            (object.material as THREE.Material).dispose();
+          }
+        });
+        scene.remove(previewGroup);
+        previewGroupRef.current = null;
       }
       boundingMarkersRef.current.forEach((marker) => {
         scene.remove(marker);
@@ -567,6 +628,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       });
       boundingMarkersRef.current = [];
       scene.clear();
+      sceneRef.current = null;
       robotRef.current = null;
       targetAnglesRef.current = null;
       currentAnglesRef.current = null;
@@ -618,6 +680,19 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   );
 
   useEffect(() => {
+    selectionModeRef.current = selectionMode;
+    const controls = controlsRef.current;
+    if (controls) {
+      controls.enableRotate = !selectionMode;
+      controls.enablePan = !selectionMode;
+    }
+  }, [selectionMode]);
+
+  useEffect(() => {
+    onPointSelectedRef.current = onPointSelected;
+  }, [onPointSelected]);
+
+  useEffect(() => {
     if (!joints || joints.length === 0) {
       return;
     }
@@ -646,6 +721,82 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       setter(showBoundingBox);
     }
   }, [showBoundingBox]);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) {
+      return;
+    }
+
+    const disposeGroup = (group: THREE.Group | null) => {
+      if (!group) {
+        return;
+      }
+      group.traverse((object) => {
+        if ((object as THREE.Mesh).isMesh) {
+          const mesh = object as THREE.Mesh;
+          mesh.geometry.dispose();
+          if (Array.isArray(mesh.material)) {
+            mesh.material.forEach((mat) => mat.dispose());
+          } else {
+            (mesh.material as THREE.Material).dispose();
+          }
+        } else if (object instanceof THREE.Line) {
+          object.geometry.dispose();
+          (object.material as THREE.Material).dispose();
+        }
+      });
+    };
+
+    if (previewGroupRef.current) {
+      scene.remove(previewGroupRef.current);
+      disposeGroup(previewGroupRef.current);
+      previewGroupRef.current = null;
+    }
+
+    if (!previewPath || previewPath.length === 0) {
+      return;
+    }
+
+    const points = previewPath.map(({ x, y, z }) => new THREE.Vector3(x, y, z));
+    const group = new THREE.Group();
+
+    if (points.length >= 2) {
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({ color: 0x38bdf8 });
+      const line = new THREE.Line(geometry, material);
+      group.add(line);
+    }
+
+    points.forEach((point, index) => {
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.008, 12, 12),
+        new THREE.MeshBasicMaterial({
+          color: index === points.length - 1 ? 0x22d3ee : 0x94a3b8,
+        }),
+      );
+      marker.position.copy(point);
+      group.add(marker);
+    });
+
+    scene.add(group);
+    previewGroupRef.current = group;
+
+    return () => {
+      scene.remove(group);
+      disposeGroup(group);
+      if (previewGroupRef.current === group) {
+        previewGroupRef.current = null;
+      }
+    };
+  }, [previewPath]);
+
+  useEffect(() => {
+    const canvas = containerRef.current?.querySelector("canvas");
+    if (canvas) {
+      canvas.style.cursor = selectionMode ? "crosshair" : "";
+    }
+  }, [selectionMode]);
 
   return <div ref={containerRef} className="absolute inset-0" />;
 });

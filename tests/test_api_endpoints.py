@@ -34,6 +34,7 @@ def patch_send(monkeypatch):
         "REC_POS",
         "END_TRAJECTORY,test",
         "RUN_TRAJECTORY,alpha,false",
+        "0,0,0,0,0,0",
     }
     call_log = []
 
@@ -42,6 +43,8 @@ def patch_send(monkeypatch):
         if command in no_reply_commands:
             if expect_response:
                 return False, f"unexpected response requested for {command}"
+            return True, ""
+        if not expect_response:
             return True, ""
         return responses.get(command, (False, f"unexpected {command}"))
 
@@ -71,6 +74,12 @@ def test_control_wait_for_idle(client):
     resp = client.post("/control/wait-for-idle")
     assert resp.status_code == 200
     assert resp.json()["detail"] == "ACK,WAIT_FOR_IDLE"
+
+
+def test_control_home(client):
+    resp = client.post("/control/home")
+    assert resp.status_code == 200
+    assert client.command_calls[-1] == ("0,0,0,0,0,0", 2.0, False)
 
 
 def test_info_status(client):
@@ -148,3 +157,49 @@ def test_trajectory_run(client):
     resp = client.post("/trajectory/run", json={"name": "alpha"})
     assert resp.status_code == 200
     assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false", 2.0, False)
+
+
+def test_preview_execute_clear(client, monkeypatch):
+    planned_path = [
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.05, 0.04, 0.03, 0.02, 0.01, 0.0],
+    ]
+
+    def fake_plan(start_q, target_pos, velocity, acceleration, frequency, use_smoothing):
+        return planned_path
+
+    monkeypatch.setattr(
+        "gradient_os.arm_controller.trajectory_execution._plan_smooth_move",
+        fake_plan,
+    )
+
+    def fake_fk(joints):
+        return [0.2, 0.1, 0.3]
+
+    monkeypatch.setattr(
+        "gradient_os.ik_solver.get_fk",
+        fake_fk,
+    )
+
+    resp = client.post(
+        "/trajectory/preview",
+        json={"x": 0.2, "y": 0.1, "z": 0.3, "velocity": 0.2, "acceleration": 0.1, "closed_loop": False},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["joints_rad"] == planned_path
+    assert body.get("cartesian_m") == [[0.2, 0.1, 0.3], [0.2, 0.1, 0.3]]
+    assert client.command_calls[-1] == ("GET_POSITION", 1.0, True)
+
+    resp = client.post("/trajectory/execute-preview")
+    assert resp.status_code == 200
+    # Last two commands: MOVE_LINE..., WAIT_FOR_IDLE
+    assert client.command_calls[-2][0].startswith("MOVE_LINE,0.2,0.1,0.3,0.2,0.1")
+    assert client.command_calls[-1] == ("WAIT_FOR_IDLE", 60.0, True)
+
+    # Preview cleared, executing again should fail
+    resp = client.post("/trajectory/execute-preview")
+    assert resp.status_code == 404
+
+    resp = client.post("/trajectory/clear-preview")
+    assert resp.status_code == 200

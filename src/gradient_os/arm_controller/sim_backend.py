@@ -161,7 +161,13 @@ def _sim_sync_write_goal_pos_speed_accel(
         _SIM_STATE.set_raw(servo_id, raw_pos)
 
 
-def _sim_sync_read_positions(servo_ids: Iterable[int]) -> Dict[int, int]:
+def _sim_sync_read_positions(
+    servo_ids: Iterable[int],
+    *,
+    timeout_s: float | None = None,
+    poll_delay_s: float | None = None,
+    **_kwargs,
+) -> Dict[int, int]:
     return {servo_id: _SIM_STATE.get_raw(servo_id) for servo_id in servo_ids}
 
 
@@ -250,4 +256,3 @@ def activate() -> None:
     servo_protocol.restart_servo = _sim_restart_servo  # type: ignore[assignment]
 
     activate._activated = True
-

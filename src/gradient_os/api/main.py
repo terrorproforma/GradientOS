@@ -6,7 +6,7 @@ import logging
 import os
 import socket
 from contextlib import closing, asynccontextmanager
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 import argparse
 
@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+import numpy as np
 
 try:
     from ..arm_controller import utils as controller_utils
@@ -181,6 +182,8 @@ class TelemetryHub:
 
 telemetry_hub = TelemetryHub()
 logger = logging.getLogger("uvicorn.error")
+_latest_plan_lock = asyncio.Lock()
+_latest_plan: dict[str, Any] | None = None
 
 
 def create_app() -> FastAPI:
@@ -243,6 +246,13 @@ def create_app() -> FastAPI:
             _controller_call_or_503, "WAIT_FOR_IDLE", timeout=60.0, expect_response=True
         )
         return {"status": "ok", "detail": detail}
+
+    @api.post("/control/home", summary="Move all joints to zero position")
+    async def control_home():
+        await run_in_threadpool(
+            _controller_call_or_503, "0,0,0,0,0,0", timeout=2.0, expect_response=False
+        )
+        return {"status": "ok"}
 
     @api.get("/info/status", summary="Controller status snapshot")
     async def info_status():
@@ -420,7 +430,126 @@ def create_app() -> FastAPI:
         )
         return {"status": "ok"}
 
+    @api.post("/trajectory/preview", summary="Plan a trajectory to a target point")
+    async def trajectory_preview(payload: dict):
+        plan = await _plan_point(payload)
+        async with _latest_plan_lock:
+            global _latest_plan
+            _latest_plan = plan
+        return plan
+
+    @api.post("/trajectory/execute-preview", summary="Execute the last planned preview trajectory")
+    async def trajectory_execute_preview():
+        global _latest_plan
+        async with _latest_plan_lock:
+            plan = _latest_plan
+        if plan is None:
+            raise HTTPException(status_code=404, detail="No planned trajectory is available.")
+
+        target = plan.get("target", {})
+        try:
+            x = float(target["x"])
+            y = float(target["y"])
+            z = float(target["z"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=500, detail="Stored plan is invalid.")
+
+        velocity = float(plan.get("velocity", 0.1))
+        acceleration = float(plan.get("acceleration", 0.05))
+        closed_loop = bool(plan.get("closed_loop", True))
+        closed_loop_token = "true" if closed_loop else "false"
+
+        command = f"MOVE_LINE,{x},{y},{z},{velocity},{acceleration},{closed_loop_token}"
+        await run_in_threadpool(
+            _controller_call_or_503, command, timeout=5.0, expect_response=False
+        )
+        await run_in_threadpool(
+            _controller_call_or_503, "WAIT_FOR_IDLE", timeout=60.0, expect_response=True
+        )
+
+        async with _latest_plan_lock:
+            _latest_plan = None
+        return {"status": "ok"}
+
+    @api.post("/trajectory/clear-preview", summary="Discard the stored preview trajectory")
+    async def trajectory_clear_preview():
+        global _latest_plan
+        async with _latest_plan_lock:
+            _latest_plan = None
+        return {"status": "ok"}
+
     return api
+
+
+def _parse_pose_response(detail: str) -> list[float]:
+    parts = detail.split(",")
+    if len(parts) < 7 or parts[0] != "CURRENT_POSE":
+        raise ValueError(f"Malformed pose reply: {detail}")
+    try:
+        joints = [float(value) for value in parts[7:]]
+    except ValueError as exc:
+        raise ValueError("Invalid joint data from controller") from exc
+    return joints
+
+
+async def _plan_point(payload: dict) -> dict[str, Any]:
+    try:
+        x = float(payload.get("x"))
+        y = float(payload.get("y"))
+        z = float(payload.get("z"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Fields 'x', 'y', 'z' are required floats")
+
+    velocity = float(payload.get("velocity", 0.1))
+    acceleration = float(payload.get("acceleration", 0.05))
+    closed_loop = bool(payload.get("closed_loop", True))
+
+    def _compute_plan() -> dict[str, Any]:
+        ok, detail = _send_controller_command("GET_POSITION", timeout=1.0)
+        if not ok:
+            raise HTTPException(status_code=503, detail=detail)
+        try:
+            start_joints = _parse_pose_response(detail)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        from ..arm_controller import trajectory_execution
+        from .. import ik_solver
+
+        target = np.array([x, y, z], dtype=float)
+        path = trajectory_execution._plan_smooth_move(
+            start_q=start_joints,
+            target_pos=target,
+            velocity=velocity,
+            acceleration=acceleration,
+            frequency=100,
+            use_smoothing=True,
+        )
+        if not path:
+            raise HTTPException(status_code=502, detail="Planner failed to produce a path")
+
+        cartesian_points: list[list[float]] = []
+        for joints in path:
+            try:
+                fk_point = ik_solver.get_fk(joints)
+            except Exception:
+                fk_point = None
+            if fk_point is None:
+                continue
+            arr = np.asarray(fk_point, dtype=float)
+            if arr.shape[0] >= 3:
+                cartesian_points.append(arr[:3].tolist())
+
+        return {
+            "target": {"x": x, "y": y, "z": z},
+            "velocity": velocity,
+            "acceleration": acceleration,
+            "closed_loop": closed_loop,
+            "joints_rad": path,
+            "cartesian_m": cartesian_points,
+        }
+
+    return await run_in_threadpool(_compute_plan)
 
 
 app = create_app()

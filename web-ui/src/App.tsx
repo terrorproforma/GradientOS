@@ -2,10 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
   CameraOff,
+  Home,
   Octagon,
+  Play,
   Plug,
   RefreshCcw,
+  Route,
   Settings,
+  Trash2,
   Unplug,
   X,
 } from "lucide-react";
@@ -17,6 +21,15 @@ type TelemetryEvent = {
   raw: string;
   joints?: number[];
   gripper?: number;
+};
+
+type TrajectoryPreview = {
+  target: { x: number; y: number; z: number };
+  velocity: number;
+  acceleration: number;
+  closed_loop: boolean;
+  joints_rad: number[][];
+  cartesian_m?: number[][];
 };
 
 function normaliseApiHost(input: string): string {
@@ -74,6 +87,102 @@ function TelemetryPanel({ latest }: { latest: TelemetryEvent | null }) {
           No telemetry yet. Connect to the API and start streaming.
         </p>
       )}
+    </div>
+  );
+}
+
+type TrajectoryPanelProps = {
+  isPlanning: boolean;
+  isPlanLoading: boolean;
+  isRunning: boolean;
+  preview: TrajectoryPreview | null;
+  onPlan: () => void;
+  onRun: () => void;
+  onClear: () => void;
+};
+
+function TrajectoryPanel({
+  isPlanning,
+  isPlanLoading,
+  isRunning,
+  preview,
+  onPlan,
+  onRun,
+  onClear,
+}: TrajectoryPanelProps) {
+  const waypoints = preview?.joints_rad?.length ?? 0;
+  const target = preview?.target;
+
+  return (
+    <div className="pointer-events-auto w-full max-w-xs rounded-xl border border-slate-700/60 bg-slate-900/80 p-4 shadow-lg shadow-slate-900/50 backdrop-blur-lg">
+      <div className="mb-3 flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200/80">
+          Trajectory
+        </span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onPlan}
+            disabled={isPlanLoading || isRunning}
+            className={`rounded-full border border-slate-600/50 p-2 transition ${
+              isPlanning
+                ? "bg-cyan-500/80 text-slate-950 shadow-inner shadow-cyan-400/40"
+                : "bg-slate-900/60 text-slate-200 hover:border-slate-400 hover:text-slate-100"
+            } ${isPlanLoading || isRunning ? "opacity-60" : ""}`}
+            aria-label="Select trajectory target"
+          >
+            <Route size={18} strokeWidth={2} />
+          </button>
+          <button
+            type="button"
+            onClick={onRun}
+            disabled={!preview || isPlanLoading || isRunning}
+            className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
+              (!preview || isPlanLoading || isRunning) ? "opacity-60" : ""
+            }`}
+            aria-label="Execute planned trajectory"
+          >
+            <Play size={18} strokeWidth={2} />
+          </button>
+          <button
+            type="button"
+            onClick={onClear}
+            disabled={(!preview && !isPlanning) || isPlanLoading}
+            className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
+              ((!preview && !isPlanning) || isPlanLoading) ? "opacity-60" : ""
+            }`}
+            aria-label="Clear planned trajectory"
+          >
+            <Trash2 size={18} strokeWidth={2} />
+          </button>
+        </div>
+      </div>
+      <div className="text-sm text-slate-100/90">
+        {isPlanLoading ? (
+          <p>Planning preview trajectory…</p>
+        ) : isRunning ? (
+          <p>Executing trajectory…</p>
+        ) : isPlanning ? (
+          <p>Select a point in the workspace to preview a trajectory.</p>
+        ) : preview ? (
+          <div className="flex flex-col gap-2">
+            {target && (
+              <div className="text-xs text-slate-300/80">
+                Target (m):{" "}
+                <span className="font-semibold text-slate-100">
+                  {target.x.toFixed(3)}, {target.y.toFixed(3)}, {target.z.toFixed(3)}
+                </span>
+              </div>
+            )}
+            <div className="text-xs text-slate-300/80">
+              Waypoints:{" "}
+              <span className="font-semibold text-slate-100">{waypoints}</span>
+            </div>
+          </div>
+        ) : (
+          <p>No preview planned yet.</p>
+        )}
+      </div>
     </div>
   );
 }
@@ -199,7 +308,14 @@ export default function App() {
   const [isVisionActive, setIsVisionActive] = useState(false);
   const [showBoundingBox, setShowBoundingBox] = useState(true);
   const [isStopping, setIsStopping] = useState(false);
+  const [previewTrajectory, setPreviewTrajectory] = useState<TrajectoryPreview | null>(null);
+  const [previewPath, setPreviewPath] = useState<Array<{ x: number; y: number; z: number }>>([]);
+  const [isPlanning, setIsPlanning] = useState(false);
+  const [isPlanLoading, setIsPlanLoading] = useState(false);
+  const [isRunningPreview, setIsRunningPreview] = useState(false);
+  const [isHoming, setIsHoming] = useState(false);
   const visualizerRef = useRef<ArmVisualizerHandle | null>(null);
+  const normalizedApiHost = useMemo(() => normaliseApiHost(apiHost), [apiHost]);
   const normalisedVisionHost = useMemo(
     () => normaliseVisionHost(visionHost),
     [visionHost],
@@ -231,6 +347,12 @@ export default function App() {
     setLatest(null);
     setIsVisionActive(false);
     setVisionError(null);
+    setPreviewTrajectory(null);
+    setPreviewPath([]);
+    setIsPlanning(false);
+    setIsPlanLoading(false);
+    setIsRunningPreview(false);
+    setIsHoming(false);
   }, []);
 
   const handleMessage = useCallback((payload: string) => {
@@ -266,7 +388,7 @@ export default function App() {
     if (isConnected) {
       return;
     }
-    const host = normaliseApiHost(apiHost);
+    const host = normalizedApiHost;
     const url = `${host}/monitor`;
     setError(null);
 
@@ -293,7 +415,7 @@ export default function App() {
       setError((err as Error).message);
       disconnect();
     }
-  }, [apiHost, disconnect, handleMessage, isConnected]);
+  }, [disconnect, handleMessage, isConnected, normalizedApiHost]);
 
   const toggleConnection = useCallback(() => {
     if (isConnected) {
@@ -317,12 +439,147 @@ export default function App() {
     visualizerRef.current?.resetView();
   }, []);
 
+  const handlePlanButton = useCallback(async () => {
+    if (isPlanLoading || isRunningPreview) {
+      return;
+    }
+    setError(null);
+    if (isPlanning) {
+      setIsPlanning(false);
+      return;
+    }
+    setPreviewTrajectory(null);
+    setPreviewPath([]);
+    setIsPlanning(true);
+    try {
+      await fetch(`${normalizedApiHost}/trajectory/clear-preview`, {
+        method: "POST",
+      });
+    } catch (err) {
+      // Clearing preview is best-effort; surface warning but keep planning enabled.
+      setError(
+        `Unable to clear previous preview: ${(err as Error).message ?? "Unknown error"}`,
+      );
+    }
+  }, [isPlanLoading, isPlanning, isRunningPreview, normalizedApiHost]);
+
+  const handlePointSelected = useCallback(
+    async (point: { x: number; y: number; z: number }) => {
+      if (!isPlanning || isPlanLoading) {
+        return;
+      }
+      setIsPlanning(false);
+      setIsPlanLoading(true);
+      setError(null);
+    try {
+      setPreviewPath([{ x: point.x, y: point.y, z: point.z }]);
+      const response = await fetch(`${normalizedApiHost}/trajectory/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          x: point.x,
+          y: point.y,
+          z: point.z,
+        }),
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(
+          message || `Preview request failed (${response.status})`,
+        );
+      }
+      const data = (await response.json()) as TrajectoryPreview;
+      setPreviewTrajectory(data);
+      const pathPoints =
+        Array.isArray(data.cartesian_m) && data.cartesian_m.length > 0
+          ? (data.cartesian_m
+              .map((coords) =>
+                Array.isArray(coords) && coords.length >= 3
+                  ? {
+                      x: Number(coords[0]),
+                      y: Number(coords[1]),
+                      z: Number(coords[2]),
+                    }
+                  : null,
+              )
+              .filter(Boolean) as Array<{ x: number; y: number; z: number }>)
+          : [];
+      setPreviewPath(
+        pathPoints.length > 0
+          ? pathPoints
+          : [{ x: point.x, y: point.y, z: point.z }],
+      );
+    } catch (err) {
+      setError(`Failed to plan trajectory: ${(err as Error).message}`);
+      setPreviewTrajectory(null);
+      setPreviewPath([]);
+    } finally {
+      setIsPlanLoading(false);
+    }
+    },
+    [isPlanning, isPlanLoading, normalizedApiHost],
+  );
+
+  const handleRunPreview = useCallback(async () => {
+    if (!previewTrajectory || isPlanLoading || isRunningPreview) {
+      return;
+    }
+    setIsRunningPreview(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `${normalizedApiHost}/trajectory/execute-preview`,
+        {
+          method: "POST",
+        },
+      );
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(
+          message || `Execute request failed (${response.status})`,
+        );
+      }
+      setPreviewTrajectory(null);
+      setPreviewPath([]);
+    } catch (err) {
+      setError(`Failed to execute trajectory: ${(err as Error).message}`);
+    } finally {
+      setIsRunningPreview(false);
+    }
+  }, [
+    previewTrajectory,
+    isPlanLoading,
+    isRunningPreview,
+    normalizedApiHost,
+  ]);
+
+  const handleClearPreview = useCallback(async () => {
+    setError(null);
+    setPreviewTrajectory(null);
+    setPreviewPath([]);
+    setIsPlanning(false);
+    try {
+      const response = await fetch(`${normalizedApiHost}/trajectory/clear-preview`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(
+          message || `Clear request failed (${response.status})`,
+        );
+      }
+    } catch (err) {
+      setError(`Failed to clear preview: ${(err as Error).message}`);
+    } finally {
+      setIsPlanLoading(false);
+    }
+  }, [normalizedApiHost]);
+
   const issueStop = useCallback(async () => {
     if (isStopping) {
       return;
     }
-    const host = normaliseApiHost(apiHost);
-    const stopEndpoint = `${host}/control/stop`;
+    const stopEndpoint = `${normalizedApiHost}/control/stop`;
     setIsStopping(true);
     try {
       const response = await fetch(stopEndpoint, {
@@ -348,7 +605,28 @@ export default function App() {
     } finally {
       setIsStopping(false);
     }
-  }, [apiHost, isStopping]);
+  }, [isStopping, normalizedApiHost]);
+
+  const handleHome = useCallback(async () => {
+    if (isHoming) {
+      return;
+    }
+    setError(null);
+    setIsHoming(true);
+    try {
+      const response = await fetch(`${normalizedApiHost}/control/home`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || `Home request failed (${response.status})`);
+      }
+    } catch (err) {
+      setError(`Failed to home: ${(err as Error).message ?? "Unknown error"}`);
+    } finally {
+      setIsHoming(false);
+    }
+  }, [isHoming, normalizedApiHost]);
 
   useEffect(() => {
     if (!hasAttemptedAutoConnect) {
@@ -384,10 +662,13 @@ export default function App() {
     <div className="flex min-h-screen flex-col bg-gradient-to-b from-slate-900/80 via-slate-950 to-black text-slate-100">
       <header className="relative flex flex-col gap-4 border-b border-slate-800/40 bg-slate-950/60 px-6 py-6 shadow-inner shadow-slate-900/40 backdrop-blur">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight text-cyan-300 sm:text-3xl">
-              Gradient Robotics Monitor
-            </h1>
+          <div className="flex flex-col">
+            <div className="flex justify-end text-2xl font-semibold tracking-tight text-cyan-300 sm:text-3xl w-full">
+              Control Center
+            </div>
+            <div className="flex justify-end text-md tracking-tight text-cyan-300 sm:text-md w-full">
+              Gradient Robotics
+            </div>
           </div>
           <div className="flex items-center gap-3">
             <span
@@ -415,6 +696,17 @@ export default function App() {
               ) : (
                 <Plug size={18} strokeWidth={2} />
               )}
+            </button>
+            <button
+              type="button"
+              onClick={handleHome}
+              disabled={!isConnected || isHoming}
+              className={`rounded-full border border-slate-600/60 bg-slate-900/60 p-2 text-slate-300 transition hover:border-slate-400 hover:text-slate-100 ${
+                (!isConnected || isHoming) ? "opacity-60 cursor-not-allowed" : ""
+              }`}
+              aria-label="Move arm to home position"
+            >
+              <Home size={18} strokeWidth={2} />
             </button>
             <button
               type="button"
@@ -473,6 +765,9 @@ export default function App() {
           ref={visualizerRef}
           joints={latest?.joints}
           showBoundingBox={showBoundingBox}
+          selectionMode={isPlanning && !isPlanLoading}
+          onPointSelected={handlePointSelected}
+          previewPath={previewPath}
         />
         {isVisionActive && !visionError && (
           <div className="pointer-events-auto absolute left-6 top-6 z-10 flex max-w-sm flex-col gap-2">
@@ -492,8 +787,17 @@ export default function App() {
             </div>
           </div>
         )}
-        <div className="pointer-events-none absolute right-6 top-6 z-10">
+        <div className="pointer-events-none absolute right-6 top-6 z-10 flex flex-col gap-3">
           <TelemetryPanel latest={latest} />
+          <TrajectoryPanel
+            isPlanning={isPlanning}
+            isPlanLoading={isPlanLoading}
+            isRunning={isRunningPreview}
+            preview={previewTrajectory}
+            onPlan={handlePlanButton}
+            onRun={handleRunPreview}
+            onClear={handleClearPreview}
+          />
         </div>
       </main>
       <SettingsDialog
