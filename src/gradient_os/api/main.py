@@ -165,13 +165,12 @@ class TelemetryHub:
                     # If still full, skip this subscriber to avoid blocking.
                     continue
 
-
-def _format_event(self, text: str) -> str:
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        return text
-    return json.dumps(parsed)
+    def _format_event(self, text: str) -> str:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return text
+        return json.dumps(parsed)
 
 
 telemetry_hub = TelemetryHub()
