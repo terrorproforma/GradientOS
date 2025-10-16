@@ -144,6 +144,18 @@ export default function App() {
   const [latest, setLatest] = useState<TelemetryEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [hasAttemptedAutoConnect, setHasAttemptedAutoConnect] = useState(false);
+  const toggleButtonClasses = useMemo(
+    () =>
+      isConnected
+        ? "rounded-lg bg-gradient-to-r from-rose-500 to-rose-600 px-5 py-2 text-sm font-semibold text-white shadow-md shadow-rose-500/30 transition hover:brightness-110"
+        : "rounded-lg bg-gradient-to-r from-cyan-400 to-blue-500 px-5 py-2 text-sm font-semibold text-slate-950 shadow-md shadow-blue-500/30 transition hover:brightness-110",
+    [isConnected],
+  );
+  const toggleButtonLabel = useMemo(
+    () => (isConnected ? "Disconnect" : "Connect"),
+    [isConnected],
+  );
   const eventSourceRef = useRef<EventSource | null>(null);
 
   const disconnect = useCallback(() => {
@@ -215,6 +227,21 @@ export default function App() {
     }
   }, [apiHost, disconnect, handleMessage, isConnected]);
 
+  const toggleConnection = useCallback(() => {
+    if (isConnected) {
+      disconnect();
+      return;
+    }
+    connect();
+  }, [connect, disconnect, isConnected]);
+
+  useEffect(() => {
+    if (!hasAttemptedAutoConnect) {
+      setHasAttemptedAutoConnect(true);
+      connect();
+    }
+  }, [connect, hasAttemptedAutoConnect]);
+
   useEffect(() => {
     return () => {
       disconnect();
@@ -252,6 +279,13 @@ export default function App() {
             </span>
             <button
               type="button"
+              onClick={toggleConnection}
+              className={toggleButtonClasses}
+            >
+              {toggleButtonLabel}
+            </button>
+            <button
+              type="button"
               onClick={() => setIsSettingsOpen(true)}
               className="rounded-full border border-slate-600/60 bg-slate-900/60 p-2 text-slate-300 transition hover:border-slate-400 hover:text-slate-100"
               aria-label="Open settings"
@@ -259,24 +293,6 @@ export default function App() {
               <Settings size={18} strokeWidth={2} />
             </button>
           </div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={connect}
-            disabled={isConnected}
-            className="rounded-lg bg-gradient-to-r from-cyan-400 to-blue-500 px-5 py-2 text-sm font-semibold text-slate-950 shadow-md shadow-blue-500/30 transition hover:brightness-110 disabled:cursor-not-allowed disabled:bg-slate-700/70 disabled:text-slate-300 disabled:shadow-none"
-          >
-            Connect
-          </button>
-          <button
-            type="button"
-            onClick={disconnect}
-            disabled={!isConnected}
-            className="rounded-lg border border-slate-600/60 px-5 py-2 text-sm font-semibold text-slate-200 transition hover:border-slate-400 disabled:cursor-not-allowed disabled:border-slate-700 disabled:text-slate-500"
-          >
-            Disconnect
-          </button>
         </div>
         {error && (
           <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
