@@ -229,11 +229,8 @@ export default function App() {
         <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight text-cyan-300 sm:text-3xl">
-              GradientOS Monitor
+              Gradient Robotics Monitor
             </h1>
-            <p className="text-sm text-slate-300/80">
-              Subscribe to controller telemetry via Server-Sent Events.
-            </p>
           </div>
           <div className="flex items-center gap-3">
             <span

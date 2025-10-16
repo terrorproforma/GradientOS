@@ -69,6 +69,8 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
     const assetBasePath = "/assets/mini-6dof-arm/";
     const urdfPath = `${assetBasePath}mini-6dof-arm.urdf`;
     loader.workingPath = assetBasePath;
+    let debugMarkers: THREE.Object3D[] = [];
+
     loader.load(
       urdfPath,
       (robot) => {
@@ -78,17 +80,6 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
         });
         robot.scale.setScalar(ROBOT_SCALE);
         robot.rotation.x = -Math.PI / 2;
-        const bbox = new THREE.Box3().setFromObject(robot);
-        const size = new THREE.Vector3();
-        bbox.getSize(size);
-        console.info("[ArmVisualizer] Bounding box (scaled)", {
-          min: bbox.min.toArray(),
-          max: bbox.max.toArray(),
-          size: size.toArray(),
-        });
-        const offset = new THREE.Vector3();
-        bbox.getCenter(offset).negate();
-        robot.position.copy(offset);
 
         const defaultMaterial = new THREE.MeshStandardMaterial({
           color: 0x1e293b,
@@ -125,39 +116,84 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
 
         scene.add(robot);
 
-        const cornerColors = [
-          0xf87171,
-          0xfbbf24,
-          0x34d399,
-          0x38bdf8,
-          0xa855f7,
-          0xf472b6,
-          0x22d3ee,
-          0xf97316,
-        ];
-        const { min, max } = bbox;
-        const corners = [
-          new THREE.Vector3(min.x, min.y, min.z),
-          new THREE.Vector3(min.x, min.y, max.z),
-          new THREE.Vector3(min.x, max.y, min.z),
-          new THREE.Vector3(min.x, max.y, max.z),
-          new THREE.Vector3(max.x, min.y, min.z),
-          new THREE.Vector3(max.x, min.y, max.z),
-          new THREE.Vector3(max.x, max.y, min.z),
-          new THREE.Vector3(max.x, max.y, max.z),
-        ];
-        corners.forEach((corner, index) => {
-          const marker = new THREE.Mesh(
-            new THREE.SphereGeometry(0.005, 12, 12),
-            new THREE.MeshBasicMaterial({
-              color: cornerColors[index % cornerColors.length],
-            }),
-          );
-          marker.position.copy(corner);
-          scene.add(marker);
-        });
-
         robotRef.current = robot;
+
+        const computeBoundingBox = () => {
+          robot.updateMatrixWorld(true, true);
+          const bbox = new THREE.Box3().setFromObject(robot);
+          const isFiniteBox =
+            Number.isFinite(bbox.min.x) &&
+            Number.isFinite(bbox.min.y) &&
+            Number.isFinite(bbox.min.z) &&
+            Number.isFinite(bbox.max.x) &&
+            Number.isFinite(bbox.max.y) &&
+            Number.isFinite(bbox.max.z);
+          if (!isFiniteBox) {
+            requestAnimationFrame(computeBoundingBox);
+            return;
+          }
+
+          const initialSize = bbox.getSize(new THREE.Vector3());
+
+          robot.position.y -= bbox.min.y;
+          robot.updateMatrixWorld(true, true);
+
+          const groundedBBox = new THREE.Box3().setFromObject(robot);
+          const groundedSize = groundedBBox.getSize(new THREE.Vector3());
+
+          console.info("[ArmVisualizer] Bounding box (grounded)", {
+            min: groundedBBox.min.toArray(),
+            max: groundedBBox.max.toArray(),
+            size: groundedSize.toArray(),
+            initialSize: initialSize.toArray(),
+          });
+
+          debugMarkers.forEach((marker) => {
+            scene.remove(marker);
+            marker.traverse((child) => {
+              if ((child as THREE.Mesh).isMesh) {
+                (child as THREE.Mesh).geometry.dispose();
+              }
+            });
+          });
+          debugMarkers = [];
+
+          const cornerColors = [
+            0xf87171,
+            0xfbbf24,
+            0x34d399,
+            0x38bdf8,
+            0xa855f7,
+            0xf472b6,
+            0x22d3ee,
+            0xf97316,
+          ];
+          const { min, max } = groundedBBox;
+          const corners = [
+            new THREE.Vector3(min.x, min.y, min.z),
+            new THREE.Vector3(min.x, min.y, max.z),
+            new THREE.Vector3(min.x, max.y, min.z),
+            new THREE.Vector3(min.x, max.y, max.z),
+            new THREE.Vector3(max.x, min.y, min.z),
+            new THREE.Vector3(max.x, min.y, max.z),
+            new THREE.Vector3(max.x, max.y, min.z),
+            new THREE.Vector3(max.x, max.y, max.z),
+          ];
+
+          corners.forEach((corner, index) => {
+            const marker = new THREE.Mesh(
+              new THREE.SphereGeometry(0.005, 12, 12),
+              new THREE.MeshBasicMaterial({
+                color: cornerColors[index % cornerColors.length],
+              }),
+            );
+            marker.position.copy(corner);
+            scene.add(marker);
+            debugMarkers.push(marker);
+          });
+        };
+
+        computeBoundingBox();
         renderer.render(scene, camera);
       },
       undefined,
