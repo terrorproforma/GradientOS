@@ -15,6 +15,9 @@ const ROBOT_SCALE = 1; // make the robot look bit bigger
 export function ArmVisualizer({ joints }: ArmVisualizerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const robotRef = useRef<URDFRobot | null>(null);
+  const targetAnglesRef = useRef<number[] | null>(null);
+  const currentAnglesRef = useRef<number[] | null>(null);
+  const previousTimeRef = useRef<number | null>(null);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -117,6 +120,12 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
         scene.add(robot);
 
         robotRef.current = robot;
+        if (!currentAnglesRef.current) {
+          currentAnglesRef.current = new Array(6).fill(0);
+        }
+        if (!targetAnglesRef.current) {
+          targetAnglesRef.current = new Array(6).fill(0);
+        }
 
         const computeBoundingBox = () => {
           robot.updateMatrixWorld(true, true);
@@ -216,8 +225,44 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
     };
 
     let animationFrameId: number;
-    const animate = () => {
+    const animate = (time?: number) => {
       animationFrameId = requestAnimationFrame(animate);
+
+      const deltaSeconds =
+        previousTimeRef.current !== null && time !== undefined
+          ? Math.min((time - previousTimeRef.current) / 1000, 0.05)
+          : 0.016;
+      previousTimeRef.current = time ?? null;
+
+      const robot = robotRef.current;
+      const targetAngles = targetAnglesRef.current;
+      if (robot && targetAngles && targetAngles.length > 0) {
+        if (!currentAnglesRef.current) {
+          currentAnglesRef.current = targetAngles.slice();
+        }
+        const currentAngles = currentAnglesRef.current!;
+        const jointsMap = robot.joints;
+        const smoothing = 12; // rad/s tracking speed
+
+        for (let index = 0; index < targetAngles.length; index += 1) {
+          const jointName = `joint${index + 1}`;
+          const joint = jointsMap[jointName];
+          if (!joint) {
+            continue;
+          }
+          const currentValue =
+            typeof currentAngles[index] === "number" ? currentAngles[index] : 0;
+          const targetValue = targetAngles[index];
+          if (!Number.isFinite(targetValue)) {
+            continue;
+          }
+          const blend = Math.min(1, deltaSeconds * smoothing);
+          const nextValue = currentValue + (targetValue - currentValue) * (Number.isFinite(blend) ? blend : 1);
+          joint.setJointValue(nextValue);
+          currentAngles[index] = nextValue;
+        }
+      }
+
       controls.update();
       renderer.render(scene, camera);
     };
@@ -241,6 +286,9 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
       }
       scene.clear();
       robotRef.current = null;
+      targetAnglesRef.current = null;
+      currentAnglesRef.current = null;
+      previousTimeRef.current = null;
     };
   }, []);
 
@@ -248,17 +296,19 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
     if (!joints || joints.length === 0) {
       return;
     }
-    const robot = robotRef.current;
-    if (!robot) {
-      return;
-    }
-    joints.forEach((value, index) => {
-      const jointName = `joint${index + 1}`;
-      const joint = robot.joints[jointName];
-      if (joint) {
-        joint.setJointValue(value);
+    targetAnglesRef.current = joints.slice();
+    if (!currentAnglesRef.current) {
+      currentAnglesRef.current = joints.slice();
+      const robot = robotRef.current;
+      if (robot) {
+        joints.forEach((value, index) => {
+          const joint = robot.joints[`joint${index + 1}`];
+          if (joint) {
+            joint.setJointValue(value);
+          }
+        });
       }
-    });
+    }
   }, [joints]);
 
   return <div ref={containerRef} className="absolute inset-0" />;

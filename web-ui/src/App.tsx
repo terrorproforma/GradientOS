@@ -30,15 +30,18 @@ function TelemetryPanel({ latest }: { latest: TelemetryEvent | null }) {
           {latest.joints && latest.joints.length > 0 && (
             <div className="flex flex-col gap-2">
               <span className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300/80">
-                Joints (rad)
+                Joints (deg)
               </span>
               <ul className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm text-slate-100/90">
-                {latest.joints.map((value, index) => (
-                  <li key={index}>
-                    <span className="text-slate-400">J{index + 1}:</span>{" "}
-                    {value.toFixed(3)}
-                  </li>
-                ))}
+                {latest.joints.map((value, index) => {
+                  const degrees = value * (180 / Math.PI);
+                  return (
+                    <li key={index}>
+                      <span className="text-slate-400">J{index + 1}:</span>{" "}
+                      {degrees.toFixed(1)}
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           )}
