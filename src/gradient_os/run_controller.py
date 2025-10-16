@@ -138,6 +138,10 @@ def main():
                 # --- High-Priority Commands ---
                 if message.upper() == "STOP":
                     command_api.handle_stop_command()
+                    try:
+                        sock.sendto("ACK,STOP".encode("utf-8"), addr)
+                    except Exception:
+                        pass
                     continue
 
                 # --- Command Parsing ---
@@ -345,6 +349,10 @@ def main():
 
                 elif command == "WAIT_FOR_IDLE":
                     command_api.handle_wait_for_idle()
+                    try:
+                        sock.sendto("ACK,WAIT_FOR_IDLE".encode("utf-8"), addr)
+                    except Exception:
+                        pass
 
                 # ------------------------------------------------------------------
                 # NEW: Gripper Commands

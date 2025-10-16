@@ -55,17 +55,24 @@ def _probe_controller(timeout: float = 0.5) -> Tuple[bool, str]:
     return False, f"Unexpected controller response '{text}' from {host}:{port}"
 
 
-def _send_controller_command(message: str, timeout: float = 0.5) -> Tuple[bool, str]:
+def _send_controller_command(
+    message: str, timeout: float = 0.5, expect_response: bool = True
+) -> Tuple[bool, str]:
     host, port = _resolve_controller_endpoint()
     with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
         sock.settimeout(max(0.05, timeout))
         try:
             sock.sendto(message.encode("utf-8"), (host, port))
+        except socket.timeout:
+        except OSError as exc:
+            return False, f"Socket error sending '{message}': {exc}"
+        else:
+            if not expect_response:
+                return True, ""
+        try:
             data, _addr = sock.recvfrom(1024)
         except socket.timeout:
             return False, f"No response for command '{message}'"
-        except OSError as exc:
-            return False, f"Socket error sending '{message}': {exc}"
     text = data.decode("utf-8", errors="ignore")
     if text.startswith("ERROR"):
         return False, text
@@ -209,6 +216,89 @@ def create_app() -> FastAPI:
             "detail": detail,
             "controller": {"host": host, "port": port},
         }
+
+    def _controller_call_or_503(
+        command: str, *, timeout: float = 0.5, expect_response: bool = True
+    ) -> str:
+        ok, detail = _send_controller_command(
+            command, timeout=timeout, expect_response=expect_response
+        )
+        if not ok:
+            raise HTTPException(status_code=503, detail=detail)
+        return detail
+
+    def _parse_bool_token(token: str) -> bool:
+        return token.strip().lower() in {"1", "true", "yes", "on"}
+
+    @api.post("/control/stop", summary="Emergency stop")
+    async def control_stop():
+        detail = await run_in_threadpool(
+            _controller_call_or_503, "STOP", timeout=1.0, expect_response=True
+        )
+        return {"status": "ok", "detail": detail}
+
+    @api.post("/control/wait-for-idle", summary="Block until motion completes")
+    async def control_wait_for_idle():
+        detail = await run_in_threadpool(
+            _controller_call_or_503, "WAIT_FOR_IDLE", timeout=30.0, expect_response=True
+        )
+        return {"status": "ok", "detail": detail}
+
+    @api.get("/info/status", summary="Controller status snapshot")
+    async def info_status():
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_STATUS")
+        parts = detail.split(",")
+        if len(parts) != 3 or parts[0] != "STATUS":
+            raise HTTPException(status_code=502, detail=f"Malformed status reply: {detail}")
+        return {"gripper_present": _parse_bool_token(parts[2])}
+
+    @api.get("/info/pose", summary="Current tool pose and joint angles")
+    async def info_pose():
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_POSITION", timeout=1.0)
+        parts = detail.split(",")
+        if len(parts) < 1 or parts[0] != "CURRENT_POSE" or len(parts) < 1 + 3 + 3:
+            raise HTTPException(status_code=502, detail=f"Malformed pose reply: {detail}")
+        try:
+            pos = list(map(float, parts[1:4]))
+            orient = list(map(float, parts[4:7]))
+            joint_vals = list(map(float, parts[7:]))
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"Invalid pose data: {exc}") from exc
+        return {
+            "position_m": {"x": pos[0], "y": pos[1], "z": pos[2]},
+            "orientation_euler_deg": {"roll": orient[0], "pitch": orient[1], "yaw": orient[2]},
+            "joints_deg": joint_vals,
+        }
+
+    @api.get("/info/joints", summary="Current joint angles")
+    async def info_joints():
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_JOINT_ANGLES")
+        parts = detail.split(",")
+        if not parts or parts[0] != "JOINT_ANGLES":
+            raise HTTPException(status_code=502, detail=f"Malformed joint reply: {detail}")
+        try:
+            angles = list(map(float, parts[1:]))
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"Invalid joint data: {exc}") from exc
+        arm = angles[:6]
+        gripper = angles[6] if len(angles) > 6 else None
+        payload = {"arm_deg": arm}
+        if gripper is not None:
+            payload["gripper_deg"] = gripper
+        return payload
+
+    @api.get("/info/gripper", summary="Gripper angle snapshot")
+    async def info_gripper():
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_GRIPPER_STATE")
+        parts = detail.split(",")
+        if len(parts) != 3 or parts[0] != "GRIPPER_STATE":
+            raise HTTPException(status_code=502, detail=f"Malformed gripper reply: {detail}")
+        try:
+            angle_deg = float(parts[1])
+            raw = int(float(parts[2]))
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"Invalid gripper data: {exc}") from exc
+        return {"angle_deg": angle_deg, "raw_position": raw}
 
     @api.get("/monitor", summary="Subscribe to controller telemetry stream")
     async def monitor():
