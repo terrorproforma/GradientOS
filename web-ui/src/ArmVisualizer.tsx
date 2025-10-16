@@ -7,10 +7,10 @@ type ArmVisualizerProps = {
   joints?: number[];
 };
 
-const GRID_CELL_SIZE = 0.1; // 10 cm per square
-const GRID_CELLS_PER_SIDE = 40; // spans 4 m total (enough workspace)
+const GRID_CELL_SIZE = 0.05; // 10 cm per square
+const GRID_CELLS_PER_SIDE = 80; // spans 4 m total (enough workspace)
 const GRID_SIZE = GRID_CELL_SIZE * GRID_CELLS_PER_SIDE;
-const ROBOT_SCALE = 1; // Temporary until we confirm units
+const ROBOT_SCALE = 1; // make the robot look bit bigger
 
 export function ArmVisualizer({ joints }: ArmVisualizerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -77,10 +77,11 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
           linkNames: Object.keys(robot.links),
         });
         robot.scale.setScalar(ROBOT_SCALE);
+        robot.rotation.x = -Math.PI / 2;
         const bbox = new THREE.Box3().setFromObject(robot);
         const size = new THREE.Vector3();
         bbox.getSize(size);
-        console.info("[ArmVisualizer] Bounding box", {
+        console.info("[ArmVisualizer] Bounding box (scaled)", {
           min: bbox.min.toArray(),
           max: bbox.max.toArray(),
           size: size.toArray(),
@@ -134,28 +135,25 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
           0x22d3ee,
           0xf97316,
         ];
-        const corners = bbox.getCorners
-          ? (bbox.getCorners() as THREE.Vector3[])
-          : [
-              new THREE.Vector3(bbox.min.x, bbox.min.y, bbox.min.z),
-              new THREE.Vector3(bbox.min.x, bbox.min.y, bbox.max.z),
-              new THREE.Vector3(bbox.min.x, bbox.max.y, bbox.min.z),
-              new THREE.Vector3(bbox.min.x, bbox.max.y, bbox.max.z),
-              new THREE.Vector3(bbox.max.x, bbox.min.y, bbox.min.z),
-              new THREE.Vector3(bbox.max.x, bbox.min.y, bbox.max.z),
-              new THREE.Vector3(bbox.max.x, bbox.max.y, bbox.min.z),
-              new THREE.Vector3(bbox.max.x, bbox.max.y, bbox.max.z),
-            ];
+        const { min, max } = bbox;
+        const corners = [
+          new THREE.Vector3(min.x, min.y, min.z),
+          new THREE.Vector3(min.x, min.y, max.z),
+          new THREE.Vector3(min.x, max.y, min.z),
+          new THREE.Vector3(min.x, max.y, max.z),
+          new THREE.Vector3(max.x, min.y, min.z),
+          new THREE.Vector3(max.x, min.y, max.z),
+          new THREE.Vector3(max.x, max.y, min.z),
+          new THREE.Vector3(max.x, max.y, max.z),
+        ];
         corners.forEach((corner, index) => {
           const marker = new THREE.Mesh(
-            new THREE.SphereGeometry(0.02, 12, 12),
-            new THREE.MeshStandardMaterial({
+            new THREE.SphereGeometry(0.005, 12, 12),
+            new THREE.MeshBasicMaterial({
               color: cornerColors[index % cornerColors.length],
-              emissive: cornerColors[index % cornerColors.length],
-              emissiveIntensity: 1.0,
             }),
           );
-          marker.position.copy(corner.clone().add(offset));
+          marker.position.copy(corner);
           scene.add(marker);
         });
 
