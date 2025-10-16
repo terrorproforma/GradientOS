@@ -11,6 +11,7 @@ import URDFLoader, { type URDFRobot } from "urdf-loader";
 
 type ArmVisualizerProps = {
   joints?: number[];
+  showBoundingBox: boolean;
 };
 
 const GRID_CELL_SIZE = 0.05; // 10 cm per square
@@ -33,7 +34,7 @@ export type ArmVisualizerHandle = {
 };
 
 export const ArmVisualizer = forwardRef(function ArmVisualizer(
-  { joints }: ArmVisualizerProps,
+  { joints, showBoundingBox }: ArmVisualizerProps,
   ref: ForwardedRef<ArmVisualizerHandle>,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -49,6 +50,12 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   const isGroundedRef = useRef(false);
   const boundingCenterRef = useRef(new THREE.Vector3());
   const pendingDynamicBoundsRef = useRef(false);
+  const boundingWallsRef = useRef<THREE.Mesh[]>([]);
+  const boundingEdgesRef = useRef<THREE.LineSegments | null>(null);
+  const boundingMarkersRef = useRef<THREE.Object3D[]>([]);
+  const setBoundsVisibilityRef = useRef<((visible: boolean) => void) | null>(
+    null,
+  );
 
   useEffect(() => {
     const container = containerRef.current;
@@ -107,7 +114,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     const assetBasePath = "/assets/mini-6dof-arm/";
     const urdfPath = `${assetBasePath}mini-6dof-arm.urdf`;
     loader.workingPath = assetBasePath;
-    let debugMarkers: THREE.Object3D[] = [];
+    const debugMarkers = boundingMarkersRef.current;
     const isFiniteBox = (box: THREE.Box3) =>
       Number.isFinite(box.min.x) &&
       Number.isFinite(box.min.y) &&
@@ -147,6 +154,151 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       }
     };
 
+    const wallConfigs = [
+      {
+        // Left wall (x = min)
+        axis: "x" as const,
+        sign: -1,
+        rotation: new THREE.Euler(0, Math.PI / 2, 0),
+        size: (size: THREE.Vector3) => new THREE.Vector2(size.z, size.y),
+        position: (box: THREE.Box3, center: THREE.Vector3) =>
+          new THREE.Vector3(box.min.x, center.y, center.z),
+      },
+      {
+        // Right wall (x = max)
+        axis: "x" as const,
+        sign: 1,
+        rotation: new THREE.Euler(0, -Math.PI / 2, 0),
+        size: (size: THREE.Vector3) => new THREE.Vector2(size.z, size.y),
+        position: (box: THREE.Box3, center: THREE.Vector3) =>
+          new THREE.Vector3(box.max.x, center.y, center.z),
+      },
+      {
+        // Front wall (z = max)
+        axis: "z" as const,
+        sign: 1,
+        rotation: new THREE.Euler(0, 0, 0),
+        size: (size: THREE.Vector3) => new THREE.Vector2(size.x, size.y),
+        position: (box: THREE.Box3, center: THREE.Vector3) =>
+          new THREE.Vector3(center.x, center.y, box.max.z),
+      },
+      {
+        // Back wall (z = min)
+        axis: "z" as const,
+        sign: -1,
+        rotation: new THREE.Euler(Math.PI, 0, 0),
+        size: (size: THREE.Vector3) => new THREE.Vector2(size.x, size.y),
+        position: (box: THREE.Box3, center: THREE.Vector3) =>
+          new THREE.Vector3(center.x, center.y, box.min.z),
+      },
+      {
+        // Ceiling (y = max)
+        axis: "y" as const,
+        sign: 1,
+        rotation: new THREE.Euler(-Math.PI / 2, 0, 0),
+        size: (size: THREE.Vector3) => new THREE.Vector2(size.x, size.z),
+        position: (box: THREE.Box3, center: THREE.Vector3) =>
+          new THREE.Vector3(center.x, box.max.y, center.z),
+      },
+      {
+        // Floor hint (y = min)
+        axis: "y" as const,
+        sign: -1,
+        rotation: new THREE.Euler(Math.PI / 2, 0, 0),
+        size: (size: THREE.Vector3) => new THREE.Vector2(size.x, size.z),
+        position: (box: THREE.Box3, center: THREE.Vector3) =>
+          new THREE.Vector3(center.x, box.min.y, center.z),
+      },
+    ];
+
+    const ensureBoundingWalls = (box: THREE.Box3) => {
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      const walls = boundingWallsRef.current;
+
+      wallConfigs.forEach((config, index) => {
+        let wall = walls[index];
+        if (!wall) {
+          const geometry = new THREE.PlaneGeometry(1, 1);
+          const material = new THREE.MeshBasicMaterial({
+            color: 0x38bdf8,
+            transparent: true,
+            opacity: 0.05,
+            depthWrite: false,
+            side: THREE.DoubleSide,
+          });
+          wall = new THREE.Mesh(geometry, material);
+          wall.renderOrder = 5;
+          walls[index] = wall;
+          scene.add(wall);
+        }
+
+        const extent = config.size(size);
+        wall.scale.set(Math.max(extent.x, 1e-6), Math.max(extent.y, 1e-6), 1);
+        wall.position.copy(config.position(box, center));
+        wall.rotation.copy(config.rotation);
+      });
+    };
+
+    const ensureBoundingEdges = (box: THREE.Box3) => {
+      const corners = [
+        new THREE.Vector3(box.min.x, box.min.y, box.min.z),
+        new THREE.Vector3(box.max.x, box.min.y, box.min.z),
+        new THREE.Vector3(box.max.x, box.max.y, box.min.z),
+        new THREE.Vector3(box.min.x, box.max.y, box.min.z),
+        new THREE.Vector3(box.min.x, box.min.y, box.max.z),
+        new THREE.Vector3(box.max.x, box.min.y, box.max.z),
+        new THREE.Vector3(box.max.x, box.max.y, box.max.z),
+        new THREE.Vector3(box.min.x, box.max.y, box.max.z),
+      ];
+
+      const indices = [
+        0, 1, 1, 2, 2, 3, 3, 0, // bottom
+        4, 5, 5, 6, 6, 7, 7, 4, // top
+        0, 4, 1, 5, 2, 6, 3, 7, // verticals
+      ];
+
+      let edges = boundingEdgesRef.current;
+      if (!edges) {
+        const geometry = new THREE.BufferGeometry();
+        const material = new THREE.LineBasicMaterial({
+          color: 0x38bdf8,
+          transparent: true,
+          opacity: 0.25,
+        });
+        edges = new THREE.LineSegments(geometry, material);
+        edges.renderOrder = 6;
+        boundingEdgesRef.current = edges;
+        scene.add(edges);
+      }
+
+      const positions = new Float32Array(indices.length * 3);
+      indices.forEach((idx, arrayIndex) => {
+        const vertex = corners[idx];
+        positions[arrayIndex * 3] = vertex.x;
+        positions[arrayIndex * 3 + 1] = vertex.y;
+        positions[arrayIndex * 3 + 2] = vertex.z;
+      });
+      edges.geometry.setAttribute(
+        "position",
+        new THREE.BufferAttribute(positions, 3),
+      );
+      edges.geometry.computeBoundingSphere();
+    };
+
+    const updateBoundsVisibility = (visible: boolean) => {
+      boundingMarkersRef.current.forEach((marker) => {
+        marker.visible = visible;
+      });
+      boundingWallsRef.current.forEach((wall) => {
+        wall.visible = visible;
+      });
+      if (boundingEdgesRef.current) {
+        boundingEdgesRef.current.visible = visible;
+      }
+    };
+    setBoundsVisibilityRef.current = updateBoundsVisibility;
+
     const alignToGroundAndUpdateBounds = (options?: {
       snapCamera?: boolean;
       applySnapshot?: boolean;
@@ -183,10 +335,13 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         return;
       }
 
-      const deltaY = baseBox.min.y;
-      if (Number.isFinite(deltaY) && Math.abs(deltaY) > 1e-5) {
-        robot.position.y -= deltaY;
-        robot.updateMatrixWorld(true, true);
+      const shouldApplyGrounding = !isGroundedRef.current;
+      if (shouldApplyGrounding) {
+        const deltaY = baseBox.min.y;
+        if (Number.isFinite(deltaY) && Math.abs(deltaY) > 1e-5) {
+          robot.position.y -= deltaY;
+          robot.updateMatrixWorld(true, true);
+        }
       }
 
       const groundedBBox = new THREE.Box3().setFromObject(robot);
@@ -198,6 +353,9 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       initialControlsTarget.current.copy(center);
 
       updateBoundingMarkers(groundedBBox);
+      ensureBoundingWalls(groundedBBox);
+      ensureBoundingEdges(groundedBBox);
+      updateBoundsVisibility(showBoundingBox);
 
       if (options?.applySnapshot) {
         const values = targetAnglesRef.current;
@@ -214,7 +372,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
 
       const controlsInstance = controlsRef.current;
       const cameraInstance = cameraRef.current;
-      if (options?.snapCamera && controlsInstance && cameraInstance) {
+      if ((options?.snapCamera || shouldApplyGrounding) && controlsInstance && cameraInstance) {
         const offset = cameraInstance.position
           .clone()
           .sub(controlsInstance.target);
@@ -297,6 +455,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         };
 
         initialiseScene();
+        updateBoundsVisibility(showBoundingBox);
         renderer.render(scene, camera);
       },
       undefined,
@@ -392,6 +551,21 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
       }
+      boundingMarkersRef.current.forEach((marker) => {
+        scene.remove(marker);
+        marker.traverse((child) => {
+          if ((child as THREE.Mesh).isMesh) {
+            const meshChild = child as THREE.Mesh;
+            meshChild.geometry.dispose();
+            if (Array.isArray(meshChild.material)) {
+              meshChild.material.forEach((mat) => mat.dispose());
+            } else if (meshChild.material) {
+              (meshChild.material as THREE.Material).dispose();
+            }
+          }
+        });
+      });
+      boundingMarkersRef.current = [];
       scene.clear();
       robotRef.current = null;
       targetAnglesRef.current = null;
@@ -400,6 +574,26 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       cameraRef.current = null;
       isGroundedRef.current = false;
       pendingDynamicBoundsRef.current = false;
+      boundingWallsRef.current.forEach((wall) => {
+        scene.remove(wall);
+        if ((wall.material as THREE.Material | THREE.Material[])) {
+          if (Array.isArray(wall.material)) {
+            wall.material.forEach((mat) => mat.dispose());
+          } else {
+            (wall.material as THREE.Material).dispose();
+          }
+        }
+        wall.geometry.dispose();
+      });
+      boundingWallsRef.current = [];
+      const edges = boundingEdgesRef.current;
+      if (edges) {
+        scene.remove(edges);
+        edges.geometry.dispose();
+        (edges.material as THREE.Material).dispose();
+        boundingEdgesRef.current = null;
+      }
+      setBoundsVisibilityRef.current = null;
     };
   }, []);
 
@@ -445,6 +639,13 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       pendingDynamicBoundsRef.current = true;
     }
   }, [joints]);
+
+  useEffect(() => {
+    const setter = setBoundsVisibilityRef.current;
+    if (setter) {
+      setter(showBoundingBox);
+    }
+  }, [showBoundingBox]);
 
   return <div ref={containerRef} className="absolute inset-0" />;
 });

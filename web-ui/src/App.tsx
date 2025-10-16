@@ -81,8 +81,10 @@ type SettingsDialogProps = {
   isOpen: boolean;
   apiHost: string;
   visionHost: string;
+  showBoundingBox: boolean;
   onHostChange: (value: string) => void;
   onVisionHostChange: (value: string) => void;
+  onShowBoundingBoxChange: (value: boolean) => void;
   onClose: () => void;
 };
 
@@ -90,8 +92,10 @@ function SettingsDialog({
   isOpen,
   apiHost,
   visionHost,
+  showBoundingBox,
   onHostChange,
   onVisionHostChange,
+  onShowBoundingBoxChange,
   onClose,
 }: SettingsDialogProps) {
   useEffect(() => {
@@ -167,6 +171,15 @@ function SettingsDialog({
             MJPEG endpoint for the camera overlay. Leave blank to default to
             the current origin on port 8080.
           </p>
+          <label className="mt-4 flex items-center gap-3 text-sm font-medium text-slate-200/90">
+            <input
+              type="checkbox"
+              className="h-4 w-4 rounded border border-slate-600 bg-slate-900 text-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+              checked={showBoundingBox}
+              onChange={(event) => onShowBoundingBoxChange(event.target.checked)}
+            />
+            Show arm bounding box
+          </label>
         </div>
       </div>
     </div>
@@ -183,6 +196,7 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [hasAttemptedAutoConnect, setHasAttemptedAutoConnect] = useState(false);
   const [isVisionActive, setIsVisionActive] = useState(false);
+  const [showBoundingBox, setShowBoundingBox] = useState(true);
   const visualizerRef = useRef<ArmVisualizerHandle | null>(null);
   const normalisedVisionHost = useMemo(
     () => normaliseVisionHost(visionHost),
@@ -409,7 +423,11 @@ export default function App() {
         )}
       </header>
       <main className="relative flex-1 overflow-hidden">
-        <ArmVisualizer ref={visualizerRef} joints={latest?.joints} />
+        <ArmVisualizer
+          ref={visualizerRef}
+          joints={latest?.joints}
+          showBoundingBox={showBoundingBox}
+        />
         {isVisionActive && !visionError && (
           <div className="pointer-events-auto absolute left-6 top-6 z-10 flex max-w-sm flex-col gap-2">
             <div className="overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950/80 shadow-lg shadow-slate-950/40 backdrop-blur">
@@ -436,8 +454,10 @@ export default function App() {
         isOpen={isSettingsOpen}
         apiHost={apiHost}
         visionHost={visionHost}
+        showBoundingBox={showBoundingBox}
         onHostChange={setApiHost}
         onVisionHostChange={setVisionHost}
+        onShowBoundingBoxChange={setShowBoundingBox}
         onClose={() => setIsSettingsOpen(false)}
       />
     </div>
