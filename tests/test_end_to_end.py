@@ -3,6 +3,7 @@ import sys
 import os
 import socket
 import threading
+import errno
 import time
 
 # Mock the serial and scipy modules before importing the controller
@@ -72,9 +73,18 @@ class TestEndToEnd(unittest.TestCase):
             time.sleep(1.5) # Give the server time to start
 
         # 3. Send a MOVE_LINE command via UDP
+        target_ip = utils.PI_IP
+        command = "MOVE_LINE,0.1,0.2,0.3,0.1,0.05"
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            command = "MOVE_LINE,0.1,0.2,0.3,0.1,0.05"
-            sock.sendto(command.encode('utf-8'), (utils.PI_IP, utils.UDP_PORT))
+            try:
+                sock.sendto(command.encode('utf-8'), (target_ip, utils.UDP_PORT))
+            except OSError as exc:
+                # Some hosts (e.g., macOS) cannot route to 0.0.0.0; fall back to loopback.
+                if getattr(exc, "errno", None) in {errno.EHOSTUNREACH, errno.EADDRNOTAVAIL, errno.ENETUNREACH}:
+                    target_ip = "127.0.0.1"
+                    sock.sendto(command.encode('utf-8'), (target_ip, utils.UDP_PORT))
+                else:
+                    raise
             time.sleep(0.5) # Give the command time to be processed
 
         # 4. Assert that the controller attempted a sync write with servo commands
@@ -87,7 +97,7 @@ class TestEndToEnd(unittest.TestCase):
 
         # 6. Stop the controller
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.sendto("STOP".encode('utf-8'), (utils.PI_IP, utils.UDP_PORT))
+            sock.sendto("STOP".encode('utf-8'), (target_ip, utils.UDP_PORT))
         
         # Give the thread time to shut down
         time.sleep(0.2)

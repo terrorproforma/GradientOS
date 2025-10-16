@@ -44,11 +44,21 @@ def main():
         default="/dev/ttyUSB0",
         help="The serial port to connect to the robot arm.",
     )
+    parser.add_argument(
+        "--sim",
+        action="store_true",
+        help="Run the controller against an in-memory servo simulator instead of hardware.",
+    )
     args = parser.parse_args()
 
     # Update the serial port from the command line argument
     if args.serial_port:
         utils.SERIAL_PORT = args.serial_port
+
+    if getattr(args, "sim", False):
+        from .arm_controller import sim_backend
+
+        sim_backend.activate()
 
     # Initialize the hardware
     servo_driver.initialize_servos()
