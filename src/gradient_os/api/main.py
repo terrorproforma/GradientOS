@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import socket
-from contextlib import closing
+from contextlib import closing, asynccontextmanager
 from typing import Dict, Tuple
 
 import argparse
@@ -63,7 +63,6 @@ def _send_controller_command(
         sock.settimeout(max(0.05, timeout))
         try:
             sock.sendto(message.encode("utf-8"), (host, port))
-        except socket.timeout:
         except OSError as exc:
             return False, f"Socket error sending '{message}': {exc}"
         else:
@@ -185,7 +184,17 @@ logger = logging.getLogger("uvicorn.error")
 
 
 def create_app() -> FastAPI:
-    api = FastAPI(title="GradientOS API", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        ok, detail = await run_in_threadpool(_probe_controller)
+        host, port = _resolve_controller_endpoint()
+        if ok:
+            logger.info("Controller: %s:%s", host, port)
+        else:
+            logger.warning("Controller: %s:%s (%s)", host, port, detail)
+        yield
+
+    api = FastAPI(title="GradientOS API", version="0.1.0", lifespan=lifespan)
     origins = _resolve_cors_origins()
     allow_credentials = "*" not in origins
     api.add_middleware(
@@ -195,15 +204,6 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         allow_credentials=allow_credentials,
     )
-
-    @api.on_event("startup")
-    async def _log_controller_status() -> None:
-        ok, detail = await run_in_threadpool(_probe_controller)
-        host, port = _resolve_controller_endpoint()
-        if ok:
-            logger.info("Controller: %s:%s", host, port)
-        else:
-            logger.warning("Controller: %s:%s (%s)", host, port, detail)
 
     @api.get("/health", summary="Controller health probe")
     async def health():
@@ -240,7 +240,7 @@ def create_app() -> FastAPI:
     @api.post("/control/wait-for-idle", summary="Block until motion completes")
     async def control_wait_for_idle():
         detail = await run_in_threadpool(
-            _controller_call_or_503, "WAIT_FOR_IDLE", timeout=30.0, expect_response=True
+            _controller_call_or_503, "WAIT_FOR_IDLE", timeout=60.0, expect_response=True
         )
         return {"status": "ok", "detail": detail}
 

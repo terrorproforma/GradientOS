@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
   CameraOff,
+  Octagon,
   Plug,
   RefreshCcw,
   Settings,
@@ -197,6 +198,7 @@ export default function App() {
   const [hasAttemptedAutoConnect, setHasAttemptedAutoConnect] = useState(false);
   const [isVisionActive, setIsVisionActive] = useState(false);
   const [showBoundingBox, setShowBoundingBox] = useState(true);
+  const [isStopping, setIsStopping] = useState(false);
   const visualizerRef = useRef<ArmVisualizerHandle | null>(null);
   const normalisedVisionHost = useMemo(
     () => normaliseVisionHost(visionHost),
@@ -315,6 +317,39 @@ export default function App() {
     visualizerRef.current?.resetView();
   }, []);
 
+  const issueStop = useCallback(async () => {
+    if (isStopping) {
+      return;
+    }
+    const host = normaliseApiHost(apiHost);
+    const stopEndpoint = `${host}/control/stop`;
+    setIsStopping(true);
+    try {
+      const response = await fetch(stopEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!response.ok) {
+        let detail = `${response.status} ${response.statusText}`;
+        try {
+          const parsed = await response.json();
+          if (typeof parsed?.detail === "string") {
+            detail = parsed.detail;
+          }
+        } catch {
+          // ignore parse error, keep default detail
+        }
+        throw new Error(detail);
+      }
+    } catch (err) {
+      setError(
+        `Failed to send STOP command: ${(err as Error).message ?? "Unknown error"}`,
+      );
+    } finally {
+      setIsStopping(false);
+    }
+  }, [apiHost, isStopping]);
+
   useEffect(() => {
     if (!hasAttemptedAutoConnect) {
       setHasAttemptedAutoConnect(true);
@@ -380,6 +415,17 @@ export default function App() {
               ) : (
                 <Plug size={18} strokeWidth={2} />
               )}
+            </button>
+            <button
+              type="button"
+              onClick={issueStop}
+              disabled={isStopping}
+              className={`rounded-full bg-gradient-to-r from-rose-600 to-rose-700 p-2 text-white shadow-md shadow-rose-500/40 transition ${
+                isStopping ? "cursor-wait opacity-60" : "hover:brightness-110"
+              }`}
+              aria-label="Send emergency stop"
+            >
+              <Octagon size={18} strokeWidth={2.5} />
             </button>
             <button
               type="button"
