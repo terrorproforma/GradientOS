@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Settings, X } from "lucide-react";
-import { resolveDefaultApiHost } from "./useEndpoint";
+import { Camera, CameraOff, Plug, Settings, Unplug, X } from "lucide-react";
+import { resolveDefaultApiHost, resolveDefaultVisionHost } from "./useEndpoint";
 import { ArmVisualizer } from "./ArmVisualizer";
 
 type TelemetryEvent = {
@@ -10,10 +10,18 @@ type TelemetryEvent = {
   gripper?: number;
 };
 
-function normaliseHost(input: string): string {
+function normaliseApiHost(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) {
     return resolveDefaultApiHost();
+  }
+  return trimmed.replace(/\/+$/, "");
+}
+
+function normaliseVisionHost(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return resolveDefaultVisionHost();
   }
   return trimmed.replace(/\/+$/, "");
 }
@@ -64,14 +72,18 @@ function TelemetryPanel({ latest }: { latest: TelemetryEvent | null }) {
 type SettingsDialogProps = {
   isOpen: boolean;
   apiHost: string;
+  visionHost: string;
   onHostChange: (value: string) => void;
+  onVisionHostChange: (value: string) => void;
   onClose: () => void;
 };
 
 function SettingsDialog({
   isOpen,
   apiHost,
+  visionHost,
   onHostChange,
+  onVisionHostChange,
   onClose,
 }: SettingsDialogProps) {
   useEffect(() => {
@@ -132,6 +144,21 @@ function SettingsDialog({
             Provide the base URL for the telemetry API. Changes apply
             immediately and persist for the next connection attempt.
           </p>
+          <label className="mt-4 text-sm font-medium text-slate-200/90">
+            Gradient Vision Host
+            <input
+              className="mt-1 w-full rounded-lg border border-slate-600/70 bg-slate-950/60 px-4 py-2 text-base text-slate-100 placeholder:text-slate-400 focus:border-cyan-400/60 focus:outline-none focus:ring-2 focus:ring-cyan-500/30"
+              type="text"
+              value={visionHost}
+              onChange={(event) => onVisionHostChange(event.target.value)}
+              placeholder="http://localhost:8080"
+              autoComplete="off"
+            />
+          </label>
+          <p className="text-xs text-slate-400/90">
+            MJPEG endpoint for the camera overlay. Leave blank to default to
+            the current origin on port 8080.
+          </p>
         </div>
       </div>
     </div>
@@ -140,21 +167,35 @@ function SettingsDialog({
 
 export default function App() {
   const [apiHost, setApiHost] = useState(() => resolveDefaultApiHost());
+  const [visionHost, setVisionHost] = useState(() => resolveDefaultVisionHost());
   const [isConnected, setIsConnected] = useState(false);
   const [latest, setLatest] = useState<TelemetryEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [visionError, setVisionError] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [hasAttemptedAutoConnect, setHasAttemptedAutoConnect] = useState(false);
+  const [isVisionActive, setIsVisionActive] = useState(false);
+  const normalisedVisionHost = useMemo(
+    () => normaliseVisionHost(visionHost),
+    [visionHost],
+  );
+  const visionStreamUrl = useMemo(
+    () => `${normalisedVisionHost}/stream.mjpg`,
+    [normalisedVisionHost],
+  );
   const toggleButtonClasses = useMemo(
     () =>
       isConnected
-        ? "rounded-lg bg-gradient-to-r from-rose-500 to-rose-600 px-5 py-2 text-sm font-semibold text-white shadow-md shadow-rose-500/30 transition hover:brightness-110"
-        : "rounded-lg bg-gradient-to-r from-cyan-400 to-blue-500 px-5 py-2 text-sm font-semibold text-slate-950 shadow-md shadow-blue-500/30 transition hover:brightness-110",
+        ? "rounded-full bg-gradient-to-r from-rose-500 to-rose-600 p-2 text-white shadow-md shadow-rose-500/30 transition hover:brightness-110"
+        : "rounded-full bg-gradient-to-r from-cyan-400 to-blue-500 p-2 text-slate-950 shadow-md shadow-blue-500/30 transition hover:brightness-110",
     [isConnected],
   );
-  const toggleButtonLabel = useMemo(
-    () => (isConnected ? "Disconnect" : "Connect"),
-    [isConnected],
+  const cameraButtonClasses = useMemo(
+    () =>
+      isVisionActive
+        ? "rounded-full bg-gradient-to-r from-rose-500 to-rose-600 p-2 text-white shadow-md shadow-rose-500/30 transition hover:brightness-110"
+        : "rounded-full bg-gradient-to-r from-cyan-400 to-blue-500 p-2 text-slate-950 shadow-md shadow-blue-500/30 transition hover:brightness-110",
+    [isVisionActive],
   );
   const eventSourceRef = useRef<EventSource | null>(null);
 
@@ -163,6 +204,8 @@ export default function App() {
     eventSourceRef.current = null;
     setIsConnected(false);
     setLatest(null);
+    setIsVisionActive(false);
+    setVisionError(null);
   }, []);
 
   const handleMessage = useCallback((payload: string) => {
@@ -198,7 +241,7 @@ export default function App() {
     if (isConnected) {
       return;
     }
-    const host = normaliseHost(apiHost);
+    const host = normaliseApiHost(apiHost);
     const url = `${host}/monitor`;
     setError(null);
 
@@ -235,6 +278,16 @@ export default function App() {
     connect();
   }, [connect, disconnect, isConnected]);
 
+  const toggleVision = useCallback(() => {
+    if (isVisionActive) {
+      setIsVisionActive(false);
+      setVisionError(null);
+      return;
+    }
+    setVisionError(null);
+    setIsVisionActive(true);
+  }, [isVisionActive]);
+
   useEffect(() => {
     if (!hasAttemptedAutoConnect) {
       setHasAttemptedAutoConnect(true);
@@ -247,6 +300,18 @@ export default function App() {
       disconnect();
     };
   }, [disconnect]);
+
+  useEffect(() => {
+    if (isConnected) {
+      setIsVisionActive(true);
+    } else {
+      setIsVisionActive(false);
+    }
+  }, [isConnected]);
+
+  useEffect(() => {
+    setVisionError(null);
+  }, [normalisedVisionHost]);
 
   const streamingLabel = useMemo(
     () => (isConnected ? "Streaming" : "Disconnected"),
@@ -281,8 +346,25 @@ export default function App() {
               type="button"
               onClick={toggleConnection}
               className={toggleButtonClasses}
+              aria-label={isConnected ? "Disconnect from robot" : "Connect to robot"}
             >
-              {toggleButtonLabel}
+              {isConnected ? (
+                <Unplug size={18} strokeWidth={2} />
+              ) : (
+                <Plug size={18} strokeWidth={2} />
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={toggleVision}
+              className={cameraButtonClasses}
+              aria-label={isVisionActive ? "Disable camera overlay" : "Enable camera overlay"}
+            >
+              {isVisionActive ? (
+                <Camera size={18} strokeWidth={2} />
+              ) : (
+                <CameraOff size={18} strokeWidth={2} />
+              )}
             </button>
             <button
               type="button"
@@ -299,9 +381,31 @@ export default function App() {
             {error}
           </div>
         )}
+        {visionError && (
+          <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            {visionError}
+          </div>
+        )}
       </header>
       <main className="relative flex-1 overflow-hidden">
         <ArmVisualizer joints={latest?.joints} />
+        {isVisionActive && (
+          <div className="pointer-events-auto absolute left-6 top-6 z-10 flex max-w-sm flex-col gap-2">
+            <div className="overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950/80 shadow-lg shadow-slate-950/40 backdrop-blur">
+              <img
+                src={visionStreamUrl}
+                alt="Gradient Vision stream"
+                className="block max-h-64 w-full object-cover"
+                onLoad={() => setVisionError(null)}
+                onError={() =>
+                  setVisionError(
+                    "Unable to load the vision stream. Ensure Gradient Vision is running and accessible.",
+                  )
+                }
+              />
+            </div>
+          </div>
+        )}
         <div className="pointer-events-none absolute right-6 top-6 z-10">
           <TelemetryPanel latest={latest} />
         </div>
@@ -309,7 +413,9 @@ export default function App() {
       <SettingsDialog
         isOpen={isSettingsOpen}
         apiHost={apiHost}
+        visionHost={visionHost}
         onHostChange={setApiHost}
+        onVisionHostChange={setVisionHost}
         onClose={() => setIsSettingsOpen(false)}
       />
     </div>
