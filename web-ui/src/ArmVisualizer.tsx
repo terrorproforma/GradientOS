@@ -1,4 +1,10 @@
-import { useEffect, useRef } from "react";
+import {
+  forwardRef,
+  type ForwardedRef,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+} from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 import URDFLoader, { type URDFRobot } from "urdf-loader";
@@ -11,13 +17,38 @@ const GRID_CELL_SIZE = 0.05; // 10 cm per square
 const GRID_CELLS_PER_SIDE = 80; // spans 4 m total (enough workspace)
 const GRID_SIZE = GRID_CELL_SIZE * GRID_CELLS_PER_SIDE;
 const ROBOT_SCALE = 1; // make the robot look bit bigger
+const BOUNDING_MARKER_COLORS = [
+  0xf87171,
+  0xfbbf24,
+  0x34d399,
+  0x38bdf8,
+  0xa855f7,
+  0xf472b6,
+  0x22d3ee,
+  0xf97316,
+] as const;
 
-export function ArmVisualizer({ joints }: ArmVisualizerProps) {
+export type ArmVisualizerHandle = {
+  resetView: () => void;
+};
+
+export const ArmVisualizer = forwardRef(function ArmVisualizer(
+  { joints }: ArmVisualizerProps,
+  ref: ForwardedRef<ArmVisualizerHandle>,
+) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const robotRef = useRef<URDFRobot | null>(null);
   const targetAnglesRef = useRef<number[] | null>(null);
   const currentAnglesRef = useRef<number[] | null>(null);
   const previousTimeRef = useRef<number | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const controlsRef = useRef<OrbitControls | null>(null);
+  const initialControlsTarget = useRef(new THREE.Vector3(0.25, 0.15, 0));
+  const defaultCameraOffset = useRef(new THREE.Vector3(1.15, 0.85, 1.6));
+  const defaultCameraOffsetCaptured = useRef(false);
+  const isGroundedRef = useRef(false);
+  const boundingCenterRef = useRef(new THREE.Vector3());
+  const pendingDynamicBoundsRef = useRef(false);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -40,11 +71,15 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
       0.05,
       50,
     );
-    camera.position.set(1.4, 1.0, 1.6);
+    camera.position
+      .copy(initialControlsTarget.current)
+      .add(defaultCameraOffset.current);
+    cameraRef.current = camera;
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    controls.target.set(0.25, 0.15, 0);
+    controls.target.copy(initialControlsTarget.current);
+    controlsRef.current = controls;
 
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
     scene.add(ambientLight);
@@ -73,6 +108,135 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
     const urdfPath = `${assetBasePath}mini-6dof-arm.urdf`;
     loader.workingPath = assetBasePath;
     let debugMarkers: THREE.Object3D[] = [];
+    const isFiniteBox = (box: THREE.Box3) =>
+      Number.isFinite(box.min.x) &&
+      Number.isFinite(box.min.y) &&
+      Number.isFinite(box.min.z) &&
+      Number.isFinite(box.max.x) &&
+      Number.isFinite(box.max.y) &&
+      Number.isFinite(box.max.z);
+
+    const updateBoundingMarkers = (box: THREE.Box3) => {
+      const corners = [
+        new THREE.Vector3(box.min.x, box.min.y, box.min.z),
+        new THREE.Vector3(box.min.x, box.min.y, box.max.z),
+        new THREE.Vector3(box.min.x, box.max.y, box.min.z),
+        new THREE.Vector3(box.min.x, box.max.y, box.max.z),
+        new THREE.Vector3(box.max.x, box.min.y, box.min.z),
+        new THREE.Vector3(box.max.x, box.min.y, box.max.z),
+        new THREE.Vector3(box.max.x, box.max.y, box.min.z),
+        new THREE.Vector3(box.max.x, box.max.y, box.max.z),
+      ];
+
+      if (debugMarkers.length === 0) {
+        corners.forEach((corner, index) => {
+          const marker = new THREE.Mesh(
+            new THREE.SphereGeometry(0.005, 12, 12),
+            new THREE.MeshBasicMaterial({
+              color: BOUNDING_MARKER_COLORS[index % BOUNDING_MARKER_COLORS.length],
+            }),
+          );
+          marker.position.copy(corner);
+          scene.add(marker);
+          debugMarkers.push(marker);
+        });
+      } else {
+        debugMarkers.forEach((marker, index) => {
+          marker.position.copy(corners[index]);
+        });
+      }
+    };
+
+    const alignToGroundAndUpdateBounds = (options?: {
+      snapCamera?: boolean;
+      applySnapshot?: boolean;
+    }) => {
+      const robot = robotRef.current;
+      if (!robot) {
+        return;
+      }
+      robot.updateMatrixWorld(true, true);
+
+      const candidateNames = ["base", "base_link", "link0", "base_link_inertia"];
+      let baseObject: THREE.Object3D | null = null;
+      const linksRecord = robot.links as unknown as Record<
+        string,
+        THREE.Object3D | undefined
+      >;
+      for (const name of candidateNames) {
+        const fromLinks = linksRecord?.[name];
+        if (fromLinks) {
+          baseObject = fromLinks;
+          break;
+        }
+        const found = robot.getObjectByName(name);
+        if (found) {
+          baseObject = found;
+          break;
+        }
+      }
+
+      const baseSource =
+        baseObject ?? linksRecord?.base ?? linksRecord?.base_link ?? robot;
+      const baseBox = new THREE.Box3().setFromObject(baseSource);
+      if (!isFiniteBox(baseBox)) {
+        return;
+      }
+
+      const deltaY = baseBox.min.y;
+      if (Number.isFinite(deltaY) && Math.abs(deltaY) > 1e-5) {
+        robot.position.y -= deltaY;
+        robot.updateMatrixWorld(true, true);
+      }
+
+      const groundedBBox = new THREE.Box3().setFromObject(robot);
+      if (!isFiniteBox(groundedBBox)) {
+        return;
+      }
+
+      const center = groundedBBox.getCenter(boundingCenterRef.current);
+      initialControlsTarget.current.copy(center);
+
+      updateBoundingMarkers(groundedBBox);
+
+      if (options?.applySnapshot) {
+        const values = targetAnglesRef.current;
+        if (values) {
+          currentAnglesRef.current = values.slice();
+          values.forEach((value, index) => {
+            const joint = robot.joints[`joint${index + 1}`];
+            if (joint) {
+              joint.setJointValue(value);
+            }
+          });
+        }
+      }
+
+      const controlsInstance = controlsRef.current;
+      const cameraInstance = cameraRef.current;
+      if (options?.snapCamera && controlsInstance && cameraInstance) {
+        const offset = cameraInstance.position
+          .clone()
+          .sub(controlsInstance.target);
+        controlsInstance.target.copy(initialControlsTarget.current);
+        cameraInstance.position
+          .copy(initialControlsTarget.current)
+          .add(offset);
+        cameraInstance.updateProjectionMatrix();
+        controlsInstance.update();
+        if (!defaultCameraOffsetCaptured.current) {
+          defaultCameraOffset.current.copy(offset);
+          defaultCameraOffsetCaptured.current = true;
+        }
+      }
+    };
+
+    const scheduleBoundingRefresh = () => {
+      if (!isGroundedRef.current) {
+        return;
+      }
+      pendingDynamicBoundsRef.current = true;
+    };
 
     loader.load(
       urdfPath,
@@ -127,82 +291,12 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
           targetAnglesRef.current = new Array(6).fill(0);
         }
 
-        const computeBoundingBox = () => {
-          robot.updateMatrixWorld(true, true);
-          const bbox = new THREE.Box3().setFromObject(robot);
-          const isFiniteBox =
-            Number.isFinite(bbox.min.x) &&
-            Number.isFinite(bbox.min.y) &&
-            Number.isFinite(bbox.min.z) &&
-            Number.isFinite(bbox.max.x) &&
-            Number.isFinite(bbox.max.y) &&
-            Number.isFinite(bbox.max.z);
-          if (!isFiniteBox) {
-            requestAnimationFrame(computeBoundingBox);
-            return;
-          }
-
-          const initialSize = bbox.getSize(new THREE.Vector3());
-
-          robot.position.y -= bbox.min.y;
-          robot.updateMatrixWorld(true, true);
-
-          const groundedBBox = new THREE.Box3().setFromObject(robot);
-          const groundedSize = groundedBBox.getSize(new THREE.Vector3());
-
-          console.info("[ArmVisualizer] Bounding box (grounded)", {
-            min: groundedBBox.min.toArray(),
-            max: groundedBBox.max.toArray(),
-            size: groundedSize.toArray(),
-            initialSize: initialSize.toArray(),
-          });
-
-          debugMarkers.forEach((marker) => {
-            scene.remove(marker);
-            marker.traverse((child) => {
-              if ((child as THREE.Mesh).isMesh) {
-                (child as THREE.Mesh).geometry.dispose();
-              }
-            });
-          });
-          debugMarkers = [];
-
-          const cornerColors = [
-            0xf87171,
-            0xfbbf24,
-            0x34d399,
-            0x38bdf8,
-            0xa855f7,
-            0xf472b6,
-            0x22d3ee,
-            0xf97316,
-          ];
-          const { min, max } = groundedBBox;
-          const corners = [
-            new THREE.Vector3(min.x, min.y, min.z),
-            new THREE.Vector3(min.x, min.y, max.z),
-            new THREE.Vector3(min.x, max.y, min.z),
-            new THREE.Vector3(min.x, max.y, max.z),
-            new THREE.Vector3(max.x, min.y, min.z),
-            new THREE.Vector3(max.x, min.y, max.z),
-            new THREE.Vector3(max.x, max.y, min.z),
-            new THREE.Vector3(max.x, max.y, max.z),
-          ];
-
-          corners.forEach((corner, index) => {
-            const marker = new THREE.Mesh(
-              new THREE.SphereGeometry(0.005, 12, 12),
-              new THREE.MeshBasicMaterial({
-                color: cornerColors[index % cornerColors.length],
-              }),
-            );
-            marker.position.copy(corner);
-            scene.add(marker);
-            debugMarkers.push(marker);
-          });
+        const initialiseScene = () => {
+          alignToGroundAndUpdateBounds({ snapCamera: true, applySnapshot: true });
+          isGroundedRef.current = true;
         };
 
-        computeBoundingBox();
+        initialiseScene();
         renderer.render(scene, camera);
       },
       undefined,
@@ -234,9 +328,10 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
           : 0.016;
       previousTimeRef.current = time ?? null;
 
-      const robot = robotRef.current;
       const targetAngles = targetAnglesRef.current;
-      if (robot && targetAngles && targetAngles.length > 0) {
+      const robot = robotRef.current;
+      let jointsChanged = false;
+      if (robot && targetAngles && targetAngles.length > 0 && isGroundedRef.current) {
         if (!currentAnglesRef.current) {
           currentAnglesRef.current = targetAngles.slice();
         }
@@ -258,9 +353,21 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
           }
           const blend = Math.min(1, deltaSeconds * smoothing);
           const nextValue = currentValue + (targetValue - currentValue) * (Number.isFinite(blend) ? blend : 1);
+          if (Math.abs(nextValue - currentValue) > 1e-5) {
+            jointsChanged = true;
+          }
           joint.setJointValue(nextValue);
           currentAngles[index] = nextValue;
         }
+      }
+
+      if (jointsChanged) {
+        scheduleBoundingRefresh();
+      }
+
+      if (pendingDynamicBoundsRef.current) {
+        pendingDynamicBoundsRef.current = false;
+        alignToGroundAndUpdateBounds({ snapCamera: false, applySnapshot: false });
       }
 
       controls.update();
@@ -274,6 +381,7 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
       window.removeEventListener("resize", handleResize);
       cancelAnimationFrame(animationFrameId);
       controls.dispose();
+      controlsRef.current = null;
       renderer.dispose();
       grid.geometry.dispose();
       if (Array.isArray(grid.material)) {
@@ -289,8 +397,31 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
       targetAnglesRef.current = null;
       currentAnglesRef.current = null;
       previousTimeRef.current = null;
+      cameraRef.current = null;
+      isGroundedRef.current = false;
+      pendingDynamicBoundsRef.current = false;
     };
   }, []);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      resetView: () => {
+        const camera = cameraRef.current;
+        const controls = controlsRef.current;
+        if (!camera || !controls) {
+          return;
+        }
+        controls.target.copy(initialControlsTarget.current);
+        camera
+          .position.copy(initialControlsTarget.current)
+          .add(defaultCameraOffset.current);
+        camera.updateProjectionMatrix();
+        controls.update();
+      },
+    }),
+    [],
+  );
 
   useEffect(() => {
     if (!joints || joints.length === 0) {
@@ -299,17 +430,21 @@ export function ArmVisualizer({ joints }: ArmVisualizerProps) {
     targetAnglesRef.current = joints.slice();
     if (!currentAnglesRef.current) {
       currentAnglesRef.current = joints.slice();
-      const robot = robotRef.current;
-      if (robot) {
-        joints.forEach((value, index) => {
-          const joint = robot.joints[`joint${index + 1}`];
-          if (joint) {
-            joint.setJointValue(value);
-          }
-        });
-      }
+    }
+    if (!isGroundedRef.current) {
+      return;
+    }
+    const robot = robotRef.current;
+    if (robot) {
+      joints.forEach((value, index) => {
+        const joint = robot.joints[`joint${index + 1}`];
+        if (joint) {
+          joint.setJointValue(value);
+        }
+      });
+      pendingDynamicBoundsRef.current = true;
     }
   }, [joints]);
 
   return <div ref={containerRef} className="absolute inset-0" />;
-}
+});

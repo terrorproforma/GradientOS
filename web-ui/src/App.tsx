@@ -1,7 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Camera, CameraOff, Plug, Settings, Unplug, X } from "lucide-react";
+import {
+  Camera,
+  CameraOff,
+  Plug,
+  RefreshCcw,
+  Settings,
+  Unplug,
+  X,
+} from "lucide-react";
 import { resolveDefaultApiHost, resolveDefaultVisionHost } from "./useEndpoint";
-import { ArmVisualizer } from "./ArmVisualizer";
+import { ArmVisualizer, type ArmVisualizerHandle } from "./ArmVisualizer";
 
 type TelemetryEvent = {
   timestamp: number;
@@ -175,6 +183,7 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [hasAttemptedAutoConnect, setHasAttemptedAutoConnect] = useState(false);
   const [isVisionActive, setIsVisionActive] = useState(false);
+  const visualizerRef = useRef<ArmVisualizerHandle | null>(null);
   const normalisedVisionHost = useMemo(
     () => normaliseVisionHost(visionHost),
     [visionHost],
@@ -288,6 +297,10 @@ export default function App() {
     setIsVisionActive(true);
   }, [isVisionActive]);
 
+  const handleResetView = useCallback(() => {
+    visualizerRef.current?.resetView();
+  }, []);
+
   useEffect(() => {
     if (!hasAttemptedAutoConnect) {
       setHasAttemptedAutoConnect(true);
@@ -368,6 +381,14 @@ export default function App() {
             </button>
             <button
               type="button"
+              onClick={handleResetView}
+              className="rounded-full border border-slate-600/60 bg-slate-900/60 p-2 text-slate-300 transition hover:border-slate-400 hover:text-slate-100"
+              aria-label="Reset arm view"
+            >
+              <RefreshCcw size={18} strokeWidth={2} />
+            </button>
+            <button
+              type="button"
               onClick={() => setIsSettingsOpen(true)}
               className="rounded-full border border-slate-600/60 bg-slate-900/60 p-2 text-slate-300 transition hover:border-slate-400 hover:text-slate-100"
               aria-label="Open settings"
@@ -388,8 +409,8 @@ export default function App() {
         )}
       </header>
       <main className="relative flex-1 overflow-hidden">
-        <ArmVisualizer joints={latest?.joints} />
-        {isVisionActive && (
+        <ArmVisualizer ref={visualizerRef} joints={latest?.joints} />
+        {isVisionActive && !visionError && (
           <div className="pointer-events-auto absolute left-6 top-6 z-10 flex max-w-sm flex-col gap-2">
             <div className="overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950/80 shadow-lg shadow-slate-950/40 backdrop-blur">
               <img
@@ -397,11 +418,12 @@ export default function App() {
                 alt="Gradient Vision stream"
                 className="block max-h-64 w-full object-cover"
                 onLoad={() => setVisionError(null)}
-                onError={() =>
+                onError={() => {
                   setVisionError(
                     "Unable to load the vision stream. Ensure Gradient Vision is running and accessible.",
-                  )
-                }
+                  );
+                  setIsVisionActive(false);
+                }}
               />
             </div>
           </div>
