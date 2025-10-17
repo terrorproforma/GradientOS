@@ -96,8 +96,10 @@ function buildPreviewPlan(
   return {
     name,
     trajectory,
-    pathPoints,
-    waypoints: waypoints.length > 0 ? waypoints : fallbackWaypoints,
+    pathPoints: pathPoints.map(({ x, y, z }) => transformToScenePoint({ x, y, z })),
+    waypoints: (waypoints.length > 0 ? waypoints : fallbackWaypoints).map(
+      ({ x, y, z }) => transformToScenePoint({ x, y, z }),
+    ),
   };
 }
 
@@ -131,9 +133,28 @@ export function previewFromTrajectoryDetail(
 }
 
 export function encodePointsForApi(points: Point3[]): any[] {
-  return points.map((point) => ({
-    x: Number(point.x),
-    y: Number(point.y),
-    z: Number(point.z),
-  }));
+  return points.map((point) => {
+    const world = transformFromScenePoint(point);
+    return {
+      x: Number(world.x),
+      y: Number(world.y),
+      z: Number(world.z),
+    };
+  });
+}
+
+export function transformToScenePoint(point: Point3): Point3 {
+  return {
+    x: point.x,
+    y: point.z,
+    z: -point.y,
+  };
+}
+
+export function transformFromScenePoint(point: Point3): Point3 {
+  return {
+    x: point.x,
+    y: -point.z,
+    z: point.y,
+  };
 }
