@@ -767,7 +767,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
 
     if (pathList.length >= 2) {
       const geometry = new THREE.BufferGeometry().setFromPoints(pathList);
-      const material = new THREE.LineBasicMaterial({ color: 0x38bdf8 });
+      const material = new THREE.LineBasicMaterial({ color: 0xfacc15 });
       const line = new THREE.Line(geometry, material);
       group.add(line);
     }
@@ -779,7 +779,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       const marker = new THREE.Mesh(
         new THREE.SphereGeometry(0.008, 12, 12),
         new THREE.MeshBasicMaterial({
-          color: index === markerSource.length - 1 ? 0x22d3ee : 0x94a3b8,
+          color: index === markerSource.length - 1 ? 0xfacc15 : 0xfef08a,
         }),
       );
       marker.position.copy(point);
