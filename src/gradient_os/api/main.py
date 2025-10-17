@@ -18,8 +18,10 @@ import numpy as np
 
 try:
     from ..arm_controller import utils as controller_utils
+    from ..arm_controller import command_api as controller_command_api
 except ImportError:
     controller_utils = None
+    controller_command_api = None
 
 
 def _default_controller_port() -> int:
@@ -397,6 +399,47 @@ def create_app() -> FastAPI:
         )
         return {"status": "ok", "name": name.strip()}
 
+    @api.post("/trajectory/plan-points", summary="Plan joint path for custom Cartesian way-points")
+    async def trajectory_plan_points(payload: dict):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body required.")
+        points = _coerce_waypoint_list(payload.get("points"))
+        if not points:
+            raise HTTPException(status_code=400, detail="Field 'points' must contain at least one waypoint.")
+
+        coord_tokens = ",".join(str(value) for point in points for value in point)
+        command = "PLAN_TRAJECTORY_POINTS," + coord_tokens
+        detail = await run_in_threadpool(
+            _controller_call_or_503, command, timeout=2.0, expect_response=True
+        )
+        prefix = "PLANNED_TRAJECTORY_POINTS,"
+        if not detail.startswith(prefix):
+            raise HTTPException(status_code=502, detail=f"Malformed planner reply: {detail}")
+        try:
+            payload_dict = json.loads(detail[len(prefix) :])
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail=f"Planner payload decode failure: {exc}") from exc
+        return payload_dict
+
+    @api.get("/trajectory/detail/{name}", summary="Fetch the definition of a recorded trajectory")
+    async def trajectory_detail(name: str):
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(status_code=400, detail="Trajectory name is required.")
+
+        def _load() -> dict[str, Any] | None:
+            if controller_command_api is None:
+                raise RuntimeError("Arm controller command API unavailable")
+            return controller_command_api._load_trajectory_by_name(name.strip())
+
+        try:
+            trajectory = await run_in_threadpool(_load)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        if trajectory is None:
+            raise HTTPException(status_code=404, detail=f"Trajectory '{name}' not found.")
+        return {"name": name.strip(), "trajectory": trajectory}
+
     @api.get("/trajectory/list", summary="List available recorded trajectories")
     async def trajectory_list():
         detail = await run_in_threadpool(_controller_call_or_503, "GET_TRAJECTORIES")
@@ -490,6 +533,28 @@ def _parse_pose_response(detail: str) -> list[float]:
     except ValueError as exc:
         raise ValueError("Invalid joint data from controller") from exc
     return joints
+
+
+def _coerce_waypoint_list(raw_points: Any) -> list[tuple[float, float, float]]:
+    if not isinstance(raw_points, list):
+        return []
+    points: list[tuple[float, float, float]] = []
+    for idx, entry in enumerate(raw_points):
+        try:
+            if isinstance(entry, dict):
+                x = float(entry["x"])
+                y = float(entry["y"])
+                z = float(entry["z"])
+            elif isinstance(entry, (list, tuple)) and len(entry) == 3:
+                x, y, z = (float(entry[0]), float(entry[1]), float(entry[2]))
+            else:
+                raise ValueError("Waypoint must be an object with x/y/z or a 3-element list/tuple.")
+        except (TypeError, ValueError, KeyError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid waypoint at index {idx}: {exc}"
+            ) from exc
+        points.append((x, y, z))
+    return points
 
 
 async def _plan_point(payload: dict) -> dict[str, Any]:

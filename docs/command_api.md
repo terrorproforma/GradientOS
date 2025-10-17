@@ -39,6 +39,11 @@ This module contains a `handle_...` function for every high-level action the rob
     -   `name`: (string, required) The name of the trajectory to run (must be a key in `trajectories.json`).
     -   `use_cache`: (boolean, optional) If `true`, loads a pre-planned path from the `trajectory_cache` directory. If `false` or omitted, plans the trajectory from scratch.
 
+#### `PLAN_TRAJECTORY_POINTS`
+-   **Syntax:** `PLAN_TRAJECTORY_POINTS,x1,y1,z1[,x2,y2,z2,...]`
+-   **Description:** Plans a joint-space path through one or more Cartesian way-points and returns the serialized steps without executing them. The response is a UDP message starting with `PLANNED_TRAJECTORY_POINTS,` followed by a JSON payload containing the joint path.
+-   **Notes:** Every point is treated as a `move_absolute` step using the current end-effector pose as the starting state. The computed trajectory is also written to `recorded_trajectories/__planner_preview__.json`, allowing immediate playback via `RUN_TRAJECTORY,__planner_preview__`. Each invocation overwrites the previous preview file. The command is **non-blocking**.
+
 #### `TRANSLATE`
 -   **Syntax:** `TRANSLATE,dx,dy,dz`
 -   **Description:** A simple, un-profiled relative move that keeps the tool's orientation locked. This is a **blocking**, single-point IK move and is less smooth than `MOVE_LINE_RELATIVE`.

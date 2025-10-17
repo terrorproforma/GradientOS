@@ -1,4 +1,6 @@
+import json
 import pytest
+
 pytest.importorskip("httpx")
 
 from contextlib import contextmanager
@@ -36,10 +38,30 @@ def patch_send(monkeypatch):
         "RUN_TRAJECTORY,alpha,false",
         "0,0,0,0,0,0",
     }
+    planner_payload = {
+        "name": "__planner_preview__",
+        "steps": [
+            {"type": "move", "path": [[1.0, 2.0, 3.0]], "freq": 100},
+        ],
+        "trajectory": {
+            "description": "Planned",
+            "loop": False,
+            "orientation_euler_angles_deg": None,
+            "moves": [
+                {"command": "move_absolute", "vector": [0.1, 0.2, 0.3]},
+                {"command": "pause", "duration": 1.0},
+            ],
+        },
+        "cartesian_path": [[0.1, 0.2, 0.3]],
+        "waypoints": [[0.1, 0.2, 0.3]],
+        "file_path": "/tmp/recorded_trajectories/__planner_preview__.json",
+    }
     call_log = []
 
     def fake_send(command, timeout=0.5, expect_response=True):
         call_log.append((command, timeout, expect_response))
+        if command.startswith("PLAN_TRAJECTORY_POINTS"):
+            return True, f"PLANNED_TRAJECTORY_POINTS,{json.dumps(planner_payload)}"
         if command in no_reply_commands:
             if expect_response:
                 return False, f"unexpected response requested for {command}"
@@ -48,9 +70,30 @@ def patch_send(monkeypatch):
             return True, ""
         return responses.get(command, (False, f"unexpected {command}"))
 
+    class DummyCommandApi:
+        sample_traj = {
+            "description": "Sample trajectory",
+            "loop": False,
+            "orientation_euler_angles_deg": None,
+            "moves": [
+                {"command": "move_absolute", "vector": [0.1, 0.2, 0.3]},
+                {"command": "pause", "duration": 1.0},
+                {"command": "move_absolute", "vector": [0.4, 0.5, 0.6]},
+            ],
+        }
+
+        @staticmethod
+        def _load_trajectory_by_name(name):
+            if name in {"alpha", "beta", "__planner_preview__"}:
+                return DummyCommandApi.sample_traj
+            return None
+
     monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
     monkeypatch.setattr(
         "gradient_os.api.main._probe_controller", lambda timeout=0.5: (True, "ok")
+    )
+    monkeypatch.setattr(
+        "gradient_os.api.main.controller_command_api", DummyCommandApi
     )
     yield call_log
 
@@ -157,6 +200,34 @@ def test_trajectory_run(client):
     resp = client.post("/trajectory/run", json={"name": "alpha"})
     assert resp.status_code == 200
     assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false", 2.0, False)
+
+
+def test_trajectory_plan_points_success(client):
+    resp = client.post(
+        "/trajectory/plan-points",
+        json={"points": [{"x": 0.1, "y": 0.2, "z": 0.3}, [0.4, 0.5, 0.6]]},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "__planner_preview__"
+    assert body["trajectory"]["moves"][0]["vector"] == [0.1, 0.2, 0.3]
+    assert client.command_calls[-1][0].startswith("PLAN_TRAJECTORY_POINTS,0.1,0.2,0.3,0.4,0.5,0.6")
+    assert client.command_calls[-1][2] is True
+
+
+def test_trajectory_plan_points_validation(client):
+    start_len = len(client.command_calls)
+    resp = client.post("/trajectory/plan-points", json={"points": [{"x": 1.0}]})
+    assert resp.status_code == 400
+    assert len(client.command_calls) == start_len
+
+
+def test_trajectory_detail(client):
+    resp = client.get("/trajectory/detail/alpha")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "alpha"
+    assert body["trajectory"]["moves"][0]["vector"] == [0.1, 0.2, 0.3]
 
 
 def test_preview_execute_clear(client, monkeypatch):

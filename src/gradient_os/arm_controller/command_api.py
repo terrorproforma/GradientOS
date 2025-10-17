@@ -1310,6 +1310,10 @@ _PROJECT_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."
 # Recorded trajectories live at the project root
 RECORDED_TRAJ_DIR = os.path.join(_PROJECT_ROOT_DIR, "recorded_trajectories")
 
+# Well-known filename for the most recent PLAN_TRAJECTORY_POINTS preview
+PLANNED_PREVIEW_NAME = "__planner_preview__"
+PLANNED_PREVIEW_FILENAME = f"{PLANNED_PREVIEW_NAME}.json"
+
 
 def _ensure_record_dir_exists():
     """Create the recorded_trajectories directory if it does not already exist."""
@@ -1404,6 +1408,132 @@ def handle_end_trajectory(traj_name: str):
     # Reset state
     _recording_state["is_recording"] = False
     _recording_state["points"].clear()
+
+
+def handle_plan_trajectory_points(points, sock, addr):
+    """
+    Plan a Cartesian trajectory for a list of way-points and return the joint-space path
+    without executing it. The resulting trajectory is written to the recorded_trajectories
+    directory under a well-known name so it can be executed with RUN_TRAJECTORY.
+    """
+    if len(points) == 0:
+        print("[Pi Trajectory] ERROR: PLAN_TRAJECTORY_POINTS requires at least one waypoint.")
+        try:
+            sock.sendto("ERROR,PLAN_TRAJECTORY_POINTS,NO_POINTS".encode("utf-8"), addr)
+        except Exception as e:
+            print(f"[Pi Trajectory] WARNING: Failed to send PLAN_TRAJECTORY_POINTS error response: {e}")
+        return
+
+    current_q = np.array(utils.current_logical_joint_angles_rad, dtype=float)
+    planned_steps = []
+    waypoint_results = []
+    cartesian_samples = []
+    planning_succeeded = True
+    sample_stride = 5  # Down-sample cartesian samples to keep UDP payload modest
+
+    print(f"[Pi Trajectory] Planning {len(points)} waypoint(s) from current state via PLAN_TRAJECTORY_POINTS.")
+
+    for idx, waypoint in enumerate(points, start=1):
+        target_pos = np.array(waypoint, dtype=float)
+        t_start = time.monotonic()
+        joint_path = trajectory_execution._plan_linear_move(
+            current_q,
+            target_pos,
+            utils.DEFAULT_PROFILE_VELOCITY,
+            utils.DEFAULT_PROFILE_ACCELERATION,
+            100,
+            True,
+            forced_orientation=None,
+        )
+        if not joint_path:
+            print(f"[Pi Trajectory] ERROR: Failed to plan waypoint #{idx} -> {np.round(target_pos, 4)}.")
+            planning_succeeded = False
+            break
+
+        planned_steps.append({
+            "type": "move",
+            "path": joint_path,
+            "freq": 100,
+        })
+
+        # Gather cartesian samples along the path for visualization.
+        for sample_index, joint_sample in enumerate(joint_path):
+            if sample_index % sample_stride != 0 and sample_index != len(joint_path) - 1:
+                continue
+            pose_matrix = ik_solver.get_fk_matrix(np.array(joint_sample))
+            if pose_matrix is None:
+                continue
+            position = pose_matrix[:3, 3]
+            cartesian_samples.append([round(float(position[0]), 4), round(float(position[1]), 4), round(float(position[2]), 4)])
+
+        final_pose = ik_solver.get_fk_matrix(np.array(joint_path[-1]))
+        if final_pose is not None:
+            position = final_pose[:3, 3].tolist()
+            orient_deg = R.from_matrix(final_pose[:3, :3]).as_euler('xyz', degrees=True).tolist()
+            waypoint_results.append({
+                "position": [round(p, 4) for p in position],
+                "orientation_euler_deg": [round(o, 2) for o in orient_deg],
+            })
+        else:
+            waypoint_results.append({
+                "position": [round(float(val), 4) for val in waypoint],
+                "orientation_euler_deg": None,
+            })
+
+        current_q = np.array(joint_path[-1])
+        t_end = time.monotonic()
+        print(f"[Pi Trajectory] Planned waypoint #{idx} -> {np.round(target_pos, 4)} in {(t_end - t_start) * 1000:.2f} ms")
+
+    if not planning_succeeded or len(planned_steps) == 0:
+        try:
+            sock.sendto("ERROR,PLAN_TRAJECTORY_POINTS,PLANNING_FAILED".encode("utf-8"), addr)
+        except Exception as e:
+            print(f"[Pi Trajectory] WARNING: Failed to send PLAN_TRAJECTORY_POINTS failure response: {e}")
+        return
+
+    # Build recorded trajectory representation mirroring handle_end_trajectory().
+    moves = []
+    for i, waypoint_data in enumerate(waypoint_results):
+        move = {
+            "command": "move_absolute",
+            "vector": waypoint_data["position"],
+        }
+        if waypoint_data["orientation_euler_deg"]:
+            move["orientation_euler_deg"] = waypoint_data["orientation_euler_deg"]
+        moves.append(move)
+        if i < len(waypoint_results) - 1:
+            moves.append({"command": "pause", "duration": 1.0})
+
+    traj_dict = {
+        "description": f"Planned on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} via PLAN_TRAJECTORY_POINTS",
+        "loop": False,
+        "orientation_euler_angles_deg": None,
+        "moves": moves,
+    }
+
+    _ensure_record_dir_exists()
+    preview_path = os.path.join(RECORDED_TRAJ_DIR, PLANNED_PREVIEW_FILENAME)
+    try:
+        with open(preview_path, "w") as f:
+            json.dump(traj_dict, f, indent=2)
+        print(f"[Pi Trajectory] Preview trajectory saved to {preview_path}")
+    except Exception as e:
+        print(f"[Pi Trajectory] WARNING: Failed to persist planner preview to {preview_path}: {e}")
+
+    payload = {
+        "name": PLANNED_PREVIEW_NAME,
+        "steps": utils._convert_numpy_to_list(planned_steps),
+        "trajectory": traj_dict,
+        "cartesian_path": cartesian_samples,
+        "waypoints": [item["position"] for item in waypoint_results],
+        "file_path": preview_path,
+    }
+    message = "PLANNED_TRAJECTORY_POINTS," + json.dumps(payload)
+    try:
+        sock.sendto(message.encode("utf-8"), addr)
+    except Exception as e:
+        print(f"[Pi Trajectory] WARNING: Failed to send PLAN_TRAJECTORY_POINTS result: {e}")
+
 
 # -----------------------------------------------------------------------------
 # Utility: load trajectory file (default + recorded)

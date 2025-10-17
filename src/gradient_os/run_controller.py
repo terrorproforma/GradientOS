@@ -403,6 +403,26 @@ def main():
                 elif command == "PLAN_TRAJECTORY":
                     command_api.handle_plan_trajectory_start()
 
+                elif command == "PLAN_TRAJECTORY_POINTS":
+                    try:
+                        raw_tokens = [item for item in parts[1:] if item.strip() != ""]
+                        coords = [float(item) for item in raw_tokens]
+                        if len(coords) == 0 or len(coords) % 3 != 0:
+                            raise ValueError("Coordinates must be supplied as x,y,z triples.")
+                        points = [
+                            (coords[i], coords[i + 1], coords[i + 2])
+                            for i in range(0, len(coords), 3)
+                        ]
+                        command_api.handle_plan_trajectory_points(points, sock, addr)
+                    except ValueError as e:
+                        print(f"[Controller] Error: Invalid PLAN_TRAJECTORY_POINTS command: {e}")
+                        try:
+                            sock.sendto("ERROR,PLAN_TRAJECTORY_POINTS,BAD_ARGS".encode("utf-8"), addr)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[Controller] Error while handling PLAN_TRAJECTORY_POINTS: {e}")
+
                 elif command == "REC_POS":
                     command_api.handle_record_position()
 

@@ -11,25 +11,24 @@ import {
   Settings,
   Trash2,
   Unplug,
+  Undo2,
   X,
 } from "lucide-react";
 import { resolveDefaultApiHost, resolveDefaultVisionHost } from "./useEndpoint";
 import { ArmVisualizer, type ArmVisualizerHandle } from "./ArmVisualizer";
+import {
+  encodePointsForApi,
+  previewFromPlannerPayload,
+  previewFromTrajectoryDetail,
+  type Point3,
+  type PreviewPlan,
+} from "./previewUtils";
 
 type TelemetryEvent = {
   timestamp: number;
   raw: string;
   joints?: number[];
   gripper?: number;
-};
-
-type TrajectoryPreview = {
-  target: { x: number; y: number; z: number };
-  velocity: number;
-  acceleration: number;
-  closed_loop: boolean;
-  joints_rad: number[][];
-  cartesian_m?: number[][];
 };
 
 function normaliseApiHost(input: string): string {
@@ -95,10 +94,19 @@ type TrajectoryPanelProps = {
   isPlanning: boolean;
   isPlanLoading: boolean;
   isRunning: boolean;
-  preview: TrajectoryPreview | null;
-  onPlan: () => void;
+  preview: PreviewPlan | null;
+  plannerPoints: Point3[];
+  savedTrajectories: string[];
+  selectedTrajectory: string;
+  isTrajectoryListLoading: boolean;
+  isLoadingSavedTrajectory: boolean;
+  onPlanToggle: () => void;
   onRun: () => void;
   onClear: () => void;
+  onRefreshTrajectories: () => void;
+  onSelectTrajectory: (value: string) => void;
+  onLoadTrajectory: () => void;
+  onUndoPoint: () => void;
 };
 
 function TrajectoryPanel({
@@ -106,12 +114,24 @@ function TrajectoryPanel({
   isPlanLoading,
   isRunning,
   preview,
-  onPlan,
+  plannerPoints,
+  savedTrajectories,
+  selectedTrajectory,
+  isTrajectoryListLoading,
+  isLoadingSavedTrajectory,
+  onPlanToggle,
   onRun,
   onClear,
+  onRefreshTrajectories,
+  onSelectTrajectory,
+  onLoadTrajectory,
+  onUndoPoint,
 }: TrajectoryPanelProps) {
-  const waypoints = preview?.joints_rad?.length ?? 0;
-  const target = preview?.target;
+  const waypointList = preview?.waypoints ?? plannerPoints;
+  const waypointCount = waypointList.length;
+  const hasSavedTrajectories = savedTrajectories.length > 0;
+  const lastPoint =
+    waypointList.length > 0 ? waypointList[waypointList.length - 1] : null;
 
   return (
     <div className="pointer-events-auto w-full max-w-xs rounded-xl border border-slate-700/60 bg-slate-900/80 p-4 shadow-lg shadow-slate-900/50 backdrop-blur-lg">
@@ -122,7 +142,7 @@ function TrajectoryPanel({
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={onPlan}
+            onClick={onPlanToggle}
             disabled={isPlanLoading || isRunning}
             className={`rounded-full border border-slate-600/50 p-2 transition ${
               isPlanning
@@ -132,6 +152,19 @@ function TrajectoryPanel({
             aria-label="Select trajectory target"
           >
             <Route size={18} strokeWidth={2} />
+          </button>
+          <button
+            type="button"
+            onClick={onUndoPoint}
+            disabled={plannerPoints.length === 0 || isPlanLoading || isRunning}
+            className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
+              plannerPoints.length === 0 || isPlanLoading || isRunning
+                ? "opacity-60"
+                : ""
+            }`}
+            aria-label="Remove last waypoint"
+          >
+            <Undo2 size={18} strokeWidth={2} />
           </button>
           <button
             type="button"
@@ -163,24 +196,88 @@ function TrajectoryPanel({
         ) : isRunning ? (
           <p>Executing trajectory…</p>
         ) : isPlanning ? (
-          <p>Select a point in the workspace to preview a trajectory.</p>
+          <p>
+            Shift-click in the workspace to add waypoints. Use undo to remove
+            the last point.
+          </p>
         ) : preview ? (
           <div className="flex flex-col gap-2">
-            {target && (
+            <div className="text-xs text-slate-300/80">
+              Loaded:{" "}
+              <span className="font-semibold text-slate-100">{preview.name}</span>
+            </div>
+            <div className="text-xs text-slate-300/80">
+              Waypoints:{" "}
+              <span className="font-semibold text-slate-100">{waypointCount}</span>
+            </div>
+            {lastPoint && (
               <div className="text-xs text-slate-300/80">
-                Target (m):{" "}
+                Last point (m):{" "}
                 <span className="font-semibold text-slate-100">
-                  {target.x.toFixed(3)}, {target.y.toFixed(3)}, {target.z.toFixed(3)}
+                  {lastPoint.x.toFixed(3)}, {lastPoint.y.toFixed(3)},{" "}
+                  {lastPoint.z.toFixed(3)}
                 </span>
               </div>
             )}
-            <div className="text-xs text-slate-300/80">
-              Waypoints:{" "}
-              <span className="font-semibold text-slate-100">{waypoints}</span>
-            </div>
           </div>
         ) : (
-          <p>No preview planned yet.</p>
+          <p>No preview loaded yet.</p>
+        )}
+      </div>
+      <div className="mt-4 border-t border-slate-700/50 pt-3">
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200/80">
+            Saved Trajectories
+          </span>
+          <button
+            type="button"
+            onClick={onRefreshTrajectories}
+            disabled={isTrajectoryListLoading}
+            className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
+              isTrajectoryListLoading ? "cursor-wait opacity-60" : ""
+            }`}
+            aria-label="Refresh saved trajectories"
+          >
+            <RefreshCcw
+              size={16}
+              strokeWidth={2}
+              className={isTrajectoryListLoading ? "animate-spin" : ""}
+            />
+          </button>
+        </div>
+        {isTrajectoryListLoading ? (
+          <p className="text-xs text-slate-300/80">Loading trajectories…</p>
+        ) : hasSavedTrajectories ? (
+          <div className="flex items-center gap-2">
+            <select
+              className="flex-1 rounded-lg border border-slate-600/70 bg-slate-950/60 px-3 py-2 text-sm text-slate-100 focus:border-cyan-400/60 focus:outline-none focus:ring-2 focus:ring-cyan-500/30"
+              value={selectedTrajectory}
+              onChange={(event) => onSelectTrajectory(event.target.value)}
+            >
+              {savedTrajectories.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={onLoadTrajectory}
+              disabled={!selectedTrajectory || isLoadingSavedTrajectory}
+              className={`rounded-lg border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-sm font-semibold text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+                (!selectedTrajectory || isLoadingSavedTrajectory)
+                  ? "cursor-not-allowed opacity-60"
+                  : ""
+              }`}
+              aria-label="Load selected trajectory"
+            >
+              {isLoadingSavedTrajectory ? "Loading…" : "Load"}
+            </button>
+          </div>
+        ) : (
+          <p className="text-xs text-slate-300/80">
+            No saved trajectories available.
+          </p>
         )}
       </div>
     </div>
@@ -308,11 +405,15 @@ export default function App() {
   const [isVisionActive, setIsVisionActive] = useState(false);
   const [showBoundingBox, setShowBoundingBox] = useState(true);
   const [isStopping, setIsStopping] = useState(false);
-  const [previewTrajectory, setPreviewTrajectory] = useState<TrajectoryPreview | null>(null);
-  const [previewPath, setPreviewPath] = useState<Array<{ x: number; y: number; z: number }>>([]);
+  const [previewPlan, setPreviewPlan] = useState<PreviewPlan | null>(null);
+  const [plannerPoints, setPlannerPoints] = useState<Point3[]>([]);
   const [isPlanning, setIsPlanning] = useState(false);
   const [isPlanLoading, setIsPlanLoading] = useState(false);
   const [isRunningPreview, setIsRunningPreview] = useState(false);
+  const [savedTrajectories, setSavedTrajectories] = useState<string[]>([]);
+  const [isTrajectoryListLoading, setIsTrajectoryListLoading] = useState(false);
+  const [selectedTrajectory, setSelectedTrajectory] = useState("");
+  const [isLoadingSavedTrajectory, setIsLoadingSavedTrajectory] = useState(false);
   const [isHoming, setIsHoming] = useState(false);
   const visualizerRef = useRef<ArmVisualizerHandle | null>(null);
   const normalizedApiHost = useMemo(() => normaliseApiHost(apiHost), [apiHost]);
@@ -324,6 +425,14 @@ export default function App() {
     () => `${normalisedVisionHost}/stream.mjpg`,
     [normalisedVisionHost],
   );
+  const visualWaypoints =
+    plannerPoints.length > 0
+      ? plannerPoints
+      : previewPlan?.waypoints ?? [];
+  const visualPathPoints =
+    previewPlan?.pathPoints && previewPlan.pathPoints.length > 0
+      ? previewPlan.pathPoints
+      : visualWaypoints;
   const toggleButtonClasses = useMemo(
     () =>
       isConnected
@@ -339,6 +448,7 @@ export default function App() {
     [isVisionActive],
   );
   const eventSourceRef = useRef<EventSource | null>(null);
+  const trajectoryRefreshInFlight = useRef(false);
 
   const disconnect = useCallback(() => {
     eventSourceRef.current?.close();
@@ -347,11 +457,15 @@ export default function App() {
     setLatest(null);
     setIsVisionActive(false);
     setVisionError(null);
-    setPreviewTrajectory(null);
-    setPreviewPath([]);
+    setPreviewPlan(null);
+    setPlannerPoints([]);
     setIsPlanning(false);
     setIsPlanLoading(false);
     setIsRunningPreview(false);
+    setSavedTrajectories([]);
+    setIsTrajectoryListLoading(false);
+    setSelectedTrajectory("");
+    setIsLoadingSavedTrajectory(false);
     setIsHoming(false);
   }, []);
 
@@ -439,141 +553,178 @@ export default function App() {
     visualizerRef.current?.resetView();
   }, []);
 
-  const handlePlanButton = useCallback(async () => {
+  const requestPlannerPreview = useCallback(
+    async (points: Point3[]) => {
+      if (points.length === 0) {
+        setPreviewPlan(null);
+        setPlannerPoints([]);
+        return;
+      }
+      setIsPlanLoading(true);
+      setError(null);
+      try {
+        const response = await fetch(`${normalizedApiHost}/trajectory/plan-points`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ points: encodePointsForApi(points) }),
+        });
+        if (!response.ok) {
+          const message = await response.text();
+          throw new Error(message || `Plan request failed (${response.status})`);
+        }
+        const data = await response.json();
+        const { plan, waypoints } = previewFromPlannerPayload(data);
+        setPreviewPlan(plan);
+        setPlannerPoints(waypoints);
+      } catch (err) {
+        setError(`Failed to plan trajectory: ${(err as Error).message}`);
+      } finally {
+        setIsPlanLoading(false);
+      }
+    },
+    [normalizedApiHost],
+  );
+
+  const handlePlanToggle = useCallback(() => {
     if (isPlanLoading || isRunningPreview) {
       return;
     }
     setError(null);
-    if (isPlanning) {
-      setIsPlanning(false);
-      return;
-    }
-    setPreviewTrajectory(null);
-    setPreviewPath([]);
-    setIsPlanning(true);
-    try {
-      await fetch(`${normalizedApiHost}/trajectory/clear-preview`, {
-        method: "POST",
-      });
-    } catch (err) {
-      // Clearing preview is best-effort; surface warning but keep planning enabled.
-      setError(
-        `Unable to clear previous preview: ${(err as Error).message ?? "Unknown error"}`,
-      );
-    }
-  }, [isPlanLoading, isPlanning, isRunningPreview, normalizedApiHost]);
+    setIsPlanning((current) => {
+      const next = !current;
+      if (next) {
+        setPlannerPoints((existing) =>
+          existing.length > 0
+            ? existing
+            : previewPlan?.waypoints ?? [],
+        );
+      }
+      return next;
+    });
+  }, [isPlanLoading, isRunningPreview, previewPlan]);
 
   const handlePointSelected = useCallback(
-    async (point: { x: number; y: number; z: number }) => {
+    async (point: Point3) => {
       if (!isPlanning || isPlanLoading) {
         return;
       }
-      setIsPlanning(false);
-      setIsPlanLoading(true);
-      setError(null);
-    try {
-      setPreviewPath([{ x: point.x, y: point.y, z: point.z }]);
-      const response = await fetch(`${normalizedApiHost}/trajectory/preview`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          x: point.x,
-          y: point.y,
-          z: point.z,
-        }),
-      });
-      if (!response.ok) {
-        const message = await response.text();
-        throw new Error(
-          message || `Preview request failed (${response.status})`,
-        );
-      }
-      const data = (await response.json()) as TrajectoryPreview;
-      setPreviewTrajectory(data);
-      const pathPoints =
-        Array.isArray(data.cartesian_m) && data.cartesian_m.length > 0
-          ? (data.cartesian_m
-              .map((coords) =>
-                Array.isArray(coords) && coords.length >= 3
-                  ? {
-                      x: Number(coords[0]),
-                      y: Number(coords[1]),
-                      z: Number(coords[2]),
-                    }
-                  : null,
-              )
-              .filter(Boolean) as Array<{ x: number; y: number; z: number }>)
-          : [];
-      setPreviewPath(
-        pathPoints.length > 0
-          ? pathPoints
-          : [{ x: point.x, y: point.y, z: point.z }],
-      );
-    } catch (err) {
-      setError(`Failed to plan trajectory: ${(err as Error).message}`);
-      setPreviewTrajectory(null);
-      setPreviewPath([]);
-    } finally {
-      setIsPlanLoading(false);
-    }
+      const nextPoints = [...plannerPoints, point];
+      setPlannerPoints(nextPoints);
+      await requestPlannerPreview(nextPoints);
     },
-    [isPlanning, isPlanLoading, normalizedApiHost],
+    [isPlanning, isPlanLoading, plannerPoints, requestPlannerPreview],
   );
 
+  const handleUndoPoint = useCallback(async () => {
+    if (plannerPoints.length === 0 || isPlanLoading) {
+      return;
+    }
+    const nextPoints = plannerPoints.slice(0, -1);
+    setPlannerPoints(nextPoints);
+    if (nextPoints.length === 0) {
+      setPreviewPlan(null);
+      return;
+    }
+    await requestPlannerPreview(nextPoints);
+  }, [plannerPoints, isPlanLoading, requestPlannerPreview]);
+
   const handleRunPreview = useCallback(async () => {
-    if (!previewTrajectory || isPlanLoading || isRunningPreview) {
+    if (!previewPlan || isPlanLoading || isRunningPreview) {
       return;
     }
     setIsRunningPreview(true);
     setError(null);
     try {
-      const response = await fetch(
-        `${normalizedApiHost}/trajectory/execute-preview`,
-        {
-          method: "POST",
-        },
-      );
+      const response = await fetch(`${normalizedApiHost}/trajectory/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: previewPlan.name, use_cache: true }),
+      });
       if (!response.ok) {
         const message = await response.text();
-        throw new Error(
-          message || `Execute request failed (${response.status})`,
-        );
+        throw new Error(message || `Run request failed (${response.status})`);
       }
-      setPreviewTrajectory(null);
-      setPreviewPath([]);
     } catch (err) {
       setError(`Failed to execute trajectory: ${(err as Error).message}`);
     } finally {
       setIsRunningPreview(false);
     }
-  }, [
-    previewTrajectory,
-    isPlanLoading,
-    isRunningPreview,
-    normalizedApiHost,
-  ]);
+  }, [previewPlan, isPlanLoading, isRunningPreview, normalizedApiHost]);
 
-  const handleClearPreview = useCallback(async () => {
+  const handleClearPreview = useCallback(() => {
     setError(null);
-    setPreviewTrajectory(null);
-    setPreviewPath([]);
+    setPreviewPlan(null);
+    setPlannerPoints([]);
     setIsPlanning(false);
+  }, []);
+
+  const refreshTrajectoryList = useCallback(async () => {
+    if (trajectoryRefreshInFlight.current) {
+      return;
+    }
+    trajectoryRefreshInFlight.current = true;
+    setError(null);
+    setIsTrajectoryListLoading(true);
     try {
-      const response = await fetch(`${normalizedApiHost}/trajectory/clear-preview`, {
-        method: "POST",
-      });
+      const response = await fetch(`${normalizedApiHost}/trajectory/list`);
       if (!response.ok) {
         const message = await response.text();
-        throw new Error(
-          message || `Clear request failed (${response.status})`,
-        );
+        throw new Error(message || `List request failed (${response.status})`);
       }
+      const data = (await response.json()) as { trajectories?: unknown };
+      const names = Array.isArray(data.trajectories)
+        ? data.trajectories
+            .map((value) =>
+              typeof value === "string" ? value.trim() : "",
+            )
+            .filter((value): value is string => value.length > 0)
+        : [];
+      setSavedTrajectories(names);
+      setSelectedTrajectory((current) =>
+        current && names.includes(current) ? current : names[0] ?? "",
+      );
     } catch (err) {
-      setError(`Failed to clear preview: ${(err as Error).message}`);
+      setError(`Failed to load trajectories: ${(err as Error).message}`);
+      setSavedTrajectories([]);
+      setSelectedTrajectory("");
     } finally {
-      setIsPlanLoading(false);
+      setIsTrajectoryListLoading(false);
+      trajectoryRefreshInFlight.current = false;
     }
   }, [normalizedApiHost]);
+
+  const handleSelectTrajectory = useCallback((value: string) => {
+    setSelectedTrajectory(value);
+  }, []);
+
+  const handleLoadTrajectory = useCallback(async () => {
+    if (!selectedTrajectory || isLoadingSavedTrajectory) {
+      return;
+    }
+    setError(null);
+    setIsLoadingSavedTrajectory(true);
+    try {
+      const response = await fetch(
+        `${normalizedApiHost}/trajectory/detail/${encodeURIComponent(selectedTrajectory)}`,
+      );
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || `Load request failed (${response.status})`);
+      }
+      const data = await response.json();
+      const plan = previewFromTrajectoryDetail(
+        typeof data?.name === "string" ? data.name : selectedTrajectory,
+        data?.trajectory ?? { moves: [] },
+      );
+      setPreviewPlan(plan);
+      setPlannerPoints(plan.waypoints);
+      setIsPlanning(false);
+    } catch (err) {
+      setError(`Failed to load trajectory: ${(err as Error).message}`);
+    } finally {
+      setIsLoadingSavedTrajectory(false);
+    }
+  }, [selectedTrajectory, isLoadingSavedTrajectory, normalizedApiHost]);
 
   const issueStop = useCallback(async () => {
     if (isStopping) {
@@ -634,6 +785,13 @@ export default function App() {
       connect();
     }
   }, [connect, hasAttemptedAutoConnect]);
+
+  useEffect(() => {
+    if (!isConnected) {
+      return;
+    }
+    refreshTrajectoryList();
+  }, [isConnected, refreshTrajectoryList]);
 
   useEffect(() => {
     return () => {
@@ -767,7 +925,8 @@ export default function App() {
           showBoundingBox={showBoundingBox}
           selectionMode={isPlanning && !isPlanLoading}
           onPointSelected={handlePointSelected}
-          previewPath={previewPath}
+          pathPoints={visualPathPoints}
+          waypoints={visualWaypoints}
         />
         {isVisionActive && !visionError && (
           <div className="pointer-events-auto absolute left-6 top-6 z-10 flex max-w-sm flex-col gap-2">
@@ -793,10 +952,19 @@ export default function App() {
             isPlanning={isPlanning}
             isPlanLoading={isPlanLoading}
             isRunning={isRunningPreview}
-            preview={previewTrajectory}
-            onPlan={handlePlanButton}
+            preview={previewPlan}
+            plannerPoints={plannerPoints}
+            savedTrajectories={savedTrajectories}
+            selectedTrajectory={selectedTrajectory}
+            isTrajectoryListLoading={isTrajectoryListLoading}
+            isLoadingSavedTrajectory={isLoadingSavedTrajectory}
+            onPlanToggle={handlePlanToggle}
             onRun={handleRunPreview}
             onClear={handleClearPreview}
+            onRefreshTrajectories={refreshTrajectoryList}
+            onSelectTrajectory={handleSelectTrajectory}
+            onLoadTrajectory={handleLoadTrajectory}
+            onUndoPoint={handleUndoPoint}
           />
         </div>
       </main>

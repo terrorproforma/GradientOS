@@ -8,13 +8,15 @@ import {
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 import URDFLoader, { type URDFRobot } from "urdf-loader";
+import type { Point3 } from "./previewUtils";
 
 type ArmVisualizerProps = {
   joints?: number[];
   showBoundingBox: boolean;
   selectionMode: boolean;
   onPointSelected?: (point: { x: number; y: number; z: number }) => void;
-  previewPath?: Array<{ x: number; y: number; z: number }>;
+  pathPoints?: Point3[];
+  waypoints?: Point3[];
 };
 
 const GRID_CELL_SIZE = 0.05; // 10 cm per square
@@ -37,7 +39,7 @@ export type ArmVisualizerHandle = {
 };
 
 export const ArmVisualizer = forwardRef(function ArmVisualizer(
-  { joints, showBoundingBox, selectionMode, onPointSelected, previewPath }: ArmVisualizerProps,
+  { joints, showBoundingBox, selectionMode, onPointSelected, pathPoints, waypoints }: ArmVisualizerProps,
   ref: ForwardedRef<ArmVisualizerHandle>,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -125,7 +127,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     scene.add(grid);
 
     const handlePointerDown = (event: PointerEvent) => {
-      if (!selectionModeRef.current) {
+      if (!selectionModeRef.current || !event.shiftKey || event.button !== 0) {
         return;
       }
       const camera = cameraRef.current;
@@ -681,11 +683,6 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
 
   useEffect(() => {
     selectionModeRef.current = selectionMode;
-    const controls = controlsRef.current;
-    if (controls) {
-      controls.enableRotate = !selectionMode;
-      controls.enablePan = !selectionMode;
-    }
   }, [selectionMode]);
 
   useEffect(() => {
@@ -754,25 +751,35 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       previewGroupRef.current = null;
     }
 
-    if (!previewPath || previewPath.length === 0) {
+    const pathList = Array.isArray(pathPoints)
+      ? pathPoints.map(({ x, y, z }) => new THREE.Vector3(x, y, z))
+      : [];
+    const waypointList =
+      Array.isArray(waypoints) && waypoints.length > 0
+        ? waypoints.map(({ x, y, z }) => new THREE.Vector3(x, y, z))
+        : [];
+
+    if (pathList.length === 0 && waypointList.length === 0) {
       return;
     }
 
-    const points = previewPath.map(({ x, y, z }) => new THREE.Vector3(x, y, z));
     const group = new THREE.Group();
 
-    if (points.length >= 2) {
-      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+    if (pathList.length >= 2) {
+      const geometry = new THREE.BufferGeometry().setFromPoints(pathList);
       const material = new THREE.LineBasicMaterial({ color: 0x38bdf8 });
       const line = new THREE.Line(geometry, material);
       group.add(line);
     }
 
-    points.forEach((point, index) => {
+    const markerSource =
+      waypointList.length > 0 ? waypointList : pathList.length > 0 ? pathList : [];
+
+    markerSource.forEach((point, index) => {
       const marker = new THREE.Mesh(
         new THREE.SphereGeometry(0.008, 12, 12),
         new THREE.MeshBasicMaterial({
-          color: index === points.length - 1 ? 0x22d3ee : 0x94a3b8,
+          color: index === markerSource.length - 1 ? 0x22d3ee : 0x94a3b8,
         }),
       );
       marker.position.copy(point);
@@ -789,7 +796,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         previewGroupRef.current = null;
       }
     };
-  }, [previewPath]);
+  }, [pathPoints, waypoints]);
 
   useEffect(() => {
     const canvas = containerRef.current?.querySelector("canvas");
