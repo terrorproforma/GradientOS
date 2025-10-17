@@ -13,8 +13,8 @@ import json
 
 try:
     from .arm_controller import (
-        command_api, 
-        servo_driver, 
+        command_api,
+        servo_driver,
         servo_protocol,
         utils
     )
@@ -55,7 +55,7 @@ def main():
     if args.serial_port:
         utils.SERIAL_PORT = args.serial_port
 
-    if getattr(args, "sim", False):
+    if args.sim:
         from .arm_controller import sim_backend
 
         sim_backend.activate()
@@ -71,7 +71,7 @@ def main():
     if utils.gripper_present:
         # Use the generic and robust word-reading function
         raw_pos = servo_protocol.read_servo_register_word(
-            utils.SERVO_ID_GRIPPER, 
+            utils.SERVO_ID_GRIPPER,
             utils.SERVO_ADDR_PRESENT_POSITION
         )
         if raw_pos is not None:
@@ -214,7 +214,7 @@ def main():
                             print(f"[Controller] Factory reset command sent to servo {servo_id_to_reset}.")
                             # Add a longer delay for the servo to process the EEPROM write before restarting.
                             print("[Controller] Waiting 1 second for servo to process reset...")
-                            time.sleep(1.0) 
+                            time.sleep(1.0)
 
                             print(f"[Controller] Now sending RESTART command to servo ID {servo_id_to_reset}.")
                             if servo_protocol.restart_servo(servo_id_to_reset):

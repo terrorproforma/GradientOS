@@ -57,3 +57,6 @@ converted_le_robot_datasets/*
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Planner preview
+recorded_trajectories/__planner_preview__.json
