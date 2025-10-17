@@ -553,7 +553,8 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
             continue;
           }
           const blend = Math.min(1, deltaSeconds * smoothing);
-          const nextValue = currentValue + (targetValue - currentValue) * (Number.isFinite(blend) ? blend : 1);
+          const blendFactor = Number.isFinite(blend) ? blend : 1;
+          const nextValue = currentValue + (targetValue - currentValue) * blendFactor;
           if (Math.abs(nextValue - currentValue) > 1e-5) {
             jointsChanged = true;
           }
