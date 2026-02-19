@@ -29,6 +29,7 @@ import {
   Trash2,
   Unplug,
   Undo2,
+  Wrench,
   X,
 } from "lucide-react";
 import { resolveDefaultApiHost, resolveDefaultVisionHost } from "./useEndpoint";
@@ -86,6 +87,113 @@ type TelemetryEvent = {
   weld_type?: string;
 };
 
+type Axis3 = { x: number; y: number; z: number };
+
+type RuntimeOffset = {
+  position_m: Axis3;
+  rotation_deg: Axis3;
+};
+
+type ToolOffsetMm = {
+  position_mm: Axis3;
+  rotation_deg: Axis3;
+};
+
+type ToolMeshConfig = {
+  asset_path: string;
+  scale: number;
+  position_mm: Axis3;
+  rotation_deg: Axis3;
+};
+
+type ToolDefinition = {
+  tool_id: string;
+  display_name: string;
+  description?: string;
+  tool_type: string;
+  keywords: string[];
+  compatible_robot_ids: string[];
+  offset: ToolOffsetMm;
+  mesh?: ToolMeshConfig | null;
+  weld?: Record<string, unknown>;
+};
+
+type KinematicsProfileSnapshot = {
+  revision: number;
+  profile: {
+    profile_id: string;
+    version: string;
+    robot_id: string;
+    robot_serial: string;
+  };
+  offsets: {
+    base: RuntimeOffset;
+    tool: RuntimeOffset;
+  };
+};
+
+type RobotPolicyOption = {
+  name: string;
+  robot_id: string;
+  display_name: string;
+  version: string;
+  default_servo_backend: string;
+  default_ik_solver_backend: string;
+};
+
+type ActiveRuntimeConfig = {
+  robot: {
+    name: string;
+    robot_id: string;
+    display_name: string;
+    version: string;
+  };
+  mode: {
+    sim: boolean;
+  };
+  ik_solver: {
+    effective_backend: string;
+    source: string;
+    robot_default_backend: string;
+    override_backend?: string | null;
+  };
+  servo_backend: {
+    effective_backend: string;
+    source: string;
+    robot_default_backend: string;
+    override_backend?: string | null;
+  };
+  tool?: {
+    active_tool_id: string;
+    display_name: string;
+    tool_type: string;
+    source?: string;
+    offset?: ToolOffsetMm;
+    mesh?: ToolMeshConfig | null;
+  };
+  allow_unsafe_overrides: boolean;
+};
+
+type RuntimeConfigSnapshot = {
+  active: ActiveRuntimeConfig | null;
+  active_error?: string | null;
+  desired: {
+    robot: string;
+    active_tool_id?: string | null;
+    allow_unsafe_overrides?: boolean;
+    overrides?: {
+      ik_solver_backend?: string | null;
+      servo_backend?: string | null;
+    };
+  };
+  meta?: {
+    updated_at?: string;
+    updated_by?: string;
+  };
+  restart_required: boolean;
+  runtime_config_path?: string;
+};
+
 type PersistedSettings = {
   showBoundingBox: boolean;
   collapseLiveCharts: boolean;
@@ -100,7 +208,7 @@ type PersistedSettings = {
   selectedProgramNodeId: string | null;
 };
 
-type SidebarPanelId = "step" | "trajectory" | "weld" | "telemetry";
+type SidebarPanelId = "step" | "trajectory" | "tools" | "weld" | "telemetry";
 
 type TopologyModel = {
   model_id: string;
@@ -128,6 +236,7 @@ type WeldDraft = {
   activeSegmentEdgeId: string | null;
   workAngleDeg: number;
   travelAngleDeg: number;
+  tangentRollDeg: number;
   transitionClearanceMm: number;
   postAction: "none" | "return_to_start" | "lift";
 };
@@ -153,6 +262,8 @@ type WeldProgramRecord = {
     work_angle_deg?: number;
     travelAngleDeg?: number;
     travel_angle_deg?: number;
+    tangentRollDeg?: number;
+    tangent_roll_deg?: number;
     transitionClearanceMm?: number;
     transition_clearance_mm?: number;
     postAction?: "none" | "return_to_start" | "lift";
@@ -227,6 +338,74 @@ const DEFAULT_STEP_TRANSFORM: StepTransform = {
   scale: 1,
 };
 
+const DEFAULT_RUNTIME_OFFSET: RuntimeOffset = {
+  position_m: { x: 0, y: 0, z: 0 },
+  rotation_deg: { x: 0, y: 0, z: 0 },
+};
+
+function createDefaultMeshConfig(assetPath = "", scale = 1): ToolMeshConfig {
+  return {
+    asset_path: assetPath,
+    scale,
+    position_mm: { x: 0, y: 0, z: 0 },
+    rotation_deg: { x: 0, y: 0, z: 0 },
+  };
+}
+
+const DEFAULT_TOOL_DRAFT: ToolDefinition = {
+  tool_id: "",
+  display_name: "",
+  description: "",
+  tool_type: "generic",
+  keywords: [],
+  compatible_robot_ids: [],
+  offset: {
+    position_mm: { x: 0, y: 0, z: 0 },
+    rotation_deg: { x: 0, y: 0, z: 0 },
+  },
+  mesh: null,
+  weld: {},
+};
+
+function cloneRuntimeOffset(offset: RuntimeOffset): RuntimeOffset {
+  return {
+    position_m: { ...offset.position_m },
+    rotation_deg: { ...offset.rotation_deg },
+  };
+}
+
+function cloneToolDefinition(tool: ToolDefinition): ToolDefinition {
+  const mesh = tool.mesh
+    ? {
+        asset_path: tool.mesh.asset_path,
+        scale: tool.mesh.scale,
+        position_mm: {
+          x: Number(tool.mesh.position_mm?.x ?? 0),
+          y: Number(tool.mesh.position_mm?.y ?? 0),
+          z: Number(tool.mesh.position_mm?.z ?? 0),
+        },
+        rotation_deg: {
+          x: Number(tool.mesh.rotation_deg?.x ?? 0),
+          y: Number(tool.mesh.rotation_deg?.y ?? 0),
+          z: Number(tool.mesh.rotation_deg?.z ?? 0),
+        },
+      }
+    : null;
+  return {
+    ...tool,
+    keywords: Array.isArray(tool.keywords) ? [...tool.keywords] : [],
+    compatible_robot_ids: Array.isArray(tool.compatible_robot_ids)
+      ? [...tool.compatible_robot_ids]
+      : [],
+    offset: {
+      position_mm: { ...tool.offset.position_mm },
+      rotation_deg: { ...tool.offset.rotation_deg },
+    },
+    mesh,
+    weld: tool.weld ? { ...tool.weld } : {},
+  };
+}
+
 function loadPersistedSettings(): PersistedSettings {
   const defaults: PersistedSettings = {
     showBoundingBox: true,
@@ -279,6 +458,7 @@ function loadPersistedSettings(): PersistedSettings {
         activePanel:
           parsed.activePanel === "step" ||
           parsed.activePanel === "trajectory" ||
+          parsed.activePanel === "tools" ||
           parsed.activePanel === "weld" ||
           parsed.activePanel === "telemetry" ||
           parsed.activePanel === null
@@ -617,6 +797,7 @@ function normalizeWeldDraftRecord(
   const weldName = String(raw.weldName ?? raw.weld_name ?? `${weldType} weld`).trim() || `${weldType} weld`;
   const workAngleDeg = Number(raw.workAngleDeg ?? raw.work_angle_deg ?? 45);
   const travelAngleDeg = Number(raw.travelAngleDeg ?? raw.travel_angle_deg ?? 0);
+  const tangentRollDeg = Number(raw.tangentRollDeg ?? raw.tangent_roll_deg ?? 0);
   const transitionClearanceMm = Number(
     raw.transitionClearanceMm ?? raw.transition_clearance_mm ?? 35,
   );
@@ -660,6 +841,7 @@ function normalizeWeldDraftRecord(
     activeSegmentEdgeId,
     workAngleDeg: Number.isFinite(workAngleDeg) ? workAngleDeg : 45,
     travelAngleDeg: Number.isFinite(travelAngleDeg) ? travelAngleDeg : 0,
+    tangentRollDeg: Number.isFinite(tangentRollDeg) ? tangentRollDeg : 0,
     transitionClearanceMm:
       Number.isFinite(transitionClearanceMm) && transitionClearanceMm > 0
         ? transitionClearanceMm
@@ -1223,6 +1405,7 @@ type WeldPanelProps = {
   isRunning: boolean;
   canRunPreview: boolean;
   weldActive: boolean;
+  planningWarnings: string[];
   onToggleSelection: () => void;
   onSelectEdge: (edgeId: string) => void;
   onRemoveEdge: (edgeId: string) => void;
@@ -1232,6 +1415,7 @@ type WeldPanelProps = {
   onSetWeldName: (value: string) => void;
   onSetWorkAngleDeg: (value: number) => void;
   onSetTravelAngleDeg: (value: number) => void;
+  onSetTangentRollDeg: (value: number) => void;
   onSetTransitionClearanceMm: (value: number) => void;
   onSetPostAction: (value: "none" | "return_to_start" | "lift") => void;
   onSetStartS: (value: number) => void;
@@ -1517,6 +1701,7 @@ function WeldPanel({
   isRunning,
   canRunPreview,
   weldActive,
+  planningWarnings,
   onToggleSelection,
   onSelectEdge,
   onRemoveEdge,
@@ -1526,6 +1711,7 @@ function WeldPanel({
   onSetWeldName,
   onSetWorkAngleDeg,
   onSetTravelAngleDeg,
+  onSetTangentRollDeg,
   onSetTransitionClearanceMm,
   onSetPostAction,
   onSetStartS,
@@ -1557,6 +1743,20 @@ function WeldPanel({
   return (
     <div className="pointer-events-auto w-full">
       <div className="space-y-2 text-[13px] leading-[1.35] text-slate-200/90">
+        {planningWarnings.length > 0 ? (
+          <div className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-2">
+            <div className="mb-1 text-[12px] font-semibold uppercase tracking-[0.14em] text-amber-200">
+              Orientation Fallback Warnings
+            </div>
+            <div className="space-y-1 text-[12px] leading-5 text-amber-100/90">
+              {planningWarnings.map((warning) => (
+                <div key={`planning-warning-${warning}`} className="rounded border border-amber-500/20 bg-amber-500/5 px-1.5 py-1">
+                  {warning}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <div className="rounded border border-slate-700/50 bg-slate-950/50 px-2 py-2">
           <div className="mb-1 flex items-center justify-between">
             <span className="text-slate-300">Topology Model</span>
@@ -1685,6 +1885,17 @@ function WeldPanel({
             />
           </label>
         </div>
+        <label className={WELD_LABEL_CLASS}>
+          Tangent Roll (deg)
+          <input
+            className={WELD_INPUT_CLASS}
+            type="number"
+            step="1"
+            value={Number((draft?.tangentRollDeg ?? 0).toFixed(1))}
+            onChange={(event) => onSetTangentRollDeg(Number(event.target.value))}
+            disabled={!draft}
+          />
+        </label>
         <div className="grid grid-cols-2 gap-2">
           <label className={WELD_LABEL_CLASS}>
             Clearance (mm)
@@ -1842,27 +2053,336 @@ function WeldPanel({
   );
 }
 
+type ToolLibraryPanelProps = {
+  robots: RobotPolicyOption[];
+  tools: ToolDefinition[];
+  filteredTools: ToolDefinition[];
+  availableToolTypes: string[];
+  selectedToolId: string;
+  toolFilterRobotId: string;
+  toolFilterType: string;
+  toolFilterQuery: string;
+  activeRuntimeConfig: ActiveRuntimeConfig | null;
+  restartRequired: boolean;
+  runtimeConfigError: string | null;
+  isRuntimeConfigBusy: boolean;
+  isRestartingController: boolean;
+  isToolLibraryBusy: boolean;
+  toolLibraryError: string | null;
+  onSelectedToolIdChange: (value: string) => void;
+  onToolFilterRobotIdChange: (value: string) => void;
+  onToolFilterTypeChange: (value: string) => void;
+  onToolFilterQueryChange: (value: string) => void;
+  onRefreshTools: () => void;
+  onRefreshRuntimeConfig: () => void;
+  onApplyRuntimeConfig: () => void;
+  onRestartController: () => void;
+  onOpenToolSettings: () => void;
+};
+
+function ToolLibraryPanel({
+  robots,
+  tools,
+  filteredTools,
+  availableToolTypes,
+  selectedToolId,
+  toolFilterRobotId,
+  toolFilterType,
+  toolFilterQuery,
+  activeRuntimeConfig,
+  restartRequired,
+  runtimeConfigError,
+  isRuntimeConfigBusy,
+  isRestartingController,
+  isToolLibraryBusy,
+  toolLibraryError,
+  onSelectedToolIdChange,
+  onToolFilterRobotIdChange,
+  onToolFilterTypeChange,
+  onToolFilterQueryChange,
+  onRefreshTools,
+  onRefreshRuntimeConfig,
+  onApplyRuntimeConfig,
+  onRestartController,
+  onOpenToolSettings,
+}: ToolLibraryPanelProps) {
+  const selectableTools = filteredTools.length > 0 ? filteredTools : tools;
+  const selectedOptionId = selectableTools.some((tool) => tool.tool_id === selectedToolId)
+    ? selectedToolId
+    : (selectableTools[0]?.tool_id ?? "");
+  const selectedTool =
+    tools.find((tool) => tool.tool_id === selectedOptionId) ??
+    tools.find((tool) => tool.tool_id === selectedToolId) ??
+    null;
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded border border-slate-700/60 bg-slate-950/40 px-3 py-2">
+        <div className={DRAWER_SECTION_TITLE_CLASS}>Runtime Tool</div>
+        <div className={`mt-1 ${DRAWER_META_TEXT_CLASS}`}>
+          {activeRuntimeConfig?.tool?.display_name
+            ? `Active ${activeRuntimeConfig.tool.display_name} (${activeRuntimeConfig.tool.active_tool_id})`
+            : "Active tool unavailable (controller/API not synced yet)."}
+        </div>
+        <div className={`mt-1 text-[12px] ${restartRequired ? "text-amber-200" : "text-emerald-200"}`}>
+          {restartRequired
+            ? "Restart required to apply desired tool."
+            : "Desired tool is in sync with controller runtime."}
+        </div>
+        {runtimeConfigError ? (
+          <div className="mt-2 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-100">
+            {runtimeConfigError}
+          </div>
+        ) : null}
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={onRefreshRuntimeConfig}
+            disabled={isRuntimeConfigBusy || isRestartingController}
+            className={`rounded border border-slate-600/70 px-2 py-1 text-xs ${isRuntimeConfigBusy || isRestartingController ? "opacity-60" : "hover:border-slate-400 hover:text-slate-100"}`}
+          >
+            Refresh Runtime
+          </button>
+          <button
+            type="button"
+            onClick={onApplyRuntimeConfig}
+            disabled={isRuntimeConfigBusy || isRestartingController || !selectedOptionId}
+            className={`rounded bg-cyan-600 px-2 py-1 text-xs font-semibold text-white ${isRuntimeConfigBusy || isRestartingController || !selectedOptionId ? "opacity-60" : "hover:brightness-110"}`}
+          >
+            Stage Tool
+          </button>
+          <button
+            type="button"
+            onClick={onRestartController}
+            disabled={!restartRequired || isRuntimeConfigBusy || isRestartingController}
+            className={`rounded border border-orange-500/60 px-2 py-1 text-xs font-semibold text-orange-100 ${!restartRequired || isRuntimeConfigBusy || isRestartingController ? "opacity-60" : "hover:border-orange-300 hover:text-orange-50"}`}
+          >
+            {isRestartingController ? "Restarting..." : "Apply + Restart"}
+          </button>
+        </div>
+      </div>
+
+      <div className="rounded border border-slate-700/60 bg-slate-950/40 px-3 py-2">
+        <div className="mb-2 flex items-center justify-between">
+          <div className={DRAWER_SECTION_TITLE_CLASS}>Tool Library</div>
+          <button
+            type="button"
+            onClick={onRefreshTools}
+            disabled={isToolLibraryBusy || isRuntimeConfigBusy || isRestartingController}
+            className={`rounded border border-slate-600/70 px-2 py-1 text-xs ${isToolLibraryBusy || isRuntimeConfigBusy || isRestartingController ? "opacity-60" : "hover:border-slate-400 hover:text-slate-100"}`}
+          >
+            Refresh
+          </button>
+        </div>
+        <div className="grid gap-2">
+          <label className={DRAWER_LABEL_CLASS}>
+            Robot Filter
+            <select
+              className={DRAWER_INPUT_CLASS}
+              value={toolFilterRobotId}
+              onChange={(event) => onToolFilterRobotIdChange(event.target.value)}
+              disabled={isToolLibraryBusy}
+            >
+              <option value="all">All robots</option>
+              {robots.map((robot) => (
+                <option key={`tool-filter-robot-${robot.robot_id}`} value={robot.robot_id}>
+                  {robot.display_name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className={DRAWER_LABEL_CLASS}>
+            Tool Type
+            <select
+              className={DRAWER_INPUT_CLASS}
+              value={toolFilterType}
+              onChange={(event) => onToolFilterTypeChange(event.target.value)}
+              disabled={isToolLibraryBusy}
+            >
+              <option value="all">All types</option>
+              {availableToolTypes.map((toolType) => (
+                <option key={`tool-type-${toolType}`} value={toolType}>
+                  {toolType}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className={DRAWER_LABEL_CLASS}>
+            Keyword
+            <input
+              className={DRAWER_INPUT_CLASS}
+              value={toolFilterQuery}
+              onChange={(event) => onToolFilterQueryChange(event.target.value)}
+              disabled={isToolLibraryBusy}
+              placeholder="tig, torch, custom..."
+            />
+          </label>
+          <label className={DRAWER_LABEL_CLASS}>
+            Desired Active Tool
+            <select
+              className={DRAWER_INPUT_CLASS}
+              value={selectedOptionId}
+              onChange={(event) => onSelectedToolIdChange(event.target.value)}
+              disabled={isToolLibraryBusy || selectableTools.length === 0}
+            >
+              {selectableTools.map((tool) => (
+                <option key={`tool-select-${tool.tool_id}`} value={tool.tool_id}>
+                  {tool.display_name} ({tool.tool_id})
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {toolLibraryError ? (
+          <div className="mt-2 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-100">
+            {toolLibraryError}
+          </div>
+        ) : null}
+        <div className={`mt-2 ${DRAWER_META_TEXT_CLASS}`}>
+          Drop-in format: <code>tools/library/&lt;tool_id&gt;/tool.json</code> + local STL/GLB/GLTF.
+        </div>
+      </div>
+
+      {selectedTool ? (
+        <div className="rounded border border-slate-700/60 bg-slate-950/40 px-3 py-2">
+          <div className={DRAWER_SECTION_TITLE_CLASS}>Selected Tool Details</div>
+          <div className="mt-1 text-[13px] text-slate-100">
+            {selectedTool.display_name} <span className="text-slate-400">({selectedTool.tool_id})</span>
+          </div>
+          <div className={`mt-1 ${DRAWER_META_TEXT_CLASS}`}>
+            Type: {selectedTool.tool_type} · Compat:{" "}
+            {selectedTool.compatible_robot_ids.length > 0
+              ? selectedTool.compatible_robot_ids.join(", ")
+              : "all robots"}
+          </div>
+          <div className={`mt-2 ${DRAWER_META_TEXT_CLASS}`}>
+            Offset mm: X {selectedTool.offset.position_mm.x.toFixed(1)}, Y {selectedTool.offset.position_mm.y.toFixed(1)}, Z {selectedTool.offset.position_mm.z.toFixed(1)}
+          </div>
+          <div className={DRAWER_META_TEXT_CLASS}>
+            Rotation deg: X {selectedTool.offset.rotation_deg.x.toFixed(1)}, Y {selectedTool.offset.rotation_deg.y.toFixed(1)}, Z {selectedTool.offset.rotation_deg.z.toFixed(1)}
+          </div>
+        </div>
+      ) : null}
+
+      <button
+        type="button"
+        onClick={onOpenToolSettings}
+        className="inline-flex w-full items-center justify-center rounded border border-slate-600/70 bg-slate-900/60 px-3 py-2 text-[13px] font-semibold text-slate-100 transition hover:border-slate-400"
+      >
+        Open Full Tool Editor
+      </button>
+    </div>
+  );
+}
+
+type SettingsDialogTab = "general" | "tools" | "kinematics";
+
 type SettingsDialogProps = {
   isOpen: boolean;
+  initialTab: SettingsDialogTab;
   apiHost: string;
   visionHost: string;
   showBoundingBox: boolean;
+  robots: RobotPolicyOption[];
+  selectedRobotName: string;
+  tools: ToolDefinition[];
+  selectedToolId: string;
+  toolFilterRobotId: string;
+  toolFilterType: string;
+  toolFilterQuery: string;
+  toolDraft: ToolDefinition;
+  activeRuntimeConfig: ActiveRuntimeConfig | null;
+  restartRequired: boolean;
+  runtimeConfigError: string | null;
+  isRuntimeConfigBusy: boolean;
+  isRestartingController: boolean;
+  isToolLibraryBusy: boolean;
+  toolLibraryError: string | null;
+  kinematics: KinematicsProfileSnapshot | null;
+  baseOffsetDraft: RuntimeOffset;
+  toolOffsetDraft: RuntimeOffset;
+  isKinematicsBusy: boolean;
+  kinematicsError: string | null;
   onHostChange: (value: string) => void;
   onVisionHostChange: (value: string) => void;
   onShowBoundingBoxChange: (value: boolean) => void;
+  onSelectedRobotNameChange: (value: string) => void;
+  onSelectedToolIdChange: (value: string) => void;
+  onToolFilterRobotIdChange: (value: string) => void;
+  onToolFilterTypeChange: (value: string) => void;
+  onToolFilterQueryChange: (value: string) => void;
+  onToolDraftChange: (value: ToolDefinition) => void;
+  onRefreshTools: () => void;
+  onNewToolDraft: () => void;
+  onCreateTool: () => void;
+  onUpdateTool: () => void;
+  onDeleteTool: () => void;
+  onRefreshRuntimeConfig: () => void;
+  onApplyRuntimeConfig: () => void;
+  onRestartController: () => void;
+  onOffsetDraftChange: (
+    target: "base" | "tool",
+    group: "position_m" | "rotation_deg",
+    axis: "x" | "y" | "z",
+    value: number,
+  ) => void;
+  onRefreshKinematics: () => void;
+  onApplyOffsets: () => void;
+  onResetOffsets: () => void;
   onClose: () => void;
 };
 
 function SettingsDialog({
   isOpen,
+  initialTab,
   apiHost,
   visionHost,
   showBoundingBox,
+  robots,
+  selectedRobotName,
+  tools,
+  selectedToolId,
+  toolFilterRobotId,
+  toolFilterType,
+  toolFilterQuery,
+  toolDraft,
+  activeRuntimeConfig,
+  restartRequired,
+  runtimeConfigError,
+  isRuntimeConfigBusy,
+  isRestartingController,
+  isToolLibraryBusy,
+  toolLibraryError,
+  kinematics,
+  baseOffsetDraft,
+  toolOffsetDraft,
+  isKinematicsBusy,
+  kinematicsError,
   onHostChange,
   onVisionHostChange,
   onShowBoundingBoxChange,
+  onSelectedRobotNameChange,
+  onSelectedToolIdChange,
+  onToolFilterRobotIdChange,
+  onToolFilterTypeChange,
+  onToolFilterQueryChange,
+  onToolDraftChange,
+  onRefreshTools,
+  onNewToolDraft,
+  onCreateTool,
+  onUpdateTool,
+  onDeleteTool,
+  onRefreshRuntimeConfig,
+  onApplyRuntimeConfig,
+  onRestartController,
+  onOffsetDraftChange,
+  onRefreshKinematics,
+  onApplyOffsets,
+  onResetOffsets,
   onClose,
 }: SettingsDialogProps) {
+  const [activeTab, setActiveTab] = useState<SettingsDialogTab>(initialTab);
+
   useEffect(() => {
     if (!isOpen) {
       return;
@@ -1878,9 +2398,106 @@ function SettingsDialog({
     };
   }, [isOpen, onClose]);
 
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+    setActiveTab(initialTab);
+  }, [initialTab, isOpen]);
+
   if (!isOpen) {
     return null;
   }
+
+  const axisOrder: Array<"x" | "y" | "z"> = ["x", "y", "z"];
+  const selectedRobot =
+    robots.find((robot) => robot.name === selectedRobotName) ??
+    robots.find((robot) => robot.robot_id === selectedRobotName) ??
+    null;
+  const renderOffsetEditor = (
+    title: string,
+    target: "base" | "tool",
+    value: RuntimeOffset,
+  ) => (
+    <div className="rounded-xl border border-slate-700/60 bg-slate-950/40 p-3">
+      <div className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-cyan-200/80">
+        {title}
+      </div>
+      <div className="grid grid-cols-3 gap-2">
+        {axisOrder.map((axis) => (
+          <label key={`${target}:p:${axis}`} className="text-xs text-slate-300/90">
+            Pos {axis.toUpperCase()} (m)
+            <input
+              type="number"
+              step="0.001"
+              className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+              value={value.position_m[axis]}
+              onChange={(event) =>
+                onOffsetDraftChange(
+                  target,
+                  "position_m",
+                  axis,
+                  Number(event.target.value),
+                )
+              }
+            />
+          </label>
+        ))}
+        {axisOrder.map((axis) => (
+          <label key={`${target}:r:${axis}`} className="text-xs text-slate-300/90">
+            Rot {axis.toUpperCase()} (deg)
+            <input
+              type="number"
+              step="0.1"
+              className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+              value={value.rotation_deg[axis]}
+              onChange={(event) =>
+                onOffsetDraftChange(
+                  target,
+                  "rotation_deg",
+                  axis,
+                  Number(event.target.value),
+                )
+              }
+            />
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+
+  const previewDeltaMm =
+    Math.hypot(baseOffsetDraft.position_m.x, baseOffsetDraft.position_m.y, baseOffsetDraft.position_m.z) * 1000
+    + Math.hypot(toolOffsetDraft.position_m.x, toolOffsetDraft.position_m.y, toolOffsetDraft.position_m.z) * 1000;
+  const availableToolTypes = Array.from(
+    new Set(tools.map((tool) => tool.tool_type).filter((token) => token.trim().length > 0)),
+  ).sort((a, b) => a.localeCompare(b));
+  const filteredTools = tools.filter((tool) => {
+    if (toolFilterRobotId && toolFilterRobotId !== "all") {
+      const compat = Array.isArray(tool.compatible_robot_ids) ? tool.compatible_robot_ids : [];
+      if (compat.length > 0 && !compat.includes(toolFilterRobotId)) {
+        return false;
+      }
+    }
+    if (toolFilterType && toolFilterType !== "all" && tool.tool_type !== toolFilterType) {
+      return false;
+    }
+    const query = toolFilterQuery.trim().toLowerCase();
+    if (!query) {
+      return true;
+    }
+    const haystack = [
+      tool.tool_id,
+      tool.display_name,
+      tool.description ?? "",
+      tool.tool_type,
+      ...tool.keywords,
+    ]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(query);
+  });
+  const toolAxisOrder: Array<"x" | "y" | "z"> = ["x", "y", "z"];
 
   return (
     <div
@@ -1893,8 +2510,8 @@ function SettingsDialog({
         }
       }}
     >
-      <div className="w-full max-w-md rounded-2xl border border-slate-700/60 bg-slate-900/90 p-6 shadow-2xl shadow-slate-950/60">
-        <div className="mb-4 flex items-center justify-between">
+      <div className="flex w-full max-w-3xl max-h-[calc(100vh-3rem)] flex-col overflow-hidden rounded-2xl border border-slate-700/60 bg-slate-900/90 shadow-2xl shadow-slate-950/60">
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-700/50 px-6 py-4">
           <h2 className="text-lg font-semibold text-cyan-200">Settings</h2>
           <button
             type="button"
@@ -1905,8 +2522,37 @@ function SettingsDialog({
             <X size={16} strokeWidth={2} />
           </button>
         </div>
-        <div className="flex flex-col gap-2">
-          <label className="text-sm font-medium text-slate-200/90">
+        <div className="shrink-0 border-b border-slate-700/40 px-6 py-3">
+          <div className="flex flex-wrap gap-2">
+            {([
+              { id: "general", label: "General" },
+              { id: "tools", label: "Tool Library" },
+              { id: "kinematics", label: "Kinematics" },
+            ] as const).map((tab) => {
+              const selected = activeTab === tab.id;
+              return (
+                <button
+                  key={`settings-tab-${tab.id}`}
+                  type="button"
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`rounded border px-3 py-1.5 text-xs font-semibold transition ${
+                    selected
+                      ? "border-cyan-400/70 bg-cyan-500/15 text-cyan-100"
+                      : "border-slate-600/70 bg-slate-900/60 text-slate-200 hover:border-slate-400 hover:text-slate-100"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div className="gradient-scrollbar min-h-0 overflow-y-auto px-6 py-4">
+          <div className="grid gap-4">
+          <div className="flex flex-col gap-2">
+            {activeTab === "general" ? (
+              <>
+            <label className="text-sm font-medium text-slate-200/90">
             Gradient API Host
             <input
               className="mt-1 w-full rounded-lg border border-slate-600/70 bg-slate-950/60 px-4 py-2 text-base text-slate-100 placeholder:text-slate-400 focus:border-cyan-400/60 focus:outline-none focus:ring-2 focus:ring-cyan-500/30"
@@ -1916,12 +2562,12 @@ function SettingsDialog({
               placeholder="http://localhost:4000"
               autoComplete="off"
             />
-          </label>
-          <p className="text-xs text-slate-400/90">
+            </label>
+            <p className="text-xs text-slate-400/90">
             Provide the base URL for the telemetry API. Changes apply
             immediately and persist for the next connection attempt.
-          </p>
-          <label className="mt-4 text-sm font-medium text-slate-200/90">
+            </p>
+            <label className="mt-4 text-sm font-medium text-slate-200/90">
             Gradient Vision Host
             <input
               className="mt-1 w-full rounded-lg border border-slate-600/70 bg-slate-950/60 px-4 py-2 text-base text-slate-100 placeholder:text-slate-400 focus:border-cyan-400/60 focus:outline-none focus:ring-2 focus:ring-cyan-500/30"
@@ -1931,12 +2577,440 @@ function SettingsDialog({
               placeholder="http://localhost:8080"
               autoComplete="off"
             />
-          </label>
-          <p className="text-xs text-slate-400/90">
+            </label>
+            <p className="text-xs text-slate-400/90">
             MJPEG endpoint for the camera overlay. Leave blank to default to
             the current origin on port 8080.
-          </p>
-          <label className="mt-4 flex items-center gap-3 text-sm font-medium text-slate-200/90">
+            </p>
+            <div className="mt-4 rounded-xl border border-slate-700/60 bg-slate-950/40 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-200/80">
+                    Robot Runtime Policy
+                  </div>
+                  <div className="text-xs text-slate-400">
+                    {activeRuntimeConfig
+                      ? `active ${activeRuntimeConfig.robot.display_name} · IK ${activeRuntimeConfig.ik_solver.effective_backend}`
+                      : "Active controller runtime unavailable"}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={onRefreshRuntimeConfig}
+                  disabled={isRuntimeConfigBusy || isRestartingController}
+                  className={`rounded border border-slate-600/70 px-2 py-1 text-xs ${isRuntimeConfigBusy || isRestartingController ? "opacity-60" : "hover:border-slate-400 hover:text-slate-100"}`}
+                >
+                  Refresh
+                </button>
+              </div>
+              <label className="text-xs text-slate-300/90">
+                Desired Robot
+                <select
+                  className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                  value={selectedRobotName}
+                  onChange={(event) => onSelectedRobotNameChange(event.target.value)}
+                  disabled={isRuntimeConfigBusy || isRestartingController || robots.length === 0}
+                >
+                  {robots.map((robot) => (
+                    <option key={`robot-opt-${robot.name}`} value={robot.name}>
+                      {robot.display_name} ({robot.name})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="mt-2 text-xs text-slate-300/90">
+                Solver policy:{" "}
+                <span className="font-semibold text-cyan-100">
+                  {selectedRobot?.default_ik_solver_backend ?? "unknown"}
+                </span>
+                {" · "}
+                Hardware backend:{" "}
+                <span className="font-semibold text-cyan-100">
+                  {selectedRobot?.default_servo_backend ?? "unknown"}
+                </span>
+              </div>
+              {activeRuntimeConfig?.ik_solver?.source === "dev_override" ||
+              activeRuntimeConfig?.servo_backend?.source === "dev_override" ? (
+                <div className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-100">
+                  Controller is running with development overrides, not strict robot policy.
+                </div>
+              ) : null}
+              <div className="mt-2 text-xs">
+                <span className={restartRequired ? "text-amber-200" : "text-emerald-200"}>
+                  {restartRequired ? "Restart required to apply desired robot policy." : "Controller is in sync with desired robot policy."}
+                </span>
+              </div>
+              {runtimeConfigError ? (
+                <div className="mt-2 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-100">
+                  {runtimeConfigError}
+                </div>
+              ) : null}
+              <div className="mt-2 flex gap-2">
+                <button
+                  type="button"
+                  onClick={onApplyRuntimeConfig}
+                  disabled={isRuntimeConfigBusy || isRestartingController || !selectedRobotName}
+                  className={`rounded bg-cyan-600 px-3 py-1.5 text-xs font-semibold text-white ${isRuntimeConfigBusy || isRestartingController || !selectedRobotName ? "opacity-60" : "hover:brightness-110"}`}
+                >
+                  Apply Runtime Config
+                </button>
+                <button
+                  type="button"
+                  onClick={onRestartController}
+                  disabled={!restartRequired || isRuntimeConfigBusy || isRestartingController}
+                  className={`rounded border border-orange-500/60 px-3 py-1.5 text-xs font-semibold text-orange-100 ${!restartRequired || isRuntimeConfigBusy || isRestartingController ? "opacity-60" : "hover:border-orange-300 hover:text-orange-50"}`}
+                >
+                  {isRestartingController ? "Restarting..." : "Apply + Restart Controller"}
+                </button>
+              </div>
+            </div>
+            </>
+            ) : null}
+            {activeTab === "tools" ? (
+            <div className="rounded-xl border border-slate-700/60 bg-slate-950/40 p-3">
+              <div className="mb-2 flex items-center justify-between">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-200/80">
+                    Tool Library
+                  </div>
+                  <div className="text-xs text-slate-400">
+                    {activeRuntimeConfig?.tool?.display_name
+                      ? `active ${activeRuntimeConfig.tool.display_name} (${activeRuntimeConfig.tool.active_tool_id})`
+                      : "Select and apply an active tool profile"}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={onRefreshTools}
+                  disabled={isToolLibraryBusy || isRuntimeConfigBusy || isRestartingController}
+                  className={`rounded border border-slate-600/70 px-2 py-1 text-xs ${isToolLibraryBusy || isRuntimeConfigBusy || isRestartingController ? "opacity-60" : "hover:border-slate-400 hover:text-slate-100"}`}
+                >
+                  Refresh
+                </button>
+              </div>
+              <div className="grid gap-2 md:grid-cols-3">
+                <label className="text-xs text-slate-300/90">
+                  Robot Filter
+                  <select
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolFilterRobotId}
+                    onChange={(event) => onToolFilterRobotIdChange(event.target.value)}
+                    disabled={isToolLibraryBusy}
+                  >
+                    <option value="all">All robots</option>
+                    {robots.map((robot) => (
+                      <option key={`tool-filter-robot-${robot.robot_id}`} value={robot.robot_id}>
+                        {robot.display_name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-xs text-slate-300/90">
+                  Tool Type
+                  <select
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolFilterType}
+                    onChange={(event) => onToolFilterTypeChange(event.target.value)}
+                    disabled={isToolLibraryBusy}
+                  >
+                    <option value="all">All types</option>
+                    {availableToolTypes.map((toolType) => (
+                      <option key={`tool-type-${toolType}`} value={toolType}>
+                        {toolType}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-xs text-slate-300/90">
+                  Keyword
+                  <input
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolFilterQuery}
+                    onChange={(event) => onToolFilterQueryChange(event.target.value)}
+                    disabled={isToolLibraryBusy}
+                    placeholder="tig, torch, custom..."
+                  />
+                </label>
+              </div>
+              <label className="mt-2 block text-xs text-slate-300/90">
+                Desired Active Tool
+                <select
+                  className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                  value={selectedToolId}
+                  onChange={(event) => onSelectedToolIdChange(event.target.value)}
+                  disabled={isToolLibraryBusy || filteredTools.length === 0}
+                >
+                  {filteredTools.map((tool) => (
+                    <option key={`tool-opt-${tool.tool_id}`} value={tool.tool_id}>
+                      {tool.display_name} ({tool.tool_id})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="mt-3 grid gap-2 md:grid-cols-2">
+                <label className="text-xs text-slate-300/90">
+                  Tool ID
+                  <input
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolDraft.tool_id}
+                    onChange={(event) =>
+                      onToolDraftChange({ ...toolDraft, tool_id: event.target.value })
+                    }
+                    disabled={isToolLibraryBusy}
+                  />
+                </label>
+                <label className="text-xs text-slate-300/90">
+                  Display Name
+                  <input
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolDraft.display_name}
+                    onChange={(event) =>
+                      onToolDraftChange({ ...toolDraft, display_name: event.target.value })
+                    }
+                    disabled={isToolLibraryBusy}
+                  />
+                </label>
+                <label className="text-xs text-slate-300/90">
+                  Tool Type
+                  <input
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolDraft.tool_type}
+                    onChange={(event) =>
+                      onToolDraftChange({ ...toolDraft, tool_type: event.target.value })
+                    }
+                    disabled={isToolLibraryBusy}
+                  />
+                </label>
+                <label className="text-xs text-slate-300/90">
+                  Keywords (comma separated)
+                  <input
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolDraft.keywords.join(", ")}
+                    onChange={(event) =>
+                      onToolDraftChange({
+                        ...toolDraft,
+                        keywords: event.target.value
+                          .split(",")
+                          .map((item) => item.trim())
+                          .filter((item) => item.length > 0),
+                      })
+                    }
+                    disabled={isToolLibraryBusy}
+                  />
+                </label>
+                <label className="text-xs text-slate-300/90 md:col-span-2">
+                  Compatible Robot IDs (comma separated, empty = all)
+                  <input
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolDraft.compatible_robot_ids.join(", ")}
+                    onChange={(event) =>
+                      onToolDraftChange({
+                        ...toolDraft,
+                        compatible_robot_ids: event.target.value
+                          .split(",")
+                          .map((item) => item.trim())
+                          .filter((item) => item.length > 0),
+                      })
+                    }
+                    disabled={isToolLibraryBusy}
+                  />
+                </label>
+                <label className="text-xs text-slate-300/90 md:col-span-2">
+                  Description
+                  <input
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolDraft.description ?? ""}
+                    onChange={(event) =>
+                      onToolDraftChange({ ...toolDraft, description: event.target.value })
+                    }
+                    disabled={isToolLibraryBusy}
+                  />
+                </label>
+                {toolAxisOrder.map((axis) => (
+                  <label key={`tool-offset-mm-${axis}`} className="text-xs text-slate-300/90">
+                    Offset {axis.toUpperCase()} (mm)
+                    <input
+                      type="number"
+                      step="0.1"
+                      className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                      value={toolDraft.offset.position_mm[axis]}
+                      onChange={(event) =>
+                        onToolDraftChange({
+                          ...toolDraft,
+                          offset: {
+                            ...toolDraft.offset,
+                            position_mm: {
+                              ...toolDraft.offset.position_mm,
+                              [axis]: Number(event.target.value),
+                            },
+                          },
+                        })
+                      }
+                      disabled={isToolLibraryBusy}
+                    />
+                  </label>
+                ))}
+                {toolAxisOrder.map((axis) => (
+                  <label key={`tool-rot-deg-${axis}`} className="text-xs text-slate-300/90">
+                    Rot {axis.toUpperCase()} (deg)
+                    <input
+                      type="number"
+                      step="0.1"
+                      className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                      value={toolDraft.offset.rotation_deg[axis]}
+                      onChange={(event) =>
+                        onToolDraftChange({
+                          ...toolDraft,
+                          offset: {
+                            ...toolDraft.offset,
+                            rotation_deg: {
+                              ...toolDraft.offset.rotation_deg,
+                              [axis]: Number(event.target.value),
+                            },
+                          },
+                        })
+                      }
+                      disabled={isToolLibraryBusy}
+                    />
+                  </label>
+                ))}
+                <label className="text-xs text-slate-300/90 md:col-span-2">
+                  Mesh Asset Path (optional)
+                  <input
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolDraft.mesh?.asset_path ?? ""}
+                    onChange={(event) =>
+                      onToolDraftChange({
+                        ...toolDraft,
+                        mesh: event.target.value.trim()
+                          ? {
+                              ...(toolDraft.mesh ?? createDefaultMeshConfig()),
+                              asset_path: event.target.value,
+                            }
+                          : null,
+                      })
+                    }
+                    disabled={isToolLibraryBusy}
+                  />
+                </label>
+                <label className="text-xs text-slate-300/90 md:col-span-2">
+                  Mesh Scale
+                  <input
+                    type="number"
+                    step="0.001"
+                    className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                    value={toolDraft.mesh?.scale ?? 1}
+                    onChange={(event) =>
+                      onToolDraftChange({
+                        ...toolDraft,
+                        mesh: {
+                          ...(toolDraft.mesh ?? createDefaultMeshConfig()),
+                          asset_path: toolDraft.mesh?.asset_path ?? "",
+                          scale: Number(event.target.value),
+                        },
+                      })
+                    }
+                    disabled={isToolLibraryBusy}
+                  />
+                </label>
+                {toolAxisOrder.map((axis) => (
+                  <label key={`mesh-offset-mm-${axis}`} className="text-xs text-slate-300/90">
+                    Mesh Offset {axis.toUpperCase()} (mm, J6 frame)
+                    <input
+                      type="number"
+                      step="0.1"
+                      className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                      value={toolDraft.mesh?.position_mm?.[axis] ?? 0}
+                      onChange={(event) =>
+                        onToolDraftChange({
+                          ...toolDraft,
+                          mesh: {
+                            ...(toolDraft.mesh ?? createDefaultMeshConfig()),
+                            position_mm: {
+                              ...(toolDraft.mesh?.position_mm ?? { x: 0, y: 0, z: 0 }),
+                              [axis]: Number(event.target.value),
+                            },
+                          },
+                        })
+                      }
+                      disabled={isToolLibraryBusy}
+                    />
+                  </label>
+                ))}
+                {toolAxisOrder.map((axis) => (
+                  <label key={`mesh-rot-deg-${axis}`} className="text-xs text-slate-300/90">
+                    Mesh Rot {axis.toUpperCase()} (deg, J6 frame)
+                    <input
+                      type="number"
+                      step="0.1"
+                      className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                      value={toolDraft.mesh?.rotation_deg?.[axis] ?? 0}
+                      onChange={(event) =>
+                        onToolDraftChange({
+                          ...toolDraft,
+                          mesh: {
+                            ...(toolDraft.mesh ?? createDefaultMeshConfig()),
+                            rotation_deg: {
+                              ...(toolDraft.mesh?.rotation_deg ?? { x: 0, y: 0, z: 0 }),
+                              [axis]: Number(event.target.value),
+                            },
+                          },
+                        })
+                      }
+                      disabled={isToolLibraryBusy}
+                    />
+                  </label>
+                ))}
+              </div>
+              {toolLibraryError ? (
+                <div className="mt-2 rounded border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-100">
+                  {toolLibraryError}
+                </div>
+              ) : null}
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={onNewToolDraft}
+                  disabled={isToolLibraryBusy}
+                  className={`rounded border border-slate-600/70 px-3 py-1.5 text-xs font-semibold text-slate-200 ${isToolLibraryBusy ? "opacity-60" : "hover:border-slate-400 hover:text-slate-100"}`}
+                >
+                  New Draft
+                </button>
+                <button
+                  type="button"
+                  onClick={onCreateTool}
+                  disabled={isToolLibraryBusy}
+                  className={`rounded bg-cyan-700 px-3 py-1.5 text-xs font-semibold text-white ${isToolLibraryBusy ? "opacity-60" : "hover:brightness-110"}`}
+                >
+                  Save New Tool
+                </button>
+                <button
+                  type="button"
+                  onClick={onUpdateTool}
+                  disabled={isToolLibraryBusy || !toolDraft.tool_id}
+                  className={`rounded bg-cyan-600 px-3 py-1.5 text-xs font-semibold text-white ${isToolLibraryBusy || !toolDraft.tool_id ? "opacity-60" : "hover:brightness-110"}`}
+                >
+                  Update Tool
+                </button>
+                <button
+                  type="button"
+                  onClick={onDeleteTool}
+                  disabled={isToolLibraryBusy || !toolDraft.tool_id || toolDraft.tool_id === "identity"}
+                  className={`rounded border border-rose-500/60 px-3 py-1.5 text-xs font-semibold text-rose-100 ${isToolLibraryBusy || !toolDraft.tool_id || toolDraft.tool_id === "identity" ? "opacity-60" : "hover:border-rose-300 hover:text-rose-50"}`}
+                >
+                  Delete Tool
+                </button>
+              </div>
+              <div className="mt-2 text-[11px] text-slate-400">
+                Active tool change is staged via runtime config and applied on controller restart for deterministic runtime behavior.
+              </div>
+              <div className="mt-1 text-[11px] text-slate-500">
+                TCP/tool-tip uses <code>offset.*</code>. Mesh visual placement uses <code>mesh.position_mm</code> and <code>mesh.rotation_deg</code> relative to J6/flange.
+              </div>
+            </div>
+            ) : null}
+            {activeTab === "general" ? (
+            <label className="mt-4 flex items-center gap-3 text-sm font-medium text-slate-200/90">
             <input
               type="checkbox"
               className="h-4 w-4 rounded border border-slate-600 bg-slate-900 text-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
@@ -1944,8 +3018,63 @@ function SettingsDialog({
               onChange={(event) => onShowBoundingBoxChange(event.target.checked)}
             />
             Show arm bounding box
-          </label>
+            </label>
+            ) : null}
+          </div>
+          {activeTab === "kinematics" ? (
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center justify-between rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-2">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-200/80">
+                  Kinematics Runtime
+                </div>
+                <div className="text-xs text-slate-400">
+                  {kinematics
+                    ? `rev ${kinematics.revision} · ${kinematics.profile.profile_id}`
+                    : "No kinematics profile loaded"}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={onRefreshKinematics}
+                disabled={isKinematicsBusy}
+                className={`rounded border border-slate-600/70 px-2 py-1 text-xs ${isKinematicsBusy ? "opacity-60" : "hover:border-slate-400 hover:text-slate-100"}`}
+              >
+                Refresh
+              </button>
+            </div>
+            {renderOffsetEditor("Base Runtime Offset", "base", baseOffsetDraft)}
+            {renderOffsetEditor("Tool Runtime Offset", "tool", toolOffsetDraft)}
+            <div className="rounded border border-slate-700/60 bg-slate-950/40 px-3 py-2 text-xs text-slate-300">
+              Preview translational delta: <span className="font-semibold text-cyan-100">{previewDeltaMm.toFixed(2)} mm</span>
+            </div>
+            {kinematicsError ? (
+              <div className="rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">
+                {kinematicsError}
+              </div>
+            ) : null}
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={onApplyOffsets}
+                disabled={isKinematicsBusy || !kinematics}
+                className={`rounded bg-cyan-600 px-3 py-1.5 text-xs font-semibold text-white ${isKinematicsBusy || !kinematics ? "opacity-60" : "hover:brightness-110"}`}
+              >
+                Apply Offsets
+              </button>
+              <button
+                type="button"
+                onClick={onResetOffsets}
+                disabled={isKinematicsBusy || !kinematics}
+                className={`rounded border border-slate-600/70 px-3 py-1.5 text-xs font-semibold text-slate-200 ${isKinematicsBusy || !kinematics ? "opacity-60" : "hover:border-slate-400 hover:text-slate-100"}`}
+              >
+                Reset Offsets
+              </button>
+            </div>
+          </div>
+          ) : null}
         </div>
+      </div>
       </div>
     </div>
   );
@@ -2006,6 +3135,30 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [visionError, setVisionError] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsDialogTab>("general");
+  const [robotOptions, setRobotOptions] = useState<RobotPolicyOption[]>([]);
+  const [runtimeConfigSnapshot, setRuntimeConfigSnapshot] = useState<RuntimeConfigSnapshot | null>(null);
+  const [selectedRobotName, setSelectedRobotName] = useState("");
+  const [toolLibrary, setToolLibrary] = useState<ToolDefinition[]>([]);
+  const [selectedToolId, setSelectedToolId] = useState("identity");
+  const [toolFilterRobotId, setToolFilterRobotId] = useState("all");
+  const [toolFilterType, setToolFilterType] = useState("all");
+  const [toolFilterQuery, setToolFilterQuery] = useState("");
+  const [toolDraft, setToolDraft] = useState<ToolDefinition>(() => cloneToolDefinition(DEFAULT_TOOL_DRAFT));
+  const [isRuntimeConfigBusy, setIsRuntimeConfigBusy] = useState(false);
+  const [runtimeConfigError, setRuntimeConfigError] = useState<string | null>(null);
+  const [isToolLibraryBusy, setIsToolLibraryBusy] = useState(false);
+  const [toolLibraryError, setToolLibraryError] = useState<string | null>(null);
+  const [isRestartingController, setIsRestartingController] = useState(false);
+  const [kinematicsSnapshot, setKinematicsSnapshot] = useState<KinematicsProfileSnapshot | null>(null);
+  const [baseOffsetDraft, setBaseOffsetDraft] = useState<RuntimeOffset>(() =>
+    cloneRuntimeOffset(DEFAULT_RUNTIME_OFFSET),
+  );
+  const [toolOffsetDraft, setToolOffsetDraft] = useState<RuntimeOffset>(() =>
+    cloneRuntimeOffset(DEFAULT_RUNTIME_OFFSET),
+  );
+  const [isKinematicsBusy, setIsKinematicsBusy] = useState(false);
+  const [kinematicsError, setKinematicsError] = useState<string | null>(null);
   const [hasAttemptedAutoConnect, setHasAttemptedAutoConnect] = useState(false);
   const [isVisionActive, setIsVisionActive] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
@@ -2069,6 +3222,444 @@ export default function App() {
     },
     [],
   );
+
+  const activeRobotId = runtimeConfigSnapshot?.active?.robot?.robot_id ?? null;
+  const activeToolId = runtimeConfigSnapshot?.active?.tool?.active_tool_id ?? null;
+  const desiredRobotId = useMemo(
+    () =>
+      robotOptions.find((robot) => robot.name === selectedRobotName)?.robot_id ??
+      null,
+    [robotOptions, selectedRobotName],
+  );
+  const visualizerRobotId = activeRobotId ?? desiredRobotId;
+  const visualizerToolId = activeToolId ?? selectedToolId ?? null;
+  const visualizerTool = useMemo(
+    () =>
+      toolLibrary.find((tool) => tool.tool_id === visualizerToolId) ??
+      null,
+    [toolLibrary, visualizerToolId],
+  );
+  const availableToolTypes = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          toolLibrary
+            .map((tool) => tool.tool_type)
+            .filter((token) => token.trim().length > 0),
+        ),
+      ).sort((a, b) => a.localeCompare(b)),
+    [toolLibrary],
+  );
+  const filteredTools = useMemo(() => {
+    return toolLibrary.filter((tool) => {
+      if (toolFilterRobotId && toolFilterRobotId !== "all") {
+        const compat = Array.isArray(tool.compatible_robot_ids)
+          ? tool.compatible_robot_ids
+          : [];
+        if (compat.length > 0 && !compat.includes(toolFilterRobotId)) {
+          return false;
+        }
+      }
+      if (toolFilterType && toolFilterType !== "all" && tool.tool_type !== toolFilterType) {
+        return false;
+      }
+      const query = toolFilterQuery.trim().toLowerCase();
+      if (!query) {
+        return true;
+      }
+      const haystack = [
+        tool.tool_id,
+        tool.display_name,
+        tool.description ?? "",
+        tool.tool_type,
+        ...tool.keywords,
+      ]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [toolFilterQuery, toolFilterRobotId, toolFilterType, toolLibrary]);
+
+  const fetchKinematicsSnapshot = useCallback(async () => {
+    const response = await fetch(`${normalizedApiHost}/kinematics/profile`);
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(body || `HTTP ${response.status}`);
+    }
+    const payload = (await response.json()) as KinematicsProfileSnapshot;
+    setKinematicsSnapshot(payload);
+    setBaseOffsetDraft(cloneRuntimeOffset(payload.offsets.base));
+    setToolOffsetDraft(cloneRuntimeOffset(payload.offsets.tool));
+    setKinematicsError(null);
+    return payload;
+  }, [normalizedApiHost]);
+
+  const fetchToolLibrarySnapshot = useCallback(async () => {
+    const response = await fetch(`${normalizedApiHost}/tools/library`);
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(body || `Tool library HTTP ${response.status}`);
+    }
+    const payload = (await response.json()) as { tools?: ToolDefinition[]; default_tool_id?: string };
+    const tools = Array.isArray(payload.tools) ? payload.tools : [];
+    setToolLibrary(tools);
+    setToolLibraryError(null);
+    setSelectedToolId((previous) => {
+      const desired = previous.trim();
+      if (desired && tools.some((tool) => tool.tool_id === desired)) {
+        return desired;
+      }
+      if (typeof payload.default_tool_id === "string" && tools.some((tool) => tool.tool_id === payload.default_tool_id)) {
+        return payload.default_tool_id;
+      }
+      return tools[0]?.tool_id ?? "identity";
+    });
+    return tools;
+  }, [normalizedApiHost]);
+
+  const fetchRuntimeConfigSnapshot = useCallback(async () => {
+    const [robotsResponse, runtimeResponse] = await Promise.all([
+      fetch(`${normalizedApiHost}/info/robots`),
+      fetch(`${normalizedApiHost}/info/runtime-config`),
+    ]);
+    if (!robotsResponse.ok) {
+      const body = await robotsResponse.text();
+      throw new Error(body || `Robot policy HTTP ${robotsResponse.status}`);
+    }
+    if (!runtimeResponse.ok) {
+      const body = await runtimeResponse.text();
+      throw new Error(body || `Runtime config HTTP ${runtimeResponse.status}`);
+    }
+    const robotsPayload = (await robotsResponse.json()) as { robots?: RobotPolicyOption[] };
+    const runtimePayload = (await runtimeResponse.json()) as RuntimeConfigSnapshot;
+    const nextRobots = Array.isArray(robotsPayload.robots) ? robotsPayload.robots : [];
+    setRobotOptions(nextRobots);
+    setRuntimeConfigSnapshot(runtimePayload);
+    const desiredRobot = runtimePayload?.desired?.robot;
+    const desiredTool = runtimePayload?.desired?.active_tool_id;
+    setSelectedRobotName((previous) => {
+      if (typeof desiredRobot === "string" && desiredRobot.trim().length > 0) {
+        return desiredRobot;
+      }
+      if (previous && previous.trim().length > 0) {
+        return previous;
+      }
+      return nextRobots[0]?.name ?? "";
+    });
+    setSelectedToolId((previous) => {
+      if (typeof desiredTool === "string" && desiredTool.trim().length > 0) {
+        return desiredTool;
+      }
+      return previous || "identity";
+    });
+    setRuntimeConfigError(null);
+    return runtimePayload;
+  }, [normalizedApiHost]);
+
+  useEffect(() => {
+    if (toolLibrary.length === 0) {
+      return;
+    }
+    const selected =
+      toolLibrary.find((tool) => tool.tool_id === selectedToolId) ??
+      toolLibrary.find((tool) => tool.tool_id === "identity") ??
+      toolLibrary[0];
+    if (!selected) {
+      return;
+    }
+    setToolDraft((previous) => {
+      if (
+        previous.tool_id === selected.tool_id &&
+        previous.display_name === selected.display_name &&
+        previous.tool_type === selected.tool_type &&
+        JSON.stringify(previous.offset) === JSON.stringify(selected.offset)
+      ) {
+        return previous;
+      }
+      return cloneToolDefinition(selected);
+    });
+  }, [selectedToolId, toolLibrary]);
+
+  const handleOffsetDraftChange = useCallback(
+    (
+      target: "base" | "tool",
+      group: "position_m" | "rotation_deg",
+      axis: "x" | "y" | "z",
+      value: number,
+    ) => {
+      const safeValue = Number.isFinite(value) ? value : 0;
+      if (target === "base") {
+        setBaseOffsetDraft((prev) => ({
+          ...prev,
+          [group]: { ...prev[group], [axis]: safeValue },
+        }));
+      } else {
+        setToolOffsetDraft((prev) => ({
+          ...prev,
+          [group]: { ...prev[group], [axis]: safeValue },
+        }));
+      }
+    },
+    [],
+  );
+
+  const handleApplyRuntimeOffsets = useCallback(async () => {
+    if (!kinematicsSnapshot) {
+      return;
+    }
+    const confirmed = window.confirm(
+      `Apply runtime offsets at revision ${kinematicsSnapshot.revision}?`,
+    );
+    if (!confirmed) {
+      return;
+    }
+    setIsKinematicsBusy(true);
+    try {
+      const response = await fetch(`${normalizedApiHost}/kinematics/runtime-offsets`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          expected_revision: kinematicsSnapshot.revision,
+          base: baseOffsetDraft,
+          tool: toolOffsetDraft,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const message =
+          typeof payload?.detail?.message === "string"
+            ? payload.detail.message
+            : response.statusText || "Failed to apply kinematics offsets.";
+        throw new Error(message);
+      }
+      setKinematicsSnapshot(payload as KinematicsProfileSnapshot);
+      setKinematicsError(null);
+    } catch (err) {
+      setKinematicsError((err as Error).message);
+      await fetchKinematicsSnapshot().catch(() => undefined);
+    } finally {
+      setIsKinematicsBusy(false);
+    }
+  }, [
+    baseOffsetDraft,
+    fetchKinematicsSnapshot,
+    kinematicsSnapshot,
+    normalizedApiHost,
+    toolOffsetDraft,
+  ]);
+
+  const handleResetRuntimeOffsets = useCallback(async () => {
+    if (!kinematicsSnapshot) {
+      return;
+    }
+    const confirmed = window.confirm("Reset runtime TCP/base offsets to zero?");
+    if (!confirmed) {
+      return;
+    }
+    setIsKinematicsBusy(true);
+    try {
+      const response = await fetch(`${normalizedApiHost}/kinematics/runtime-offsets/reset`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ expected_revision: kinematicsSnapshot.revision }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const message =
+          typeof payload?.detail?.message === "string"
+            ? payload.detail.message
+            : response.statusText || "Failed to reset kinematics offsets.";
+        throw new Error(message);
+      }
+      const snapshot = payload as KinematicsProfileSnapshot;
+      setKinematicsSnapshot(snapshot);
+      setBaseOffsetDraft(cloneRuntimeOffset(snapshot.offsets.base));
+      setToolOffsetDraft(cloneRuntimeOffset(snapshot.offsets.tool));
+      setKinematicsError(null);
+    } catch (err) {
+      setKinematicsError((err as Error).message);
+      await fetchKinematicsSnapshot().catch(() => undefined);
+    } finally {
+      setIsKinematicsBusy(false);
+    }
+  }, [fetchKinematicsSnapshot, kinematicsSnapshot, normalizedApiHost]);
+
+  const handleNewToolDraft = useCallback(() => {
+    setToolDraft(
+      cloneToolDefinition({
+        ...DEFAULT_TOOL_DRAFT,
+        tool_id: `tool-${Date.now()}`,
+        display_name: "New Tool",
+      }),
+    );
+  }, []);
+
+  const handleCreateTool = useCallback(async () => {
+    setIsToolLibraryBusy(true);
+    setToolLibraryError(null);
+    try {
+      const response = await fetch(`${normalizedApiHost}/tools/library`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          actor: "web-ui",
+          tool: toolDraft,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const message =
+          typeof payload?.detail === "string"
+            ? payload.detail
+            : response.statusText || "Failed to create tool.";
+        throw new Error(message);
+      }
+      await fetchToolLibrarySnapshot();
+      setSelectedToolId(toolDraft.tool_id);
+      setToolLibraryError(null);
+    } catch (err) {
+      setToolLibraryError((err as Error).message);
+    } finally {
+      setIsToolLibraryBusy(false);
+    }
+  }, [fetchToolLibrarySnapshot, normalizedApiHost, toolDraft]);
+
+  const handleUpdateTool = useCallback(async () => {
+    if (!toolDraft.tool_id) {
+      return;
+    }
+    setIsToolLibraryBusy(true);
+    setToolLibraryError(null);
+    try {
+      const response = await fetch(
+        `${normalizedApiHost}/tools/library/${encodeURIComponent(toolDraft.tool_id)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            actor: "web-ui",
+            tool: toolDraft,
+          }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        const message =
+          typeof payload?.detail === "string"
+            ? payload.detail
+            : response.statusText || "Failed to update tool.";
+        throw new Error(message);
+      }
+      await fetchToolLibrarySnapshot();
+      setSelectedToolId(toolDraft.tool_id);
+      setToolLibraryError(null);
+    } catch (err) {
+      setToolLibraryError((err as Error).message);
+    } finally {
+      setIsToolLibraryBusy(false);
+    }
+  }, [fetchToolLibrarySnapshot, normalizedApiHost, toolDraft]);
+
+  const handleDeleteTool = useCallback(async () => {
+    if (!toolDraft.tool_id || toolDraft.tool_id === "identity") {
+      return;
+    }
+    const confirmed = window.confirm(`Delete tool '${toolDraft.tool_id}'?`);
+    if (!confirmed) {
+      return;
+    }
+    setIsToolLibraryBusy(true);
+    setToolLibraryError(null);
+    try {
+      const response = await fetch(
+        `${normalizedApiHost}/tools/library/${encodeURIComponent(toolDraft.tool_id)}?actor=web-ui`,
+        { method: "DELETE" },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        const message =
+          typeof payload?.detail === "string"
+            ? payload.detail
+            : response.statusText || "Failed to delete tool.";
+        throw new Error(message);
+      }
+      await fetchToolLibrarySnapshot();
+      setSelectedToolId("identity");
+      setToolLibraryError(null);
+    } catch (err) {
+      setToolLibraryError((err as Error).message);
+    } finally {
+      setIsToolLibraryBusy(false);
+    }
+  }, [fetchToolLibrarySnapshot, normalizedApiHost, toolDraft.tool_id]);
+
+  const handleApplyRuntimeConfig = useCallback(async () => {
+    if (!selectedRobotName) {
+      return;
+    }
+    setIsRuntimeConfigBusy(true);
+    try {
+      const response = await fetch(`${normalizedApiHost}/info/runtime-config`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          robot: selectedRobotName,
+          active_tool_id: selectedToolId || null,
+          actor: "web-ui",
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const message =
+          typeof payload?.detail === "string"
+            ? payload.detail
+            : response.statusText || "Failed to update runtime config.";
+        throw new Error(message);
+      }
+      setRuntimeConfigSnapshot(payload as RuntimeConfigSnapshot);
+      setRuntimeConfigError(null);
+    } catch (err) {
+      setRuntimeConfigError((err as Error).message);
+      await fetchRuntimeConfigSnapshot().catch(() => undefined);
+    } finally {
+      setIsRuntimeConfigBusy(false);
+    }
+  }, [fetchRuntimeConfigSnapshot, normalizedApiHost, selectedRobotName, selectedToolId]);
+
+  const handleRestartController = useCallback(async () => {
+    if (!runtimeConfigSnapshot?.restart_required) {
+      return;
+    }
+    const confirmed = window.confirm(
+      "Request controller restart now? An external supervisor should restart it automatically.",
+    );
+    if (!confirmed) {
+      return;
+    }
+    setIsRestartingController(true);
+    setRuntimeConfigError(null);
+    try {
+      const response = await fetch(`${normalizedApiHost}/control/restart-controller`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "runtime-config-change" }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const message =
+          typeof payload?.detail === "string"
+            ? payload.detail
+            : response.statusText || "Failed to request controller restart.";
+        throw new Error(message);
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 1250));
+      await fetchRuntimeConfigSnapshot();
+    } catch (err) {
+      setRuntimeConfigError((err as Error).message);
+    } finally {
+      setIsRestartingController(false);
+    }
+  }, [fetchRuntimeConfigSnapshot, normalizedApiHost, runtimeConfigSnapshot?.restart_required]);
   const visionStreamUrl = useMemo(
     () => `${normalisedVisionHost}/stream.mjpg`,
     [normalisedVisionHost],
@@ -2263,6 +3854,7 @@ export default function App() {
     () => [
       { id: "step", label: "STEP Import", icon: <FolderOpen size={17} />, shortcut: "1" },
       { id: "trajectory", label: "Trajectory", icon: <Route size={17} />, shortcut: "2" },
+      { id: "tools", label: "Tool Library", icon: <Wrench size={17} /> },
       { id: "weld", label: "Weld", icon: <Flame size={17} />, shortcut: "3" },
       { id: "telemetry", label: "Live Charts", icon: <Camera size={17} />, shortcut: "4" },
     ],
@@ -2797,6 +4389,7 @@ export default function App() {
             options: {
               work_angle_deg: draft.workAngleDeg,
               travel_angle_deg: draft.travelAngleDeg,
+              tangent_roll_deg: draft.tangentRollDeg,
               transition_clearance_mm: draft.transitionClearanceMm,
               post_action: draft.postAction,
             },
@@ -2917,6 +4510,7 @@ export default function App() {
           activeSegmentEdgeId: edgeId,
           workAngleDeg: current?.workAngleDeg ?? 45,
           travelAngleDeg: current?.travelAngleDeg ?? 0,
+          tangentRollDeg: current?.tangentRollDeg ?? 0,
           transitionClearanceMm: current?.transitionClearanceMm ?? 35,
           postAction: current?.postAction ?? "return_to_start",
         };
@@ -3080,6 +4674,7 @@ export default function App() {
             weldName: weldDraft.weldName,
             workAngleDeg: weldDraft.workAngleDeg,
             travelAngleDeg: weldDraft.travelAngleDeg,
+            tangentRollDeg: weldDraft.tangentRollDeg,
             transitionClearanceMm: weldDraft.transitionClearanceMm,
             postAction: weldDraft.postAction,
             segments: weldDraft.segments.map((segment) => ({
@@ -3243,6 +4838,12 @@ export default function App() {
           weld.options && typeof weld.options === "object"
             ? (weld.options as Record<string, unknown>)
             : {};
+        const workAngleDeg = Number(options.work_angle_deg ?? 45);
+        const travelAngleDeg = Number(options.travel_angle_deg ?? 0);
+        const tangentRollDeg = Number(
+          options.tangent_roll_deg ?? options.tangentRollDeg ?? 0,
+        );
+        const transitionClearanceMm = Number(options.transition_clearance_mm ?? 35);
         const postActionRaw =
           typeof options.post_action === "string" ? options.post_action.trim() : "return_to_start";
         const postAction: "none" | "return_to_start" | "lift" =
@@ -3273,9 +4874,13 @@ export default function App() {
                     : `${weldType} weld`,
                 segments,
                 activeSegmentEdgeId: segments[0].edgeId,
-                workAngleDeg: 45,
-                travelAngleDeg: 0,
-                transitionClearanceMm: 35,
+                workAngleDeg: Number.isFinite(workAngleDeg) ? workAngleDeg : 45,
+                travelAngleDeg: Number.isFinite(travelAngleDeg) ? travelAngleDeg : 0,
+                tangentRollDeg: Number.isFinite(tangentRollDeg) ? tangentRollDeg : 0,
+                transitionClearanceMm:
+                  Number.isFinite(transitionClearanceMm) && transitionClearanceMm > 0
+                    ? transitionClearanceMm
+                    : 35,
                 postAction,
               }
             : null,
@@ -3396,6 +5001,48 @@ export default function App() {
     setVisionError(null);
   }, [normalisedVisionHost]);
 
+  useEffect(() => {
+    if (!isSettingsOpen) {
+      return;
+    }
+    setIsKinematicsBusy(true);
+    fetchKinematicsSnapshot()
+      .catch((err) => {
+        setKinematicsError((err as Error).message);
+      })
+      .finally(() => {
+        setIsKinematicsBusy(false);
+      });
+  }, [fetchKinematicsSnapshot, isSettingsOpen]);
+
+  useEffect(() => {
+    if (!isSettingsOpen && activePanel !== "tools") {
+      return;
+    }
+    setIsRuntimeConfigBusy(true);
+    fetchRuntimeConfigSnapshot()
+      .catch((err) => {
+        setRuntimeConfigError((err as Error).message);
+      })
+      .finally(() => {
+        setIsRuntimeConfigBusy(false);
+      });
+  }, [activePanel, fetchRuntimeConfigSnapshot, isSettingsOpen]);
+
+  useEffect(() => {
+    if (!isSettingsOpen && activePanel !== "tools") {
+      return;
+    }
+    setIsToolLibraryBusy(true);
+    fetchToolLibrarySnapshot()
+      .catch((err) => {
+        setToolLibraryError((err as Error).message);
+      })
+      .finally(() => {
+        setIsToolLibraryBusy(false);
+      });
+  }, [activePanel, fetchToolLibrarySnapshot, isSettingsOpen]);
+
   // Lightweight API health probe to surface clearer 5xx reasons
   useEffect(() => {
     let cancelled = false;
@@ -3514,6 +5161,7 @@ export default function App() {
         "2": "trajectory",
         "3": "weld",
         "4": "telemetry",
+        "5": "tools",
       };
       if (panelByKey[key]) {
         const nextPanel = panelByKey[key];
@@ -3585,8 +5233,10 @@ export default function App() {
   const alertTone = error ? "rose" : "amber";
   const activeDrawerWidthClass = activePanel === "telemetry"
     ? "w-[30rem] max-w-[calc(100vw-7rem)]"
-    : "w-[20rem] max-w-[calc(100vw-7rem)]";
-  const activeDrawerHeightMode = activePanel === "weld" ? "full" : "content";
+    : activePanel === "tools"
+      ? "w-[23rem] max-w-[calc(100vw-7rem)]"
+      : "w-[20rem] max-w-[calc(100vw-7rem)]";
+  const activeDrawerHeightMode: "content" | "full" = "content";
   const activeDrawerHeader = activePanel === "step"
     ? (
         <span className="text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200/80">
@@ -3599,6 +5249,12 @@ export default function App() {
             Trajectory
           </span>
         )
+      : activePanel === "tools"
+        ? (
+            <span className="text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200/80">
+              Tool Library
+            </span>
+          )
       : activePanel === "weld"
         ? (
             <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -3653,6 +5309,48 @@ export default function App() {
             onUndoPoint={handleUndoPoint}
           />
         )
+      : activePanel === "tools"
+        ? (
+            <ToolLibraryPanel
+              robots={robotOptions}
+              tools={toolLibrary}
+              filteredTools={filteredTools}
+              availableToolTypes={availableToolTypes}
+              selectedToolId={selectedToolId}
+              toolFilterRobotId={toolFilterRobotId}
+              toolFilterType={toolFilterType}
+              toolFilterQuery={toolFilterQuery}
+              activeRuntimeConfig={runtimeConfigSnapshot?.active ?? null}
+              restartRequired={Boolean(runtimeConfigSnapshot?.restart_required)}
+              runtimeConfigError={runtimeConfigError}
+              isRuntimeConfigBusy={isRuntimeConfigBusy}
+              isRestartingController={isRestartingController}
+              isToolLibraryBusy={isToolLibraryBusy}
+              toolLibraryError={toolLibraryError}
+              onSelectedToolIdChange={setSelectedToolId}
+              onToolFilterRobotIdChange={setToolFilterRobotId}
+              onToolFilterTypeChange={setToolFilterType}
+              onToolFilterQueryChange={setToolFilterQuery}
+              onRefreshTools={() => {
+                setIsToolLibraryBusy(true);
+                fetchToolLibrarySnapshot()
+                  .catch((err) => setToolLibraryError((err as Error).message))
+                  .finally(() => setIsToolLibraryBusy(false));
+              }}
+              onRefreshRuntimeConfig={() => {
+                setIsRuntimeConfigBusy(true);
+                fetchRuntimeConfigSnapshot()
+                  .catch((err) => setRuntimeConfigError((err as Error).message))
+                  .finally(() => setIsRuntimeConfigBusy(false));
+              }}
+              onApplyRuntimeConfig={handleApplyRuntimeConfig}
+              onRestartController={handleRestartController}
+              onOpenToolSettings={() => {
+                setSettingsInitialTab("tools");
+                setIsSettingsOpen(true);
+              }}
+            />
+          )
       : activePanel === "weld"
         ? (
             <WeldPanel
@@ -3668,6 +5366,7 @@ export default function App() {
               isRunning={isRunningPreview}
               canRunPreview={Boolean(previewPlan?.name)}
               weldActive={weldActive}
+              planningWarnings={previewPlan?.planningWarnings ?? []}
               onToggleSelection={() => setWeldSelectionMode((value) => !value)}
               onSelectEdge={(edgeId) => {
                 panelSelectionOriginRef.current = "weld";
@@ -3753,6 +5452,18 @@ export default function App() {
                     ? {
                         ...current,
                         travelAngleDeg: Number.isFinite(value) ? value : current.travelAngleDeg,
+                      }
+                    : current,
+                )
+              }
+              onSetTangentRollDeg={(value) =>
+                setWeldDraft((current) =>
+                  current
+                    ? {
+                        ...current,
+                        tangentRollDeg: Number.isFinite(value)
+                          ? value
+                          : current.tangentRollDeg,
                       }
                     : current,
                 )
@@ -3949,7 +5660,10 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => setIsSettingsOpen(true)}
+              onClick={() => {
+                setSettingsInitialTab("general");
+                setIsSettingsOpen(true);
+              }}
               className="rounded-full border border-slate-600/60 bg-slate-900/60 p-1.5 text-slate-300 transition hover:border-slate-400 hover:text-slate-100"
               aria-label="Open settings"
             >
@@ -3960,6 +5674,8 @@ export default function App() {
       </header>
       <main className="relative flex-1 overflow-hidden">
         <ArmVisualizer
+          robotId={visualizerRobotId}
+          activeTool={visualizerTool}
           ref={visualizerRef}
           joints={latest?.joints}
           showBoundingBox={showBoundingBox}
@@ -4077,12 +5793,66 @@ export default function App() {
       </main>
       <SettingsDialog
         isOpen={isSettingsOpen}
+        initialTab={settingsInitialTab}
         apiHost={apiHost}
         visionHost={visionHost}
         showBoundingBox={showBoundingBox}
+        robots={robotOptions}
+        selectedRobotName={selectedRobotName}
+        tools={toolLibrary}
+        selectedToolId={selectedToolId}
+        toolFilterRobotId={toolFilterRobotId}
+        toolFilterType={toolFilterType}
+        toolFilterQuery={toolFilterQuery}
+        toolDraft={toolDraft}
+        activeRuntimeConfig={runtimeConfigSnapshot?.active ?? null}
+        restartRequired={Boolean(runtimeConfigSnapshot?.restart_required)}
+        runtimeConfigError={runtimeConfigError}
+        isRuntimeConfigBusy={isRuntimeConfigBusy}
+        isRestartingController={isRestartingController}
+        isToolLibraryBusy={isToolLibraryBusy}
+        toolLibraryError={toolLibraryError}
+        kinematics={kinematicsSnapshot}
+        baseOffsetDraft={baseOffsetDraft}
+        toolOffsetDraft={toolOffsetDraft}
+        isKinematicsBusy={isKinematicsBusy}
+        kinematicsError={kinematicsError}
         onHostChange={setApiHost}
         onVisionHostChange={setVisionHost}
         onShowBoundingBoxChange={(value) => updateSettings({ showBoundingBox: value })}
+        onSelectedRobotNameChange={setSelectedRobotName}
+        onSelectedToolIdChange={setSelectedToolId}
+        onToolFilterRobotIdChange={setToolFilterRobotId}
+        onToolFilterTypeChange={setToolFilterType}
+        onToolFilterQueryChange={setToolFilterQuery}
+        onToolDraftChange={setToolDraft}
+        onRefreshTools={() => {
+          setIsToolLibraryBusy(true);
+          fetchToolLibrarySnapshot()
+            .catch((err) => setToolLibraryError((err as Error).message))
+            .finally(() => setIsToolLibraryBusy(false));
+        }}
+        onNewToolDraft={handleNewToolDraft}
+        onCreateTool={handleCreateTool}
+        onUpdateTool={handleUpdateTool}
+        onDeleteTool={handleDeleteTool}
+        onRefreshRuntimeConfig={() => {
+          setIsRuntimeConfigBusy(true);
+          fetchRuntimeConfigSnapshot()
+            .catch((err) => setRuntimeConfigError((err as Error).message))
+            .finally(() => setIsRuntimeConfigBusy(false));
+        }}
+        onApplyRuntimeConfig={handleApplyRuntimeConfig}
+        onRestartController={handleRestartController}
+        onOffsetDraftChange={handleOffsetDraftChange}
+        onRefreshKinematics={() => {
+          setIsKinematicsBusy(true);
+          fetchKinematicsSnapshot()
+            .catch((err) => setKinematicsError((err as Error).message))
+            .finally(() => setIsKinematicsBusy(false));
+        }}
+        onApplyOffsets={handleApplyRuntimeOffsets}
+        onResetOffsets={handleResetRuntimeOffsets}
         onClose={() => setIsSettingsOpen(false)}
       />
     </div>

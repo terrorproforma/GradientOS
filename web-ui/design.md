@@ -54,8 +54,8 @@ Use these tokens before introducing new text-size classes.
   - Use fixed shared insets (`top-6`, `bottom-6`) for the drawer overlay lane.
   - Keep non-drawer UI (e.g. Robot Control, vision card) aligned to the same `bottom-6` baseline.
 - Height behavior:
-  - Default mode (STEP / Trajectory / Telemetry): content-driven shell (`max-h-full`) so sparse panels do not appear stretched.
-  - Dense mode (Weld): full-height shell (`h-full`) so long workflows keep a stable baseline and predictable internal scroll region.
+  - All drawer panels use content-driven shell (`max-h-full`) so sparse panels do not appear stretched to the bottom.
+  - When content exceeds available lane height, drawer caps at lane bounds (`top-6`/`bottom-6`) and body scrolls internally.
   - Never let long content extend beyond the overlay lane; content must scroll internally.
 - Scrolling:
   - Use internal scroll region only.
@@ -63,6 +63,12 @@ Use these tokens before introducing new text-size classes.
 - Width behavior:
   - Default drawers use standard width.
   - Telemetry/charts drawer may use a wider variant to prevent horizontal overflow.
+
+## Settings Modal Layout Rules
+
+- Settings modal should cap vertical size to viewport (`max-h` with top/bottom breathing room), not overflow the window.
+- Keep header + tab row fixed; content area scrolls internally with `gradient-scrollbar`.
+- Do not allow tool/kinematics forms to push action controls beyond viewport bounds.
 
 ## Tooltip and Popover Rules
 

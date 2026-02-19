@@ -7,11 +7,27 @@ import {
 } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+import { STLLoader } from "three/examples/jsm/loaders/STLLoader";
 import URDFLoader, { type URDFRobot } from "urdf-loader";
 import occtWasmUrl from "occt-import-js/dist/occt-import-js.wasm?url";
 import type { Point3 } from "./previewUtils";
 
 type ArmVisualizerProps = {
+  robotId?: string | null;
+  activeTool?: {
+    tool_id: string;
+    display_name: string;
+    offset: {
+      position_mm: { x: number; y: number; z: number };
+      rotation_deg: { x: number; y: number; z: number };
+    };
+    mesh?: {
+      asset_path: string;
+      scale: number;
+      position_mm?: { x: number; y: number; z: number };
+      rotation_deg?: { x: number; y: number; z: number };
+    } | null;
+  } | null;
   joints?: number[];
   showBoundingBox: boolean;
   selectionMode: boolean;
@@ -107,6 +123,11 @@ export type TopologyEdgeOverlay = {
   id: string;
   partId?: string;
   points: Point3[];
+};
+
+type RobotAssetIndex = {
+  defaultRobotId: string;
+  robots: Record<string, { urdfPath: string }>;
 };
 
 async function loadOcctImporter(): Promise<OcctImporter> {
@@ -209,6 +230,73 @@ function disposeObject3D(object: THREE.Object3D) {
       return;
     }
   });
+}
+
+function computeGroundingBoxFromBase(
+  baseSource: THREE.Object3D,
+  excludedSubtree?: THREE.Object3D | null,
+): THREE.Box3 | null {
+  const bounds = new THREE.Box3();
+  const worldGeometryBounds = new THREE.Box3();
+  const pending: THREE.Object3D[] = [baseSource];
+  let hasGeometry = false;
+
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (!current) {
+      continue;
+    }
+    if (excludedSubtree && current === excludedSubtree) {
+      continue;
+    }
+
+    const asMesh = current as THREE.Mesh;
+    if (asMesh.isMesh) {
+      const geometry = asMesh.geometry as THREE.BufferGeometry | undefined;
+      if (geometry) {
+        if (!geometry.boundingBox) {
+          geometry.computeBoundingBox();
+        }
+        if (geometry.boundingBox) {
+          worldGeometryBounds.copy(geometry.boundingBox).applyMatrix4(asMesh.matrixWorld);
+          bounds.union(worldGeometryBounds);
+          hasGeometry = true;
+        }
+      }
+    }
+
+    current.children.forEach((child) => {
+      if (excludedSubtree && child === excludedSubtree) {
+        return;
+      }
+      const childRecord = child as unknown as {
+        isURDFJoint?: boolean;
+        jointType?: unknown;
+        type?: string;
+      };
+      const childType = typeof childRecord.type === "string" ? childRecord.type.toLowerCase() : "";
+      const childName = child.name.toLowerCase();
+      const isJointNode =
+        childRecord.isURDFJoint === true ||
+        Object.prototype.hasOwnProperty.call(childRecord, "jointType") ||
+        childType.includes("urdfjoint") ||
+        childName === "joint" ||
+        childName.startsWith("joint");
+      if (!isJointNode) {
+        pending.push(child);
+      }
+    });
+  }
+
+  if (hasGeometry) {
+    return bounds;
+  }
+
+  const baseOrigin = baseSource.getWorldPosition(new THREE.Vector3());
+  if (!Number.isFinite(baseOrigin.z)) {
+    return null;
+  }
+  return new THREE.Box3(baseOrigin.clone(), baseOrigin.clone());
 }
 
 function createAxisLabelSprite(
@@ -349,6 +437,90 @@ function createEdgeOverlayMesh(
   return mesh;
 }
 
+async function resolveRobotUrdfConfig(selectedRobotId?: string | null): Promise<{
+  robotId: string;
+  urdfPath: string;
+  assetBasePath: string;
+}> {
+  const response = await fetch("/assets/robots/index.json", { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(`Failed to load robot asset index: HTTP ${response.status}`);
+  }
+
+  const parsed = (await response.json()) as Partial<RobotAssetIndex>;
+  if (!parsed || typeof parsed.defaultRobotId !== "string" || !parsed.robots) {
+    throw new Error("Invalid robot asset index format");
+  }
+  const requestedRobotId =
+    typeof selectedRobotId === "string" && selectedRobotId.trim().length > 0
+      ? selectedRobotId.trim()
+      : parsed.defaultRobotId;
+  const resolvedRobotId =
+    parsed.robots[requestedRobotId] ? requestedRobotId : parsed.defaultRobotId;
+  const selected = parsed.robots[resolvedRobotId];
+  if (!selected || typeof selected.urdfPath !== "string") {
+    throw new Error(`Robot '${resolvedRobotId}' missing urdfPath in index`);
+  }
+
+  const slashIndex = selected.urdfPath.lastIndexOf("/");
+  if (slashIndex < 0) {
+    throw new Error(`Invalid URDF path in robot asset index: ${selected.urdfPath}`);
+  }
+  const assetBasePath = selected.urdfPath.slice(0, slashIndex + 1);
+  return {
+    robotId: resolvedRobotId,
+    urdfPath: selected.urdfPath,
+    assetBasePath,
+  };
+}
+
+function _resolveToolAssetPath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed.startsWith("/")) {
+    return trimmed;
+  }
+  return `/assets/tools/${trimmed.replace(/^\.\/+/, "")}`;
+}
+
+function _createFallbackToolMarker(): THREE.Group {
+  const group = new THREE.Group();
+  group.name = "active-tool-fallback";
+
+  const body = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.008, 0.008, 0.12, 20),
+    new THREE.MeshStandardMaterial({
+      color: 0xf97316,
+      metalness: 0.15,
+      roughness: 0.55,
+      transparent: true,
+      opacity: 0.9,
+    }),
+  );
+  body.rotation.x = Math.PI / 2;
+  body.position.z = 0.06;
+  body.castShadow = true;
+  body.receiveShadow = true;
+  group.add(body);
+
+  const tip = new THREE.Mesh(
+    new THREE.ConeGeometry(0.011, 0.03, 24),
+    new THREE.MeshStandardMaterial({
+      color: 0xfacc15,
+      metalness: 0.2,
+      roughness: 0.45,
+    }),
+  );
+  tip.rotation.x = Math.PI / 2;
+  tip.position.z = 0.135;
+  tip.castShadow = true;
+  tip.receiveShadow = true;
+  group.add(tip);
+  return group;
+}
+
 export type ArmVisualizerHandle = {
   resetView: () => void;
   focusOnPoints: (points: Point3[]) => void;
@@ -356,6 +528,8 @@ export type ArmVisualizerHandle = {
 
 export const ArmVisualizer = forwardRef(function ArmVisualizer(
   {
+    robotId,
+    activeTool,
     joints,
     showBoundingBox,
     selectionMode,
@@ -409,6 +583,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   const onPointSelectedRef = useRef(onPointSelected);
   const onTopologyEdgeSelectedRef = useRef(onTopologyEdgeSelected);
   const previewGroupRef = useRef<THREE.Group | null>(null);
+  const activeToolGroupRef = useRef<THREE.Group | null>(null);
   const stepRootRef = useRef<THREE.Group | null>(null);
   const topologyEdgesGroupRef = useRef<THREE.Group | null>(null);
   const topologyEdgeObjectsRef = useRef<THREE.Line[]>([]);
@@ -587,9 +762,8 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     };
 
     const loader = new URDFLoader();
-    const assetBasePath = "/assets/mini-6dof-arm/";
-    const urdfPath = `${assetBasePath}mini-6dof-arm.urdf`;
-    loader.workingPath = assetBasePath;
+    let disposed = false;
+    let attemptedUrdfPath = "(not resolved)";
     const debugMarkers = boundingMarkersRef.current;
     const isFiniteBox = (box: THREE.Box3) =>
       Number.isFinite(box.min.x) &&
@@ -806,7 +980,12 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
 
       const baseSource =
         baseObject ?? linksRecord?.base ?? linksRecord?.base_link ?? robot;
-      const baseBox = new THREE.Box3().setFromObject(baseSource);
+      const activeToolGroup = activeToolGroupRef.current;
+      // Grounding must be based on base-link geometry only and never track tool meshes.
+      const baseBox = computeGroundingBoxFromBase(baseSource, activeToolGroup);
+      if (!baseBox) {
+        return;
+      }
       if (!isFiniteBox(baseBox)) {
         return;
       }
@@ -872,74 +1051,215 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       pendingDynamicBoundsRef.current = true;
     };
 
-    loader.load(
-      urdfPath,
-      (robot) => {
-        console.info("[ArmVisualizer] URDF loaded", {
-          jointNames: Object.keys(robot.joints),
-          linkNames: Object.keys(robot.links),
+    const attachActiveToolVisual = (robot: URDFRobot) => {
+      const previous = activeToolGroupRef.current;
+      if (previous) {
+        previous.parent?.remove(previous);
+        disposeObject3D(previous);
+        activeToolGroupRef.current = null;
+      }
+      if (!activeTool) {
+        return;
+      }
+      const linksRecord = robot.links as unknown as Record<string, THREE.Object3D | undefined>;
+      const jointsRecord = robot.joints as unknown as Record<
+        string,
+        THREE.Object3D | undefined
+      >;
+      const joint6Anchor =
+        jointsRecord?.joint6 ??
+        Object.entries(jointsRecord ?? {}).find(([name]) => {
+          const token = name.toLowerCase();
+          return token === "joint6" || token === "joint_6" || token === "j6";
+        })?.[1] ??
+        robot.getObjectByName("joint6");
+      const flangeLikeLink = Object.entries(linksRecord).find(([name]) => {
+        const lower = name.toLowerCase();
+        return lower.includes("flange");
+      })?.[1];
+      // Mesh origin must be at J6 flange/joint frame (never TCP/tool tip).
+      const anchor = joint6Anchor ?? flangeLikeLink ?? robot;
+      if (!joint6Anchor) {
+        console.warn("[ArmVisualizer] joint6 anchor not found; using fallback anchor", {
+          fallback: anchor.name || "unnamed",
         });
-        robot.scale.setScalar(ROBOT_SCALE);
-        const defaultMaterial = new THREE.MeshStandardMaterial({
-          color: 0x1e293b,
-          metalness: 0.1,
-          roughness: 0.8,
-        });
-        const accentMaterial = new THREE.MeshStandardMaterial({
-          color: 0x38bdf8,
-          metalness: 0.2,
-          roughness: 0.5,
-        });
-
-        robot.traverse((obj) => {
-          if ((obj as THREE.Mesh).isMesh) {
-            const mesh = obj as THREE.Mesh;
-            mesh.castShadow = true;
-            mesh.receiveShadow = true;
-            const material =
-              mesh.name.toLowerCase().includes("wrist") ||
-              mesh.name.toLowerCase().includes("tool")
-                ? accentMaterial
-                : defaultMaterial;
-
-            if (Array.isArray(mesh.material)) {
-              mesh.material.forEach((mat) => {
-                (mat as THREE.Material).dispose();
+      }
+      const toolRootGroup = new THREE.Group();
+      toolRootGroup.name = `active-tool-${activeTool.tool_id}`;
+      // TCP/tool-tip frame (used by kinematic tool offset semantics).
+      const toolTcpGroup = new THREE.Group();
+      toolTcpGroup.name = `active-tool-tcp-${activeTool.tool_id}`;
+      const mm = activeTool.offset?.position_mm ?? { x: 0, y: 0, z: 0 };
+      const deg = activeTool.offset?.rotation_deg ?? { x: 0, y: 0, z: 0 };
+      toolTcpGroup.position.set(
+        Number(mm.x) / 1000,
+        Number(mm.y) / 1000,
+        Number(mm.z) / 1000,
+      );
+      toolTcpGroup.rotation.set(
+        (Number(deg.x) * Math.PI) / 180,
+        (Number(deg.y) * Math.PI) / 180,
+        (Number(deg.z) * Math.PI) / 180,
+      );
+      // Tool offset is TCP-only. Mesh stays in J6 frame via toolRootGroup.
+      const fallbackMarker = _createFallbackToolMarker();
+      const hasMeshAsset =
+        typeof activeTool.mesh?.asset_path === "string" &&
+        activeTool.mesh.asset_path.trim().length > 0;
+      // Only show fallback when no mesh is configured or mesh loading fails.
+      fallbackMarker.visible = !hasMeshAsset;
+      toolTcpGroup.add(fallbackMarker);
+      toolRootGroup.add(toolTcpGroup);
+      if (activeTool.mesh?.asset_path) {
+        const meshPath = _resolveToolAssetPath(activeTool.mesh.asset_path);
+        if (meshPath.toLowerCase().endsWith(".stl")) {
+          const stlLoader = new STLLoader();
+          stlLoader.load(
+            meshPath,
+            (geometry) => {
+              if (disposed) {
+                geometry.dispose();
+                return;
+              }
+              if (activeToolGroupRef.current !== toolRootGroup) {
+                geometry.dispose();
+                return;
+              }
+              const mesh = new THREE.Mesh(
+                geometry,
+                new THREE.MeshStandardMaterial({
+                  color: 0x38bdf8,
+                  metalness: 0.15,
+                  roughness: 0.6,
+                }),
+              );
+              const scale = Number(activeTool.mesh?.scale ?? 1);
+              mesh.scale.setScalar(Number.isFinite(scale) ? Math.max(1e-5, scale) : 1);
+              const meshPosMm = activeTool.mesh?.position_mm ?? { x: 0, y: 0, z: 0 };
+              const meshRotDeg = activeTool.mesh?.rotation_deg ?? { x: 0, y: 0, z: 0 };
+              mesh.position.set(
+                Number(meshPosMm.x) / 1000,
+                Number(meshPosMm.y) / 1000,
+                Number(meshPosMm.z) / 1000,
+              );
+              mesh.rotation.set(
+                (Number(meshRotDeg.x) * Math.PI) / 180,
+                (Number(meshRotDeg.y) * Math.PI) / 180,
+                (Number(meshRotDeg.z) * Math.PI) / 180,
+              );
+              mesh.castShadow = true;
+              mesh.receiveShadow = true;
+              mesh.name = `tool-mesh-${activeTool.tool_id}`;
+              // Mesh transform is relative to the J6/flange anchor frame, not TCP.
+              toolRootGroup.add(mesh);
+              fallbackMarker.visible = false;
+            },
+            undefined,
+            (error) => {
+              fallbackMarker.visible = true;
+              console.warn("[ArmVisualizer] Failed to load active tool STL", {
+                toolId: activeTool.tool_id,
+                meshPath,
+                error,
               });
-            } else if (mesh.material) {
-              (mesh.material as THREE.Material).dispose();
+            },
+          );
+        } else {
+          fallbackMarker.visible = true;
+        }
+      }
+      anchor.add(toolRootGroup);
+      activeToolGroupRef.current = toolRootGroup;
+    };
+
+    const loadRobotModel = async () => {
+      try {
+        const urdfConfig = await resolveRobotUrdfConfig(robotId);
+        if (disposed) {
+          return;
+        }
+        attemptedUrdfPath = urdfConfig.urdfPath;
+        loader.workingPath = urdfConfig.assetBasePath;
+
+        loader.load(
+          urdfConfig.urdfPath,
+          (robot) => {
+            if (disposed) {
+              return;
             }
-            mesh.material = material;
-          }
-        });
+            console.info("[ArmVisualizer] URDF loaded", {
+              robotId: urdfConfig.robotId,
+              urdfPath: urdfConfig.urdfPath,
+              jointNames: Object.keys(robot.joints),
+              linkNames: Object.keys(robot.links),
+            });
+            robot.scale.setScalar(ROBOT_SCALE);
+            const defaultMaterial = new THREE.MeshStandardMaterial({
+              color: 0x1e293b,
+              metalness: 0.1,
+              roughness: 0.8,
+            });
+            const accentMaterial = new THREE.MeshStandardMaterial({
+              color: 0x38bdf8,
+              metalness: 0.2,
+              roughness: 0.5,
+            });
 
-        scene.add(robot);
+            robot.traverse((obj) => {
+              if ((obj as THREE.Mesh).isMesh) {
+                const mesh = obj as THREE.Mesh;
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                const material =
+                  mesh.name.toLowerCase().includes("wrist") ||
+                  mesh.name.toLowerCase().includes("tool")
+                    ? accentMaterial
+                    : defaultMaterial;
 
-        robotRef.current = robot;
-        if (!currentAnglesRef.current) {
-          currentAnglesRef.current = new Array(6).fill(0);
-        }
-        if (!targetAnglesRef.current) {
-          targetAnglesRef.current = new Array(6).fill(0);
-        }
+                if (Array.isArray(mesh.material)) {
+                  mesh.material.forEach((mat) => {
+                    (mat as THREE.Material).dispose();
+                  });
+                } else if (mesh.material) {
+                  (mesh.material as THREE.Material).dispose();
+                }
+                mesh.material = material;
+              }
+            });
 
-        const initialiseScene = () => {
-          alignToGroundAndUpdateBounds({ snapCamera: true, applySnapshot: true });
-          isGroundedRef.current = true;
-        };
+            scene.add(robot);
+            attachActiveToolVisual(robot);
 
-        initialiseScene();
-        updateBoundsVisibility(showBoundingBoxRef.current);
-        renderer.render(scene, camera);
-      },
-      undefined,
-      (error) => {
-        console.error("[ArmVisualizer] Failed to load URDF", {
-          error,
-          attemptedPath: urdfPath,
-        });
-      },
-    );
+            robotRef.current = robot;
+            if (!currentAnglesRef.current) {
+              currentAnglesRef.current = new Array(6).fill(0);
+            }
+            if (!targetAnglesRef.current) {
+              targetAnglesRef.current = new Array(6).fill(0);
+            }
+
+            const initialiseScene = () => {
+              alignToGroundAndUpdateBounds({ snapCamera: true, applySnapshot: true });
+              isGroundedRef.current = true;
+            };
+
+            initialiseScene();
+            updateBoundsVisibility(showBoundingBoxRef.current);
+            renderer.render(scene, camera);
+          },
+          undefined,
+          (error) => {
+            console.error("[ArmVisualizer] Failed to load URDF", {
+              error,
+              attemptedPath: attemptedUrdfPath,
+            });
+          },
+        );
+      } catch (error) {
+        console.error("[ArmVisualizer] Failed to resolve robot URDF config", { error });
+      }
+    };
+    void loadRobotModel();
 
     const handleResize = () => {
       if (!container) {
@@ -1038,6 +1358,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     window.addEventListener("resize", handleResize);
 
     return () => {
+      disposed = true;
       renderer.domElement.removeEventListener("pointerdown", handlePointerDown);
       renderer.domElement.removeEventListener("pointermove", handlePointerMove);
       renderer.domElement.removeEventListener("pointerleave", handlePointerLeave);
@@ -1070,6 +1391,12 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         disposeObject3D(stepRoot);
         scene.remove(stepRoot);
         stepRootRef.current = null;
+      }
+      const activeToolGroup = activeToolGroupRef.current;
+      if (activeToolGroup) {
+        activeToolGroup.parent?.remove(activeToolGroup);
+        disposeObject3D(activeToolGroup);
+        activeToolGroupRef.current = null;
       }
       const topologyGroup = topologyEdgesGroupRef.current;
       if (topologyGroup) {
@@ -1140,7 +1467,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       }
       setBoundsVisibilityRef.current = null;
     };
-  }, []);
+  }, [activeTool, robotId]);
 
   useImperativeHandle(
     ref,

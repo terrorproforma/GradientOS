@@ -1,0 +1,10 @@
+{
+  "tools": {
+    "identity": {
+      "meshAssetPath": null
+    },
+    "tig-torch-65deg": {
+      "meshAssetPath": "/assets/tools/tig-torch-65deg/tool_mesh.stl"
+    }
+  }
+}

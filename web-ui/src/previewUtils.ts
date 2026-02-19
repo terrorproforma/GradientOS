@@ -20,6 +20,7 @@ export type PreviewPlan = {
   trajectory: TrajectoryFile;
   pathPoints: Point3[];
   waypoints: Point3[];
+  planningWarnings?: string[];
 };
 
 export type ProgramNodeType =
@@ -102,6 +103,15 @@ function coercePointList(value: unknown): Point3[] {
     .filter((point): point is Point3 => point !== null);
 }
 
+function coerceStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+    .filter((entry) => entry.length > 0);
+}
+
 function deriveWaypointsFromTrajectory(trajectory: TrajectoryFile): Point3[] {
   if (!trajectory?.moves || !Array.isArray(trajectory.moves)) {
     return [];
@@ -123,6 +133,7 @@ function buildPreviewPlan(
   trajectory: TrajectoryFile,
   explicitPath?: unknown,
   explicitWaypoints?: unknown,
+  explicitWarnings?: unknown,
 ): PreviewPlan {
   const fallbackWaypoints = deriveWaypointsFromTrajectory(trajectory);
   const explicitWaypointsList = coercePointList(explicitWaypoints);
@@ -137,6 +148,7 @@ function buildPreviewPlan(
       : waypoints.length > 0
         ? waypoints
         : fallbackWaypoints;
+  const planningWarnings = coerceStringList(explicitWarnings);
 
   return {
     name,
@@ -145,6 +157,7 @@ function buildPreviewPlan(
     waypoints: (waypoints.length > 0 ? waypoints : fallbackWaypoints).map(
       ({ x, y, z }) => transformToScenePoint({ x, y, z }),
     ),
+    planningWarnings,
   };
 }
 
@@ -165,6 +178,7 @@ export function previewFromPlannerPayload(payload: any): {
     trajectory,
     payload?.cartesian_path,
     payload?.waypoints,
+    payload?.planning_warnings,
   );
   const waypoints = plan.waypoints;
   return { plan, waypoints };

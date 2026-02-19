@@ -1,7 +1,7 @@
 """Numeric kinematics test script.
 
 This script now loads Denavit–Hartenberg (DH) parameters directly from the
-``mini-6dof-arm/dh_params.csv`` file that accompanies the repository.  To aid
+``robots/mini-6dof-arm/dh_params.csv`` file that accompanies the repository.  To aid
 readability and to make clear which column maps to which DH parameter, the
 script prints out the header row found in the CSV before constructing the
 ``DH`` numpy array.  This ensures that anyone running the test can immediately
@@ -30,10 +30,10 @@ from numeric_k import compute_ref_rot, user_to_ee_quat, ee_to_user_euler  # Impo
 # Locate and load the CSV file containing the DH table
 # ---------------------------------------------------------------------------
 
-# Resolve the path to ``mini-6dof-arm/dh_params.csv`` relative to this file so
+# Resolve the path to ``robots/mini-6dof-arm/dh_params.csv`` relative to this file so
 # that the script works no matter where it is launched from.
 
-CSV_PATH = Path(__file__).resolve().parents[2] / "mini-6dof-arm" / "dh_params.csv"
+CSV_PATH = Path(__file__).resolve().parents[2] / "robots" / "mini-6dof-arm" / "dh_params.csv"
 
 # Read the header row to display the column order to the user.
 with CSV_PATH.open(newline="") as csvfile:

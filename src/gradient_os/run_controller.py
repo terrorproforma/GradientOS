@@ -20,6 +20,7 @@ import argparse
 import threading
 import subprocess
 import json
+import base64
 
 try:
     # Import the backend registry FIRST - it must be configured before other modules
@@ -34,10 +35,16 @@ try:
     )
     from .arm_controller.robots import (
         get_robot_config,
+        get_robot_name_by_id,
         list_available_robots,
         RobotConfig,
     )
+    from . import ik_solver
+    from . import robot_assets
+    from . import runtime_config
+    from . import tool_library
     from .telemetry import alerts as _alerts
+    from .kinematics import runtime as kinematics_runtime
 except ImportError as e:
     print(f"Error importing arm_controller package: {e}")
     print("Please ensure the script is run from the project root directory and 'src' is in the Python path.")
@@ -45,6 +52,18 @@ except ImportError as e:
 
 # Get available servo backends from the registry
 AVAILABLE_SERVO_BACKENDS = backend_registry.list_available_backends()
+IK_BACKEND_CHOICES = ["ikfast", "numeric"]
+
+
+def _resolve_default_robot_name() -> str:
+    available = list_available_robots()
+    if not available:
+        raise RuntimeError("No available robot configurations were found.")
+    default_robot_id = robot_assets.get_default_robot_id()
+    mapped = get_robot_name_by_id(default_robot_id)
+    if mapped in available:
+        return mapped
+    return available[0]
 
 
 def main():
@@ -62,8 +81,14 @@ def main():
     7. Manages a simple calibration mode for streaming servo data.
     8. Ensures a graceful shutdown of the serial port on exit.
     """
+    exit_code = 0
+    restart_requested = False
+    restart_reason = ""
+    active_runtime_config: dict[str, object] | None = None
+
     # Get list of available robots for help text
     available_robots = list_available_robots()
+    default_robot_name = _resolve_default_robot_name()
     
     parser = argparse.ArgumentParser(
         description="Robot Arm Controller",
@@ -73,23 +98,47 @@ Available robots: {', '.join(available_robots)}
 Available servo backends: {', '.join(AVAILABLE_SERVO_BACKENDS)}
 
 Examples:
-  python -m gradient_os.run_controller --robot gradient0 --servo-backend feetech
-  python -m gradient_os.run_controller --robot gradient0 --sim
+  python -m gradient_os.run_controller --robot gradient05 --sim
+  python -m gradient_os.run_controller --robot gradient05 --allow-unsafe-overrides --servo-backend simulation
         """
     )
     parser.add_argument(
         "--robot",
         type=str,
-        default="gradient0",
+        default=None,
         choices=available_robots,
-        help=f"Robot configuration to use. Available: {', '.join(available_robots)} (default: gradient0)",
+        help=(
+            f"Robot configuration to use. Available: {', '.join(available_robots)} "
+            f"(default: runtime policy -> {default_robot_name})"
+        ),
     )
     parser.add_argument(
         "--servo-backend",
         type=str,
-        default=None,  # Will use robot's default if not specified
+        default=None,
         choices=AVAILABLE_SERVO_BACKENDS,
-        help=f"Servo backend to use. Available: {', '.join(AVAILABLE_SERVO_BACKENDS)} (default: from robot config)",
+        help=(
+            f"Development override: servo backend ({', '.join(AVAILABLE_SERVO_BACKENDS)}). "
+            "Requires --allow-unsafe-overrides."
+        ),
+    )
+    parser.add_argument(
+        "--ik-solver-backend",
+        type=str,
+        default=None,
+        choices=IK_BACKEND_CHOICES,
+        help=(
+            "Development override: IK backend (ikfast|numeric). "
+            "Requires --allow-unsafe-overrides."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unsafe-overrides",
+        action="store_true",
+        help=(
+            "Enable development-only override paths (solver/backend). "
+            "Without this flag, robot policy is authoritative."
+        ),
     )
     parser.add_argument(
         "--serial-port",
@@ -111,30 +160,121 @@ Examples:
 
     # Handle --list-robots
     if args.list_robots:
+        print(f"Default robot policy: {default_robot_name}")
         print("Available robot configurations:")
         for robot_name in available_robots:
             try:
                 cfg = get_robot_config(robot_name)
-                print(f"  - {robot_name}: {cfg.name} v{cfg.version} ({cfg.num_logical_joints} joints, {cfg.num_physical_actuators} actuators)")
+                print(
+                    f"  - {robot_name}: {cfg.name} v{cfg.version} "
+                    f"({cfg.num_logical_joints} joints, {cfg.num_physical_actuators} actuators, "
+                    f"ik={cfg.default_ik_solver_backend}, servo={cfg.default_servo_backend})"
+                )
             except Exception as e:
                 print(f"  - {robot_name}: (error loading: {e})")
         sys.exit(0)
 
+    desired_runtime = runtime_config.load_runtime_config()
+    desired_obj = desired_runtime.get("desired", {}) if isinstance(desired_runtime, dict) else {}
+    desired_robot = str(desired_obj.get("robot", "")).strip()
+    desired_active_tool_id = desired_obj.get("active_tool_id")
+    desired_allow_unsafe = bool(desired_obj.get("allow_unsafe_overrides", False))
+    desired_overrides = desired_obj.get("overrides", {})
+    desired_overrides = desired_overrides if isinstance(desired_overrides, dict) else {}
+    allow_unsafe_overrides = runtime_config.resolve_allow_unsafe_overrides(
+        cli_flag=bool(args.allow_unsafe_overrides),
+        desired_flag=desired_allow_unsafe,
+    )
+
+    requested_robot_name = args.robot or desired_robot or default_robot_name
+    if requested_robot_name not in available_robots:
+        print(
+            f"[Controller] WARNING: Requested robot '{requested_robot_name}' is unavailable. "
+            f"Falling back to policy default '{default_robot_name}'."
+        )
+        requested_robot_name = default_robot_name
+
     # ==========================================================================
     # Initialize Robot Configuration
     # ==========================================================================
-    print(f"[Controller] Loading robot configuration: {args.robot}")
+    print(f"[Controller] Loading robot configuration: {requested_robot_name}")
     try:
-        selected_robot = get_robot_config(args.robot)
+        selected_robot = get_robot_config(requested_robot_name)
         print(f"[Controller] Robot: {selected_robot.name} v{selected_robot.version}")
         print(f"[Controller]   - {selected_robot.num_logical_joints} logical joints")
         print(f"[Controller]   - {selected_robot.num_physical_actuators} physical actuators")
         print(f"[Controller]   - Gripper: {'Yes' if selected_robot.has_gripper else 'No'}")
-        
+
         # Update the global robot configuration
         robot_config.set_active_robot(selected_robot)
+
+        requested_ik_backend = None
+        if allow_unsafe_overrides:
+            requested_ik_backend = (
+                args.ik_solver_backend
+                or desired_overrides.get("ik_solver_backend")
+                or os.environ.get("MINI_ARM_SOLVER", "").strip().lower()
+                or None
+            )
+        elif args.ik_solver_backend or os.environ.get("MINI_ARM_SOLVER", "").strip():
+            print(
+                "[Controller] WARNING: IK override requested but unsafe overrides are disabled. "
+                "Using robot policy backend."
+            )
+
+        requested_servo_backend = None
+        if allow_unsafe_overrides:
+            requested_servo_backend = (
+                args.servo_backend
+                or desired_overrides.get("servo_backend")
+                or None
+            )
+        elif args.servo_backend:
+            print(
+                "[Controller] WARNING: Servo backend override requested but unsafe overrides are disabled. "
+                "Using robot policy backend."
+            )
+
+        active_runtime_config = runtime_config.resolve_effective_runtime(
+            robot_name=requested_robot_name,
+            sim_mode=bool(args.sim),
+            requested_ik_solver_backend=requested_ik_backend,
+            requested_servo_backend=requested_servo_backend,
+            requested_active_tool_id=str(desired_active_tool_id) if desired_active_tool_id is not None else None,
+            allow_unsafe_overrides=allow_unsafe_overrides,
+        )
+
+        # Keep asset resolution deterministic for the selected robot.
+        os.environ["GRADIENT_ROBOT_ID"] = selected_robot.robot_id
+        ik_solver.configure(
+            robot_id=selected_robot.robot_id,
+            backend_name=str(
+                active_runtime_config.get("ik_solver", {}).get("effective_backend", "")
+            ),
+        )
+        print(
+            "[Controller] IK backend: "
+            f"{active_runtime_config['ik_solver']['effective_backend']} "
+            f"(source={active_runtime_config['ik_solver']['source']})"
+        )
+        tool_block = active_runtime_config.get("tool", {})
+        if isinstance(tool_block, dict):
+            try:
+                kinematics_runtime.set_active_tool_definition(
+                    tool_block,
+                    expected_revision=None,
+                    motion_state="IDLE",
+                    reset_runtime_trim=True,
+                )
+            except Exception as tool_error:
+                print(f"[Controller] WARNING: Failed to apply active tool definition: {tool_error}")
+            print(
+                "[Controller] Active tool: "
+                f"{tool_block.get('display_name', tool_block.get('active_tool_id', 'unknown'))} "
+                f"(id={tool_block.get('active_tool_id', 'identity')}, source={tool_block.get('source', 'unknown')})"
+            )
     except Exception as e:
-        print(f"[Controller] Error loading robot configuration '{args.robot}': {e}")
+        print(f"[Controller] Error loading robot configuration '{requested_robot_name}': {e}")
         sys.exit(1)
 
     # ==========================================================================
@@ -151,20 +291,20 @@ Examples:
     # ==========================================================================
     # Configure Servo Backend (MUST be done before using any servo-dependent modules)
     # ==========================================================================
-    # Priority: command-line arg > robot's default
-    # If --sim is specified, override to use simulation backend
-    if args.sim:
-        servo_backend = "simulation"
+    if bool(active_runtime_config and active_runtime_config.get("mode", {}).get("sim")):
         print("[Controller] Running in SIMULATION mode (no hardware)")
-    else:
-        servo_backend = args.servo_backend if args.servo_backend else selected_robot.default_servo_backend
+    servo_backend = str(
+        active_runtime_config.get("servo_backend", {}).get("effective_backend", selected_robot.default_servo_backend)
+    )
+    print(
+        f"[Controller] Servo backend: {servo_backend} "
+        f"(source={active_runtime_config['servo_backend']['source']})"
+    )
     
-    print(f"[Controller] Servo backend: {servo_backend}")
-    
-    # Set active backend CONFIG (loads constants like encoder resolution, register addresses)
-    # Note: For simulation, we still use feetech config since it doesn't have its own
-    config_backend = servo_backend if servo_backend != "simulation" else "feetech"
-    backend_registry.set_active_backend(config_backend)
+    # Set active backend CONFIG (loads constants like encoder resolution, register addresses).
+    # Simulation now has its own config module (compatible constants/parsers) so
+    # runtime state/logs correctly reflect "simulation".
+    backend_registry.set_active_backend(servo_backend)
     
     # Populate utils with servo-specific constants from the active backend
     utils._populate_servo_constants()
@@ -282,6 +422,19 @@ Examples:
         telemetry_stop_event = threading.Event()
         telemetry_target = None  # (ip, port)
         telemetry_hz = 10
+        def _env_float(name: str, default: float) -> float:
+            raw = os.environ.get(name, str(default))
+            try:
+                return float(raw)
+            except Exception:
+                return float(default)
+
+        command_silence_warn_s = max(
+            1.0, _env_float("GRADIENT_COMMAND_SILENCE_WARN_S", 10.0)
+        )
+        udp_reset_log_throttle_s = max(
+            1.0, _env_float("GRADIENT_UDP_RESET_LOG_THROTTLE_S", 5.0)
+        )
 
         def _telemetry_loop():
             period = 1.0 / max(1, int(telemetry_hz))
@@ -296,12 +449,43 @@ Examples:
                     q = servo_driver.get_current_arm_state_rad(verbose=False)
                     g = utils.current_gripper_angle_rad if utils.gripper_present else None
                     msg: dict[str, object] = {"t": time.time(), "joints": [float(x) for x in q]}
+                    correlation_id = utils.trajectory_state_get("last_correlation_id")
+                    if isinstance(correlation_id, str) and correlation_id:
+                        msg["correlation_id"] = correlation_id
                     if g is not None:
                         msg["gripper"] = float(g)
-                    msg["weld_active"] = bool(utils.trajectory_state.get("weld_active", False))
-                    weld_type = utils.trajectory_state.get("current_weld_type")
+                    msg["weld_active"] = bool(utils.trajectory_state_get("weld_active", False))
+                    weld_type = utils.trajectory_state_get("current_weld_type")
                     if isinstance(weld_type, str) and weld_type:
                         msg["weld_type"] = weld_type
+                    planner_diag = utils.trajectory_state.get("last_planner_diagnostics")
+                    if isinstance(planner_diag, dict):
+                        msg["planner_diagnostics"] = planner_diag
+                    # Communication health (useful for diagnosing transport issues).
+                    comms = {
+                        "command_link_stale": bool(
+                            utils.trajectory_state_get("command_link_stale", False)
+                        ),
+                        "last_command_age_s": float(
+                            utils.trajectory_state_get("last_command_age_s", 0.0)
+                        ),
+                        "recent_udp_reset_count": int(
+                            utils.trajectory_state_get("recent_udp_reset_count", 0)
+                        ),
+                    }
+                    last_peer = utils.trajectory_state_get("last_command_peer", "")
+                    if isinstance(last_peer, str) and last_peer:
+                        comms["last_command_peer"] = last_peer
+                    msg["comms"] = comms
+                    try:
+                        k_snapshot = kinematics_runtime.get_runtime_state_snapshot()
+                        msg["kinematics"] = {
+                            "revision": int(k_snapshot.get("revision", 0)),
+                            "profile_id": k_snapshot.get("profile", {}).get("profile_id"),
+                            "offsets": k_snapshot.get("offsets", {}),
+                        }
+                    except Exception:
+                        pass
                     
                     # --- Servo telemetry (voltage/temp/current/torque + alarms) ---
                     now = time.time()
@@ -370,17 +554,65 @@ Examples:
         # --- Episode recorder process state ---
         recorder_proc = None
         camera_proc = None
+        last_command_rx_monotonic = time.monotonic()
+        last_comms_warning_monotonic = 0.0
+        last_udp_reset_warning_monotonic = 0.0
+        was_command_link_stale = False
+        recent_udp_reset_count = 0
+        utils.trajectory_state_update(
+            command_link_stale=False,
+            last_command_age_s=0.0,
+            last_command_rx_ts=time.time(),
+            last_command_peer="",
+            recent_udp_reset_count=0,
+        )
 
         while True:
             try:
                 sock.settimeout(0.1) # 100ms timeout for non-blocking checks
-                data, addr = sock.recvfrom(utils.BUFFER_SIZE)
+                try:
+                    data, addr = sock.recvfrom(utils.BUFFER_SIZE)
+                except ConnectionResetError as exc:
+                    # Windows UDP can emit WSAECONNRESET (10054) when a previous
+                    # sendto() hit an unreachable peer. This is transport noise
+                    # for datagram sockets, not a controller crash condition.
+                    if getattr(exc, "winerror", None) == 10054:
+                        recent_udp_reset_count += 1
+                        utils.trajectory_state_set("recent_udp_reset_count", recent_udp_reset_count)
+                        now = time.monotonic()
+                        if now - last_udp_reset_warning_monotonic >= udp_reset_log_throttle_s:
+                            print(
+                                "[Controller] UDP peer reset (WinError 10054). "
+                                "Ignoring and continuing."
+                            )
+                            last_udp_reset_warning_monotonic = now
+                        continue
+                    raise
+                now_monotonic = time.monotonic()
+                link_was_stale = was_command_link_stale
+                last_command_rx_monotonic = now_monotonic
+                was_command_link_stale = False
+                recent_udp_reset_count = 0
+                utils.trajectory_state_update(
+                    command_link_stale=False,
+                    last_command_age_s=0.0,
+                    last_command_rx_ts=time.time(),
+                    last_command_peer=f"{addr[0]}:{addr[1]}",
+                    recent_udp_reset_count=0,
+                )
+                if link_was_stale:
+                    print("[Controller] UDP command link restored.")
                 message = data.decode("utf-8").strip()
                 print(f"[Controller] Received: '{message}' from {addr}")
 
                 # --- High-Priority Commands ---
                 if message.upper() == "STOP":
+                    corr_id = utils.begin_correlation("STOP")
                     command_api.handle_stop_command()
+                    try:
+                        utils.append_audit("command_completed", correlation_id=corr_id, command="STOP", result="OK")
+                    except Exception:
+                        pass
                     try:
                         sock.sendto("ACK,STOP".encode("utf-8"), addr)
                     except Exception:
@@ -390,6 +622,20 @@ Examples:
                 # --- Command Parsing ---
                 parts = message.split(',')
                 command = parts[0].upper()
+                corr_id = utils.begin_correlation(command)
+                try:
+                    profile_revision = kinematics_runtime.get_runtime_state_snapshot().get("revision")
+                except Exception:
+                    profile_revision = None
+                try:
+                    utils.append_audit(
+                        "command_dispatch",
+                        correlation_id=corr_id,
+                        command=command,
+                        profile_revision=profile_revision,
+                    )
+                except Exception:
+                    pass
 
                 # --- Mode-Based Handling (Calibration) ---
                 if in_calibration_mode:
@@ -520,6 +766,137 @@ Examples:
                 elif command == "GET_STATUS":
                     reply = f"STATUS,gripper_present,{utils.gripper_present}"
                     sock.sendto(reply.encode("utf-8"), addr)
+
+                elif command == "GET_RUNTIME_CONFIG":
+                    try:
+                        if active_runtime_config is None:
+                            raise RuntimeError("Runtime config is unavailable.")
+                        payload = dict(active_runtime_config)
+                        payload["controller"] = {
+                            "pid": os.getpid(),
+                        }
+                        reply = "RUNTIME_CONFIG," + json.dumps(payload, separators=(",", ":"))
+                        sock.sendto(reply.encode("utf-8"), addr)
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,RUNTIME_CONFIG,{msg}".encode("utf-8"), addr)
+
+                elif command == "SET_ACTIVE_TOOL":
+                    requested_tool_id_raw = parts[1].strip() if len(parts) > 1 else ""
+                    requested_tool_id = requested_tool_id_raw if requested_tool_id_raw else None
+                    try:
+                        # Block until motion completes so kinematics tool transform can be
+                        # applied without changing frame assumptions mid-trajectory.
+                        command_api.handle_wait_for_idle()
+                        selected_tool = tool_library.resolve_active_tool(
+                            robot_id=selected_robot.robot_id,
+                            requested_tool_id=requested_tool_id,
+                        )
+                        kinematics_runtime.set_active_tool_definition(
+                            selected_tool,
+                            expected_revision=None,
+                            motion_state="IDLE",
+                            reset_runtime_trim=True,
+                        )
+                        if isinstance(active_runtime_config, dict):
+                            active_runtime_config["tool"] = {
+                                "active_tool_id": selected_tool.get("tool_id"),
+                                "display_name": selected_tool.get("display_name"),
+                                "tool_type": selected_tool.get("tool_type"),
+                                "source": selected_tool.get("selection_source", "live_update"),
+                                "offset": selected_tool.get("offset"),
+                                "mesh": selected_tool.get("mesh"),
+                                "compatible_robot_ids": selected_tool.get("compatible_robot_ids"),
+                                "weld": selected_tool.get("weld"),
+                            }
+                        active_tool_id = str(selected_tool.get("tool_id", "identity"))
+                        print(
+                            "[Controller] Active tool updated live: "
+                            f"{selected_tool.get('display_name', active_tool_id)} "
+                            f"(id={active_tool_id})"
+                        )
+                        sock.sendto(f"ACK,SET_ACTIVE_TOOL,{active_tool_id}".encode("utf-8"), addr)
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,SET_ACTIVE_TOOL,{msg}".encode("utf-8"), addr)
+
+                elif command == "REQUEST_RESTART":
+                    restart_reason = parts[1].strip() if len(parts) > 1 else "api-request"
+                    print(f"[Controller] Restart requested: {restart_reason}")
+                    try:
+                        utils.append_audit(
+                            "controller_restart_requested",
+                            reason=restart_reason,
+                            source="udp",
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        sock.sendto(f"ACK,REQUEST_RESTART,{restart_reason}".encode("utf-8"), addr)
+                    except Exception:
+                        pass
+                    try:
+                        command_api.handle_stop_command()
+                        command_api.handle_wait_for_idle()
+                    except Exception:
+                        pass
+                    restart_requested = True
+                    break
+
+                elif command == "GET_KINEMATICS_PROFILE":
+                    try:
+                        payload = command_api.handle_get_kinematics_profile()
+                        reply = "KINEMATICS_PROFILE," + json.dumps(payload, separators=(",", ":"))
+                        sock.sendto(reply.encode("utf-8"), addr)
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,KINEMATICS,INTERNAL,{msg}".encode("utf-8"), addr)
+
+                elif command == "PATCH_RUNTIME_OFFSETS":
+                    try:
+                        rev_token = parts[1].strip() if len(parts) > 1 else ""
+                        expected_revision = int(rev_token) if rev_token != "" else None
+                        payload_b64 = parts[2].strip() if len(parts) > 2 else ""
+                        if not payload_b64:
+                            raise ValueError("Missing base64 payload")
+                        payload_json = base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+                        payload = json.loads(payload_json)
+                        snapshot = command_api.handle_patch_runtime_offsets(payload, expected_revision)
+                        reply = "KINEMATICS_OK," + json.dumps(snapshot, separators=(",", ":"))
+                        sock.sendto(reply.encode("utf-8"), addr)
+                    except Exception as e:
+                        code = getattr(e, "code", "INVALID_PAYLOAD")
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,KINEMATICS,{code},{msg}".encode("utf-8"), addr)
+
+                elif command == "RESET_RUNTIME_OFFSETS":
+                    try:
+                        rev_token = parts[1].strip() if len(parts) > 1 else ""
+                        expected_revision = int(rev_token) if rev_token != "" else None
+                        snapshot = command_api.handle_reset_runtime_offsets(expected_revision)
+                        reply = "KINEMATICS_OK," + json.dumps(snapshot, separators=(",", ":"))
+                        sock.sendto(reply.encode("utf-8"), addr)
+                    except Exception as e:
+                        code = getattr(e, "code", "INVALID_PAYLOAD")
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,KINEMATICS,{code},{msg}".encode("utf-8"), addr)
+
+                elif command == "APPLY_KINEMATICS_PROFILE":
+                    try:
+                        rev_token = parts[1].strip() if len(parts) > 1 else ""
+                        expected_revision = int(rev_token) if rev_token != "" else None
+                        payload_b64 = parts[2].strip() if len(parts) > 2 else ""
+                        if not payload_b64:
+                            raise ValueError("Missing base64 payload")
+                        payload_json = base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+                        payload = json.loads(payload_json)
+                        snapshot = command_api.handle_apply_kinematics_profile(payload, expected_revision)
+                        reply = "KINEMATICS_OK," + json.dumps(snapshot, separators=(",", ":"))
+                        sock.sendto(reply.encode("utf-8"), addr)
+                    except Exception as e:
+                        code = getattr(e, "code", "INVALID_PAYLOAD")
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,KINEMATICS,{code},{msg}".encode("utf-8"), addr)
 
                 elif command == "DIAGNOSTICS":
                     # Toggle runtime diagnostics without restart
@@ -1001,6 +1378,18 @@ Examples:
                         print(f"[Controller] Error: Could not parse joint angle command '{message}'")
 
             except socket.timeout:
+                now_monotonic = time.monotonic()
+                idle_s = now_monotonic - last_command_rx_monotonic
+                utils.trajectory_state_set("last_command_age_s", float(idle_s))
+                if idle_s >= command_silence_warn_s:
+                    was_command_link_stale = True
+                    utils.trajectory_state_set("command_link_stale", True)
+                    if now_monotonic - last_comms_warning_monotonic >= command_silence_warn_s:
+                        print(
+                            "[Controller] WARNING: No UDP commands received for "
+                            f"{idle_s:.1f}s."
+                        )
+                        last_comms_warning_monotonic = now_monotonic
                 if in_calibration_mode and calibrating_servo_id is not None:
                     # Keep streaming calibration data if no new command arrives
                     raw_pos = servo_driver.read_single_servo_position(calibrating_servo_id)
@@ -1014,10 +1403,15 @@ Examples:
                 print("[Controller] An unexpected error occurred in the main loop:")
                 traceback.print_exc()
 
+        if restart_requested:
+            exit_code = 75
+
     except socket.error as e:
         print(f"[Controller] Error binding UDP socket: {e}")
+        exit_code = 1
     except KeyboardInterrupt:
         print("\n[Controller] Shutdown requested.")
+        exit_code = 0
     finally:
         print("[Controller] Shutting down.")
         sock.close()
@@ -1033,5 +1427,9 @@ Examples:
             utils.ser.close()
             print("[Controller] Serial port closed.")
 
+    if restart_requested:
+        print(f"[Controller] Exiting for supervisor restart (reason={restart_reason}).")
+    return exit_code
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

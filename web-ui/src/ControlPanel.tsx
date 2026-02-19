@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_SPEED_SLIDER } from "./uiConstants";
 
 type Props = {
@@ -29,6 +29,7 @@ export function ControlPanel({ apiHost, onError }: Props) {
 	const [angBaseDegS, setAngBaseDegS] = useState<number>(15);
 	const [lastJogCommand, setLastJogCommand] = useState<[number, number, number, number, number, number]>([0, 0, 0, 0, 0, 0]);
 	const jogTimerRef = useRef<number | null>(null);
+	const sendJogTickRef = useRef<() => Promise<void>>(async () => {});
 	const lastSentRef = useRef<[number, number, number, number, number, number]>([0, 0, 0, 0, 0, 0]);
 	const lastSentAtRef = useRef<number>(0);
 	const keepaliveMs = 200;
@@ -121,6 +122,11 @@ export function ControlPanel({ apiHost, onError }: Props) {
 		lastSentAtRef.current = now;
 	}, [computeJogVector, post]);
 
+	// Keep the interval callback hot-swapped with latest slider/deadman/base values.
+	useEffect(() => {
+		sendJogTickRef.current = sendJogTick;
+	}, [sendJogTick]);
+
 	const ensureJogStarted = useCallback(async () => {
 		if (!jogEnabled) {
 			setJogEnabled(true);
@@ -131,10 +137,10 @@ export function ControlPanel({ apiHost, onError }: Props) {
 				window.clearInterval(jogTimerRef.current);
 			}
 			jogTimerRef.current = window.setInterval(() => {
-				sendJogTick().catch(() => {});
+				sendJogTickRef.current().catch(() => {});
 			}, 20);
 		}
-	}, [jogEnabled, post, deadman, sendJogTick]);
+	}, [jogEnabled, post, deadman]);
 
 	const stopJog = useCallback(async () => {
 		setJogEnabled(false);

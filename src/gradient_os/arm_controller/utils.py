@@ -13,6 +13,10 @@
 
 import math
 import os
+import threading
+import time
+import uuid
+from typing import Any
 import numpy as np
 
 # Import robot configuration for backward compatibility
@@ -256,7 +260,95 @@ trajectory_state = {
     "jog_deadman": False,
     # Jog debug logging verbosity flag
     "jog_debug": False,
+    # Explicit controller motion state
+    "motion_state": "IDLE",
+    # Correlation ID for command/audit tracing
+    "last_correlation_id": None,
+    # Rolling audit trail (small in-memory ring)
+    "audit_log": [],
 }
+
+trajectory_state_lock = threading.RLock()
+
+MOTION_STATE_TRANSITIONS: dict[str, set[str]] = {
+    "IDLE": {"PLANNING", "EXECUTING", "FAULT", "E_STOP"},
+    "PLANNING": {"IDLE", "EXECUTING", "FAULT", "E_STOP"},
+    "EXECUTING": {"PAUSED", "IDLE", "FAULT", "E_STOP"},
+    "PAUSED": {"EXECUTING", "IDLE", "FAULT", "E_STOP"},
+    "FAULT": {"IDLE", "E_STOP"},
+    "E_STOP": {"IDLE"},
+}
+
+
+def trajectory_state_get(key: str, default: Any = None) -> Any:
+    with trajectory_state_lock:
+        return trajectory_state.get(key, default)
+
+
+def trajectory_state_set(key: str, value: Any) -> None:
+    with trajectory_state_lock:
+        trajectory_state[key] = value
+
+
+def trajectory_state_update(**kwargs: Any) -> None:
+    with trajectory_state_lock:
+        trajectory_state.update(kwargs)
+
+
+def trajectory_state_snapshot() -> dict[str, Any]:
+    with trajectory_state_lock:
+        return dict(trajectory_state)
+
+
+def get_motion_state() -> str:
+    with trajectory_state_lock:
+        state = trajectory_state.get("motion_state", "IDLE")
+        return str(state) if state else "IDLE"
+
+
+def set_motion_state(next_state: str) -> None:
+    next_state_norm = str(next_state).strip().upper()
+    if next_state_norm not in MOTION_STATE_TRANSITIONS:
+        raise ValueError(f"Invalid motion state '{next_state}'.")
+    with trajectory_state_lock:
+        current = str(trajectory_state.get("motion_state", "IDLE")).upper()
+        allowed = MOTION_STATE_TRANSITIONS.get(current, set())
+        if next_state_norm not in allowed and next_state_norm != current:
+            raise ValueError(
+                f"Illegal motion state transition {current} -> {next_state_norm}."
+            )
+        trajectory_state["motion_state"] = next_state_norm
+
+
+def begin_correlation(command_name: str) -> str:
+    correlation_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    with trajectory_state_lock:
+        trajectory_state["last_correlation_id"] = correlation_id
+        log = trajectory_state.setdefault("audit_log", [])
+        if isinstance(log, list):
+            log.append(
+                {
+                    "ts": time.time(),
+                    "event": "command_received",
+                    "command": str(command_name),
+                    "correlation_id": correlation_id,
+                }
+            )
+            if len(log) > 200:
+                del log[:-200]
+    return correlation_id
+
+
+def append_audit(event: str, **fields: Any) -> None:
+    with trajectory_state_lock:
+        log = trajectory_state.setdefault("audit_log", [])
+        if not isinstance(log, list):
+            return
+        row = {"ts": time.time(), "event": event}
+        row.update(fields)
+        log.append(row)
+        if len(log) > 200:
+            del log[:-200]
 
 # =============================================================================
 # Global Serial & State Objects

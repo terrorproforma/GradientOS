@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "desired": {
+    "robot": "gradient05",
+    "active_tool_id": "tig-torch-65deg",
+    "allow_unsafe_overrides": false,
+    "overrides": {
+      "ik_solver_backend": null,
+      "servo_backend": null
+    }
+  },
+  "meta": {
+    "updated_at": "2026-02-19T15:24:34+00:00",
+    "updated_by": "web-ui"
+  }
+}

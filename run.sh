@@ -11,6 +11,18 @@ cd "$(dirname "$0")"
 REPO_ROOT="${PWD}"
 VENV_BIN="${REPO_ROOT}/.venv/bin"
 VENV_PY="${VENV_BIN}/python"
+START_SH="${REPO_ROOT}/start.sh"
+
+# Prefer the same bootstrap semantics as manual shells when env is not already active.
+if [[ -z "${VIRTUAL_ENV:-}" || "${VIRTUAL_ENV}" != "${REPO_ROOT}/.venv" ]]; then
+  if [[ -f "${START_SH}" ]]; then
+    # shellcheck disable=SC1090
+    if ! source "${START_SH}" >/dev/null 2>&1; then
+      echo "[gradient-robotics] ERROR: Failed to bootstrap environment via ${START_SH}" >&2
+      exit 1
+    fi
+  fi
+fi
 
 # Put project paths at the front so systemd/manual runs behave consistently
 if [[ -d "${VENV_BIN}" ]]; then

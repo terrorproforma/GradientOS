@@ -6,10 +6,16 @@
 # Each robot has its own subfolder with a config.py defining a RobotConfig subclass.
 # The base RobotConfig class provides the interface that all robots must implement.
 #
+# Note:
+# Robot *assets* (URDF, DH CSV, meshes) are stored in the repository-level
+# `robots/<robot_id>/` catalog with a `robot.json` manifest. Runtime config
+# classes in this package must expose `robot_id` so solver/UI layers can resolve
+# those canonical assets.
+#
 # Supported Robots:
 # -----------------
 # - Gradient0: Original 6-DOF arm with 9 Feetech servos (8 arm + 1 gripper)
-# - [Future] Gradient0.5: Next iteration with improvements
+# - Gradient05: Template scaffold for the next robot iteration
 #
 # Usage:
 # ------
@@ -25,10 +31,12 @@
 
 from .base import RobotConfig
 from .gradient0 import Gradient0Config
+from .gradient05 import Gradient05Config
 
 # Registry of available robot configurations
 _ROBOT_REGISTRY: dict[str, type[RobotConfig]] = {
     'gradient0': Gradient0Config,
+    'gradient05': Gradient05Config,
 }
 
 
@@ -62,6 +70,43 @@ def list_available_robots() -> list[str]:
     return list(_ROBOT_REGISTRY.keys())
 
 
+def get_robot_name_by_id(robot_id: str) -> str | None:
+    """
+    Resolve registry name (e.g. ``gradient05``) from stable robot asset ID.
+    """
+    target = str(robot_id).strip()
+    if not target:
+        return None
+    for name, config_class in _ROBOT_REGISTRY.items():
+        try:
+            cfg = config_class()
+        except Exception:
+            continue
+        if cfg.robot_id == target:
+            return name
+    return None
+
+
+def list_robot_metadata() -> list[dict[str, str]]:
+    """
+    Return robot metadata suitable for API/UI selection lists.
+    """
+    out: list[dict[str, str]] = []
+    for name in list_available_robots():
+        cfg = get_robot_config(name)
+        out.append(
+            {
+                "name": name,
+                "robot_id": cfg.robot_id,
+                "display_name": cfg.name,
+                "version": cfg.version,
+                "default_servo_backend": cfg.default_servo_backend,
+                "default_ik_solver_backend": cfg.default_ik_solver_backend,
+            }
+        )
+    return out
+
+
 def register_robot(name: str, config_class: type[RobotConfig]) -> None:
     """
     Register a new robot configuration.
@@ -78,8 +123,11 @@ def register_robot(name: str, config_class: type[RobotConfig]) -> None:
 __all__ = [
     'RobotConfig',
     'Gradient0Config',
+    'Gradient05Config',
     'get_robot_config',
+    'get_robot_name_by_id',
     'list_available_robots',
+    'list_robot_metadata',
     'register_robot',
 ]
 

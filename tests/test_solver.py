@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 from ikfast_solver.ikfast_wrapper import IKFastSolver
+from gradient_os import ik_solver
 
 @pytest.fixture(scope="module")
 def solver():
@@ -60,3 +61,57 @@ def test_batch_solver(solver):
     assert path_solutions.shape == (len(waypoints), solver.num_joints), "Batch solver returned incorrect shape"
     # Confirm the solver follows the intended joint-space path
     assert np.allclose(path_solutions[-1], waypoints[-1], atol=1e-5), "Batch solver deviated from expected joint configuration"
+
+
+def test_backend_pose_adapter_ikfast_uses_wrist_target():
+    target_pos = np.array([0.42, -0.05, 0.31], dtype=float)
+    target_rot = np.eye(3, dtype=float)
+
+    adapted_pos, adapted_rot = ik_solver._prepare_backend_target_pose(
+        target_pos, target_rot, "ikfast"
+    )
+    expected_pos = target_pos - ik_solver.END_EFFECTOR_OFFSET
+
+    assert np.allclose(adapted_pos, expected_pos, atol=1e-12)
+    assert np.allclose(adapted_rot, target_rot, atol=1e-12)
+
+
+def test_backend_pose_adapter_numeric_uses_tool_target_directly():
+    target_pos = np.array([0.42, -0.05, 0.31], dtype=float)
+    target_rot = np.eye(3, dtype=float)
+
+    adapted_pos, adapted_rot = ik_solver._prepare_backend_target_pose(
+        target_pos, target_rot, "numeric"
+    )
+
+    assert np.allclose(adapted_pos, target_pos, atol=1e-12)
+    assert np.allclose(adapted_rot, target_rot, atol=1e-12)
+
+
+def test_batch_preparation_matches_single_pose_adapter(monkeypatch):
+    class _CaptureSolver:
+        def __init__(self):
+            self.last_batch = None
+
+        def solve_ik_path(self, poses_batch, initial_joint_angles):
+            self.last_batch = np.asarray(poses_batch, dtype=float)
+            return np.zeros((len(poses_batch), 6), dtype=float)
+
+    capture_solver = _CaptureSolver()
+    target_pos = [0.25, 0.10, 0.20]
+    target_rot = np.eye(3, dtype=float)
+
+    original_backend = ik_solver._BACKEND_NAME
+    original_solver = ik_solver.IK_SOLVER
+    try:
+        for backend_name in ("ikfast", "numeric"):
+            monkeypatch.setattr(ik_solver, "_BACKEND_NAME", backend_name)
+            monkeypatch.setattr(ik_solver, "IK_SOLVER", capture_solver)
+            ik_solver.solve_ik_path_batch([target_pos], initial_joint_angles=[0.0] * 6, target_orientations=[target_rot])
+            expected_pos, expected_rot = ik_solver._prepare_backend_target_pose(target_pos, target_rot, backend_name)
+            assert capture_solver.last_batch is not None
+            assert np.allclose(capture_solver.last_batch[0, :3], expected_pos, atol=1e-12)
+            assert np.allclose(capture_solver.last_batch[0, 3:].reshape(3, 3), expected_rot, atol=1e-12)
+    finally:
+        monkeypatch.setattr(ik_solver, "_BACKEND_NAME", original_backend)
+        monkeypatch.setattr(ik_solver, "IK_SOLVER", original_solver)

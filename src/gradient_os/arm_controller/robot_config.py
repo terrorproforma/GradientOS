@@ -38,6 +38,7 @@ def _ensure_robot_configured():
 # =============================================================================
 
 # --- Robot Identity ---
+ROBOT_ID = None
 ROBOT_NAME = None
 ROBOT_VERSION = None
 
@@ -158,7 +159,7 @@ def set_active_robot(robot: RobotConfig) -> None:
         robot: The new robot configuration to use.
     """
     global _robot
-    global ROBOT_NAME, ROBOT_VERSION
+    global ROBOT_ID, ROBOT_NAME, ROBOT_VERSION
     global NUM_LOGICAL_JOINTS, NUM_PHYSICAL_SERVOS, SERVO_IDS
     global SERVO_ID_GRIPPER, SERVO_ID_JOINT_2_SECOND, SERVO_ID_JOINT_3_SECOND
     global LOGICAL_TO_PHYSICAL_MAP, LOGICAL_JOINT_LIMITS_RAD, GRIPPER_LIMITS_RAD
@@ -174,6 +175,7 @@ def set_active_robot(robot: RobotConfig) -> None:
     _robot = robot
     
     # --- Robot Identity ---
+    ROBOT_ID = robot.robot_id
     ROBOT_NAME = robot.name
     ROBOT_VERSION = robot.version
     

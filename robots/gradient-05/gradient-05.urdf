@@ -1,0 +1,116 @@
+<?xml version="1.0"?>
+<robot name="gradient-05">
+  <!-- Template URDF for Gradient-05.
+       Replace placeholder geometry/origins/limits with production CAD values. -->
+
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="stl-files/base.stl"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="link_1">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="stl-files/L1.stl"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="link_2">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="stl-files/L2.stl"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="link_3">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="stl-files/L3.stl"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="link_4">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="stl-files/L4.stl"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="link_5">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="stl-files/L5.stl"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="tool0">
+    <!-- <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="stl-files/tool_mesh.stl"/>
+      </geometry>
+    </visual> -->
+  </link>
+
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link_1"/>
+    <origin xyz="0 0 0.0328" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.3" upper="6.3" effort="100" velocity="2.0"/>
+  </joint>
+
+  <joint name="joint2" type="revolute">
+    <parent link="link_1"/>
+    <child link="link_2"/>
+    <origin xyz="0.160 -0.1255 0.2652" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.9" upper="1.9" effort="100" velocity="2.0"/>
+  </joint>
+
+  <joint name="joint3" type="revolute">
+    <parent link="link_2"/>
+    <child link="link_3"/>
+    <origin xyz="0 0 0.600" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-4.2" upper="1.53" effort="100" velocity="2.0"/>
+  </joint>
+
+  <joint name="joint4" type="revolute">
+    <parent link="link_3"/>
+    <child link="link_4"/>
+    <origin xyz="0.159 0.1255 0.105" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.3" upper="6.3" effort="100" velocity="2.0"/>
+  </joint>
+
+  <joint name="joint5" type="revolute">
+    <parent link="link_4"/>
+    <child link="link_5"/>
+    <origin xyz="0.4877 -0.0478830 0" rpy="0 1.5707963267948966 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-6.3" upper="6.3" effort="100" velocity="2.0"/>
+  </joint>
+
+  <joint name="joint6" type="revolute">
+    <parent link="link_5"/>
+    <child link="tool0"/>
+    <origin xyz="0.0933 0.0478830 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-6.3" upper="6.3" effort="100" velocity="2.0"/>
+  </joint>
+</robot>

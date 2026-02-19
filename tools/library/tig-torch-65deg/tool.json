@@ -1,0 +1,44 @@
+{
+  "tool_id": "tig-torch-65deg",
+  "display_name": "TIG Torch 65deg",
+  "description": "Template TIG torch definition from flange/J6 axis drawing. Update XYZ mm offsets after final metrology.",
+  "tool_type": "tig_torch",
+  "keywords": [
+    "tig",
+    "torch",
+    "weld",
+    "65deg"
+  ],
+  "compatible_robot_ids": [],
+  "offset": {
+    "position_mm": {
+      "x": 0.0,
+      "y": 37.5,
+      "z": 347.773
+    },
+    "rotation_deg": {
+      "x": 0.0,
+      "y": 65.0,
+      "z": 0.0
+    }
+  },
+  "mesh": {
+    "asset_path": "tool_mesh.stl",
+    "scale": 1.0,
+    "position_mm": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    },
+    "rotation_deg": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    }
+  },
+  "weld": {
+    "torch_axis_angle_from_j6_deg": 65.0,
+    "work_angle_min_deg": 0.0,
+    "work_angle_max_deg": 89.0
+  }
+}

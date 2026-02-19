@@ -1,0 +1,11 @@
+{
+  "defaultRobotId": "gradient-05",
+  "robots": {
+    "gradient-05": {
+      "urdfPath": "/assets/robots/gradient-05/robot.urdf"
+    },
+    "mini-6dof-arm": {
+      "urdfPath": "/assets/robots/mini-6dof-arm/robot.urdf"
+    }
+  }
+}

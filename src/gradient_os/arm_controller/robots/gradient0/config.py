@@ -42,6 +42,10 @@ class Gradient0Config(RobotConfig):
     # =========================================================================
     
     @property
+    def robot_id(self) -> str:
+        return "mini-6dof-arm"
+
+    @property
     def name(self) -> str:
         return "Gradient0"
     
@@ -55,6 +59,11 @@ class Gradient0Config(RobotConfig):
         The Gradient0 uses Feetech STS3215 servos.
         """
         return "feetech"
+
+    @property
+    def default_ik_solver_backend(self) -> str:
+        """Default IK backend policy for Gradient0."""
+        return "ikfast"
     
     # =========================================================================
     # Kinematic Structure

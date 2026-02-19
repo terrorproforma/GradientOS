@@ -1,0 +1,33 @@
+{
+  "robot_id": "mini-6dof-arm",
+  "name": "Mini 6-DOF Arm",
+  "description": "Primary GradientOS mini arm geometry and kinematics assets.",
+  "default": false,
+  "kinematics": {
+    "dh_csv": "dh_params.csv"
+  },
+  "models": {
+    "controller_urdf": "mini-6dof-arm.urdf",
+    "web_urdf": "mini-6dof-arm.urdf",
+    "opw_urdf": "opw-mini-arm.urdf"
+  },
+  "web": {
+    "asset_source_dir": ".",
+    "urdf": "mini-6dof-arm.urdf"
+  },
+  "numeric": {
+    "tbase": [
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1
+    ],
+    "ttool": [
+      0, 0, 1, 0,
+      0, -1, 0, 0,
+      1, 0, 0, -0.026,
+      0, 0, 0, 1
+    ],
+    "q_sign": [1, 1, 1, 1, 1, 1]
+  }
+}

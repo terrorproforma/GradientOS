@@ -1944,3 +1944,2250 @@ Use this file as persistent, repo-local execution memory.
 
 - Remaining risk or pending check:
   - None immediate.
+
+### 2026-02-18 23:07 +11:00 - No-fallback robot catalog migration
+
+#### Task Summary
+
+- Migrated robot assets from legacy root path to canonical `robots/<robot_id>/`.
+- Added strict manifest-based resolver and rewired controller/IK/numeric/web to use it.
+- Removed legacy mini-arm asset files and hardcoded web/solver path usage.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - First web sync script copied entire robot asset directories into `web-ui/public/assets/robots/`, including non-runtime docs/scripts.
+- Detection:
+  - Post-sync file inspection showed extra copied files not required by the browser asset loader.
+- Fix:
+  - Reduced sync scope to canonical URDF + optional `stl-files/` and generated canonical `robot.urdf`.
+- Preventive rule:
+  - For build-time asset sync, copy the minimum runtime surface by default; only add broader copy lists intentionally.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Commit to migration with no fallback code paths and clean legacy references.
+  - Prefer concrete implementation over explanation-only responses.
+- How it changed execution:
+  - Removed old root asset files and switched runtime to manifest-driven resolution in one pass.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Running `run_controller --list-robots` plus a short unbuffered `--sim` startup smoke gave fast confidence that registry + runtime wiring stayed healthy.
+  - `ReadLints` + `npm run build` caught no regressions after broad multi-file migration.
+
+#### What Did Not Work
+
+- Source: `[self]`
+- Failed attempt and why:
+  - Buffered simulation run produced no immediate logs in the first smoke attempt; switched to `python -u` to verify startup state reliably.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For additional robots, require `robots/<robot_id>/robot.json` first and fail fast if missing instead of adding defaults.
+  - Keep controller-facing robot config (`robot_id`) decoupled from user-facing config key (`--robot` registry name).
+  - Re-run asset sync before web build/dev (`npm run sync:robot-assets`) whenever robot catalog content changes.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If future URDFs reference textures or mesh folders outside `stl-files/`, update `web-ui/scripts/sync-robot-assets.mjs` include logic explicitly.
+
+### 2026-02-18 23:22 +11:00 - Mesh/USD recovery after robot asset migration
+
+#### Task Summary
+
+- Restored missing mini-arm mesh assets required by URDF rendering in web UI.
+- Reinstated USD asset in canonical robot bundle and ensured sync keeps USD artifacts.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Removed/omitted required STL/USD robot files during migration cleanup, which left the web URDF without mesh payloads.
+- Detection:
+  - User reported blank robot render; terminal startup logs were healthy, indicating a front-end asset issue rather than controller failure.
+- Fix:
+  - Restored legacy tracked files via `git restore`.
+  - Copied `mini-6dof-arm/stl-files/*.stl` and `mini-6dof-arm/mini-6dof-arm.usd` into `robots/mini-6dof-arm/`.
+  - Re-ran `npm run sync:robot-assets` and confirmed generated web assets include STL + USD.
+- Preventive rule:
+  - For URDF migrations, treat mesh + scene files as required runtime artifacts; validate file presence in both canonical catalog and web output before handoff.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Keep USD assets preserved because they are useful for external tools like Isaac Sim.
+  - Prioritize immediate implementation/fixes over explanation-only responses.
+- How it changed execution:
+  - Added explicit USD preservation in manifest and sync behavior and ran full sync/build verification.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - `git ls-files "mini-6dof-arm/*" "mini-6dof-arm/stl-files/*"` quickly confirmed STL/USD were tracked and recoverable.
+  - `Get-ChildItem -Recurse` checks on `web-ui/public/assets/robots/mini-6dof-arm` verified the effective runtime payload after sync.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - `Glob`/text-file searches did not surface `.stl`/`.usd` binaries, which initially obscured file existence.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When migrating robot assets, inventory all binary artifacts (`.stl`, `.usd`, etc.) from git index before deleting legacy paths.
+  - After any `sync-robot-assets` change, verify generated `web-ui/public/assets/robots/<id>/` contains mesh files referenced by URDF.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Consider adding a CI check that parses URDF mesh references and asserts corresponding files exist in synced web assets.
+
+### 2026-02-18 23:25 +11:00 - USD optionality clarification
+
+#### Task Summary
+
+- Applied user clarification: USD files should be preserved when present but never required.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Added `models.usd` in `robot.json`, which could imply required semantics even though runtime did not enforce it.
+- Detection:
+  - User explicitly clarified that USD is not a hard requirement and must not block future flows.
+- Fix:
+  - Removed `models.usd` from manifest.
+  - Kept sync script behavior as optional pass-through copy for `.usd/.usda/.usdc`.
+- Preventive rule:
+  - For non-runtime auxiliary artifacts, avoid placing them in required manifest schema unless there is a real consumer and enforcement intent.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Preserve USD files, but do not introduce hard checks for them.
+- How it changed execution:
+  - Kept USD copy support and removed manifest-level required implication.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Quick `sync:robot-assets` + `build` loop validated optional USD handling without regressions.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Used `&&` in PowerShell command chain; shell requires `;` in this environment.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Treat manifest entries as contract surface; only include fields intended for long-term validation.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If USD becomes a first-class runtime input later, add explicit schema/versioning before enforcing checks.
+
+### 2026-02-18 23:39 +11:00 - Gradient-05 template scaffold
+
+#### Task Summary
+
+- Created a ready-to-fill template for a second robot model (`gradient-05`) in both asset catalog and controller registry.
+- Kept migration constraints intact (manifest-driven assets, no fallback requirements changed).
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - None during this scaffold pass.
+- Detection:
+  - N/A.
+- Fix:
+  - N/A.
+- Preventive rule:
+  - For new robot templates, keep them non-default and provide valid placeholder files so sync/build/list checks stay green.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - User wants implementation-first assistance and practical setup scaffolds to fill in real robot details incrementally.
+- How it changed execution:
+  - Added concrete folder/file templates plus immediate registry wiring instead of providing only instructions.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Inheriting `Gradient05Config` from `Gradient0Config` provided a safe starter config while exposing a new `robot_id`.
+  - Running `run_controller --list-robots` and `sync:robot-assets` confirmed end-to-end registration quickly.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - None in this pass.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Keep controller key (`gradient05`) and asset ID (`gradient-05`) explicit and documented to avoid naming drift.
+  - Ensure each new robot manifest references real files from day one, even if placeholders.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Active simulator/API sessions can mutate runtime files (observed `recorded_trajectories/__weld_preview__.json`); avoid touching unrelated runtime outputs during scaffolding tasks.
+
+### 2026-02-18 23:59 +11:00 - Gradient-05 URDF mesh path wiring
+
+#### Task Summary
+
+- Updated `robots/gradient-05/gradient-05.urdf` to point link visuals at `stl-files/*` mesh filenames.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - None in this pass.
+- Detection:
+  - N/A.
+- Fix:
+  - N/A.
+- Preventive rule:
+  - When users request mesh-path wiring, keep references relative (`stl-files/...`) to match existing resolver/web-loader behavior.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - User wants direct implementation updates to files currently being authored.
+- How it changed execution:
+  - Patched URDF immediately with concrete mesh filename references instead of leaving primitive placeholders.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Referencing the existing mini-arm URDF mesh naming convention (`base`, `L1`-`L5`, `wrist`) provided a consistent template.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - None in this pass.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Keep scaffold URDF and expected mesh filenames synchronized with files that will be dropped into `stl-files/`.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Rendering for `gradient-05` will remain incomplete until matching STL files are added.
+
+### 2026-02-19 00:14 +11:00 - Move link offsets into joints
+
+#### Task Summary
+
+- Moved non-zero visual offsets from links into joint origins for `robots/gradient-05/gradient-05.urdf`.
+- Reset affected link visual origins back to `xyz="0 0 0"` / `rpy="0 0 0"`.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - None in this pass.
+- Detection:
+  - N/A.
+- Fix:
+  - N/A.
+- Preventive rule:
+  - For "transfer offsets" requests, apply a deterministic mapping and document it explicitly for user verification.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - User wants quick direct transform edits in the active URDF file.
+- How it changed execution:
+  - Implemented immediate in-file transfer (no planning detour) and preserved exact numeric values.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Reading full URDF before patching made it straightforward to move offsets and preserve mesh path sections unchanged.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - None in this pass.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When base link also has a visual offset, call out that transfer mapping choice (sequential link-to-joint mapping here) so frame assumptions remain explicit.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If the intended mapping was "incoming joint per link child frame" rather than sequential order, joint origins may need a remap.
+
+### 2026-02-19 00:59 +11:00 - DH extraction and visual validation tooling
+
+#### Task Summary
+
+- Implemented `robots/gradient-05/dh_tools.py` to extract initial DH rows from URDF and validate against URDF FK.
+- Added optional visual comparison output (`dh_validation.png`) for fast geometric sanity checks.
+
+#### Mistakes And Fixes
+
+- Source: `[tool]`
+- Mistake:
+  - Initial script import relied on `utilities/urdf2dh` package internals that required `nptyping`, which is not installed in repo venv.
+- Detection:
+  - Runtime error: `ModuleNotFoundError: No module named 'nptyping'`.
+- Fix:
+  - Inlined the required `get_a` / `get_alpha` math in `dh_tools.py` to remove external import dependency.
+- Preventive rule:
+  - For repo-local utilities, avoid pulling optional-typing dependencies into runtime tooling unless they are already in project deps.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Wants practical DH setup support plus visual validation, not just conceptual advice.
+- How it changed execution:
+  - Delivered executable extraction + validation flow and generated a visual artifact.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Combined numeric FK error metrics + a side-by-side 3D plot to quickly distinguish "extractable" vs "needs manual tuning".
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Auto extraction produced high mismatch (meter-scale position error, ~180 deg orientation max), indicating frame convention/theta offsets are not solved by naive extraction alone.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Treat URDF-derived DH as an initial estimate; always run FK residual checks before wiring into numeric solver runtime.
+  - If validation is poor, move to manual convention fitting (especially theta offsets and frame assignments), not blind CSV acceptance.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - `gradient-05` DH table still requires manual tuning before numeric IK can be trusted in control loops.
+
+### 2026-02-19 01:10 +11:00 - DH workflow restart + visualization build
+
+#### Task Summary
+
+- Rebuilt `robots/gradient-05/dh_tools.py` from scratch around a fit-to-URDF workflow.
+- Generated fresh DH CSV and visualization output in one pass.
+
+#### Mistakes And Fixes
+
+- Source: `[tool]`
+- Mistake:
+  - First rerun used an overly heavy fit configuration (`fit-samples=1200`, high eval budget), causing a long-running job with no timely output.
+- Detection:
+  - Command exceeded the blocking timeout and continued in background without completing within practical iteration time.
+- Fix:
+  - Added `--max-nfev` CLI control, switched to robust `soft_l1` loss, reduced sample counts, and reran with lighter settings.
+- Preventive rule:
+  - For nonlinear identification loops, expose evaluation/sampling controls in CLI and start with moderate sample sizes before scaling up.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - User explicitly wants visualization built as part of DH validation.
+- How it changed execution:
+  - Validation plot generation was included in the main workflow and regenerated in the successful run.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Restarting from a cleaner fit pipeline reduced position residuals and produced repeatable artifacts (`dh_params.csv`, `dh_validation.png`) in one command.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Even with fitting, orientation residual remains very high (~124 deg mean), and some parameters saturate bounds, suggesting the DH-only model is still under-parameterized for this URDF representation.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Treat high orientation residual + bound saturation as a structural model warning (not just optimizer tuning noise).
+  - If residuals stay high, add base/tool transform fitting or revise frame assumptions before accepting DH output.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - The current `gradient-05` DH CSV is not yet trustworthy for production numeric IK without an improved kinematic mapping model.
+
+### 2026-02-19 01:20 +11:00 - IKFast vs QuIK validation on mini-arm
+
+#### Task Summary
+
+- Ran requested cross-check using `mini-6dof-arm`: IKFast treated as reference; compared QuIK using canonical DH vs freshly extracted DH.
+- Repaired QuIK integration path so numeric backend can actually be benchmarked in this environment.
+
+#### Mistakes And Fixes
+
+- Source: `[tool]`
+- Mistake:
+  - QuIK backend was effectively disconnected: no built `pyquik` extension and wrapper expected methods (`ik`/`fk`) not exposed by bindings (`solve`/`FK`).
+- Detection:
+  - Runtime errors: missing `pyquik`, then attribute mismatch (`IKSolver` missing `ik`).
+- Fix:
+  - Built `pyquik` locally and added method adapter in `numeric_wrapper`.
+  - Added manifest-driven numeric frame/sign overrides and set mini-arm overrides in `robot.json`.
+- Preventive rule:
+  - Keep wrapper API assumptions in lockstep with actual pybind export names; add adapters instead of monkey-patching extension objects.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Validate extraction quality empirically against IKFast baseline, not by intuition.
+- How it changed execution:
+  - Added a dedicated benchmark script and generated quantitative + visual comparisons for canonical vs extracted DH.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Estimating and applying a constant QuIK frame transform (`numeric.ttool`) for mini-arm collapsed FK mismatch to near numerical zero with canonical DH.
+  - Canonical-DH benchmark produced strong FK/IK agreement with IKFast.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - URDF seed extraction method (`--seed-only`) produced poor FK alignment against IKFast on mini-arm (large translational and rotational error), confirming it is not sufficient as-is.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Any new DH extraction method must pass IKFast-vs-QuIK FK/IK benchmark on mini-arm before being trusted for new robots.
+  - Validate both frame alignment (Tbase/Ttool) and DH values; poor results can come from either.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - For `gradient-05`, we still need a robust frame-aware extraction/fitting approach that reproduces mini-arm style benchmark performance.
+
+### 2026-02-19 09:24 +11:00 - QuIK upstream status check
+
+#### Task Summary
+
+- Performed read-only verification that nested `src/numeric_solver/quik` matches upstream `origin/main`.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - None in this step.
+- Detection:
+  - N/A.
+- Fix:
+  - N/A.
+- Preventive rule:
+  - For vendor repos marked as important, verify with fetch+commit comparison before proposing updates.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Do not edit the `quik` repo content; only ensure/update to latest when needed.
+- How it changed execution:
+  - Kept checks strictly read-only and avoided checkout/pull/update operations because repo is already current.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - `git rev-list --left-right --count HEAD...origin/main` provided an immediate authoritative up-to-date result (`0 0`).
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - None in this step.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Treat detached HEAD in nested dependency repos as potentially intentional pinning unless user explicitly requests branch-tracking behavior.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - None; `quik` repo local commit and upstream `origin/main` currently match exactly.
+
+### 2026-02-19 11:58 +11:00 - Full kinematics hardening execution
+
+#### Task Summary
+
+- Implemented all stages in the kinematics reliability plan end-to-end:
+  - IK semantics fix,
+  - versioned profile foundation + runtime control plane,
+  - UI offset controls,
+  - planner gates/fallback diagnostics,
+  - calibration workflow,
+  - motion-state/audit hardening.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - API kinematics helper initially used a keyword-only timeout signature but was called with positional args via `run_in_threadpool`, causing endpoint runtime failures.
+- Detection:
+  - `tests/test_api_endpoints.py` failed with `TypeError: ... takes 1 positional argument but 2 were given`.
+- Fix:
+  - Changed helper signature to accept positional timeout and re-ran API tests to green.
+- Preventive rule:
+  - For threadpool callback helpers in FastAPI, prefer positional-compatible signatures unless every call site uses keyword binding.
+
+- Source: `[tool]`
+- Mistake:
+  - Planner hardening gates broke legacy unit tests that used dummy Cartesian points incompatible with FK residual checks.
+- Detection:
+  - `tests/test_planning.py` started failing after gate insertion.
+- Fix:
+  - Updated tests to patch `_validate_joint_trajectory_gates` for behavior-isolation in unwrap/smoothing unit cases.
+- Preventive rule:
+  - When adding physical-validity gates, adapt logic-unit tests to isolate the behavior under test rather than relying on previously permissive planner side effects.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Implement changes directly; do not stop at discussion.
+  - Execute the full staged plan and keep todo status accurate.
+  - Always update both `DEVLOG.md` and `AGENT_SCRATCHPAD.md` for meaningful work.
+- How it changed execution:
+  - Kept continuous implementation flow across all stages in one turn, with full test/build/lint validation and mandatory memory-loop writeback.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Stage-by-stage with frequent regression runs (`pytest` subsets + `npm run build`) prevented hidden cross-layer breakage.
+  - Adding explicit runtime/profile abstractions (`kinematics/runtime.py`, `kinematics/profile.py`) made API/controller/UI integration straightforward.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Running tests from PowerShell required explicit `&` call syntax and local venv deps (`pytest`, `httpx`) before endpoint tests could execute.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For broad multi-stage reliability changes, lock in a quick regression suite early and rerun after each stage.
+  - If planner semantics tighten, immediately audit and update tests that intentionally use synthetic/non-physical trajectories.
+  - Before final handoff, always append both memory files and run `ReadLints` on changed paths.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Continue migrating remaining legacy direct `trajectory_state[...]` accesses to lock helpers for complete thread-safety coverage.
+  - Consider adding dedicated long-window diagnostics aggregation for planner residual trends (beyond per-plan snapshots).
+
+### 2026-02-19 12:24 +11:00 - Live weld planning crash fix (`NaN` JSON + post-action fallback)
+
+#### Task Summary
+
+- Debugged live API/controller logs for weld planning failures and applied targeted runtime fixes.
+- Eliminated FastAPI response crash caused by non-JSON-safe planner diagnostics values.
+- Made optional post-action transition failures non-fatal with explicit warnings.
+
+#### Mistakes And Fixes
+
+- Source: `[tool]`
+- Mistake:
+  - Planner diagnostics could emit `NaN`/`Inf` (`joint_limit_margin_rad`) which broke JSON response encoding in `/trajectory/plan-weld`.
+- Detection:
+  - Live API trace showed `ValueError: Out of range float values are not JSON compliant: nan`.
+- Fix:
+  - Added JSON-safe float conversion in `trajectory_execution._validate_joint_trajectory_gates` and regression coverage in `tests/test_planning.py`.
+- Preventive rule:
+  - Any telemetry/payload diagnostics intended for HTTP JSON must sanitize non-finite floats before storing/returning.
+
+- Source: `[self]`
+- Mistake:
+  - Optional post-action transitions (`return_to_start` segments) were treated as hard planning failures, causing avoidable 502 responses.
+- Detection:
+  - Live terminal logs showed weld interior succeeded while post-action transition failed and aborted whole plan.
+- Fix:
+  - Converted post-action transition failures to warnings and skipped just that optional segment; preserved successful weld preview output.
+- Preventive rule:
+  - Keep optional workflow features non-fatal unless explicitly marked safety-critical; surface clear warnings instead.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Fast, direct debugging from real runtime logs and concrete fixes over theory.
+- How it changed execution:
+  - Started from live terminal evidence first, then patched exact failure path and validated with tests.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Reading active API/sim logs immediately exposed root cause and avoided speculative debugging.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - None in this pass.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For runtime API failures, always inspect terminal stack traces first and prioritize crash-proof serialization paths for diagnostics-heavy payloads.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Monitor frequency of post-action warnings; if frequent, add adaptive return strategy options (clearance scaling or alternate post-action policy).
+
+### 2026-02-19 12:08 +11:00 - Mermaid diagram parse error fix in docs
+
+#### Task Summary
+
+- Fixed a non-rendering Mermaid diagram in `docs/ik_solver.md` by simplifying flowchart syntax to a parser-safe form.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Previous Mermaid block used syntax that was accepted by some engines but failed in the active renderer (`<br/>`, mixed node forms, trailing semicolons).
+- Detection:
+  - Renderer error reported parse failure near the first node label (`got 'PS'`).
+- Fix:
+  - Rewrote the block using `flowchart TD`, quoted labels, and cleaner decision/edge syntax.
+- Preventive rule:
+  - For docs Mermaid diagrams, prefer conservative syntax (quoted text labels, no HTML tags) for cross-renderer compatibility.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Explain changes, but implement directly instead of only discussing.
+- How it changed execution:
+  - Applied the doc patch immediately, then logged exact changes and validation.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Reading the exact selected lines from `docs/ik_solver.md` before patching made it easy to target the failing Mermaid fragment precisely.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - None in this pass.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When Mermaid parse errors mention unexpected tokens, first remove HTML tags and unquoted complex labels, then validate with minimal syntax.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If another renderer is used (e.g., different Mermaid version), keep fallback to even simpler labels without punctuation if needed.
+
+### 2026-02-19 12:12 +11:00 - Mermaid fallback syntax hardening
+
+#### Task Summary
+
+- Applied a stricter Mermaid fallback for the IK docs diagram after parse errors persisted in the active Markdown renderer.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - First fix still assumed renderer support for quoted labels and richer edge text.
+- Detection:
+  - User screenshot showed parse failure continuing on the conditional branch line.
+- Fix:
+  - Replaced diagram labels with plain words and minimal symbols only.
+- Preventive rule:
+  - For unknown Mermaid engine versions, default immediately to minimal syntax before using richer label formats.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Keep implementing concrete fixes until the issue is actually resolved.
+- How it changed execution:
+  - Performed a second immediate patch instead of only suggesting possible causes.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Iterative simplification with direct file patching is effective for parser-compatibility issues.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - The first post-error Mermaid variant remained too expressive for this renderer.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For docs visuals, start with compatibility-first Mermaid syntax, then add expressiveness only if confirmed supported.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If errors continue, use non-Mermaid fallback (ASCII/bulleted flow) in docs to avoid renderer dependency.
+
+### 2026-02-19 12:13 +11:00 - Mermaid diagram type compatibility fallback
+
+#### Task Summary
+
+- Switched the IK docs diagram to legacy Mermaid grammar to handle renderers that do not recognize `flowchart`.
+
+#### Mistakes And Fixes
+
+- Source: `[tool]`
+- Mistake:
+  - Assumed active renderer supported modern `flowchart` keyword after syntax cleanup.
+- Detection:
+  - Preview error changed to "No diagram type detected," indicating diagram-type parsing mismatch.
+- Fix:
+  - Migrated to `graph TD;` format with semicolons and legacy edge-label syntax.
+- Preventive rule:
+  - When Mermaid errors shift from token parse errors to "no diagram type," downgrade diagram keyword/version features first.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Continue implementing until the visual issue is fully resolved.
+- How it changed execution:
+  - Performed another direct patch immediately from screenshot evidence.
+
+#### What Worked
+
+- Source: `[self]`
+- Pattern/check that worked:
+  - Reading the exact renderer error wording helps choose the right compatibility fallback quickly.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - `flowchart` syntax was still incompatible with the active Markdown Mermaid renderer.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Use this fallback order for Mermaid docs issues: content simplification -> legacy `graph TD` -> non-Mermaid fallback text.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If parser still fails after `graph TD`, inspect preview extension/settings and treat doc syntax as likely no longer the root cause.
+
+### 2026-02-19 12:13 +11:00 - Ultra-minimal Mermaid syntax fallback
+
+#### Task Summary
+
+- Replaced the IK diagram text with parser-safe token labels (`underscore_style`) to support strict or outdated Mermaid grammars.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Previous fallback still used natural-language labels with spaces and optional punctuation.
+- Detection:
+  - Continued rendering uncertainty after multiple syntax downgrades.
+- Fix:
+  - Reduced diagram to minimal grammar: `graph TD`, compact operators, simple alphanumeric/underscore labels.
+- Preventive rule:
+  - For compatibility-sensitive diagrams, start with tokenized labels first; add readability labels only after renderer confirmation.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Keep iterating with concrete edits until the issue is fully fixed.
+- How it changed execution:
+  - Implemented one more immediate patch rather than waiting for further prompting.
+
+#### What Worked
+
+- Source: `[self]`
+- Pattern/check that worked:
+  - Progressive simplification produced a deterministic lowest-common-denominator Mermaid form.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Richer label styles likely exceeded active renderer compatibility envelope.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Use an explicit compatibility ladder for Mermaid: token labels -> simple labels -> rich labels.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If render still fails, request/inspect Markdown preview Mermaid configuration and version support.
+
+### 2026-02-19 12:23 +11:00 - Weld orientation fallback visibility in UI
+
+#### Task Summary
+
+- Added operator-facing weld planning warnings so orientation degradations are visible in the Weld drawer instead of only backend/API logs.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Planner warnings were not surfaced in the weld workflow UI, reducing operator awareness of quality-impacting fallbacks.
+- Detection:
+  - User asked for explicit explanation and requested these warnings be brought into the UI because orientation quality matters.
+- Fix:
+  - Threaded `planning_warnings` through `previewFromPlannerPayload` into `PreviewPlan` and rendered a dedicated warning section in `WeldPanel`.
+- Preventive rule:
+  - When backend introduces degraded-but-successful modes, always expose them as explicit operator warnings in the related panel.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Explain behavior deeply, define terms clearly, and implement requested UX changes immediately.
+- How it changed execution:
+  - Combined detailed technical explanation with a direct UI implementation in the same turn.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Running `npm run build` plus scoped `ReadLints` after UI edits quickly verified the warning pipeline change.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Inspect planner payload contracts (`planning_warnings`, diagnostics fields) before assuming the UI currently surfaces them.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Consider a secondary global notification (toast/monitor banner) if warnings must remain visible outside the Weld panel context.
+
+### 2026-02-19 12:24 +11:00 - End-to-end warning plumbing check
+
+#### Task Summary
+
+- Ensured torch-angle fallback warnings are emitted in planner payloads, not only printed in backend logs.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Initially wired UI rendering for `planning_warnings` before confirming that torch-angle fallback warnings were actually appended to that payload list.
+- Detection:
+  - Code review of `command_api.py` showed the fallback warning was printed but not stored in `planning_warnings`.
+- Fix:
+  - Added `planning_warnings.append(...)` for torch-angle fallback retries in weld section planning.
+- Preventive rule:
+  - For any UI surfacing task, verify producer and consumer both handle the same event key end-to-end.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Welding-orientation quality signals must be visible to operators in UI, not hidden in backend logs.
+- How it changed execution:
+  - Added backend event propagation in the same pass instead of stopping at UI-only presentation.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Targeted regression run (`tests/test_api_endpoints.py` + `tests/test_planning.py`) validated no behavioral breakage from warning-path changes.
+
+#### What Did Not Work
+
+- Source: `[self]`
+- Failed attempt and why:
+  - UI-only warning integration was incomplete until backend payload append was added.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When exposing diagnostics in UI, confirm log-only warnings are also serialized in API responses.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If warning volume grows, switch to structured warning objects (`code`, `message`, `section`) for cleaner UI filtering.
+
+### 2026-02-19 13:08 +11:00 - Gradient-05 production switching rollout
+
+#### Task Summary
+
+- Completed end-to-end implementation for restart-required robot switching with robot-config-derived solver policy and supervisor-oriented restart flow.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Initially wired `POST /control/restart-controller` using positional arguments into `_controller_call_or_503`, which has keyword-only parameters.
+- Detection:
+  - Code review during API integration showed this would raise a runtime `TypeError`.
+- Fix:
+  - Switched to keyword arguments (`timeout=...`, `expect_response=...`) in the threadpool call.
+- Preventive rule:
+  - Re-check helper signatures when wrapping threadpool calls, especially if `*` keyword-only parameters are used.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Robot solver selection must come from robot config policy; UI can stage runtime config but not pick arbitrary solver in normal mode.
+- How it changed execution:
+  - Implemented policy-driven resolver first, then gated overrides behind explicit unsafe flags and surfaced override source in API/UI.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Shared `runtime_config.py` module for both controller and API kept desired-vs-active semantics consistent and simplified endpoint logic.
+  - Running backend pytest matrix plus `npm run build` after each major integration pass caught issues quickly.
+
+#### What Did Not Work
+
+- Source: `[self]`
+- Failed attempt and why:
+  - Treating runtime desired config as implicit fallback-only made invalid robot selectors silently default instead of failing fast.
+- Correction:
+  - Added strict validation for PATCH updates so invalid robot selectors return explicit 400 errors.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For restart-required runtime settings, always implement and verify all three pieces together: desired config store, active runtime introspection, and explicit restart request endpoint.
+- Preflight rule:
+  - When policy can be overridden in dev mode, expose override source (`robot_policy` vs `dev_override`) in both logs and UI.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Supervisor behavior (restart-on-exit code policy and backoff settings) must be validated in deployment environment to complete industrial hardening.
+
+### 2026-02-19 13:18 +11:00 - Python environment activation guardrail
+
+#### Task Summary
+
+- Added a strict execution preference for Python-driven work: always verify the environment is active first; if not active, prefer activating via `start.sh`.
+
+#### Mistakes And Fixes
+
+- Source: `[user]`
+- Mistake:
+  - Environment activation could be assumed in ad-hoc Python command contexts.
+- Detection:
+  - User explicitly requested a hard rule to enforce environment activation and use `start.sh` as the preferred recovery path.
+- Fix:
+  - Recorded the preflight rule in persistent scratchpad guidance.
+- Preventive rule:
+  - Before any direct Python command, confirm env activation status; if uncertain/inactive, initialize through `start.sh` before proceeding.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - For Python-driven workflows, do not proceed without an active environment; default remediation path is `start.sh`.
+- How it changed execution:
+  - Added explicit environment preflight checks to the agent's operational guardrails.
+
+#### What Worked
+
+- Source: `[self]`
+- Pattern/check that worked:
+  - Converting the instruction into a persistent scratchpad rule prevents future regressions across sessions.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this process-only update.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Treat environment activation as mandatory for all Python-driven steps; if not active, run via `start.sh` first.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Keep launch instructions aligned between shell variants (`start.sh` and Windows launcher scripts) so the activation path is unambiguous.
+
+### 2026-02-19 13:29 +11:00 - Launcher bootstrap enforcement
+
+#### Task Summary
+
+- Implemented environment-activation preflight directly in backend/controller launch scripts so startup paths are robust even when invoked from UI-driven or external orchestration flows.
+
+#### Mistakes And Fixes
+
+- Source: `[tool]`
+- Mistake:
+  - Tried using `bash -n` validation on a Windows host where `bash` is unavailable on PATH.
+- Detection:
+  - Command errors showed `bash` command not recognized.
+- Fix:
+  - Validated PowerShell launcher behavior with `--help` smoke runs and recorded the bash-validation gap explicitly.
+- Preventive rule:
+  - On Windows, check shell availability before scheduling bash-specific validation steps.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - If Web UI (or any orchestrator) is used to start controller/backend processes, environment activation must happen first so required packages are always accessible.
+- How it changed execution:
+  - Added explicit startup bootstrap logic to launchers instead of relying on implicit active-shell state.
+
+#### What Worked
+
+- Source: `[self]`
+- Pattern/check that worked:
+  - Centralizing activation checks in launch scripts protects both manual and automated startup paths without requiring extra operator steps.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Full bash syntax linting could not run on this machine due missing `bash`.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For startup reliability tasks, validate launch scripts in the native host shell first, then run cross-shell checks only when that shell runtime exists.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If you want strict Linux-side verification, run `bash -n run.sh run-sim.sh run-api.sh` on a host with bash/WSL.
+
+### 2026-02-19 13:36 +11:00 - API startup warning root-cause fix
+
+#### Task Summary
+
+- Removed `runpy` warning during API startup by eliminating eager `main` import side effects in `gradient_os.api` package init.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Package `src/gradient_os/api/__init__.py` imported `.main` eagerly, which caused `gradient_os.api.main` to already exist in `sys.modules` before `python -m gradient_os.api.main` executed it.
+- Detection:
+  - Warning text in startup logs explicitly indicated preloaded module before runpy execution.
+- Fix:
+  - Converted package exports to lazy-loading (`create_app` proxy + `__getattr__` for `app`) so package import is side-effect free.
+- Preventive rule:
+  - Avoid importing runnable `__main__` targets from package `__init__` files when those modules are launched via `-m`.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Treat startup warnings as robustness defects and investigate to root cause.
+- How it changed execution:
+  - Implemented warning removal, not just explanation, and validated with launcher smoke tests.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Re-running `run-api.ps1 --help` immediately after patch gave a fast, deterministic confirmation that warning was removed.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this change.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For `python -m package.module` entrypoints, inspect package `__init__.py` for eager imports that can preload the target module.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Accessing lazy `app` still imports `main` intentionally; startup logs from backend registry/IK initialization at that moment are expected behavior.
+
+### 2026-02-19 13:44 +11:00 - UDP reset and command-link health hardening
+
+#### Task Summary
+
+- Improved controller robustness for Windows UDP behavior and made command-link loss visible in telemetry.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Connection-reset events from UDP were treated as generic unexpected errors, generating scary traceback logs despite non-fatal behavior.
+- Detection:
+  - Sim terminal showed `ConnectionResetError [WinError 10054]` during active operation, followed by normal command processing.
+- Fix:
+  - Added explicit handling for `winerror=10054` as benign datagram reset noise with throttled warning and continue.
+  - Added command silence tracking and stale-link warning/restore logging.
+  - Added comms-health telemetry fields for operator visibility.
+- Preventive rule:
+  - For UDP controllers on Windows, classify known socket reset codes before falling through to generic exception handling.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Robust software means warnings should be investigated and real connection-loss risk should be addressed, not dismissed.
+- How it changed execution:
+  - Implemented both noise suppression and actual link-health observability in the same patch.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Fast syntax compile plus launcher smoke run gave quick confidence that comms hardening didn’t break startup behavior.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this change.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Distinguish transport-noise handling from true link-health detection; implement both when hardening comms paths.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If strict command delivery guarantees are required, layer heartbeat/ack/retry semantics above UDP instead of relying on socket-level behavior.
+
+### 2026-02-19 13:53 +11:00 - Weld entry IK no-solution mitigation
+
+#### Task Summary
+
+- Addressed weld-entry planning failures by removing unnecessary orientation-lock rigidity during the transition into the first weld point.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Weld entry path used `_plan_linear_move(..., forced_orientation=None)`, which implicitly locks orientation to current pose and can make an otherwise reachable entry point infeasible.
+- Detection:
+  - Logs showed `IK_NO_SOLUTION` on dense sequential fallback during weld entry even for a nearby, expected-reachable start point.
+- Fix:
+  - Derived an entry orientation from `_build_weld_orientations(...)` and planned entry with interpolated orientation toward that target.
+  - Added deterministic fallback back to legacy orientation-lock if interpolated entry fails.
+  - Added warning plumbing so fallback use is visible.
+- Preventive rule:
+  - For transition-to-process segments (e.g., weld entry), avoid defaulting to strict start-pose orientation lock when process orientation is known.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - If a path should be solvable in practice, planning should degrade gracefully before hard-failing with `IK_NO_SOLUTION`.
+- How it changed execution:
+  - Implemented entry-specific fallback ladder instead of leaving single rigid entry orientation behavior.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Reusing existing weld orientation builder allowed a minimal targeted fix without changing solver internals.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this change.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When diagnosing `IK_NO_SOLUTION`, inspect whether failures occur on approach/transition segments with mismatched orientation constraints before changing global IK settings.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If edge geometry and process angle still conflict at entry, add a bounded intermediate waypoint strategy as the next fallback stage.
+
+### 2026-02-19 14:02 +11:00 - API planner runtime alignment
+
+#### Task Summary
+
+- Corrected weld planning failures caused by API-process planner runtime drift from controller runtime (robot/solver mismatch).
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Weld planning (`/trajectory/plan-weld`) executed through API-process `command_api` without ensuring local planner robot/IK config matched active controller runtime.
+- Detection:
+  - Terminal evidence showed controller pose at ~`[0.807, 0.0, 0.91]` while failing dense path points started around `[0.489, 0.0, 0.37]`, indicating mismatched kinematic model/backend during planning.
+- Fix:
+  - Added pre-plan runtime sync in API weld planning path using controller `GET_RUNTIME_CONFIG`, then set active robot + IK backend in API-process planner modules before generating weld path.
+- Secondary issue:
+  - Introduced `NameError` by calling the scoped helper from module-level preview planner.
+- Secondary fix:
+  - Removed preview-path call to scoped helper; kept sync where needed for weld planning.
+- Preventive rule:
+  - When planning can run in multiple processes, always align robot/solver runtime explicitly before planning; do not rely on startup defaults.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - A path that should be reachable must not fail due to configuration drift or hidden runtime mismatch.
+- How it changed execution:
+  - Prioritized runtime-consistency fixes over tuning IK thresholds.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Cross-checking API logs against controller telemetry/pose made process-mismatch diagnosis fast and concrete.
+
+#### What Did Not Work
+
+- Source: `[self]`
+- Failed attempt and why:
+  - Initial helper placement created scope mismatch for module-level preview function.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For API endpoints invoking local planning modules, verify they consume the same robot/solver runtime as controller before trajectory generation.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If weld planning still fails after runtime sync + entry fallback, add intermediate entry waypoint fallback with bounded clearance.
+
+### 2026-02-19 21:57 +11:00 - Speed multiplier felt ineffective
+
+#### Task Summary
+
+- Fixed motion speed scaling so UI speed multiplier changes are observable for short profile moves, not only long cruise segments.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Relative/profiled move code scaled only profile velocity while keeping acceleration constant.
+- Detection:
+  - User reported that speed multiplier "seems to do nothing"; code trace showed `speed_multiplier` forwarded correctly but acceleration remained fixed (`DEFAULT_PROFILE_ACCELERATION`), which keeps many short moves acceleration-limited.
+- Fix:
+  - Added `_resolve_profile_params_for_speed_multiplier(...)` in `command_api.py`.
+  - Scaled velocity by `speed_mult` and acceleration by `speed_mult^2`.
+  - Applied this logic to relative move handlers and trajectory planning move branches.
+- Preventive rule:
+  - When exposing a UI speed multiplier for motion profiles, verify both velocity and acceleration scaling, otherwise short moves can appear unaffected.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - If behavior is wrong, implement the fix directly and explain what changed (not just analysis).
+- How it changed execution:
+  - Delivered code change + tests in one pass and provided concrete root-cause explanation.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - End-to-end path tracing (UI payload -> API command -> controller parser -> planner params) quickly isolated where multiplier influence dropped.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For "slider has no effect" reports, inspect unit conversions and whether the scaled parameter is dominant in the active motion regime (acceleration-limited vs velocity-limited).
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Very high multipliers can reduce planned sample count and feel abrupt; consider optional runtime cap tuning per robot profile if operators report jerkiness.
+
+### 2026-02-19 22:14 +11:00 - Sim backend identity mismatch
+
+#### Task Summary
+
+- Corrected simulation startup so backend config identity remains `simulation` (instead of logging/setting `feetech`) while keeping telemetry/config compatibility.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - `run_controller` forced `config_backend = "feetech"` whenever servo backend was `simulation`.
+- Detection:
+  - User pointed out startup line: `[Backend Registry] Active servo backend set to: feetech` during `run-sim.ps1`.
+- Fix:
+  - Added `backends/simulation/config.py` and registered simulation with its own config module path.
+  - Changed controller startup to set active config backend directly from resolved `servo_backend`.
+- Preventive rule:
+  - For each runtime backend, keep registry identity and config identity aligned; use compatibility aliases inside backend-specific config modules instead of swapping names at call sites.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - In sim mode, software state/logs must accurately reflect simulation backend selection (no misleading hardware-backend labels).
+- How it changed execution:
+  - Implemented the fix immediately and validated backend activation output with a direct runtime check.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Direct `registry.set_active_backend("simulation")` smoke test quickly validated both naming and constant resolution after patch.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When reviewing startup logs, treat backend-name mismatches as correctness issues (not cosmetic), because they can mislead diagnostics and safety triage.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Keep simulation config compatibility in sync with hardware config expectations if telemetry schema evolves.
+
+### 2026-02-19 22:17 +11:00 - Realtime jog slider stale callback
+
+#### Task Summary
+
+- Fixed realtime jog so speed multiplier changes take effect immediately during active jog sessions.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Realtime jog interval captured `sendJogTick` at jog-start time, so slider/deadman/base changes could be stale while interval kept running.
+- Detection:
+  - User reported speed multiplier worked for incremental jogs but not realtime jog controls; code inspection showed `setInterval(() => sendJogTick(), ...)` with a closure-bound callback.
+- Fix:
+  - Added `sendJogTickRef` and `useEffect` to keep interval callback pointing at the latest `sendJogTick`.
+  - Interval now executes `sendJogTickRef.current()` so updated speed multiplier/base values are always used.
+- Preventive rule:
+  - For long-running timers in React that depend on frequently changing state, use a callback ref (or explicit timer restart logic) to avoid stale-closure control bugs.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Validate behavior in the actual interaction mode (realtime jog) and fix the real flow, not just adjacent features.
+- How it changed execution:
+  - Traced and patched the realtime client loop directly in UI instead of further tuning backend profile math.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Path split between incremental and realtime control handlers quickly isolated the bug to the frontend interval lifecycle.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When a control appears to apply only after restart/toggle, inspect React hook closure lifetimes before changing transport/backend logic.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If operators still perceive plateauing at high multipliers, check backend jog caps and expose cap telemetry in UI for clarity.
+
+### 2026-02-19 23:12 +11:00 - Tool library + TIG semantics
+
+#### Task Summary
+
+- Implemented global tool library support (backend/API/UI/visualizer) and moved weld angle interpretation to torch-target semantics compensated by active tool definition.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Initial restart-required logic treated missing `active.tool` in legacy runtime payloads as a mismatch and incorrectly flagged restart required.
+- Detection:
+  - `tests/test_api_endpoints.py::test_runtime_config_get_and_patch` failed (`restart_required` unexpectedly `True`).
+- Fix:
+  - Updated `runtime_config.compute_restart_required(...)` to only compare tool ids when active runtime payload includes a tool id.
+- Preventive rule:
+  - When extending active runtime payload contracts, keep backward compatibility for older controller payload shapes in restart/health predicates.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Tool definitions should drive weld-angle behavior (not static conversion hacks), and tool management must be practical in UI with filtering and quick swapping.
+- How it changed execution:
+  - Implemented explicit active-tool runtime policy, filterable global tool library, and weld orientation compensation tied to selected tool metadata.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Building the feature around existing runtime kinematics offset layering (base/tool runtime) enabled minimal invasive IK integration while keeping deterministic restart-required policy flow.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For any new geometry/tool abstraction, update both planner semantics and visualization in the same pass to avoid UI/runtime mismatch during operator validation.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - TIG template currently has 65 deg rotation with zero XYZ placeholder; replace with metrology-calibrated offsets before production weld quality validation.
+
+### 2026-02-19 23:47 +11:00 - Folder-per-tool library layout
+
+#### Task Summary
+
+- Refactored tool storage to per-tool folders so dropping `tools/library/<tool_id>/tool.json` (+ local mesh file) is enough for backend + UI asset sync discovery.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Initial loader fallback logic always re-added `tig-torch-65deg` when missing, which would have prevented intentional deletion of TIG from a customized library.
+- Detection:
+  - Code review after refactor showed fallback behavior was too aggressive for non-empty libraries.
+- Fix:
+  - Changed fallback policy to seed both default tools only for an empty library; for non-empty libraries, only enforce identity fallback.
+- Preventive rule:
+  - When seeding defaults in discovery-based storage, distinguish bootstrap behavior (empty state) from steady-state behavior (operator-managed set).
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Tool definitions must be self-contained and drop-in, with definition + STL colocated in each tool folder.
+- How it changed execution:
+  - Replaced monolithic `tool_library.json` design with folder discovery, metadata sidecar, and sync logic that reads each `tool.json`.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Keeping `GRADIENT_TOOL_LIBRARY_PATH` as a backward-compatible env var while interpreting `.json` values as legacy paths allowed migration without breaking existing tests/mocks.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For library/file-layout refactors, update both runtime loaders and build-time sync scripts in the same change to avoid backend/UI asset drift.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Local mesh autodetect is currently root-folder only; nested mesh assets need explicit `mesh.asset_path` until recursive detection is added.
+
+### 2026-02-20 00:41 +11:00 - Tool drawer integration
+
+#### Task Summary
+
+- Added a dedicated `Tool Library` drawer in the left sidebar so operators can load/select tools in the same workflow lane as STEP/Trajectory/Weld panels.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Tool library/runtime fetch triggers were previously scoped to Settings dialog only.
+- Detection:
+  - UI flow review showed tool drawer would open stale/empty unless Settings was opened first.
+- Fix:
+  - Runtime and tool-library fetch effects now trigger when either Settings is open or `activePanel === "tools"`.
+- Preventive rule:
+  - For any feature moved from modal settings into primary workflow drawers, re-check data-fetch lifecycle triggers and not just visual component placement.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Tool library loading should live in the left main menu flow, not buried in Settings.
+- How it changed execution:
+  - Added sidebar `Tool Library` panel with quick filter/select/stage/restart actions and kept Settings as a full editor path.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Reusing existing runtime-config handlers (`handleApplyRuntimeConfig`, `handleRestartController`) avoided divergent behavior between Settings and drawer flows.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When adding new sidebar drawer modes, update `SidebarPanelId`, persisted panel parsing, keyboard map, and drawer header/content switch together to avoid hidden dead states.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Tool CRUD UI still lives in Settings; if operators need full create/edit in-drawer, extract shared editor component instead of duplicating forms.
+
+### 2026-02-20 00:48 +11:00 - Drawer fit-to-content behavior
+
+#### Task Summary
+
+- Adjusted Tool Library and Weld drawers to avoid forced full-height stretching when content is short, while preserving internal scrolling when content exceeds lane height.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Previous iteration forced `heightMode="full"` for Weld/Tool Library to stabilize baseline, which conflicted with user preference for non-stretched sparse panels.
+- Detection:
+  - User screenshot/feedback showed unwanted empty vertical space down to drawer bottom.
+- Fix:
+  - Switched active drawer mode back to content-fit (`max-h-full`) universally and updated the design rule.
+- Preventive rule:
+  - Treat “fit-content-until-overflow” as the default drawer height contract unless user explicitly asks for fixed full-height.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Drawer should not stretch when content is short; if content is long it should cap and scroll in-place.
+- How it changed execution:
+  - Unified drawer height mode across Tool Library and Weld to content-fit with max-lane internal scrolling.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Existing `SidebarDrawer` structure (`max-h-full` shell + internal `overflow-y-auto` body) already supports desired behavior; only panel mode selection needed adjustment.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Prior dense-mode `h-full` strategy improved alignment but violated fit-content UX expectation.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - Validate drawer height decisions against both sparse and dense panel screenshots before locking design rules.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If future panel content introduces sticky footers, re-test content-fit + scroll interaction to avoid clipped controls.
+
+### 2026-02-20 00:53 +11:00 - Tool editor tabbed settings flow
+
+#### Task Summary
+
+- Changed Tool Library drawer “Open Full Tool Editor” behavior to open a focused tool-settings tab in Settings, and split Settings into tabs to reduce on-screen overload.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Earlier implementation opened Settings directly without context, showing too many unrelated controls at once.
+- Detection:
+  - User feedback and screenshot indicated high visual density and wrong navigation target for the drawer action.
+- Fix:
+  - Added settings tab model (`General`, `Tool Library`, `Kinematics`) and an `initialTab` flow from caller context.
+- Preventive rule:
+  - Any cross-entry “open editor” CTA should deep-link into the relevant settings section/tab rather than opening global settings defaults.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - “Open full library” must show tool parameters only, and tool settings should live on their own tab in Settings.
+- How it changed execution:
+  - Introduced context-aware settings open behavior (`tools` from drawer, `general` from header).
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Adding an `initialTab` prop to `SettingsDialog` provided a low-risk way to support deep-linking without creating an entirely separate modal codepath.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For large settings dialogs, enforce tab segregation before adding new major feature controls to prevent UI clutter regressions.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If stakeholders want a truly standalone tool modal later, extract Tool Library tab content into a shared component to avoid duplicating editor logic.
+
+### 2026-02-20 01:02 +11:00 - Settings modal constraints + mesh transform schema
+
+#### Task Summary
+
+- Applied bounded-height + internal-scroll behavior to Settings modal and added separate mesh visual transform fields (`mesh.position_mm`, `mesh.rotation_deg`) so mesh origin does not have to coincide with TCP/tool-tip.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Initial Settings modal refactor introduced mismatched JSX closing tags and broke `npm run build`.
+- Detection:
+  - Vite/esbuild parse errors at `web-ui/src/App.tsx` with invalid JSX closing sequence.
+- Fix:
+  - Re-counted modal wrapper hierarchy and corrected final closing `</div>` count.
+- Preventive rule:
+  - After structural JSX wrapper changes, validate opening/closing div counts before running full build to avoid avoidable parse churn.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Settings modal should follow same cap-and-scroll behavior as side drawers.
+  - Tool config must separately define TCP offset/orientation vs mesh visual offset/orientation.
+- How it changed execution:
+  - Settings layout now uses fixed header/tab with internal scroll body, and tool schema/UI/visualizer now expose dedicated mesh transform controls.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Extending normalization at backend (`tool_library.py`) first enabled backward-compatible schema migration (mesh string shorthand + richer object) without breaking existing tool files.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - One build cycle failed due a JSX wrapper mismatch after modal refactor.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When introducing new geometry fields, update all three layers in one pass: backend normalization, UI editor fields, and runtime visualizer application.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Mesh transform defaults are zeroed; CAD-origin-specific offsets/rotations should be measured and filled for each production tool mesh.
+
+### 2026-02-20 01:16 +11:00 - Mesh load diagnosis and J6-relative visual frame
+
+#### Task Summary
+
+- Diagnosed why TIG mesh is not showing and updated visual semantics so mesh transform is J6/flange-relative while TCP offset remains independent.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Earlier visualizer applied mesh transform under the TCP offset group, coupling mesh placement to tool-tip frame.
+- Detection:
+  - User requirement explicitly asked for mesh zero point at J6, not tool-tip.
+- Fix:
+  - Refactored visualizer hierarchy: J6/flange anchor root + TCP subgroup; mesh now applies transform on anchor root.
+- Preventive rule:
+  - Separate kinematic TCP transforms from visual mesh transforms in scene graph hierarchy to avoid frame-coupling regressions.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Mesh origin/zero should be relative to J6 anchor, and tool-tip offset semantics should remain separate.
+- How it changed execution:
+  - Updated UI labels/docs and runtime visualizer transform frame semantics accordingly.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Verifying on-disk tool folder contents (`tools/library/tig-torch-65deg`) quickly identified root cause: missing STL file for configured path.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When mesh fails to render, first validate `tool.json mesh.asset_path` against actual files in the tool folder before changing rendering code.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - TIG tool will keep showing fallback marker until `tool_mesh.stl` (or whichever file name is configured) is present in `tools/library/tig-torch-65deg/`.
+
+### 2026-02-20 01:19 +11:00 - Corrected TIG mesh file state
+
+#### Task Summary
+
+- Confirmed user was correct: `tool_mesh.stl` exists for TIG tool; prior “missing file” diagnosis became stale.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Reported mesh file missing based on earlier filesystem snapshot.
+- Detection:
+  - User escalation + direct `ls` verification showed file present in `tools/library/tig-torch-65deg/`.
+- Fix:
+  - Revalidated live disk state, ran `npm run sync:tool-assets`, and confirmed file copied into `web-ui/public/assets/tools/tig-torch-65deg/`.
+- Preventive rule:
+  - When user disputes file existence, re-check live filesystem immediately before asserting diagnostics.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Direct, accurate file-state checks over assumptions.
+- How it changed execution:
+  - Added immediate filesystem + sync verification pass and reported concrete paths.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Fast triage via `ls` on source folder + synced public folder + reading `index.json` confirms entire asset path chain.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Earlier absence check was outdated once file was added.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For asset-loading issues, always validate source file, synced public file, and generated asset index in one checklist.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Browser tab/dev server may need refresh/restart to pick up newly synced static assets.
+
+### 2026-02-20 01:32 +11:00 - Live tool apply (no restart) + UDP reset hardening
+
+#### Task Summary
+
+- Implemented live active-tool apply path and removed tool-only restart gating; fixed API UDP receive error handling that previously escalated controller restart churn into 500s.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Tool change flow was still restart-gated despite user requirement for operational hot-swap behavior.
+- Detection:
+  - User reported clicking Apply+Restart and called out that tool changes should not require controller restart.
+- Fix:
+  - Added controller command `SET_ACTIVE_TOOL` + API live-apply call on runtime-config patch; removed tool mismatch from restart predicate.
+- Preventive rule:
+  - Treat “hot-swappable runtime policy” fields separately from startup-only policy fields in restart calculations.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Active tool changes should apply immediately without restart.
+- How it changed execution:
+  - Runtime config patch now performs live tool apply and keeps restart requirement for robot/backend policy changes only.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Extending existing fake controller command harness in API tests (`patch_send`) made it straightforward to validate the live apply command and restart_required behavior.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For UDP controller calls in API paths, always guard both send and receive with socket error handling; never allow transport resets to bubble as uncaught exceptions.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Live tool apply currently waits for idle via existing blocking wait path; if future UX needs asynchronous/non-blocking apply queues, introduce explicit pending-state telemetry.
+
+### 2026-02-20 01:36 +11:00 - Ground plane pinned back to robot base
+
+#### Task Summary
+
+- Fixed a 3D visualizer regression where the floor reference no longer aligned with the robot's base after tool-visual integration changes.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Grounding used a box that could include active tool visuals, letting tool mesh origin/offset influence base-floor alignment.
+- Detection:
+  - User reported that the ground plane was no longer at the bottom of the robot.
+- Fix:
+  - Updated grounding path in `web-ui/src/ArmVisualizer.tsx` to temporarily hide `activeToolGroup` while computing base bounds.
+- Preventive rule:
+  - Never allow end-effector visual assets to participate in floor/base grounding calculations; ground from robot base geometry only.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Ground plane must remain anchored to the bottom of the robot base consistently.
+- How it changed execution:
+  - Added guardrails in grounding logic so tool visuals cannot perturb floor placement.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - A focused patch plus `npm run build` and lint check validated the fix quickly without touching unrelated planner/runtime paths.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For any scene-graph additions under wrist/tool links, re-check whether grounding/bounds logic should exclude those nodes.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If any specific robot still appears offset, inspect that robot CAD base mesh origin in the URDF asset bundle.
+
+### 2026-02-20 01:48 +11:00 - Hide fallback marker when real tool mesh is loaded
+
+#### Task Summary
+
+- Fixed duplicated/confusing tool visuals by stopping fallback TCP marker from rendering when the actual STL tool mesh loads successfully.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Fallback marker was always attached, even when the real tool mesh was present, creating a second "ghost tool" in scene.
+- Detection:
+  - User screenshot showed detached orange marker while blue TIG mesh was already loaded at the wrist.
+- Fix:
+  - Added `fallbackMarker` visibility logic in `web-ui/src/ArmVisualizer.tsx`:
+    - default hidden when mesh asset is configured,
+    - forced hidden on successful STL load,
+    - shown on load failure or unsupported mesh extension.
+- Preventive rule:
+  - Visual fallbacks should be conditional diagnostics, not always-on overlays when primary asset path succeeds.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - UI should not show confusing duplicate tool geometry after selecting/applying a tool.
+- How it changed execution:
+  - Implemented cleaner default visualization behavior that prioritizes the actual mesh once available.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Fast code-path isolation in `attachActiveToolVisual` + immediate build/lint cycle confirmed fix without touching runtime config APIs.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When adding visual fallback objects, explicitly define success/failure visibility transitions in async loader callbacks.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If calibration users want TCP marker always visible, gate it behind a user-controlled debug toggle.
+
+### 2026-02-20 01:51 +11:00 - J6-first anchor for tool mesh placement
+
+#### Task Summary
+
+- Fixed mesh placement frame selection so active tool visuals anchor to J6 joint first instead of being attached to arbitrary tool/wrist links.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Anchor resolution prioritized links containing `tool`/`wrist`, which can be offset from J6 and cause placement drift.
+- Detection:
+  - User reported STL placement still looked off after prior fixes.
+- Fix:
+  - Updated anchor order in `web-ui/src/ArmVisualizer.tsx` to: `joint6` -> flange link -> tool/wrist link -> robot root.
+- Preventive rule:
+  - When frame semantics are explicitly "J6-relative", always hard-prioritize `joint6` in scene graph anchor lookup.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Tool mesh placement must match intended J6-relative frame semantics in runtime visualization.
+- How it changed execution:
+  - Anchor lookup became deterministic and aligned with requested frame contract.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Minimal targeted edit + immediate `npm run build` and lint check quickly validated behavior and safety.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For any robot-agnostic link selection logic, define explicit semantic priority order before using fuzzy name matching.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - CAD mesh local origin may still require per-tool transform tuning via `mesh.position_mm`/`mesh.rotation_deg`.
+
+### 2026-02-20 01:56 +11:00 - Enforced joint6/child-frame anchoring and cleaned tool0 link
+
+#### Task Summary
+
+- Corrected `gradient-05` tool-frame handling by anchoring tool visuals to `joint6` semantics and removing invalid placeholder mesh geometry from `tool0` in URDF.
+
+#### Mistakes And Fixes
+
+- Source: `[tool]`
+- Mistake:
+  - URDF contained an invalid placeholder (`<mesh/>`) in `tool0` and visual anchoring logic still used fuzzy name-based fallbacks.
+- Detection:
+  - User flagged that `tool0` visual reference was not valid and tool placement must reference joint6.
+- Fix:
+  - Updated `web-ui/src/ArmVisualizer.tsx` to resolve J6 deterministically and prefer the child link of J6 as anchor frame.
+  - Updated `robots/gradient-05/gradient-05.urdf` `tool0` link to be frame-only with explanatory comment.
+- Preventive rule:
+  - For URDF frame links (tool/tcp), avoid placeholder geometry and keep frame semantics explicit in both URDF and scene-graph code.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Tool placement should be referenced to actual `joint6` transform contract in URDF, not inferred from potentially missing visual assets.
+- How it changed execution:
+  - Replaced fuzzy matching with deterministic joint-frame lookup and cleaned source URDF frame declaration.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Checking filesystem for missing `wrist.stl` and then aligning both URDF + visualizer in one pass removed ambiguity quickly.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Initial patch attempt on URDF failed due stale context; re-read exact local file block and patched successfully.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - When user cites URDF lines, re-read exact current block before patching to avoid context drift errors.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Final physical match still depends on per-tool mesh local origin and may require small tool-editor transform tuning.
+
+### 2026-02-20 02:02 +11:00 - Base-only floor grounding (never tool-driven)
+
+#### Task Summary
+
+- Reworked floor grounding math so the robot is grounded from base-link geometry only, preventing tool mesh offsets/origins from moving the floor level.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Prior grounding relied on `setFromObject(baseLink)` and temporary visibility toggles, which can still include descendants and let tool geometry influence `min.z`.
+- Detection:
+  - User reinforced non-negotiable rule: floor/ground plane must be at robot base, never where the tool is.
+- Fix:
+  - Added `computeGroundingBoxFromBase(...)` in `web-ui/src/ArmVisualizer.tsx` to compute bounds from base-link mesh geometry while stopping traversal at URDF joint nodes and excluding active-tool subtree.
+- Preventive rule:
+  - For grounding semantics, never use broad descendant bounds of articulated hierarchies; isolate base-frame geometry explicitly.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Floor/ground plane must always align to robot base and must never follow tool position/origin.
+- How it changed execution:
+  - Grounding computation now enforces a base-only geometry contract with explicit exclusions.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Immediate `npm run build` + `ReadLints` after the targeted patch validated correctness quickly without unrelated churn.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - The previous visibility-toggle strategy was insufficient because bounding expansion can still include hidden descendants depending on traversal behavior.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - If a user reports grounding drift, first audit which scene subtrees are included in bounds calculation before adjusting robot/tool transforms.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Robots with incorrect base CAD origin may still appear offset; fix belongs in robot base mesh/URDF frame definitions.
+
+### 2026-02-20 02:10 +11:00 - J6-only anchor contract for tool STL
+
+#### Task Summary
+
+- Tightened tool visual frame semantics so STL attachment is anchored to `joint6` frame first and offset values remain TCP-only.
+
+#### Mistakes And Fixes
+
+- Source: `[self]`
+- Mistake:
+  - Previous anchor logic preferred `joint6` child link, which can introduce ambiguity when users require strict J6 flange semantics.
+- Detection:
+  - User clarified non-negotiable requirement: tool STL origin is at J6 flange/J6 location (`gradient-05.urdf` joint6 frame).
+- Fix:
+  - Updated `web-ui/src/ArmVisualizer.tsx` anchor resolution to use `joint6` directly (fallback only if unresolved), and added runtime warning on fallback usage.
+- Preventive rule:
+  - When user specifies an exact URDF joint frame contract, anchor visuals to that joint object explicitly rather than descendant links.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Tool mesh origin must stay at J6 flange location; tool offset values are for TCP semantics and should not shift STL origin.
+- How it changed execution:
+  - Added explicit code comment/behavior split: `offset.*` affects TCP frame only; mesh stays in J6 frame.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Reading exact URDF/tool JSON lines first and then doing a targeted anchor patch kept the fix small and deterministic.
+  - Verifying against live API on the actual port (`:4000`) exposed stale active-tool offsets and confirmed live re-apply behavior.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Initial API checks against wrong ports (`:8001`, `:8000`) failed/misled validation; controller API in this session is served on `:4000`.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For tool-frame regressions, verify three layers in order: URDF joint frame, visualizer anchor frame, then tool JSON offset/mesh splits.
+  - Before concluding an offset mismatch, compare `/tools/library` vs `/info/runtime-config`; active runtime may be stale until `active_tool_id` is re-applied.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - If visual mismatch persists after this patch, inspect STL local CAD origin/orientation (mesh authoring), not runtime offset math.
+  - `GET /kinematics/profile` currently hits WinError 10040 (UDP payload size path), so runtime offset verification should use `/info/runtime-config` until that transport issue is fixed.
+
+### 2026-02-20 02:25 +11:00 - User-corrected J6 URDF origin accepted
+
+#### Task Summary
+
+- Incorporated user-corrected `joint6` URDF origin for `gradient-05` and synced web robot assets so tool/flange frame visualization follows the corrected transform.
+
+#### Mistakes And Fixes
+
+- Source: `[user]`
+- Mistake:
+  - Previous `joint6` origin values in URDF were incorrect for this robot build.
+- Detection:
+  - User supplied corrected `gradient-05.urdf` joint block values directly.
+- Fix:
+  - Confirmed `joint6` now uses `<origin xyz="0.0933 0.0478830 0" ...>` and synced web robot assets (`npm run sync:robot-assets`).
+- Preventive rule:
+  - Treat user-provided calibrated URDF joint origins as source-of-truth over prior assumptions/log history.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - J6/tool0 frame alignment must reflect corrected URDF values exactly.
+- How it changed execution:
+  - No transform reinterpretation added; runtime now consumes corrected URDF directly.
+
+#### What Worked
+
+- Source: `[tool]`
+- Pattern/check that worked:
+  - Fast verify + asset sync loop avoids unnecessary code churn when correction is data-only (URDF).
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - N/A for this task.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - After URDF frame edits, always run `npm run sync:robot-assets` before judging visualizer alignment.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Browser cache/dev session can mask updated robot bundles; use hard refresh/restart if old frame persists.
+
+### 2026-02-20 02:43 +11:00 - Tangent-roll weld orientation implemented end-to-end
+
+#### Task Summary
+
+- Implemented a third weld angle (`tangent_roll_deg`) that rotates torch orientation about the per-step path tangent and wired it through planner/API/UI/save-load + tests.
+
+#### Mistakes And Fixes
+
+- Source: `[tool]`
+- Mistake:
+  - Attempted `pytest ...` directly in PowerShell before confirming command availability in this environment.
+- Detection:
+  - Shell returned `pytest : The term 'pytest' is not recognized...`.
+- Fix:
+  - Re-ran tests via repo venv interpreter: `.\.venv\Scripts\python -m pytest ...`.
+- Preventive rule:
+  - On Windows sessions in this repo, default to `.\.venv\Scripts\python -m pytest` unless `pytest` command availability is already confirmed.
+
+#### User Preferences
+
+- Source: `[user]`
+- New or reinforced preference:
+  - Add real implementation changes (not just explanation), and support exact weld orientation control with tangent-relative behavior.
+- How it changed execution:
+  - Implemented planner math + API/UI contract + persistence + tests in one pass, rather than limiting to conceptual guidance.
+
+#### What Worked
+
+- Source: `[self]`
+- Pattern/check that worked:
+  - Reusing existing `_rotate_about_axis(...)` with tangent (`forward`) axis kept the orientation change minimal and robust.
+  - Normalizing option names at API boundary (`tangentRollDeg` -> `tangent_roll_deg`) prevented UI/backend mismatch.
+  - Capturing `orientations_list` in a monkeypatched planner test verified actual orientation delta for nonzero tangent roll.
+
+#### What Did Not Work
+
+- Source: `[tool]`
+- Failed attempt and why:
+  - Running plain `pytest` failed due PATH/environment mismatch in PowerShell.
+
+#### Guardrails For Next Session
+
+- Preflight rule:
+  - For new weld angle parameters, update all four layers together: UI draft type + API normalization + planner option parse + persistence (weld program save/load).
+  - Validate both default-backward compatibility (`0.0`) and nonzero behavior through tests before handoff.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check:
+  - Operator ergonomics may still prefer inverted sign direction for tangent roll; if requested, invert in UI input mapping while keeping planner right-hand-rule internal semantics stable.

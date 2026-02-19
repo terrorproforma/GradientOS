@@ -26,6 +26,11 @@ from ..cad.topology_service import (
     TopologyDependencyError,
     TopologyModelNotFoundError,
 )
+from ..kinematics import runtime as kinematics_runtime
+from .. import robot_assets
+from .. import runtime_config
+from .. import tool_library
+from ..arm_controller.robots import get_robot_name_by_id, list_robot_metadata
 
 try:
     from ..arm_controller import utils as controller_utils
@@ -94,6 +99,8 @@ def _send_controller_command(
             data, _addr = sock.recvfrom(1024)
         except socket.timeout:
             return False, f"No response for command '{message}'"
+        except OSError as exc:
+            return False, f"Socket receive error for '{message}': {exc}"
     text = data.decode("utf-8", errors="ignore")
     if text.startswith("ERROR"):
         return False, text
@@ -397,6 +404,136 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail=detail)
         return detail
 
+    def _encode_payload_b64(payload: dict[str, Any]) -> str:
+        body = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        return base64.urlsafe_b64encode(body).decode("ascii")
+
+    def _parse_kinematics_error(detail: str) -> HTTPException:
+        if detail.startswith("ERROR,KINEMATICS,"):
+            parts = detail.split(",", 3)
+            code = parts[2] if len(parts) > 2 else "UNKNOWN"
+            message = parts[3] if len(parts) > 3 else detail
+            status_map = {
+                "STALE_REVISION": 409,
+                "MOTION_ACTIVE": 409,
+                "APPLY_REQUIRES_RESTART": 409,
+                "INVALID_PAYLOAD": 400,
+                "PROFILE_INVALID": 400,
+                "INTERNAL": 500,
+            }
+            return HTTPException(
+                status_code=status_map.get(code, 400),
+                detail={"code": code, "message": message},
+            )
+        return HTTPException(status_code=503, detail=detail)
+
+    def _controller_kinematics_call(command: str, timeout: float = 2.0) -> dict[str, Any]:
+        ok, detail = _send_controller_command(command, timeout=timeout, expect_response=True)
+        if not ok:
+            raise _parse_kinematics_error(detail)
+
+        if detail.startswith("KINEMATICS_PROFILE,"):
+            payload_json = detail[len("KINEMATICS_PROFILE,") :]
+        elif detail.startswith("KINEMATICS_OK,"):
+            payload_json = detail[len("KINEMATICS_OK,") :]
+        else:
+            raise HTTPException(status_code=502, detail=f"Malformed kinematics reply: {detail}")
+
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail=f"Kinematics payload decode failure: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="Kinematics payload must be a JSON object.")
+        return payload
+
+    def _controller_runtime_config_call(timeout: float = 2.0) -> dict[str, Any]:
+        ok, detail = _send_controller_command(
+            "GET_RUNTIME_CONFIG",
+            timeout=timeout,
+            expect_response=True,
+        )
+        if not ok:
+            raise HTTPException(status_code=503, detail=detail)
+        if detail.startswith("ERROR,RUNTIME_CONFIG,"):
+            message = detail.split(",", 2)[-1]
+            raise HTTPException(status_code=503, detail=message)
+        if not detail.startswith("RUNTIME_CONFIG,"):
+            raise HTTPException(status_code=502, detail=f"Malformed runtime-config reply: {detail}")
+        payload_json = detail[len("RUNTIME_CONFIG,") :]
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=502, detail=f"Runtime-config decode failure: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="Runtime-config payload must be a JSON object.")
+        return payload
+
+    def _controller_set_active_tool_call(tool_id: str | None, timeout: float = 2.0) -> str:
+        tool_token = str(tool_id).strip() if tool_id is not None else ""
+        ok, detail = _send_controller_command(
+            f"SET_ACTIVE_TOOL,{tool_token}",
+            timeout=timeout,
+            expect_response=True,
+        )
+        if not ok:
+            raise HTTPException(status_code=503, detail=detail)
+        if detail.startswith("ERROR,SET_ACTIVE_TOOL,"):
+            message = detail.split(",", 2)[-1]
+            raise HTTPException(status_code=503, detail=message)
+        if not detail.startswith("ACK,SET_ACTIVE_TOOL,"):
+            raise HTTPException(status_code=502, detail=f"Malformed set-active-tool reply: {detail}")
+        return detail
+
+    def _sync_local_planner_runtime(timeout: float = 1.0) -> dict[str, Any]:
+        """
+        Keep API-process planner modules aligned with the active controller runtime.
+
+        Weld/preview planning currently executes in-process through arm_controller
+        modules, so we must mirror the controller's active robot + IK backend.
+        """
+        runtime_payload = _controller_runtime_config_call(timeout=timeout)
+        robot_block = runtime_payload.get("robot")
+        ik_block = runtime_payload.get("ik_solver")
+        tool_block = runtime_payload.get("tool")
+        if not isinstance(robot_block, dict) or not isinstance(ik_block, dict):
+            raise RuntimeError("Controller runtime config payload missing robot/ik_solver blocks.")
+
+        robot_name = str(robot_block.get("name", "")).strip()
+        ik_backend = str(ik_block.get("effective_backend", "")).strip().lower()
+        if not robot_name:
+            raise RuntimeError("Controller runtime config did not include robot.name.")
+        if not ik_backend:
+            raise RuntimeError("Controller runtime config did not include ik_solver.effective_backend.")
+
+        from ..arm_controller import robot_config as controller_robot_config
+        from ..arm_controller.robots import get_robot_config
+        from .. import ik_solver as api_ik_solver
+
+        robot_cfg = get_robot_config(robot_name)
+        controller_robot_config.set_active_robot(robot_cfg)
+        api_ik_solver.configure(robot_id=robot_cfg.robot_id, backend_name=ik_backend)
+        if isinstance(tool_block, dict):
+            try:
+                kinematics_runtime.set_active_tool_definition(
+                    tool_block,
+                    expected_revision=None,
+                    motion_state="IDLE",
+                    reset_runtime_trim=True,
+                )
+            except Exception:
+                pass
+        return {
+            "robot_name": robot_name,
+            "robot_id": robot_cfg.robot_id,
+            "ik_backend": ik_backend,
+            "active_tool_id": (
+                str(tool_block.get("active_tool_id"))
+                if isinstance(tool_block, dict) and tool_block.get("active_tool_id")
+                else None
+            ),
+        }
+
     def _parse_bool_token(token: str) -> bool:
         return token.strip().lower() in {"1", "true", "yes", "on"}
 
@@ -406,6 +543,29 @@ def create_app() -> FastAPI:
             _controller_call_or_503, "STOP", timeout=1.0, expect_response=True
         )
         return {"status": "ok", "detail": detail}
+
+    @api.post(
+        "/control/restart-controller",
+        summary="Request graceful controller restart (external supervisor should restart process)",
+    )
+    async def control_restart_controller(payload: dict[str, Any] | None = None):
+        reason = "api-request"
+        if isinstance(payload, dict) and "reason" in payload:
+            raw_reason = str(payload.get("reason", "")).strip()
+            if raw_reason:
+                reason = raw_reason.replace(",", ";")[:120]
+        detail = await run_in_threadpool(
+            _controller_call_or_503,
+            f"REQUEST_RESTART,{reason}",
+            timeout=2.0,
+            expect_response=True,
+        )
+        return {
+            "status": "ok",
+            "detail": detail,
+            "restart_requested": True,
+            "reason": reason,
+        }
 
     @api.post("/control/wait-for-idle", summary="Block until motion completes")
     async def control_wait_for_idle():
@@ -560,6 +720,184 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=f"Malformed status reply: {detail}")
         return {"gripper_present": _parse_bool_token(parts[2])}
 
+    @api.get("/info/robots", summary="Available robot policies for selection")
+    async def info_robots():
+        default_robot_id = robot_assets.get_default_robot_id()
+        return {
+            "default_robot_id": default_robot_id,
+            "default_robot_name": get_robot_name_by_id(default_robot_id),
+            "robots": list_robot_metadata(),
+            "runtime_config_path": runtime_config.get_runtime_config_path(),
+            "tool_library_path": tool_library.get_tool_library_path(),
+        }
+
+    @api.get("/tools/library", summary="List tool library entries with optional filtering")
+    async def tools_library_list(
+        robot_id: str | None = None,
+        tool_type: str | None = None,
+        q: str | None = None,
+    ):
+        try:
+            tools = tool_library.list_tools(
+                robot_id=robot_id.strip() if isinstance(robot_id, str) and robot_id.strip() else None,
+                tool_type=tool_type.strip() if isinstance(tool_type, str) and tool_type.strip() else None,
+                query=q,
+            )
+            library = tool_library.load_tool_library()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "tools": tools,
+            "default_tool_id": library.get("default_tool_id"),
+            "meta": library.get("meta", {}),
+            "tool_library_path": tool_library.get_tool_library_path(),
+        }
+
+    @api.get("/tools/library/{tool_id}", summary="Get one tool definition")
+    async def tools_library_get(tool_id: str):
+        try:
+            return tool_library.get_tool(tool_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @api.post("/tools/library", summary="Create a new tool definition")
+    async def tools_library_create(payload: dict[str, Any]):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body required.")
+        actor = str(payload.get("actor", "api")).strip() or "api"
+        tool_payload = payload.get("tool")
+        if not isinstance(tool_payload, dict):
+            raise HTTPException(status_code=400, detail="Field 'tool' is required and must be an object.")
+        try:
+            tool_id = str(tool_payload.get("tool_id", "")).strip()
+            if not tool_id:
+                raise ValueError("Field 'tool.tool_id' is required.")
+            existing = None
+            try:
+                existing = tool_library.get_tool(tool_id)
+            except ValueError:
+                existing = None
+            if existing is not None:
+                raise HTTPException(status_code=409, detail=f"Tool '{tool_id}' already exists.")
+            saved = tool_library.upsert_tool(tool_payload, actor=actor)
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "status": "ok",
+            "tool": tool_library.get_tool(str(tool_payload.get("tool_id"))),
+            "default_tool_id": saved.get("default_tool_id"),
+            "meta": saved.get("meta", {}),
+        }
+
+    @api.patch("/tools/library/{tool_id}", summary="Update a tool definition")
+    async def tools_library_update(tool_id: str, payload: dict[str, Any]):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body required.")
+        actor = str(payload.get("actor", "api")).strip() or "api"
+        patch_tool = payload.get("tool")
+        if not isinstance(patch_tool, dict):
+            raise HTTPException(status_code=400, detail="Field 'tool' is required and must be an object.")
+        try:
+            current = tool_library.get_tool(tool_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        merged = dict(current)
+        merged.update(patch_tool)
+        merged["tool_id"] = current.get("tool_id")
+        try:
+            saved = tool_library.upsert_tool(merged, actor=actor)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "status": "ok",
+            "tool": tool_library.get_tool(str(current.get("tool_id"))),
+            "default_tool_id": saved.get("default_tool_id"),
+            "meta": saved.get("meta", {}),
+        }
+
+    @api.delete("/tools/library/{tool_id}", summary="Delete a tool definition")
+    async def tools_library_delete(tool_id: str, actor: str = "api"):
+        try:
+            saved = tool_library.delete_tool(tool_id, actor=actor)
+        except ValueError as exc:
+            message = str(exc)
+            status_code = 404 if "Unknown tool_id" in message else 400
+            raise HTTPException(status_code=status_code, detail=message) from exc
+        return {
+            "status": "ok",
+            "deleted_tool_id": tool_id,
+            "default_tool_id": saved.get("default_tool_id"),
+            "meta": saved.get("meta", {}),
+        }
+
+    @api.get("/info/runtime-config", summary="Active vs desired runtime config with restart-required flag")
+    async def info_runtime_config():
+        desired_config = runtime_config.load_runtime_config()
+        active_runtime: dict[str, Any] | None = None
+        active_error: str | None = None
+        try:
+            active_runtime = await run_in_threadpool(_controller_runtime_config_call, 2.0)
+        except HTTPException as exc:
+            active_error = str(exc.detail)
+
+        restart_required = runtime_config.compute_restart_required(
+            active_runtime=active_runtime,
+            desired_config=desired_config,
+        )
+        return {
+            "active": active_runtime,
+            "active_error": active_error,
+            "desired": desired_config.get("desired", {}),
+            "meta": desired_config.get("meta", {}),
+            "restart_required": restart_required,
+            "runtime_config_path": runtime_config.get_runtime_config_path(),
+        }
+
+    @api.patch("/info/runtime-config", summary="Stage desired runtime config (tool applies live; robot/backend changes require restart)")
+    async def patch_runtime_config(payload: dict[str, Any]):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body required.")
+        actor_raw = payload.get("actor", "api")
+        actor = str(actor_raw).strip() if str(actor_raw).strip() else "api"
+        try:
+            updated = runtime_config.update_runtime_config_desired(payload, actor=actor)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        active_error: str | None = None
+        if "active_tool_id" in payload:
+            try:
+                await run_in_threadpool(
+                    _controller_set_active_tool_call,
+                    payload.get("active_tool_id"),
+                    2.0,
+                )
+            except HTTPException as exc:
+                active_error = f"Live tool apply failed: {exc.detail}"
+
+        active_runtime: dict[str, Any] | None = None
+        try:
+            active_runtime = await run_in_threadpool(_controller_runtime_config_call, 2.0)
+        except HTTPException as exc:
+            runtime_error = str(exc.detail)
+            active_error = f"{active_error} | {runtime_error}" if active_error else runtime_error
+
+        restart_required = runtime_config.compute_restart_required(
+            active_runtime=active_runtime,
+            desired_config=updated,
+        )
+        return {
+            "status": "ok",
+            "active": active_runtime,
+            "active_error": active_error,
+            "desired": updated.get("desired", {}),
+            "meta": updated.get("meta", {}),
+            "restart_required": restart_required,
+            "runtime_config_path": runtime_config.get_runtime_config_path(),
+        }
+
     @api.get("/info/pose", summary="Current tool pose and joint angles")
     async def info_pose():
         detail = await run_in_threadpool(_controller_call_or_503, "GET_POSITION", timeout=1.0)
@@ -650,6 +988,102 @@ def create_app() -> FastAPI:
                 position_int = None
             payload.append({"servo_id": servo_id_int, "raw_position": position_int})
         return {"servos": payload}
+
+    @api.get("/kinematics/profile", summary="Active kinematics profile and runtime offsets")
+    async def kinematics_profile():
+        payload = await run_in_threadpool(_controller_kinematics_call, "GET_KINEMATICS_PROFILE")
+        return payload
+
+    @api.patch("/kinematics/runtime-offsets", summary="Patch runtime TCP/base offsets with CAS revision")
+    async def kinematics_patch_runtime_offsets(payload: dict[str, Any]):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body required.")
+        expected_revision_raw = payload.get("expected_revision")
+        if expected_revision_raw is None:
+            expected_revision_token = ""
+            expected_revision = None
+        else:
+            try:
+                expected_revision = int(expected_revision_raw)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expected_revision must be an integer.")
+            expected_revision_token = str(expected_revision)
+
+        patch_payload: dict[str, Any] = {}
+        if "base" in payload:
+            patch_payload["base"] = payload["base"]
+        if "tool" in payload:
+            patch_payload["tool"] = payload["tool"]
+        if not patch_payload:
+            raise HTTPException(status_code=400, detail="Body must include 'base' and/or 'tool'.")
+
+        encoded = _encode_payload_b64(patch_payload)
+        command = f"PATCH_RUNTIME_OFFSETS,{expected_revision_token},{encoded}"
+        state = await run_in_threadpool(_controller_kinematics_call, command, 2.0)
+
+        # Keep API-local planning process aligned when controller and API are separate.
+        try:
+            kinematics_runtime.patch_runtime_offsets(
+                patch_payload,
+                expected_revision=None,
+                motion_state="IDLE",
+            )
+        except Exception:
+            pass
+        return state
+
+    @api.post("/kinematics/runtime-offsets/reset", summary="Reset runtime TCP/base offsets")
+    async def kinematics_reset_runtime_offsets(payload: dict[str, Any] | None = None):
+        expected_revision = None
+        expected_revision_token = ""
+        if isinstance(payload, dict) and "expected_revision" in payload:
+            try:
+                expected_revision = int(payload.get("expected_revision"))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expected_revision must be an integer.")
+            expected_revision_token = str(expected_revision)
+        command = f"RESET_RUNTIME_OFFSETS,{expected_revision_token}"
+        state = await run_in_threadpool(_controller_kinematics_call, command, 2.0)
+        try:
+            kinematics_runtime.reset_runtime_offsets(
+                expected_revision=None,
+                motion_state="IDLE",
+            )
+        except Exception:
+            pass
+        return state
+
+    @api.post("/kinematics/profile/apply", summary="Apply a kinematics profile revision")
+    async def kinematics_apply_profile(payload: dict[str, Any]):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body required.")
+        profile_payload = payload.get("profile")
+        if not isinstance(profile_payload, dict):
+            raise HTTPException(status_code=400, detail="Field 'profile' is required and must be an object.")
+        expected_revision_raw = payload.get("expected_revision")
+        if expected_revision_raw is None:
+            expected_revision_token = ""
+            expected_revision = None
+        else:
+            try:
+                expected_revision = int(expected_revision_raw)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="expected_revision must be an integer.")
+            expected_revision_token = str(expected_revision)
+        encoded = _encode_payload_b64(profile_payload)
+        command = f"APPLY_KINEMATICS_PROFILE,{expected_revision_token},{encoded}"
+        state = await run_in_threadpool(_controller_kinematics_call, command, 2.0)
+        try:
+            backend_name = os.environ.get("MINI_ARM_SOLVER", "ikfast").strip().lower()
+            kinematics_runtime.apply_profile_payload(
+                profile_payload,
+                expected_revision=None,
+                motion_state="IDLE",
+                backend_name=backend_name,
+            )
+        except Exception:
+            pass
+        return state
 
     @api.get("/monitor", summary="Subscribe to controller telemetry stream")
     async def monitor():
@@ -813,6 +1247,9 @@ def create_app() -> FastAPI:
             "weldName": str(weld_draft_raw.get("weldName", weld_draft_raw.get("weld_name", f"{active_weld_type} weld"))).strip() or f"{active_weld_type} weld",
             "workAngleDeg": float(weld_draft_raw.get("workAngleDeg", weld_draft_raw.get("work_angle_deg", 45.0))),
             "travelAngleDeg": float(weld_draft_raw.get("travelAngleDeg", weld_draft_raw.get("travel_angle_deg", 0.0))),
+            "tangentRollDeg": float(
+                weld_draft_raw.get("tangentRollDeg", weld_draft_raw.get("tangent_roll_deg", 0.0))
+            ),
             "transitionClearanceMm": float(
                 weld_draft_raw.get("transitionClearanceMm", weld_draft_raw.get("transition_clearance_mm", 35.0))
             ),
@@ -976,6 +1413,13 @@ def create_app() -> FastAPI:
             if post_action_raw == "none"
             else ("lift" if post_action_raw == "lift" else "return_to_start")
         )
+        try:
+            tangent_roll_deg = float(
+                weld_options.get("tangent_roll_deg", weld_options.get("tangentRollDeg", 0.0))
+            )
+        except Exception:
+            tangent_roll_deg = 0.0
+        weld_options["tangent_roll_deg"] = tangent_roll_deg
 
         if sections:
             weld_points = [
@@ -1019,6 +1463,7 @@ def create_app() -> FastAPI:
         }
 
         def _plan():
+            _sync_local_planner_runtime(timeout=1.0)
             live_joints = _get_live_joint_angles_from_controller(timeout=1.0)
             if controller_utils is not None:
                 controller_utils.current_logical_joint_angles_rad = list(live_joints)

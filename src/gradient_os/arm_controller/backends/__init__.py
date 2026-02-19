@@ -109,7 +109,7 @@ registry.register_backend_class(
 registry.register_backend_class(
     name="simulation",
     factory=_create_simulation_backend,
-    config_module_path=None,  # Simulation uses feetech config as fallback
+    config_module_path="gradient_os.arm_controller.backends.simulation.config",
 )
 
 # EtherCAT RTCore proxy backend

@@ -50,6 +50,17 @@ class RobotConfig(ABC):
     
     @property
     @abstractmethod
+    def robot_id(self) -> str:
+        """
+        Stable robot asset identifier used for model/kinematics lookup.
+
+        Returns:
+            str: Robot asset ID (e.g., "mini-6dof-arm")
+        """
+        pass
+
+    @property
+    @abstractmethod
     def name(self) -> str:
         """
         Human-readable name of the robot.
@@ -206,6 +217,21 @@ class RobotConfig(ABC):
         
         Returns:
             str: Backend name (e.g., "feetech", "dynamixel")
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def default_ik_solver_backend(self) -> str:
+        """
+        The default IK solver backend for this robot.
+
+        This policy is the source of truth for solver selection in normal
+        operation. Development overrides may supersede it only when explicitly
+        enabled.
+
+        Returns:
+            str: Backend name (e.g., "ikfast", "numeric")
         """
         pass
     
@@ -541,6 +567,7 @@ class RobotConfig(ABC):
             dict: Configuration dictionary
         """
         return {
+            'robot_id': self.robot_id,
             'name': self.name,
             'version': self.version,
             'num_logical_joints': self.num_logical_joints,
@@ -560,6 +587,7 @@ class RobotConfig(ABC):
             'default_serial_port': self.default_serial_port,
             'actuator_pid_gains': self.actuator_pid_gains,
             'default_servo_backend': self.default_servo_backend,
+            'default_ik_solver_backend': self.default_ik_solver_backend,
         }
     
     def get_actuator_config_index(self, actuator_id: int) -> Optional[int]:

@@ -9,6 +9,7 @@ The app provides:
 - trajectory preview and execution controls
 - STEP topology loading and weld planning tools
 - Program Tree inspection/editing for planned motion
+- global Tool Library management (create/save/select end effectors)
 
 ## Prerequisites
 
@@ -28,11 +29,15 @@ npm install
 - `npm run dev` - start Vite dev server (default port `8000`)
 - `npm run build` - production build
 - `npm run preview` - serve the production build locally
+- `npm run sync:assets` - sync robot and tool assets into `public/assets`
+- `npm run sync:robot-assets` - sync robot URDF/mesh assets
+- `npm run sync:tool-assets` - sync tool mesh assets
 
 ## Run (Local)
 
 1. Start backend services from repo root:
    - `./run-sim.sh` and `./run-api.sh` (or PowerShell `.ps1` variants)
+   - These launchers now bootstrap the repo environment first (`start.sh` semantics on bash, `.venv\Scripts\Activate.ps1` on PowerShell) before starting Python modules.
 2. Start UI:
 
 ```bash
@@ -63,6 +68,18 @@ npm run dev
 - per-segment weld configuration
 - work/travel angles and transition clearance
 - post-actions (`none`, `lift`, `return_to_start`)
+- work/travel inputs interpreted as desired torch angles, compensated by active tool definition
+
+### Tool Library
+
+- filter tools by robot compatibility, tool type, and keyword
+- create/update/delete tool definitions (XYZ mm + RPY deg)
+- stage desired active tool in runtime policy and apply on controller restart
+- optional STL mesh preview in the visualizer (fallback marker is shown when no mesh is provided)
+- tools are auto-discovered from `tools/library/<tool_id>/tool.json` with per-tool local asset files
+- quick load/select flow is available directly in the left sidebar `Tool Library` drawer
+- full tool parameter editing is isolated under the `Tool Library` tab in Settings
+- mesh placement can be defined separately from TCP (`mesh.position_mm` + `mesh.rotation_deg`, relative to J6/flange anchor) to decouple visual mesh origin from tool-tip offset
 
 ### Program Tree
 

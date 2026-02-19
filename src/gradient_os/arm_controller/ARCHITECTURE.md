@@ -132,6 +132,17 @@ arm_controller/
 └── pid_tuner.py                 # PID tuning utilities
 ```
 
+Repository-level robot assets (outside Python package):
+
+```
+robots/
+└── <robot_id>/
+    ├── robot.json               # Canonical manifest (URDF, DH CSV, web assets)
+    ├── mini-6dof-arm.urdf
+    ├── dh_params.csv
+    └── ...                      # model-local files (meshes, docs, tools)
+```
+
 ## ActuatorBackend Interface
 
 The complete interface that all servo backends must implement:
@@ -226,6 +237,10 @@ class RobotConfig(ABC):
     """Abstract interface for robot-specific configuration."""
     
     # --- Identity ---
+    @property
+    @abstractmethod
+    def robot_id(self) -> str: ...
+
     @property
     @abstractmethod
     def name(self) -> str: ...
@@ -328,11 +343,19 @@ class RobotConfig(ABC):
 
 ## Adding a New Robot
 
-1. Create `robots/my_robot/config.py`:
+1. Create a robot asset bundle under the repo-level catalog:
+   - `robots/my_robot/robot.json`
+   - include model files referenced by the manifest (URDF, DH CSV, optional meshes/docs)
+
+2. Create controller config `arm_controller/robots/my_robot/config.py`:
    ```python
    from ..base import RobotConfig
    
    class MyRobotConfig(RobotConfig):
+       @property
+       def robot_id(self) -> str:
+           return "my_robot"
+
        @property
        def name(self) -> str:
            return "My Robot"
@@ -344,13 +367,13 @@ class RobotConfig(ABC):
        # ... implement all abstract properties
    ```
 
-2. Register in `robots/__init__.py`:
+3. Register in `robots/__init__.py`:
    ```python
    from .my_robot.config import MyRobotConfig
    register_robot("my_robot", MyRobotConfig)
    ```
 
-3. Use: `python -m gradient_os.run_controller --robot my_robot`
+4. Use: `python -m gradient_os.run_controller --robot my_robot`
 
 ## Adding a New Servo Backend
 

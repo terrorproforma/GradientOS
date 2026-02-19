@@ -8,8 +8,10 @@ This keeps 100 % of the heavy lifting inside the highly-optimised C++
 code while presenting a clean, dependency-free (no ROS) Python surface.
 """
 
+import json
 import numpy as np
 from scipy.spatial.transform import Rotation
+from gradient_os import robot_assets
 
 # ---------------------------------------------------------------------------
 # PyQuIK binding helper – build Robot + IKSolver exactly once
@@ -35,27 +37,102 @@ except ImportError as e:  # pragma: no cover – dev machines may lack the .so
         pyquik = _PyQuikMock()  # type: ignore
 
 
-_NUMERIC_ROBOT = None   # pyquik.Robot instance (cached)
-_NUMERIC_IKSOLVER = None  # pyquik.IKSolver instance (cached)
+_NUMERIC_CACHE: dict[str, tuple[object, object]] = {}
+_ACTIVE_ROBOT_ID: str = robot_assets.get_active_robot_id()
 
 
-def _ensure_loaded(dh_csv_path: str):
-    """Internal helper – lazily load Robot & IKSolver (idempotent)."""
-    global _NUMERIC_ROBOT, _NUMERIC_IKSOLVER
+class _NumericIKAdapter:
+    """Adapter that normalizes pyquik solver API to expected project API."""
 
-    if _NUMERIC_ROBOT is not None:
-        return _NUMERIC_ROBOT, _NUMERIC_IKSOLVER
+    def __init__(self, robot, solver):
+        self.R = robot
+        self._solver = solver
 
-    # ------------------------------------------------------------------
-    # 1. Load DH parameters from CSV (identical format to test_numeric.py)
-    # ------------------------------------------------------------------
-    # Resolve relative path from project root if needed
-    from pathlib import Path
-    dh_path_obj = Path(dh_csv_path)
-    if not dh_path_obj.is_file():
-        dh_path_obj = Path(__file__).resolve().parents[2] / dh_csv_path
-    if not dh_path_obj.is_file():
-        raise FileNotFoundError(f"DH CSV not found at {dh_csv_path} or {dh_path_obj}")
+    def ik(self, quat: np.ndarray, pos: np.ndarray, seed: np.ndarray):
+        q_vec, e_vec, iters, br = self._solver.solve(quat, pos, seed)
+        return np.asarray(q_vec, dtype=float), np.asarray(e_vec, dtype=float), int(iters), int(br)
+
+    def solve_ik_path(self, poses_batch: np.ndarray, initial_joint_angles: np.ndarray):
+        out = []
+        q_seed = np.asarray(initial_joint_angles, dtype=float)
+        for pose in poses_batch:
+            px, py_, pz, *rot_flat = pose
+            rot_m = np.array(rot_flat, dtype=float).reshape(3, 3)
+            quat = Rotation.from_matrix(rot_m).as_quat()
+            q, _, _, _ = self.ik(quat, np.array([px, py_, pz], dtype=float), q_seed)
+            if q is None:
+                return None
+            out.append(q)
+            q_seed = q
+        return np.vstack(out)
+
+
+def _parse_matrix4(value, field_name: str, manifest_path: str) -> np.ndarray:
+    """Parse 4x4 matrix from nested list or flat 16-list."""
+    if isinstance(value, list):
+        # Flat 16 values
+        if len(value) == 16 and all(isinstance(v, (int, float)) for v in value):
+            return np.array(value, dtype=float).reshape(4, 4)
+        # Nested 4x4
+        if len(value) == 4 and all(isinstance(row, list) and len(row) == 4 for row in value):
+            flat = [v for row in value for v in row]
+            if all(isinstance(v, (int, float)) for v in flat):
+                return np.array(flat, dtype=float).reshape(4, 4)
+    raise ValueError(
+        f"Invalid numeric.{field_name} in {manifest_path}. "
+        "Expected 16-number flat list or 4x4 nested list."
+    )
+
+
+def _load_numeric_overrides(robot_id: str, dof: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load optional numeric solver frame/sign overrides from robot manifest."""
+    manifest = robot_assets.get_robot_manifest(robot_id)
+    with manifest.manifest_path.open("r", encoding="utf-8") as f:
+        manifest_data = json.load(f)
+
+    numeric_cfg = manifest_data.get("numeric", {})
+    if not isinstance(numeric_cfg, dict):
+        raise ValueError(f"Field 'numeric' must be an object in {manifest.manifest_path}")
+
+    tbase = np.eye(4, dtype=float)
+    ttool = np.eye(4, dtype=float)
+    q_sign = np.ones(dof, dtype=float)
+
+    if "tbase" in numeric_cfg:
+        tbase = _parse_matrix4(numeric_cfg["tbase"], "tbase", str(manifest.manifest_path))
+    if "ttool" in numeric_cfg:
+        ttool = _parse_matrix4(numeric_cfg["ttool"], "ttool", str(manifest.manifest_path))
+    if "q_sign" in numeric_cfg:
+        q_list = numeric_cfg["q_sign"]
+        if not isinstance(q_list, list) or len(q_list) != dof or not all(isinstance(v, (int, float)) for v in q_list):
+            raise ValueError(
+                f"Invalid numeric.q_sign in {manifest.manifest_path}. "
+                f"Expected list of {dof} numeric values."
+            )
+        q_sign = np.array(q_list, dtype=float)
+
+    return tbase, ttool, q_sign
+
+
+def set_robot_id(robot_id: str) -> None:
+    """Set active robot for numeric solver path resolution."""
+    global _ACTIVE_ROBOT_ID
+    robot_assets.get_robot_manifest(robot_id)  # fail loudly on invalid IDs
+    _ACTIVE_ROBOT_ID = robot_id
+
+
+def _resolve_robot_id(robot_id: str | None = None) -> str:
+    return robot_id if robot_id is not None else _ACTIVE_ROBOT_ID
+
+
+def _ensure_loaded(robot_id: str | None = None):
+    """Internal helper – lazily load Robot & IKSolver (idempotent by robot ID)."""
+    resolved_robot_id = _resolve_robot_id(robot_id)
+    cached = _NUMERIC_CACHE.get(resolved_robot_id)
+    if cached is not None:
+        return cached
+
+    dh_path_obj = robot_assets.get_dh_csv_path(resolved_robot_id)
 
     DH = np.genfromtxt(str(dh_path_obj), delimiter=",", skip_header=1, usecols=(1, 2, 3, 4), dtype=float)
 
@@ -64,59 +141,30 @@ def _ensure_loaded(dh_csv_path: str):
     # ------------------------------------------------------------------
     # pyquik bindings expose Robot.__init__(DH, link_types, q_sign, Tbase, Ttool)
     link_types = [0] * DH.shape[0]  # 0 = revolute for all joints by default
-    q_sign = np.ones(DH.shape[0])
-    from numpy import identity
-    _NUMERIC_ROBOT = pyquik.Robot(
+    tbase, ttool, q_sign = _load_numeric_overrides(resolved_robot_id, DH.shape[0])
+    numeric_robot = pyquik.Robot(
         DH,
         link_types,
         q_sign,
-        identity(4),
-        identity(4),
+        tbase,
+        ttool,
     )
 
-    # Empirically, IKSolver expects (robot, max_iterations, ...); we pass
-    # defaults identical to previous Python bindings (200 iters etc.).
+    # Empirically, IKSolver expects (robot, max_iterations, ...); constructor
+    # defaults match previous behavior.
     try:
-        _NUMERIC_IKSOLVER = pyquik.IKSolver(_NUMERIC_ROBOT)
+        raw_numeric_iksolver = pyquik.IKSolver(numeric_robot)
     except Exception as e:
         raise RuntimeError(f"Failed to create pyquik.IKSolver: {e}")
+    numeric_iksolver = _NumericIKAdapter(numeric_robot, raw_numeric_iksolver)
 
-    # Attach a Python-level convenience for batched IK if not present.
-    # 2a. Provide single-pose IK alias expected by numeric_wrapper/ik_solver.
-    if not hasattr(_NUMERIC_IKSOLVER, "ik"):
-        def _ik(quat: np.ndarray, pos: np.ndarray, seed: np.ndarray):
-            """Thin wrapper around the C++ .solve method to mimic original API."""
-            q_vec, e_vec, iters, br = _NUMERIC_IKSOLVER.solve(quat, pos, seed)
-            return np.asarray(q_vec, dtype=float), np.asarray(e_vec, dtype=float), iters, br
-
-        _NUMERIC_IKSOLVER.ik = _ik  # type: ignore
-
-    # 2b. Provide batch path solver if missing
-    if not hasattr(_NUMERIC_IKSOLVER, "solve_ik_path"):
-
-        def _solve_ik_path(poses_batch: np.ndarray, initial_joint_angles: np.ndarray):
-            """Fallback: loop over poses if C++ batch API unavailable."""
-            out = []
-            q_seed = initial_joint_angles
-            for pose in poses_batch:
-                px, py_, pz, *rot_flat = pose
-                rot_m = np.array(rot_flat, dtype=float).reshape(3, 3)
-                quat = Rotation.from_matrix(rot_m).as_quat()
-                q, _, _, _ = _NUMERIC_IKSOLVER.ik(quat, np.array([px, py_, pz]), q_seed)
-                if q is None:
-                    return None
-                out.append(q)
-                q_seed = q
-            return np.vstack(out)
-
-        _NUMERIC_IKSOLVER.solve_ik_path = _solve_ik_path  # type: ignore
-
-    return _NUMERIC_ROBOT, _NUMERIC_IKSOLVER
+    _NUMERIC_CACHE[resolved_robot_id] = (numeric_robot, numeric_iksolver)
+    return _NUMERIC_CACHE[resolved_robot_id]
 
 
-def init_numeric_solver(dh_csv_path: str):
-    """External entry‐point used by ik_solver – returns (robot, iksolver)."""
-    return _ensure_loaded(dh_csv_path)
+def init_numeric_solver(robot_id: str | None = None):
+    """External entry-point used by ik_solver – returns (robot, iksolver)."""
+    return _ensure_loaded(robot_id)
 
 
 # ---------------------------------------------------------------------------
@@ -126,8 +174,12 @@ def init_numeric_solver(dh_csv_path: str):
 
 def numeric_fk(joint_angles: np.ndarray) -> np.ndarray:
     """Forward kinematics: ndarray(6,) → 4×4 H-matrix (numpy)."""
-    robot, _ = _ensure_loaded("mini-6dof-arm/dh_params.csv")
-    return robot.fk(joint_angles)  # Assumes pyquik Robot.fk returns np.ndarray
+    robot, _ = _ensure_loaded()
+    if hasattr(robot, "fk"):
+        return robot.fk(joint_angles)
+    if hasattr(robot, "FK"):
+        return robot.FK(joint_angles)
+    raise RuntimeError("Loaded numeric robot does not expose FK/fk method.")
 
 
 def numeric_ik(quat: np.ndarray, pos: np.ndarray, seed: np.ndarray | None = None):
@@ -135,7 +187,7 @@ def numeric_ik(quat: np.ndarray, pos: np.ndarray, seed: np.ndarray | None = None
 
     Returns (q_star, e_star, iters, reason) just like IKFast’s Python wrapper.
     """
-    _, solver = _ensure_loaded("mini-6dof-arm/dh_params.csv")
+    _, solver = _ensure_loaded()
     if seed is None:
         seed = np.zeros(solver.R.dof if hasattr(solver, "R") else 6, dtype=float)
 

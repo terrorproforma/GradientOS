@@ -6,6 +6,7 @@ import statistics
 import datetime
 import numpy as np
 from scipy.signal import savgol_filter
+from scipy.spatial.transform import Rotation as R
 from typing import Sequence, Union
 from pathlib import Path
 import os
@@ -28,6 +29,7 @@ from . import servo_protocol
 from . import robot_config
 from .backends import registry as backend_registry
 from .actuator_interface import ActuatorBackend
+from ..kinematics import runtime as kinematics_runtime
 
 
 # =============================================================================
@@ -105,6 +107,141 @@ def _get_twin_motor_pairs() -> list[tuple[int, int]]:
     return pairs
 
 JointTraj = Union[Sequence[Sequence[float]], np.ndarray]
+
+MAX_JOINT_STEP_RAD = float(os.environ.get("MINI_ARM_MAX_JOINT_STEP_RAD", "0.75"))
+JOINT_LIMIT_MARGIN_RAD = float(os.environ.get("MINI_ARM_JOINT_LIMIT_MARGIN_RAD", "0.03"))
+MAX_CART_RESIDUAL_M = float(os.environ.get("MINI_ARM_MAX_CART_RESIDUAL_M", "0.012"))
+MAX_ORIENT_RESIDUAL_DEG = float(os.environ.get("MINI_ARM_MAX_ORIENT_RESIDUAL_DEG", "6.0"))
+
+
+def _set_planner_diagnostics(payload: dict) -> None:
+    utils.trajectory_state_set("last_planner_diagnostics", payload)
+
+
+def _json_safe_float(value: float) -> float | None:
+    if not np.isfinite(value):
+        return None
+    return float(value)
+
+
+def _rotation_residual_deg(actual: np.ndarray, target: np.ndarray) -> float:
+    try:
+        delta = R.from_matrix(target.T @ actual)
+        return float(np.rad2deg(delta.magnitude()))
+    except Exception:
+        return float("inf")
+
+
+def _densify_cartesian_path(
+    cartesian_points: list,
+    orientations_list: list[np.ndarray],
+    *,
+    max_segment_m: float = 0.01,
+) -> tuple[list[list[float]], list[np.ndarray]]:
+    if len(cartesian_points) <= 1:
+        return [list(map(float, p)) for p in cartesian_points], list(orientations_list)
+
+    dense_points: list[list[float]] = [list(map(float, cartesian_points[0]))]
+    dense_orientations: list[np.ndarray] = [np.asarray(orientations_list[0], dtype=float).reshape(3, 3)]
+    for idx in range(1, len(cartesian_points)):
+        p0 = np.asarray(cartesian_points[idx - 1], dtype=float)
+        p1 = np.asarray(cartesian_points[idx], dtype=float)
+        seg_len = float(np.linalg.norm(p1 - p0))
+        steps = max(1, int(math.ceil(seg_len / max_segment_m)))
+        o1 = np.asarray(orientations_list[idx], dtype=float).reshape(3, 3)
+        for step in range(1, steps + 1):
+            t = step / steps
+            pi = (1.0 - t) * p0 + t * p1
+            dense_points.append(pi.tolist())
+            # Keep deterministic orientation interpolation by selecting end orientation for each dense sample.
+            dense_orientations.append(o1)
+    return dense_points, dense_orientations
+
+
+def _validate_joint_trajectory_gates(
+    joint_trajectory: list[list[float]],
+    cartesian_points: list,
+    orientations_list: list[np.ndarray],
+) -> tuple[bool, str, dict[str, float | None]]:
+    if not joint_trajectory:
+        return False, "IK_NO_SOLUTION", {}
+
+    num_joints = len(joint_trajectory[0])
+    max_joint_step = 0.0
+    min_limit_margin = float("inf")
+    max_cart_residual = 0.0
+    max_orient_residual = 0.0
+
+    limits = utils.LOGICAL_JOINT_LIMITS_RAD or [(-math.inf, math.inf)] * num_joints
+
+    for i in range(len(joint_trajectory)):
+        q = np.asarray(joint_trajectory[i], dtype=float)
+        if i > 0:
+            prev = np.asarray(joint_trajectory[i - 1], dtype=float)
+            step = float(np.max(np.abs(q - prev)))
+            max_joint_step = max(max_joint_step, step)
+            if step > MAX_JOINT_STEP_RAD:
+                return False, "IK_JUMP_REJECTED", {
+                    "max_joint_step_rad": _json_safe_float(max_joint_step),
+                    "joint_limit_margin_rad": _json_safe_float(min_limit_margin),
+                    "cartesian_residual_m": _json_safe_float(max_cart_residual),
+                    "orientation_residual_deg": _json_safe_float(max_orient_residual),
+                }
+
+        for j in range(min(num_joints, len(limits))):
+            lo, hi = limits[j]
+            margin = min(float(q[j] - lo), float(hi - q[j]))
+            min_limit_margin = min(min_limit_margin, margin)
+            if margin < JOINT_LIMIT_MARGIN_RAD:
+                return False, "LIMIT_VIOLATION", {
+                    "max_joint_step_rad": _json_safe_float(max_joint_step),
+                    "joint_limit_margin_rad": _json_safe_float(min_limit_margin),
+                    "cartesian_residual_m": _json_safe_float(max_cart_residual),
+                    "orientation_residual_deg": _json_safe_float(max_orient_residual),
+                }
+
+        if i < len(cartesian_points):
+            fk_matrix = ik_solver.get_fk_matrix(q)
+            if fk_matrix is None:
+                return False, "FK_VALIDATION_FAILED", {
+                    "max_joint_step_rad": _json_safe_float(max_joint_step),
+                    "joint_limit_margin_rad": _json_safe_float(min_limit_margin),
+                    "cartesian_residual_m": _json_safe_float(max_cart_residual),
+                    "orientation_residual_deg": _json_safe_float(max_orient_residual),
+                }
+            fk_pos = np.asarray(fk_matrix[:3, 3], dtype=float)
+            target_pos = np.asarray(cartesian_points[i], dtype=float).reshape(3)
+            cart_residual = float(np.linalg.norm(fk_pos - target_pos))
+            max_cart_residual = max(max_cart_residual, cart_residual)
+            if cart_residual > MAX_CART_RESIDUAL_M:
+                return False, "CARTESIAN_RESIDUAL_EXCEEDED", {
+                    "max_joint_step_rad": _json_safe_float(max_joint_step),
+                    "joint_limit_margin_rad": _json_safe_float(min_limit_margin),
+                    "cartesian_residual_m": _json_safe_float(max_cart_residual),
+                    "orientation_residual_deg": _json_safe_float(max_orient_residual),
+                }
+
+            if i < len(orientations_list):
+                target_rot = np.asarray(orientations_list[i], dtype=float).reshape(3, 3)
+                orient_residual = _rotation_residual_deg(np.asarray(fk_matrix[:3, :3], dtype=float), target_rot)
+                max_orient_residual = max(max_orient_residual, orient_residual)
+                if orient_residual > MAX_ORIENT_RESIDUAL_DEG:
+                    return False, "ORIENTATION_RESIDUAL_EXCEEDED", {
+                        "max_joint_step_rad": _json_safe_float(max_joint_step),
+                        "joint_limit_margin_rad": _json_safe_float(min_limit_margin),
+                        "cartesian_residual_m": _json_safe_float(max_cart_residual),
+                        "orientation_residual_deg": _json_safe_float(max_orient_residual),
+                    }
+
+    if min_limit_margin == float("inf"):
+        min_limit_margin = float("inf")
+
+    return True, "OK", {
+        "max_joint_step_rad": _json_safe_float(max_joint_step),
+        "joint_limit_margin_rad": _json_safe_float(min_limit_margin),
+        "cartesian_residual_m": _json_safe_float(max_cart_residual),
+        "orientation_residual_deg": _json_safe_float(max_orient_residual),
+    }
 
 def _save_executor_diagnostics_charts(
     mode: str,
@@ -533,6 +670,10 @@ def _plan_high_fidelity_trajectory(cartesian_points: list,
     Returns:
         The final, dense list of joint angle solutions, or None on failure.
     """
+    try:
+        utils.set_motion_state("PLANNING")
+    except Exception:
+        pass
     print(f"[Pi Plan HF] Planning high-fidelity trajectory for {len(cartesian_points)} points.")
     # Optional diagnostics: compare FK position sources at start
     try:
@@ -555,51 +696,141 @@ def _plan_high_fidelity_trajectory(cartesian_points: list,
             initial_pose_matrix = ik_solver.get_fk_matrix(start_q)
             if initial_pose_matrix is None:
                 print("[Pi Plan HF] ERROR: FK failed on start_q. Cannot determine orientation lock.")
+                try:
+                    if utils.get_motion_state() == "PLANNING":
+                        utils.set_motion_state("IDLE")
+                except Exception:
+                    pass
                 return None
             target_orientation = initial_pose_matrix[:3, :3]
         orientations_list = [target_orientation] * len(cartesian_points)
 
-    # 2. Solve IK for the entire path in one batch call for maximum performance.
-    t_start_ik = time.monotonic()
-    
-    joint_trajectory = ik_solver.solve_ik_path_batch(
-        path_points=cartesian_points,
-        initial_joint_angles=start_q,
-        target_orientations=orientations_list
+    profile_revision = None
+    try:
+        profile_revision = int(kinematics_runtime.get_runtime_state_snapshot()["revision"])
+    except Exception:
+        profile_revision = None
+
+    planner_diag = {
+        "reason_code": "IK_NO_SOLUTION",
+        "seed_used": "start_q",
+        "fallback_level": 0,
+        "residuals": {},
+        "profile_revision": profile_revision,
+        "smoothing_applied": False,
+    }
+
+    dense_points, dense_orientations = _densify_cartesian_path(
+        cartesian_points,
+        orientations_list,
+        max_segment_m=0.01,
     )
-    
-    t_end_ik = time.monotonic()
+    attempts = [
+        ("batch", cartesian_points, orientations_list, 0),
+        ("sequential", cartesian_points, orientations_list, 1),
+        ("dense_batch", dense_points, dense_orientations, 2),
+        ("dense_sequential", dense_points, dense_orientations, 3),
+    ]
 
-    if joint_trajectory is None:
-        print("[Pi Plan HF] ERROR: Batch IK solver failed to find a solution for the path.")
+    selected_unwrapped: list[list[float]] | None = None
+    selected_points: list = cartesian_points
+    selected_orientations: list[np.ndarray] = orientations_list
+    selected_residuals: dict[str, float | None] = {}
+    selected_attempt = "batch"
+
+    for attempt_name, attempt_points, attempt_orientations, fallback_level in attempts:
+        t_start_ik = time.monotonic()
+        if attempt_name.endswith("batch"):
+            joint_trajectory = ik_solver.solve_ik_path_batch(
+                path_points=attempt_points,
+                initial_joint_angles=start_q,
+                target_orientations=attempt_orientations,
+            )
+        else:
+            joint_trajectory = ik_solver.solve_ik_path_sequential(
+                path_points=attempt_points,
+                initial_joint_angles=start_q,
+                target_orientations=attempt_orientations,
+            )
+        t_end_ik = time.monotonic()
+        print(
+            f"[Pi Plan HF] IK attempt '{attempt_name}' finished in "
+            f"{(t_end_ik - t_start_ik) * 1000:.2f} ms"
+        )
+
+        if joint_trajectory is None:
+            planner_diag["reason_code"] = "IK_NO_SOLUTION"
+            planner_diag["fallback_level"] = fallback_level
+            continue
+
+        unwrapped_joint_trajectory = _unwrap_joint_trajectory(joint_trajectory)
+        is_valid, reason_code, residuals = _validate_joint_trajectory_gates(
+            unwrapped_joint_trajectory,
+            attempt_points,
+            attempt_orientations,
+        )
+        if is_valid:
+            selected_unwrapped = unwrapped_joint_trajectory
+            selected_points = attempt_points
+            selected_orientations = attempt_orientations
+            selected_residuals = residuals
+            selected_attempt = attempt_name
+            planner_diag["reason_code"] = "OK"
+            planner_diag["fallback_level"] = fallback_level
+            planner_diag["seed_used"] = (
+                "prev_valid_seed" if "sequential" in attempt_name else "start_q"
+            )
+            break
+
+        planner_diag["reason_code"] = reason_code
+        planner_diag["fallback_level"] = fallback_level
+        planner_diag["residuals"] = residuals
+
+    if selected_unwrapped is None:
+        _set_planner_diagnostics(planner_diag)
+        print(
+            f"[Pi Plan HF] ERROR: IK solve rejected. reason_code={planner_diag['reason_code']} "
+            f"fallback_level={planner_diag['fallback_level']}"
+        )
+        try:
+            if utils.get_motion_state() == "PLANNING":
+                utils.set_motion_state("IDLE")
+        except Exception:
+            pass
         return None
-    
-    print(f"[Pi Plan HF] Batch IK solving complete. Took {(t_end_ik - t_start_ik) * 1000:.2f} ms")
 
-    # 3. Post-process the trajectory (unwrap and smooth).
-    unwrapped_joint_trajectory = _unwrap_joint_trajectory(joint_trajectory)
-    
+    # 3. Post-process the trajectory (smooth + safety re-validation).
+    final_joint_trajectory = selected_unwrapped
     if use_smoothing:
-        # Using the same smoothing parameters as the old function for consistency.
-        raw_joint_trajectory_np = np.array(unwrapped_joint_trajectory).T
-        window_length = 15 
+        raw_joint_trajectory_np = np.array(selected_unwrapped).T
+        window_length = 15
         polyorder = 3
 
-        # The window for the filter must be odd and smaller than the number of points.
-        if window_length > len(unwrapped_joint_trajectory):
-            window_length = max(polyorder + 1, len(unwrapped_joint_trajectory) - 1)
-            if window_length % 2 == 0: window_length -= 1
-        
+        if window_length > len(selected_unwrapped):
+            window_length = max(polyorder + 1, len(selected_unwrapped) - 1)
+            if window_length % 2 == 0:
+                window_length -= 1
+
         if window_length > polyorder:
             smoothed_joint_trajectory_np = savgol_filter(
                 raw_joint_trajectory_np, window_length, polyorder, axis=1
             )
-            final_joint_trajectory = smoothed_joint_trajectory_np.T.tolist()
-        else:
-            # Not enough points to smooth, return the unwrapped path.
-            final_joint_trajectory = unwrapped_joint_trajectory
-    else:
-        final_joint_trajectory = unwrapped_joint_trajectory
+            smoothed_candidate = smoothed_joint_trajectory_np.T.tolist()
+            is_valid_smooth, smooth_reason, smooth_residuals = _validate_joint_trajectory_gates(
+                smoothed_candidate,
+                selected_points,
+                selected_orientations,
+            )
+            if is_valid_smooth:
+                final_joint_trajectory = smoothed_candidate
+                selected_residuals = smooth_residuals
+                planner_diag["smoothing_applied"] = True
+            else:
+                # Safety-first fallback: keep unsmoothed segment if filter violates gates.
+                planner_diag["reason_code"] = smooth_reason
+                planner_diag["smoothing_disabled_reason"] = smooth_reason
+                planner_diag["smoothing_residuals"] = smooth_residuals
+                final_joint_trajectory = selected_unwrapped
         
     print("[Pi Plan HF] Path post-processing complete.")
     # Optional diagnostics: verify endpoint FK against last Cartesian target
@@ -651,6 +882,15 @@ def _plan_high_fidelity_trajectory(cartesian_points: list,
         except Exception as e:
             print(f"[Pi Plan HF] WARNING: Failed to write joint_path.csv: {e}")
 
+    planner_diag["reason_code"] = "OK"
+    planner_diag["residuals"] = selected_residuals
+    planner_diag["attempt"] = selected_attempt
+    _set_planner_diagnostics(planner_diag)
+    try:
+        if utils.get_motion_state() == "PLANNING":
+            utils.set_motion_state("IDLE")
+    except Exception:
+        pass
     return final_joint_trajectory
 
 
@@ -666,18 +906,18 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
         should_loop (bool): Whether to repeat the entire sequence upon completion.
     """
     try:
-        utils.trajectory_state["weld_active"] = False
+        utils.trajectory_state_set("weld_active", False)
         execution_loop_active = True
-        while execution_loop_active and not utils.trajectory_state["should_stop"]:
+        while execution_loop_active and not bool(utils.trajectory_state_get("should_stop", False)):
             for i, step in enumerate(planned_steps):
                 # Before each step, check if a stop has been requested.
-                if utils.trajectory_state["should_stop"]:
+                if bool(utils.trajectory_state_get("should_stop", False)):
                     print("[Pi Trajectory] Stop detected, halting execution.")
                     execution_loop_active = False
                     break
 
                 print(f"[Pi Execute] Executing Step {i+1}/{len(planned_steps)} ({step['type']})...")
-                utils.trajectory_state["weld_active"] = bool(step.get("weld_active", False))
+                utils.trajectory_state_set("weld_active", bool(step.get("weld_active", False)))
                 if step['type'] == 'move':
                     _execute_joint_path(step['path'], step['freq'])
                 elif step['type'] == 'joint_move':
@@ -687,19 +927,19 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
                     utils.current_logical_joint_angles_rad = step['target_q']
                     # Make joint_move interruptible with correct timing
                     end_time = time.monotonic() + step['duration']
-                    while not utils.trajectory_state["should_stop"] and time.monotonic() < end_time:
+                    while not bool(utils.trajectory_state_get("should_stop", False)) and time.monotonic() < end_time:
                         time.sleep(0.01)  # Check for stop every 10 ms
                 elif step['type'] == 'pause':
-                    utils.trajectory_state["weld_active"] = False
+                    utils.trajectory_state_set("weld_active", False)
                     print(f"[Pi Execute] Pausing for {step['duration']} seconds.")
                     # Make pause interruptible with correct timing
                     end_time = time.monotonic() + step['duration']
-                    while not utils.trajectory_state["should_stop"] and time.monotonic() < end_time:
+                    while not bool(utils.trajectory_state_get("should_stop", False)) and time.monotonic() < end_time:
                         time.sleep(0.01)  # Check for stop every 10 ms
             
             if not should_loop:
                 execution_loop_active = False
-            elif not utils.trajectory_state["should_stop"]:
+            elif not bool(utils.trajectory_state_get("should_stop", False)):
                 print("\n[Pi Trajectory] Loop enabled. Restarting sequence...")
                 time.sleep(1)
 
@@ -707,10 +947,16 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
         print("[Pi Trajectory] Executor thread finished.")
         # Clean up global state, but DO NOT reset the should_stop flag.
         # The stop flag should persist until a new motion command clears it.
-        utils.trajectory_state["weld_active"] = False
-        utils.trajectory_state["current_weld_type"] = None
-        utils.trajectory_state["is_running"] = False
-        utils.trajectory_state["thread"] = None
+        utils.trajectory_state_update(
+            weld_active=False,
+            current_weld_type=None,
+            is_running=False,
+            thread=None,
+        )
+        try:
+            utils.set_motion_state("IDLE")
+        except Exception:
+            pass
 
 
 def _open_loop_executor_thread(
@@ -794,7 +1040,7 @@ def _open_loop_executor_thread(
                     _target_angles_per_joint[j_idx].append(target_q[j_idx])
                     _actual_angles_per_joint[j_idx].append(actual_q[j_idx])
 
-            if utils.trajectory_state["should_stop"]:
+            if bool(utils.trajectory_state_get("should_stop", False)):
                 print("[Pi OL] Stop signal received, halting execution.")
                 break
 
@@ -917,7 +1163,7 @@ def _closed_loop_executor_thread(
             iter_start = time.perf_counter()
 
             # --- Stop Check ---
-            if utils.trajectory_state["should_stop"]:
+            if bool(utils.trajectory_state_get("should_stop", False)):
                 print("[Pi CLC] Stop signal received, halting execution.")
                 break
 

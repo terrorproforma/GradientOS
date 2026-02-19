@@ -12,6 +12,15 @@ $repoRoot = (Get-Location).Path
 $venvScripts = Join-Path $repoRoot ".venv\Scripts"
 $venvPython = Join-Path $venvScripts "python.exe"
 $srcPath = Join-Path $repoRoot "src"
+$activateScript = Join-Path $venvScripts "Activate.ps1"
+$repoVenv = Join-Path $repoRoot ".venv"
+
+# Activate repo environment first for consistent package/environment behavior.
+if ((-not $env:VIRTUAL_ENV) -or ($env:VIRTUAL_ENV -ne $repoVenv)) {
+    if (Test-Path -LiteralPath $activateScript) {
+        . $activateScript
+    }
+}
 
 if (Test-Path -LiteralPath $venvScripts) {
     $env:Path = "$venvScripts;$env:Path"

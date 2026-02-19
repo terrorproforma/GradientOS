@@ -5,15 +5,15 @@ This module exposes **solver-agnostic** helper functions:
     get_fk_matrix(...)   – full 4×4 pose of the tool tip
     get_fk(...)          – convenience: only tool-tip XYZ
 
-Internally we can plug in several different solver back-ends.  Selection is
+Internally we can plug in several different solver back-ends. Selection is
 done **at import time** via the environment variable ``MINI_ARM_SOLVER``.
 
     "ikfast"   – the original IKFast C++ wrapper (default)
     "numeric"  – the QuIK numeric solver (via ``numeric_wrapper.py``)
     "trac"     – placeholder for future TRAC-IK integration
 
-The goal: callers’ code never changes – you just switch the env-var or call
-``set_backend()`` at runtime *before* the first IK/FK call.
+The goal: callers’ code never changes – you can switch the backend via env-var
+and update robot assets at runtime via ``set_robot_id()``.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ import os
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from .arm_controller import utils  # for diagnostics folder/session info
+from . import robot_assets
+from .kinematics import runtime as kinematics_runtime
 
 # -----------------------------------------------------------
 # END-EFFECTOR OFFSET (tool-tip with respect to wrist frame)
@@ -38,6 +40,7 @@ END_EFFECTOR_OFFSET = np.array([0.180, 0.0, 0.0], dtype=float)
 # is assigned inside the backend-specific initialisers so that legacy code
 # that still refers to ``IK_SOLVER`` continues to work.
 IK_SOLVER = None  # type: ignore
+_KINEMATICS_PROFILE = None  # type: ignore
 
 def _find_closest_solution(solutions, current_joint_angles):
     """
@@ -70,17 +73,58 @@ def _find_closest_solution(solutions, current_joint_angles):
     # Return the wrapped version so the caller already gets a continuous vector
     return continuous_solutions[best_solution_idx]
 
+
+def _coerce_rotation_matrix(target_orientation_matrix):
+    """Normalize orientation input to a 3x3 rotation matrix."""
+    if target_orientation_matrix is None:
+        return np.identity(3, dtype=float)
+    return np.asarray(target_orientation_matrix, dtype=float).reshape(3, 3)
+
+
+def _prepare_backend_target_pose(target_position, target_orientation_matrix, backend_name: str):
+    """
+    Convert a tool-frame target pose into the backend-expected target pose.
+
+    Backend semantics:
+      - IKFast expects wrist-frame target position.
+      - Numeric (QuIK) expects tool-frame target position directly.
+    """
+    target_rotation = _coerce_rotation_matrix(target_orientation_matrix)
+    target_pos = np.asarray(target_position, dtype=float).reshape(3)
+    target_pos, target_rotation = kinematics_runtime.compensate_target_pose_for_runtime(
+        target_pos, target_rotation
+    )
+
+    if backend_name == "ikfast":
+        rotated_offset = target_rotation.dot(END_EFFECTOR_OFFSET)
+        target_pos = target_pos - rotated_offset
+    elif backend_name == "numeric":
+        # QuIK path uses tool-frame pose directly.
+        pass
+    else:
+        raise ValueError(f"Unsupported backend '{backend_name}' in pose adapter.")
+
+    return target_pos, target_rotation
+
 # -----------------------------------------------------------
 # Backend selection helper – import the chosen solver only once
 # -----------------------------------------------------------
 
 _BACKEND_NAME: str = os.getenv("MINI_ARM_SOLVER", "ikfast").lower()  # set ikfast as default
 # _BACKEND_NAME: str = os.getenv("MINI_ARM_SOLVER", "numeric").lower()   # set numeric as default
+_ROBOT_ID: str = robot_assets.get_active_robot_id()
 
 # These module-level globals will be filled by the selected backend loader.
 _solve_ik_impl = None  # type: ignore
 _fk_matrix_impl = None  # type: ignore
 NUM_JOINTS = 6  # default until backend sets the real value
+
+
+def _normalize_backend_name(raw: str) -> str:
+    backend = str(raw).strip().lower()
+    if backend not in {"ikfast", "numeric", "trac"}:
+        raise ValueError(f"Unknown MINI_ARM_SOLVER backend '{backend}'")
+    return backend
 
 
 def _init_ikfast_backend():
@@ -90,11 +134,13 @@ def _init_ikfast_backend():
     from ikfast_solver.ikfast_wrapper import IKFastSolver  # local import: heavy .so
 
     try:
+        profile = robot_assets.load_kinematics_profile(_ROBOT_ID, backend_name="ikfast")
+        globals()["_KINEMATICS_PROFILE"] = profile
         solver = IKFastSolver()
         NUM_JOINTS = solver.num_joints
         globals()["IK_SOLVER"] = solver  # expose for legacy helpers
         print(f"[IK Solver] IKFast back-end initialised for {NUM_JOINTS} joints.")
-    except (RuntimeError, OSError) as e:
+    except Exception as e:
         print("--- [IK Solver] FATAL ERROR – IKFast backend ---")
         print(f"Failed to load IKFast: {e}")
         solver = None
@@ -104,15 +150,11 @@ def _init_ikfast_backend():
         if solver is None:
             return None
 
-        # fall back to identity if orientation omitted
-        target_rotation = (
-            np.identity(3)
-            if target_orientation_matrix is None
-            else np.array(target_orientation_matrix).reshape(3, 3)
+        wrist_position, target_rotation = _prepare_backend_target_pose(
+            target_position,
+            target_orientation_matrix,
+            "ikfast",
         )
-
-        rotated_offset = target_rotation.dot(END_EFFECTOR_OFFSET)
-        wrist_position = np.array(target_position) - rotated_offset
 
         pose_rot_flat = target_rotation.flatten()
         sol = solver.solve_ik(wrist_position, pose_rot_flat, initial_joint_angles)
@@ -157,15 +199,21 @@ def _init_numeric_backend():
         numeric_fk,
         numeric_ik,
         init_numeric_solver,
+        set_robot_id as set_numeric_robot_id,
     )
 
-    # Lazy initialisation – path to DH CSV via env var or default location
-    dh_path = os.getenv("MINI_ARM_DH_CSV", "mini-6dof-arm/dh_params.csv")
     try:
-        kin, solver = init_numeric_solver(dh_path)
+        profile = robot_assets.load_kinematics_profile(_ROBOT_ID, backend_name="numeric")
+        globals()["_KINEMATICS_PROFILE"] = profile
+        set_numeric_robot_id(_ROBOT_ID)
+        kin, solver = init_numeric_solver(_ROBOT_ID)
         NUM_JOINTS = kin.num_joints if hasattr(kin, "num_joints") else 6
         globals()["IK_SOLVER"] = solver  # expose numeric IKSolver for future use
-        print(f"[IK Solver] Numeric (QuIK) back-end initialised for {NUM_JOINTS} joints.")
+        dh_csv_path = robot_assets.get_dh_csv_path(_ROBOT_ID)
+        print(
+            "[IK Solver] Numeric (QuIK) back-end initialised for "
+            f"{NUM_JOINTS} joints (robot_id={_ROBOT_ID}, dh={dh_csv_path})."
+        )
     except Exception as e:
         print("--- [IK Solver] FATAL ERROR – Numeric backend ---")
         print(f"Failed to load numeric solver: {e}")
@@ -176,16 +224,13 @@ def _init_numeric_backend():
         if solver is None:
             return None
 
-        # Expect orientation as 3×3 matrix or flat 9.
-        target_rotation = (
-            np.identity(3)
-            if target_orientation_matrix is None
-            else np.array(target_orientation_matrix).reshape(3, 3)
+        numeric_position, target_rotation = _prepare_backend_target_pose(
+            target_position,
+            target_orientation_matrix,
+            "numeric",
         )
-
-        # QuIK solver already accepts tool-frame pose directly – **do not** subtract offset.
         quat = R.from_matrix(target_rotation).as_quat()
-        sol, _, _, _ = numeric_ik(quat, np.asarray(target_position, dtype=float), initial_joint_angles)
+        sol, _, _, _ = numeric_ik(quat, np.asarray(numeric_position, dtype=float), initial_joint_angles)
 
         if sol is None:
             return None
@@ -219,8 +264,47 @@ def _init_backend():
         raise ValueError(f"Unknown MINI_ARM_SOLVER backend '{_BACKEND_NAME}'")
 
 
+def configure(*, robot_id: str | None = None, backend_name: str | None = None) -> dict[str, str]:
+    """
+    Explicitly configure active robot + backend and reinitialize solver internals.
+
+    This function is the runtime-safe path used by controller startup. It keeps
+    environment variables synchronized for compatibility with legacy call paths.
+    """
+    global _ROBOT_ID, _BACKEND_NAME
+
+    next_robot_id = _ROBOT_ID if robot_id is None else str(robot_id).strip()
+    if not next_robot_id:
+        raise ValueError("robot_id cannot be empty.")
+    robot_assets.get_robot_manifest(next_robot_id)
+
+    next_backend = _BACKEND_NAME if backend_name is None else _normalize_backend_name(backend_name)
+    _ROBOT_ID = next_robot_id
+    _BACKEND_NAME = next_backend
+    os.environ["GRADIENT_ROBOT_ID"] = _ROBOT_ID
+    os.environ["MINI_ARM_SOLVER"] = _BACKEND_NAME
+    _init_backend()
+    return {
+        "robot_id": _ROBOT_ID,
+        "backend_name": _BACKEND_NAME,
+    }
+
+
+def set_robot_id(robot_id: str) -> None:
+    """Backward-compatible helper that preserves current backend selection."""
+    configure(robot_id=robot_id, backend_name=_BACKEND_NAME)
+
+
+def get_backend_name() -> str:
+    return _BACKEND_NAME
+
+
+def get_robot_id() -> str:
+    return _ROBOT_ID
+
+
 # Initialise the chosen backend immediately so NUM_JOINTS is correct.
-_init_backend()
+configure(robot_id=_ROBOT_ID, backend_name=_BACKEND_NAME)
 
 # -----------------------------------------------------------
 # Public, solver-independent API
@@ -234,7 +318,10 @@ def solve_ik(*, target_position, target_orientation_matrix=None, initial_joint_a
 
 def get_fk_matrix(active_joint_angles):
     """Return 4×4 tool-tip pose (world frame) for *active_joint_angles* or None on failure."""
-    return _fk_matrix_impl(active_joint_angles)
+    fk_matrix = _fk_matrix_impl(active_joint_angles)
+    if fk_matrix is None:
+        return None
+    return kinematics_runtime.apply_runtime_to_fk_matrix(fk_matrix)
 
 
 def get_fk(active_joint_angles):
@@ -318,7 +405,7 @@ def solve_ik_path_batch(path_points, initial_joint_angles=None, target_orientati
     # --- Prepare the batch data for the C++ function ---
     poses_batch = np.zeros((num_poses, 12), dtype=np.float64)
     
-    default_rotation = np.identity(3)
+    default_rotation = np.identity(3, dtype=float)
     
     for i in range(num_poses):
         position = path_points[i]
@@ -327,12 +414,15 @@ def solve_ik_path_batch(path_points, initial_joint_angles=None, target_orientati
             target_rotation = np.array(target_orientations[i]).reshape(3, 3)
         else:
             target_rotation = default_rotation
-            
-        rotated_offset = target_rotation.dot(END_EFFECTOR_OFFSET)
-        wrist_position = np.array(position) - rotated_offset
-        
-        poses_batch[i, :3] = wrist_position
-        poses_batch[i, 3:] = target_rotation.flatten()
+
+        backend_position, backend_rotation = _prepare_backend_target_pose(
+            position,
+            target_rotation,
+            _BACKEND_NAME,
+        )
+
+        poses_batch[i, :3] = backend_position
+        poses_batch[i, 3:] = backend_rotation.flatten()
 
     # Call the new batch solver in the wrapper
     joint_solutions = IK_SOLVER.solve_ik_path(poses_batch, start_angles_np)

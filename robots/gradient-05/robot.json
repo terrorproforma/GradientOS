@@ -1,0 +1,17 @@
+{
+  "robot_id": "gradient-05",
+  "name": "Gradient-05",
+  "description": "Template asset bundle for Gradient-05. Replace placeholder URDF/DH with real model data.",
+  "default": true,
+  "kinematics": {
+    "dh_csv": "dh_params.csv"
+  },
+  "models": {
+    "controller_urdf": "gradient-05.urdf",
+    "web_urdf": "gradient-05.urdf"
+  },
+  "web": {
+    "asset_source_dir": ".",
+    "urdf": "gradient-05.urdf"
+  }
+}

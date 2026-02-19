@@ -1,0 +1,25 @@
+{
+  "tool_id": "identity",
+  "display_name": "Identity (No Tool Offset)",
+  "description": "No additional tool transform.",
+  "tool_type": "utility",
+  "keywords": [
+    "identity",
+    "debug"
+  ],
+  "compatible_robot_ids": [],
+  "offset": {
+    "position_mm": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    },
+    "rotation_deg": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    }
+  },
+  "mesh": null,
+  "weld": {}
+}

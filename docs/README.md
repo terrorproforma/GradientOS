@@ -13,6 +13,7 @@ This file is the starting point for new contributors and operators.
 - STEP-based offline programming workflow with topology-aware weld planning
 - Web UI with 3D scene visualization, telemetry, and program inspection
 - Program Tree tooling to inspect exact execution path samples and edit control points
+- Global Tool Library for end-effector definitions (offsets + optional meshes)
 - Optional vision pipeline for camera streaming and image/AI processing
 
 ## How The System Works
@@ -84,6 +85,9 @@ source ./start.sh
 ./run-web.sh
 ```
 
+The Python launchers (`run.sh`, `run-sim.sh`, `run-api.sh`) bootstrap the repo environment
+before process startup. If no repo env is active, they first apply `start.sh` semantics.
+
 ### Windows PowerShell
 
 ```powershell
@@ -99,6 +103,9 @@ npm install
 npm run dev -- --host 0.0.0.0 --port 8000
 ```
 
+PowerShell launchers activate the repo environment (`.venv\Scripts\Activate.ps1`) before
+running controller/API modules.
+
 Defaults:
 
 - Web UI: `http://localhost:8000`
@@ -111,8 +118,9 @@ Defaults:
 3. Load/import a STEP model for topology extraction.
 4. Select edges, configure weld options, and plan preview.
 5. Inspect execution details in Program Tree.
-6. Run preview trajectory/weld program.
-7. Save/load weld programs as needed.
+6. Select desired active tool in Settings > Tool Library (if needed) and apply runtime config.
+7. Run preview trajectory/weld program.
+8. Save/load weld programs as needed.
 
 ## Key Motion And Weld Behavior
 
@@ -120,6 +128,14 @@ Defaults:
 - Program Tree reflects exact execution path samples (no intentionally coarse display path).
 - `return_to_start` for weld runs resolves from the run-time pre-weld start pose.
 - Realtime jog and trajectory playback include runtime guards to avoid controller contention.
+- Weld work/travel angles are interpreted as torch-target angles and compensated by the active tool definition.
+
+Tool library storage is folder-based so definitions are drop-in discoverable:
+
+- `tools/library/<tool_id>/tool.json`
+- `tools/library/<tool_id>/*.stl` (or `.glb`/`.gltf`) for local mesh assets
+- `tools/library/library.json` for library metadata (default tool, update metadata)
+- In each `tool.json`, `offset.*` defines TCP/tool-tip transform, while optional `mesh.position_mm` + `mesh.rotation_deg` define visual mesh placement relative to the J6/flange anchor frame.
 
 ## CLI And Service Entry Points
 
@@ -141,6 +157,7 @@ If scripts are not on PATH, run through modules:
 
 ## Project Layout
 
+- `robots/` - canonical robot asset catalog (`robots/<robot_id>/robot.json`, URDF, DH CSV, model-local files)
 - `src/gradient_os/arm_controller/` - controller runtime and command handlers
 - `src/gradient_os/api/` - HTTP/SSE API
 - `src/gradient_os/cad/` - topology extraction and STEP-driven planning helpers
@@ -148,6 +165,22 @@ If scripts are not on PATH, run through modules:
 - `web-ui/` - React operator interface
 - `docs/` - subsystem docs and references
 - `tests/` - automated tests
+
+## Robot Asset Catalog
+
+Robot geometry/kinematics files are resolved from `robots/<robot_id>/robot.json` with no
+legacy path fallback. The controller selects runtime behavior via `--robot` (e.g. `gradient0`),
+and each robot config exposes a stable `robot_id` that points to the matching asset bundle.
+
+The Web UI syncs assets from this catalog with:
+
+```bash
+cd web-ui
+npm run sync:assets
+```
+
+`npm run dev` and `npm run build` run this sync step automatically via npm pre-scripts.
+`sync:assets` includes both robot and tool asset sync.
 
 ## Documentation Map
 

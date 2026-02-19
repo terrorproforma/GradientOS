@@ -22,6 +22,32 @@ from . import utils
 from . import servo_driver
 from . import trajectory_execution
 from . import pid_tuner
+from ..kinematics import runtime as kinematics_runtime
+
+def _resolve_profile_params_for_speed_multiplier(speed_multiplier: float | int | str | None) -> tuple[float, float, float]:
+    """
+    Normalize a speed multiplier and derive profile velocity/acceleration.
+
+    We intentionally scale acceleration by speed^2 so that short, acceleration-
+    limited moves still exhibit a clear and near-linear time scaling with the
+    UI speed multiplier.
+
+    Returns:
+        tuple[float, float, float]: (normalized_multiplier, velocity_m_s, acceleration_m_s2)
+    """
+    try:
+        multiplier = float(speed_multiplier) if speed_multiplier is not None else 1.0
+    except (TypeError, ValueError):
+        multiplier = 1.0
+    if not np.isfinite(multiplier):
+        multiplier = 1.0
+
+    # Match UI slider semantics (0.1x .. 10x) while keeping backend-safe bounds.
+    multiplier = float(np.clip(multiplier, 0.1, 10.0))
+
+    velocity = float(utils.DEFAULT_PROFILE_VELOCITY * multiplier)
+    acceleration = float(utils.DEFAULT_PROFILE_ACCELERATION * (multiplier ** 2))
+    return multiplier, velocity, acceleration
 
 def handle_translate_command(dx: float, dy: float, dz: float):
     """
@@ -278,12 +304,20 @@ def handle_set_orientation_command(
     )
 
     # Mark motion active so jog pauses during execution.
-    utils.trajectory_state["is_running"] = True
+    utils.trajectory_state_set("is_running", True)
+    try:
+        utils.set_motion_state("EXECUTING")
+    except Exception:
+        pass
     try:
         executor_thread.start()
         executor_thread.join() # Block until the move is finished
     finally:
-        utils.trajectory_state["is_running"] = False
+        utils.trajectory_state_set("is_running", False)
+        try:
+            utils.set_motion_state("IDLE")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 6. Final verification (optional, quick FK check).
@@ -325,7 +359,7 @@ def handle_move_profiled(target_x: float,
     utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     print(f"[Pi Smooth] Received MOVE_PROFILED command to [{target_x}, {target_y}, {target_z}]")
     
-    if utils.trajectory_state["is_running"]:
+    if bool(utils.trajectory_state_get("is_running", False)):
         print("[Pi Smooth] ERROR: Cannot start move, another task is running.")
         return
 
@@ -373,9 +407,11 @@ def handle_move_profiled(target_x: float,
             kwargs={'joint_path': joint_path, 'frequency': frequency, 'diagnostics': diagnostics_enabled},
             daemon=True,
         )
-        utils.trajectory_state["thread"] = executor_thread
-        utils.trajectory_state["is_running"] = True
-        utils.trajectory_state["should_stop"] = False
+        utils.trajectory_state_update(thread=executor_thread, is_running=True, should_stop=False)
+        try:
+            utils.set_motion_state("EXECUTING")
+        except Exception:
+            pass
         executor_thread.start()
         print("[Pi Smooth] Trajectory started "
               f"({'closed' if closed_loop else 'open'} loop, background).")
@@ -402,11 +438,13 @@ def handle_move_profiled_relative(dx: float, dy: float, dz: float, speed: float 
     target_pos = start_pos + np.array([dx, dy, dz])
     
     # 3. Calculate profiled move parameters
-    target_velocity = utils.DEFAULT_PROFILE_VELOCITY * speed
-    target_acceleration = utils.DEFAULT_PROFILE_ACCELERATION
+    resolved_speed, target_velocity, target_acceleration = _resolve_profile_params_for_speed_multiplier(speed)
     
     # 4. Call the absolute profiled move handler to perform the action
-    print(f"[Pi Smooth] Calculated absolute target: {np.round(target_pos, 4)}. Executing profiled move.")
+    print(
+        f"[Pi Smooth] Calculated absolute target: {np.round(target_pos, 4)}. "
+        f"Executing profiled move at {resolved_speed:.2f}x."
+    )
     handle_move_profiled(target_pos[0], target_pos[1], target_pos[2], target_velocity, target_acceleration, use_smoothing=use_smoothing)
 
 def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_override: bool | None = None):
@@ -517,6 +555,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 t_start_plan = time.monotonic()
                 vector = np.array(move_cmd.get("vector", [0,0,0]))
                 speed_mult = move_cmd.get("speed_multiplier", 1.0)
+                _, move_velocity, move_acceleration = _resolve_profile_params_for_speed_multiplier(speed_mult)
                 is_weld_move = bool(move_cmd.get("is_weld", False))
 
                 # Per-move orientation override
@@ -538,7 +577,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 forced_orient = per_move_orientation_matrix if per_move_orientation_matrix is not None else target_orientation_matrix
 
                 joint_path = trajectory_execution._plan_linear_move(
-                    current_q, target_pos, utils.DEFAULT_PROFILE_VELOCITY * speed_mult, utils.DEFAULT_PROFILE_ACCELERATION, 100, True,
+                    current_q, target_pos, move_velocity, move_acceleration, 100, True,
                     forced_orientation=forced_orient
                 )
                 
@@ -562,6 +601,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 t_start_plan = time.monotonic()
                 target_pos = np.array(move_cmd.get("vector", [0,0,0]))
                 speed_mult = move_cmd.get("speed_multiplier", 1.0)
+                _, move_velocity, move_acceleration = _resolve_profile_params_for_speed_multiplier(speed_mult)
                 is_weld_move = bool(move_cmd.get("is_weld", False))
 
                 move_orient_euler = move_cmd.get("orientation_euler_deg")
@@ -575,7 +615,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 forced_orient = per_move_orientation_matrix if per_move_orientation_matrix is not None else target_orientation_matrix
 
                 joint_path = trajectory_execution._plan_linear_move(
-                    current_q, target_pos, utils.DEFAULT_PROFILE_VELOCITY * speed_mult, utils.DEFAULT_PROFILE_ACCELERATION, 100, True,
+                    current_q, target_pos, move_velocity, move_acceleration, 100, True,
                     forced_orientation=forced_orient
                 )
                     
@@ -600,6 +640,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 end_pos = np.array(move_cmd.get("end_point", [0,0,0]))
                 center_pos = np.array(move_cmd.get("center_point", [0,0,0]))
                 speed_mult = move_cmd.get("speed_multiplier", 1.0)
+                _, move_velocity, move_acceleration = _resolve_profile_params_for_speed_multiplier(speed_mult)
                 is_weld_move = bool(move_cmd.get("is_weld", False))
                 
                 start_pos = ik_solver.get_fk(current_q)
@@ -610,7 +651,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 
                 # 1. Generate the Cartesian path for the arc
                 cartesian_path = trajectory_planner.generate_arc_trajectory(
-                    start_pos, end_pos, center_pos, utils.DEFAULT_PROFILE_VELOCITY * speed_mult, utils.DEFAULT_PROFILE_ACCELERATION, 100)
+                    start_pos, end_pos, center_pos, move_velocity, move_acceleration, 100)
                 
                 if not cartesian_path:
                     print(f"[Pi Trajectory] ERROR: Could not generate arc trajectory. Aborting plan.")
@@ -737,8 +778,11 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
     # --- 2. Execution Phase ---
     print("\n--- Trajectory Ready. Starting Execution in a background thread ---")
     
-    utils.trajectory_state["is_running"] = True
-    utils.trajectory_state["should_stop"] = False
+    utils.trajectory_state_update(is_running=True, should_stop=False)
+    try:
+        utils.set_motion_state("EXECUTING")
+    except Exception:
+        pass
 
     # NEW: For looping, first move to the trajectory's start point from current position.
     # Explanation: We re-plan this move every time (even for cache) to avoid jerk if starting from a different position.
@@ -750,9 +794,15 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         current_pose = ik_solver.get_fk_matrix(current_q)
         if current_pose is None or first_pose is None:
             print("[Pi Trajectory] Failed to get current or first pose, aborting trajectory.")
-            utils.trajectory_state["is_running"] = False
-            utils.trajectory_state["weld_active"] = False
-            utils.trajectory_state["current_weld_type"] = None
+            utils.trajectory_state_update(
+                is_running=False,
+                weld_active=False,
+                current_weld_type=None,
+            )
+            try:
+                utils.set_motion_state("IDLE")
+            except Exception:
+                pass
             return
         first_pos = first_pose[:3, 3]
         first_orient = first_pose[:3, :3]
@@ -777,9 +827,15 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         )
         if joint_path_initial is None:
             print("[Pi Trajectory] Failed to plan initial move to first waypoint, aborting trajectory.")
-            utils.trajectory_state["is_running"] = False
-            utils.trajectory_state["weld_active"] = False
-            utils.trajectory_state["current_weld_type"] = None
+            utils.trajectory_state_update(
+                is_running=False,
+                weld_active=False,
+                current_weld_type=None,
+            )
+            try:
+                utils.set_motion_state("IDLE")
+            except Exception:
+                pass
             return
         initial_freq = frequency_hz
         initial_thread = threading.Thread(
@@ -822,8 +878,11 @@ def handle_stop_command():
     """
     print("[Controller] Received STOP command. Halting all motion.")
     # Set the flag to stop any high-level trajectory loops
-    utils.trajectory_state["should_stop"] = True
-    utils.trajectory_state["weld_active"] = False
+    utils.trajectory_state_update(should_stop=True, weld_active=False)
+    try:
+        utils.set_motion_state("IDLE")
+    except Exception:
+        pass
 
     # Also send an immediate brake command to the physical servos
     # by commanding them to their current position with zero speed.
@@ -985,12 +1044,13 @@ def handle_move_line_relative(dx: float, dy: float, dz: float, speed: float = 1.
         print("[Pi Smooth] ERROR: Cannot start relative move, failed to get start position.")
         return
         
+    _, target_velocity, target_acceleration = _resolve_profile_params_for_speed_multiplier(speed)
     target_pos = start_pos + np.array([dx, dy, dz])
     
     handle_move_profiled(
         target_pos[0], target_pos[1], target_pos[2],
-        velocity=utils.DEFAULT_PROFILE_VELOCITY * speed,
-        acceleration=utils.DEFAULT_PROFILE_ACCELERATION,
+        velocity=target_velocity,
+        acceleration=target_acceleration,
         closed_loop=closed_loop,
         use_smoothing=True,
         diagnostics=False
@@ -1535,6 +1595,7 @@ def _plan_preview_points_payload(
     planned_steps = []
     waypoint_results = []
     cartesian_samples = []
+    planning_warnings: list[str] = []
     planning_succeeded = True
     failed_waypoint_idx: int | None = None
     failed_waypoint_target: np.ndarray | None = None
@@ -1635,6 +1696,8 @@ def _plan_preview_points_payload(
         start_angles: np.ndarray,
         work_angle_deg: float,
         travel_angle_deg: float,
+        tangent_roll_deg: float,
+        tool_rotation_inv: np.ndarray,
     ) -> list[np.ndarray]:
         start_pose = ik_solver.get_fk_matrix(start_angles.tolist())
         fallback_orientation = (
@@ -1646,6 +1709,7 @@ def _plan_preview_points_payload(
         world_up = np.array([0.0, 0.0, 1.0], dtype=float)
         work_rad = np.deg2rad(np.clip(work_angle_deg, 0.0, 89.0))
         travel_rad = np.deg2rad(np.clip(travel_angle_deg, -89.0, 89.0))
+        roll_rad = np.deg2rad(np.clip(tangent_roll_deg, -180.0, 180.0))
         orientations: list[np.ndarray] = []
         last_forward = fallback_forward.copy()
         for idx, point in enumerate(path_points):
@@ -1660,6 +1724,8 @@ def _plan_preview_points_payload(
             torch_axis = (np.cos(work_rad) * horizontal_forward) - (np.sin(work_rad) * world_up)
             torch_axis = _normalize(torch_axis, -world_up)
             torch_axis = _rotate_about_axis(torch_axis, side_axis, travel_rad)
+            if abs(roll_rad) > 1e-9:
+                torch_axis = _rotate_about_axis(torch_axis, forward, roll_rad)
             torch_axis = _normalize(torch_axis, -world_up)
             y_axis = np.cross(torch_axis, forward)
             y_axis = _normalize(y_axis, np.cross(torch_axis, fallback_forward))
@@ -1667,13 +1733,46 @@ def _plan_preview_points_payload(
             x_axis = _normalize(x_axis, fallback_forward)
             y_axis = np.cross(torch_axis, x_axis)
             y_axis = _normalize(y_axis, np.array([0.0, 1.0, 0.0], dtype=float))
-            orientation = np.column_stack((x_axis, y_axis, torch_axis))
+            desired_torch_orientation = np.column_stack((x_axis, y_axis, torch_axis))
+            # Convert desired world-frame torch pose to required flange/J6 pose
+            # using the active tool definition's flange->tool rotation.
+            orientation = desired_torch_orientation.dot(tool_rotation_inv)
             orientations.append(orientation)
             last_forward = forward
         return orientations
 
     print(f"[Pi Trajectory] Planning {len(points)} waypoint(s) for preview '{preview_name}'.")
     weld_points_for_payload: list[list[float]] | None = None
+    active_tool_id = "identity"
+    active_tool_rotation_inv = np.identity(3, dtype=float)
+    try:
+        runtime_snapshot = kinematics_runtime.get_runtime_state_snapshot()
+        active_tool = runtime_snapshot.get("active_tool")
+        if isinstance(active_tool, dict):
+            tool_id_token = str(
+                active_tool.get("active_tool_id")
+                or active_tool.get("tool_id")
+                or ""
+            ).strip()
+            if tool_id_token:
+                active_tool_id = tool_id_token
+        effective_offset = runtime_snapshot.get("offsets", {}).get("tool_effective")
+        if isinstance(effective_offset, dict):
+            tool_rot = effective_offset.get("rotation_deg")
+            if isinstance(tool_rot, dict):
+                active_tool_rotation = R.from_euler(
+                    "xyz",
+                    [
+                        float(tool_rot.get("x", 0.0)),
+                        float(tool_rot.get("y", 0.0)),
+                        float(tool_rot.get("z", 0.0)),
+                    ],
+                    degrees=True,
+                ).as_matrix()
+                active_tool_rotation_inv = np.linalg.inv(active_tool_rotation)
+    except Exception:
+        active_tool_rotation_inv = np.identity(3, dtype=float)
+
     if weld_metadata:
         options = weld_metadata.get("options") if isinstance(weld_metadata.get("options"), dict) else {}
         interior_speed = max(0.005, _safe_float(options.get("interior_speed_m_s", plan_velocity), plan_velocity))
@@ -1685,6 +1784,10 @@ def _plan_preview_points_payload(
         transition_clearance_m = transition_clearance_mm / 1000.0
         work_angle_deg = _safe_float(options.get("work_angle_deg", 45.0), 45.0)
         travel_angle_deg = _safe_float(options.get("travel_angle_deg", 0.0), 0.0)
+        tangent_roll_deg = _safe_float(
+            options.get("tangent_roll_deg", options.get("tangentRollDeg", 0.0)),
+            0.0,
+        )
         post_action_raw = str(options.get("post_action", "return_to_start")).strip().lower()
         post_action = (
             post_action_raw
@@ -1692,10 +1795,15 @@ def _plan_preview_points_payload(
             else "return_to_start"
         )
         options["post_action"] = post_action
+        options["tangent_roll_deg"] = tangent_roll_deg
         if isinstance(weld_metadata.get("options"), dict):
             weld_metadata["options"]["post_action"] = post_action
+            weld_metadata["options"]["tangent_roll_deg"] = tangent_roll_deg
         else:
-            weld_metadata["options"] = {"post_action": post_action}
+            weld_metadata["options"] = {
+                "post_action": post_action,
+                "tangent_roll_deg": tangent_roll_deg,
+            }
         planned_sections = sections if isinstance(sections, list) and len(sections) > 0 else [
             {"kind": "weld", "points": points, "weld_type": weld_metadata.get("type")}
         ]
@@ -1716,6 +1824,25 @@ def _plan_preview_points_payload(
 
             if section_kind == "weld":
                 first_target = section_points[0]
+                entry_orientation = None
+                try:
+                    # Use the same weld-angle orientation model for entry approach so
+                    # we do not over-constrain entry with a stale orientation lock.
+                    entry_orientations = _build_weld_orientations(
+                        section_points,
+                        current_q,
+                        work_angle_deg=work_angle_deg,
+                        travel_angle_deg=travel_angle_deg,
+                        tangent_roll_deg=tangent_roll_deg,
+                        tool_rotation_inv=active_tool_rotation_inv,
+                    )
+                    if entry_orientations:
+                        entry_orientation = np.asarray(entry_orientations[0], dtype=float)
+                except Exception as entry_orientation_error:
+                    print(
+                        "[Pi Trajectory] WARNING: Failed to derive weld-entry orientation "
+                        f"for section #{section_index}: {entry_orientation_error}"
+                    )
                 current_pos = ik_solver.get_fk(current_q.tolist())
                 if current_pos is None or np.linalg.norm(np.array(current_pos) - first_target) > 1e-4:
                     joint_path = trajectory_execution._plan_linear_move(
@@ -1725,8 +1852,24 @@ def _plan_preview_points_payload(
                         float(plan_acceleration),
                         100,
                         True,
-                        forced_orientation=None,
+                        forced_orientation=entry_orientation,
                     )
+                    if not joint_path and entry_orientation is not None:
+                        warning = (
+                            f"Weld entry orientation interpolation failed for section #{section_index}; "
+                            f"tool={active_tool_id}; retrying with orientation lock."
+                        )
+                        print(f"[Pi Trajectory] WARNING: {warning}")
+                        planning_warnings.append(warning)
+                        joint_path = trajectory_execution._plan_linear_move(
+                            current_q,
+                            first_target,
+                            float(plan_velocity),
+                            float(plan_acceleration),
+                            100,
+                            True,
+                            forced_orientation=None,
+                        )
                     if not joint_path:
                         print(f"[Pi Trajectory] ERROR: Failed weld entry for section #{section_index} -> {np.round(first_target, 4)}.")
                         planning_succeeded = False
@@ -1760,6 +1903,8 @@ def _plan_preview_points_payload(
                     current_q,
                     work_angle_deg=work_angle_deg,
                     travel_angle_deg=travel_angle_deg,
+                    tangent_roll_deg=tangent_roll_deg,
+                    tool_rotation_inv=active_tool_rotation_inv,
                 )
                 joint_path = trajectory_execution._plan_high_fidelity_trajectory(
                     cartesian_points=[point.tolist()[:3] for point in interior_points],
@@ -1768,9 +1913,12 @@ def _plan_preview_points_payload(
                     orientations_list=interior_orientations,
                 )
                 if not joint_path:
-                    print(
-                        f"[Pi Trajectory] WARNING: Torch-angle orientations failed for weld section #{section_index}; retrying with orientation lock."
+                    warning = (
+                        f"Torch-angle orientations failed for weld section #{section_index}; "
+                        f"tool={active_tool_id}; retrying with orientation lock."
                     )
+                    print(f"[Pi Trajectory] WARNING: {warning}")
+                    planning_warnings.append(warning)
                     joint_path = trajectory_execution._plan_high_fidelity_trajectory(
                         cartesian_points=[point.tolist()[:3] for point in interior_points],
                         start_q=current_q,
@@ -1826,10 +1974,6 @@ def _plan_preview_points_payload(
         if planning_succeeded:
             def _plan_post_action_target(target_pos: np.ndarray, label: str) -> bool:
                 nonlocal current_q
-                nonlocal planning_succeeded
-                nonlocal failed_waypoint_idx
-                nonlocal failed_waypoint_target
-                nonlocal failed_segment_start_fk
 
                 current_pos_local = ik_solver.get_fk(current_q.tolist())
                 if (
@@ -1852,13 +1996,12 @@ def _plan_preview_points_payload(
                     forced_orientation=None,
                 )
                 if not joint_path:
-                    print(
-                        f"[Pi Trajectory] ERROR: Failed post-action transition ({label}) -> {np.round(target_pos, 4)}."
+                    warning = (
+                        f"Post-action transition skipped ({label}) target="
+                        f"{[round(float(v), 4) for v in target_pos.tolist()[:3]]}"
                     )
-                    planning_succeeded = False
-                    failed_waypoint_idx = len(planned_steps) + 1
-                    failed_waypoint_target = target_pos
-                    failed_segment_start_fk = segment_start_fk
+                    print(f"[Pi Trajectory] WARNING: {warning}.")
+                    planning_warnings.append(warning)
                     return False
                 planned_steps.append(
                     {"type": "move", "path": joint_path, "freq": 100, "weld_active": False}
@@ -1987,6 +2130,8 @@ def _plan_preview_points_payload(
         "orientation_euler_angles_deg": None,
         "moves": moves,
     }
+    if planning_warnings:
+        traj_dict["planning_warnings"] = planning_warnings
     if weld_metadata:
         traj_dict["weld"] = weld_metadata
 
@@ -2015,6 +2160,11 @@ def _plan_preview_points_payload(
             for step in planned_steps
         ],
     }
+    planner_diag = utils.trajectory_state.get("last_planner_diagnostics")
+    if isinstance(planner_diag, dict):
+        payload["planner_diagnostics"] = planner_diag
+    if planning_warnings:
+        payload["planning_warnings"] = planning_warnings
     if weld_metadata:
         payload["weld"] = weld_metadata
     return payload
@@ -2100,3 +2250,66 @@ def _load_trajectory_by_name(name: str):
         print(f"[Pi Trajectory] ERROR: Could not load fallback trajectories.json: {e}")
 
     return None
+
+
+def get_motion_state() -> str:
+    """
+    Best-effort motion state snapshot for safety gating.
+
+    The richer state machine is tracked elsewhere; this helper provides a strict
+    idle-vs-active gate for runtime kinematics changes.
+    """
+    state = utils.get_motion_state()
+    if state != "IDLE":
+        return state
+    if bool(utils.trajectory_state_get("is_jogging", False)):
+        return "EXECUTING"
+    return "IDLE"
+
+
+def handle_get_kinematics_profile() -> dict:
+    return kinematics_runtime.get_runtime_state_snapshot()
+
+
+def handle_patch_runtime_offsets(payload: dict, expected_revision: int | None = None) -> dict:
+    result = kinematics_runtime.patch_runtime_offsets(
+        payload,
+        expected_revision=expected_revision,
+        motion_state=get_motion_state(),
+    )
+    utils.append_audit(
+        "kinematics_patch",
+        expected_revision=expected_revision,
+        applied_revision=result.get("revision"),
+    )
+    return result
+
+
+def handle_reset_runtime_offsets(expected_revision: int | None = None) -> dict:
+    result = kinematics_runtime.reset_runtime_offsets(
+        expected_revision=expected_revision,
+        motion_state=get_motion_state(),
+    )
+    utils.append_audit(
+        "kinematics_reset",
+        expected_revision=expected_revision,
+        applied_revision=result.get("revision"),
+    )
+    return result
+
+
+def handle_apply_kinematics_profile(payload: dict, expected_revision: int | None = None) -> dict:
+    backend_name = ik_solver.get_backend_name()
+    result = kinematics_runtime.apply_profile_payload(
+        payload,
+        expected_revision=expected_revision,
+        motion_state=get_motion_state(),
+        backend_name=backend_name,
+    )
+    utils.append_audit(
+        "kinematics_apply_profile",
+        expected_revision=expected_revision,
+        applied_revision=result.get("revision"),
+        profile_id=result.get("profile", {}).get("profile_id"),
+    )
+    return result
