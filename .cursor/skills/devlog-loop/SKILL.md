@@ -3,15 +3,15 @@ name: devlog-loop
 description: Keep a concise, chronological DEVLOG for meaningful tasks. Use when work should be documented for handoff, traceability, or future debugging.
 ---
 
-Maintain `DEVLOG.md` as the durable engineering timeline for this repository.
+Maintain `.cursor/memory/DEVLOG.md` as the durable engineering timeline for this repository.
 
 ## Core Workflow
 
-1. Read latest `DEVLOG.md` entries before starting meaningful work.
+1. Read latest `.cursor/memory/DEVLOG.md` entries before starting meaningful work.
 2. During the task, capture commands/checks and key outcomes.
 3. Before handoff, append one new dated entry.
 
-Use `/DEVLOG.md` as the default log file unless the user requests another path.
+Use `.cursor/memory/DEVLOG.md` as the default log file unless the user requests another path.
 
 ## Entry Requirements
 

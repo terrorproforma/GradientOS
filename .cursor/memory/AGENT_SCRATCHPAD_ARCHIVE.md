@@ -1,35 +1,4 @@
-# Agent Scratchpad
-
-Use this file as persistent, repo-local execution memory.
-
-## File Policy
-
-- Current policy: `COMMITTED`
-- Rationale:
-  - The user explicitly asked for persistent use of scratchpad/devlog skills and visible top-level references.
-
-## How To Use
-
-1. Read latest entries before starting meaningful work.
-2. Build a short preflight checklist from recurring mistakes and preferences.
-3. Re-read before risky operations (migrations, broad refactors, unfamiliar tooling, destructive commands).
-4. Log high-signal learnings immediately during the task.
-5. Append one new session entry before handoff.
-6. Keep entries concrete, concise, and testable.
-
-## Entry Rules
-
-- Tag operational notes with source: `[self]`, `[user]`, or `[tool]`.
-- Prefer facts tied to files, commands, and outcomes.
-- Do not log low-signal reminders.
-
-## Retained Lessons
-
-- [user] Prefer implementation over discussion; "do it, do not only explain."
-- [user] UI preferences are specific and iterative; keep changes minimal and visual hierarchy clean.
-- [tool] Build and lint checks (`npm run build`, `ReadLints`) catch regressions quickly in the web-ui workflow.
-
-## Session Entries
+# Agent Scratchpad Archive
 
 ### 2026-02-16 00:14 +11:00 - Sidebar UX refinement and workflow persistence
 
@@ -74,7 +43,7 @@ Use this file as persistent, repo-local execution memory.
 #### Guardrails For Next Session
 
 - Preflight rule:
-  - Read this scratchpad + `DEVLOG.md` first, then align any overlay control to the actual rendered panel width before finalizing.
+  - Read this scratchpad + `.cursor/memory/DEVLOG.md` first, then align any overlay control to the actual rendered panel width before finalizing.
 
 #### Follow-Ups / Risks
 
@@ -196,7 +165,7 @@ Use this file as persistent, repo-local execution memory.
 #### User Preferences
 
 - New or reinforced preference:
-  - Always use and update both `AGENT_SCRATCHPAD.md` and `DEVLOG.md`.
+  - Always use and update both `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md`.
 - How it changed execution:
   - Implemented an always-apply rule and logged this change in both memory files immediately.
 
@@ -213,7 +182,7 @@ Use this file as persistent, repo-local execution memory.
 #### Guardrails For Next Session
 
 - Preflight rule:
-  - Before substantial edits, read `AGENT_SCRATCHPAD.md` + `DEVLOG.md`; before handoff, append both.
+  - Before substantial edits, read `.cursor/memory/AGENT_SCRATCHPAD.md` + `.cursor/memory/DEVLOG.md`; before handoff, append both.
 
 #### Follow-Ups / Risks
 
@@ -320,7 +289,7 @@ Use this file as persistent, repo-local execution memory.
   - weld section planning with transitions
   - torch-angle controls (UI -> API -> planner)
   - planner robustness and diagnostics.
-- Closed workflow loop by writing explicit session entries to both `DEVLOG.md` and `AGENT_SCRATCHPAD.md`.
+- Closed workflow loop by writing explicit session entries to both `.cursor/memory/DEVLOG.md` and `.cursor/memory/AGENT_SCRATCHPAD.md`.
 
 #### Mistakes And Fixes
 
@@ -551,7 +520,7 @@ Use this file as persistent, repo-local execution memory.
 #### Task Summary
 
 - Corrected left drawer vertical sizing so it keeps a bottom inset instead of visually running to the edge.
-- Updated `AGENTS.md` to reflect the rename from `QUICK_START.md` and documented all installed skills with usage triggers.
+- Updated `.cursor/rules/000-project-instructions.md` to reflect the rename from `QUICK_START.md` and documented all installed skills with usage triggers.
 
 #### Mistakes And Fixes
 
@@ -572,7 +541,7 @@ Use this file as persistent, repo-local execution memory.
   - Agent docs must stay current when top-level onboarding files are renamed.
   - Design-oriented skill usage should be explicit and discoverable.
 - How it changed execution:
-  - Applied layout fix first, then codified full skill relevance in `AGENTS.md`.
+  - Applied layout fix first, then codified full skill relevance in `.cursor/rules/000-project-instructions.md`.
 
 #### What Worked
 
@@ -785,7 +754,7 @@ Use this file as persistent, repo-local execution memory.
 #### Task Summary
 
 - Extended typography consistency work from Weld to STEP and Trajectory panels.
-- Added `web-ui/design.md` as the living design-system document and referenced it from `AGENTS.md`.
+- Added `web-ui/design.md` as the living design-system document and referenced it from `.cursor/rules/000-project-instructions.md`.
 
 #### Mistakes And Fixes
 
@@ -796,7 +765,7 @@ Use this file as persistent, repo-local execution memory.
   - User approved extending hierarchy consistency across all drawer tabs and requested a persistent living design doc.
 - Fix:
   - Introduced shared `DRAWER_*` tokens in `App.tsx` and aligned STEP/Trajectory class usage with those tokens.
-  - Created `web-ui/design.md` with rules/checklist and linked it from `AGENTS.md`.
+  - Created `web-ui/design.md` with rules/checklist and linked it from `.cursor/rules/000-project-instructions.md`.
 - Preventive rule:
   - When UI consistency request spans multiple panels, establish or update a repo-local design source-of-truth before further styling changes.
 
@@ -832,7 +801,7 @@ Use this file as persistent, repo-local execution memory.
 
 #### Task Summary
 
-- Strengthened `AGENTS.md` so updating both `DEVLOG.md` and `AGENT_SCRATCHPAD.md` is explicitly non-optional.
+- Strengthened `.cursor/rules/000-project-instructions.md` so updating both `.cursor/memory/DEVLOG.md` and `.cursor/memory/AGENT_SCRATCHPAD.md` is explicitly non-optional.
 
 #### Mistakes And Fixes
 
@@ -842,7 +811,7 @@ Use this file as persistent, repo-local execution memory.
 - Detection:
   - User explicitly requested stronger emphasis that these tasks must never be left undone.
 - Fix:
-  - Added MUST language on both workflow bullets and a non-negotiable blocker rule in `AGENTS.md`.
+  - Added MUST language on both workflow bullets and a non-negotiable blocker rule in `.cursor/rules/000-project-instructions.md`.
 - Preventive rule:
   - If user says "every time", encode it with explicit "MUST" + "blocker" phrasing in the top-level onboarding doc.
 
@@ -851,7 +820,7 @@ Use this file as persistent, repo-local execution memory.
 - New or reinforced preference:
   - Memory-loop updates are mandatory on every meaningful task with zero exceptions.
 - How it changed execution:
-  - Immediately hardened policy text in `AGENTS.md` and logged the change in both memory files.
+  - Immediately hardened policy text in `.cursor/rules/000-project-instructions.md` and logged the change in both memory files.
 
 #### What Worked
 
@@ -866,7 +835,7 @@ Use this file as persistent, repo-local execution memory.
 #### Guardrails For Next Session
 
 - Preflight rule:
-  - Treat absent updates in either `DEVLOG.md` or `AGENT_SCRATCHPAD.md` as a stop condition before final handoff.
+  - Treat absent updates in either `.cursor/memory/DEVLOG.md` or `.cursor/memory/AGENT_SCRATCHPAD.md` as a stop condition before final handoff.
 
 #### Follow-Ups / Risks
 
@@ -1294,7 +1263,7 @@ Use this file as persistent, repo-local execution memory.
 #### User Preferences
 
 - New or reinforced preference:
-  - Use `AGENTS.md` as startup context and install all repo-local skills when requested.
+  - Use `.cursor/rules/000-project-instructions.md` as startup context and install all repo-local skills when requested.
 - How it changed execution:
   - Followed skill-installer guidance for workflow framing, then performed local copy/install for all `.cursor/skills` folders.
 
@@ -1313,7 +1282,7 @@ Use this file as persistent, repo-local execution memory.
 
 - Preflight rule:
   - For skill installation requests, check both `.cursor/skills` and any AGENTS-referenced paths, but install only paths present in the active workspace.
-  - Always finish by updating both `DEVLOG.md` and `AGENT_SCRATCHPAD.md` before handoff.
+  - Always finish by updating both `.cursor/memory/DEVLOG.md` and `.cursor/memory/AGENT_SCRATCHPAD.md` before handoff.
 
 #### Follow-Ups / Risks
 
@@ -1805,7 +1774,7 @@ Use this file as persistent, repo-local execution memory.
 #### Follow-Ups / Risks
 
 - Remaining risk or pending check:
-  - Consider later consolidation between `README.md`, `AGENTS.md`, and `docs/README.md` to reduce duplicated startup guidance.
+  - Consider later consolidation between `README.md`, `.cursor/rules/000-project-instructions.md`, and `docs/README.md` to reduce duplicated startup guidance.
 
 ### 2026-02-18 11:55 +11:00 - Main README clarification: docs/README is canonical
 
@@ -2490,7 +2459,7 @@ Use this file as persistent, repo-local execution memory.
 - New or reinforced preference:
   - Implement changes directly; do not stop at discussion.
   - Execute the full staged plan and keep todo status accurate.
-  - Always update both `DEVLOG.md` and `AGENT_SCRATCHPAD.md` for meaningful work.
+  - Always update both `.cursor/memory/DEVLOG.md` and `.cursor/memory/AGENT_SCRATCHPAD.md` for meaningful work.
 - How it changed execution:
   - Kept continuous implementation flow across all stages in one turn, with full test/build/lint validation and mandatory memory-loop writeback.
 
@@ -4141,53 +4110,3 @@ Use this file as persistent, repo-local execution memory.
 - Remaining risk or pending check:
   - Browser cache/dev session can mask updated robot bundles; use hard refresh/restart if old frame persists.
 
-### 2026-02-20 02:43 +11:00 - Tangent-roll weld orientation implemented end-to-end
-
-#### Task Summary
-
-- Implemented a third weld angle (`tangent_roll_deg`) that rotates torch orientation about the per-step path tangent and wired it through planner/API/UI/save-load + tests.
-
-#### Mistakes And Fixes
-
-- Source: `[tool]`
-- Mistake:
-  - Attempted `pytest ...` directly in PowerShell before confirming command availability in this environment.
-- Detection:
-  - Shell returned `pytest : The term 'pytest' is not recognized...`.
-- Fix:
-  - Re-ran tests via repo venv interpreter: `.\.venv\Scripts\python -m pytest ...`.
-- Preventive rule:
-  - On Windows sessions in this repo, default to `.\.venv\Scripts\python -m pytest` unless `pytest` command availability is already confirmed.
-
-#### User Preferences
-
-- Source: `[user]`
-- New or reinforced preference:
-  - Add real implementation changes (not just explanation), and support exact weld orientation control with tangent-relative behavior.
-- How it changed execution:
-  - Implemented planner math + API/UI contract + persistence + tests in one pass, rather than limiting to conceptual guidance.
-
-#### What Worked
-
-- Source: `[self]`
-- Pattern/check that worked:
-  - Reusing existing `_rotate_about_axis(...)` with tangent (`forward`) axis kept the orientation change minimal and robust.
-  - Normalizing option names at API boundary (`tangentRollDeg` -> `tangent_roll_deg`) prevented UI/backend mismatch.
-  - Capturing `orientations_list` in a monkeypatched planner test verified actual orientation delta for nonzero tangent roll.
-
-#### What Did Not Work
-
-- Source: `[tool]`
-- Failed attempt and why:
-  - Running plain `pytest` failed due PATH/environment mismatch in PowerShell.
-
-#### Guardrails For Next Session
-
-- Preflight rule:
-  - For new weld angle parameters, update all four layers together: UI draft type + API normalization + planner option parse + persistence (weld program save/load).
-  - Validate both default-backward compatibility (`0.0`) and nonzero behavior through tests before handoff.
-
-#### Follow-Ups / Risks
-
-- Remaining risk or pending check:
-  - Operator ergonomics may still prefer inverted sign direction for tangent roll; if requested, invert in UI input mapping while keeping planner right-hand-rule internal semantics stable.

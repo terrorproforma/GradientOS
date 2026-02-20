@@ -14,10 +14,10 @@ alwaysApply: true
 
 - Scratchpad skill: `.cursor/skills/learning-scratchpad-loop/SKILL.md`
 - Scratchpad template: `.cursor/skills/learning-scratchpad-loop/references/scratchpad-template.md`
-- Scratchpad file: `AGENT_SCRATCHPAD.md`
+- Scratchpad file: `.cursor/memory/AGENT_SCRATCHPAD.md`
 - Devlog skill: `.cursor/skills/devlog-loop/SKILL.md`
 - Devlog template: `.cursor/skills/devlog-loop/references/devlog-entry-template.md`
-- Devlog file: `DEVLOG.md`
+- Devlog file: `.cursor/memory/DEVLOG.md`
 
 If instructions conflict, the full specification wins.
 

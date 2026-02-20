@@ -31,3 +31,16 @@ This folder is the canonical asset bundle for the `gradient-05` robot.
    - `npm run sync:robot-assets` (from `web-ui/`)
    - `& ".\\.venv\\Scripts\\python.exe" -m gradient_os.run_controller --list-robots`
 9. (Optional) preserve `.usd` files here; they are pass-through only and not required.
+
+## Joint limit update workflow
+
+Use this whenever `gradient-05.urdf` joint `<limit .../>` values change.
+
+1. Preview proposed config changes:
+   - `& ".\\.venv\\Scripts\\python.exe" "scripts/sync_urdf_limits.py" --dry-run`
+2. Apply sync into Python runtime config:
+   - `& ".\\.venv\\Scripts\\python.exe" "scripts/sync_urdf_limits.py"`
+3. Review the resulting diff in:
+   - `src/gradient_os/arm_controller/robots/gradient05/config.py`
+4. Run targeted regression checks:
+   - `& ".\\.venv\\Scripts\\python.exe" -m pytest "tests/test_gradient05_limits_and_backends.py" -q`

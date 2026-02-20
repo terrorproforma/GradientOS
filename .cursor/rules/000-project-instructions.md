@@ -1,3 +1,8 @@
+---
+description: "Primary project execution guide, skills catalog, and run commands."
+alwaysApply: true
+---
+
 # AGENTS
 
 This file was previously `QUICK_START.md` and is now the primary startup + execution guide.
@@ -7,15 +12,15 @@ This file was previously `QUICK_START.md` and is now the primary startup + execu
 
 To keep implementation quality and session continuity high, maintain these repo-local files:
 
-- `DEVLOG.md` - chronological engineering timeline (what changed, validation, risks). **MUST be updated for every meaningful task.**
-- `AGENT_SCRATCHPAD.md` - persistent execution memory (mistakes, preferences, guardrails). **MUST be updated for every meaningful task.**
+- `.cursor/memory/DEVLOG.md` - chronological engineering timeline (what changed, validation, risks). **MUST be updated for every meaningful task.**
+- `.cursor/memory/AGENT_SCRATCHPAD.md` - persistent execution memory (mistakes, preferences, guardrails). **MUST be updated for every meaningful task.**
 - `web-ui/design.md` - living UI consistency spec (typography hierarchy, panel rules, spacing, review checklist).
-- `.cursor/skills/devlog-loop/SKILL.md` -> writes to `DEVLOG.md` (template: `.cursor/skills/devlog-loop/references/devlog-entry-template.md`).
-- `.cursor/skills/learning-scratchpad-loop/SKILL.md` -> writes to `AGENT_SCRATCHPAD.md` (template: `.cursor/skills/learning-scratchpad-loop/references/scratchpad-template.md`).
+- `.cursor/skills/devlog-loop/SKILL.md` -> writes to `.cursor/memory/DEVLOG.md` (template: `.cursor/skills/devlog-loop/references/devlog-entry-template.md`).
+- `.cursor/skills/learning-scratchpad-loop/SKILL.md` -> writes to `.cursor/memory/AGENT_SCRATCHPAD.md` (template: `.cursor/skills/learning-scratchpad-loop/references/scratchpad-template.md`).
 
 Non-negotiable workflow rule:
 
-- Never hand off or stop after implementation without appending both `DEVLOG.md` and `AGENT_SCRATCHPAD.md`.
+- Never hand off or stop after implementation without appending both `.cursor/memory/DEVLOG.md` and `.cursor/memory/AGENT_SCRATCHPAD.md`.
 - Treat missing updates to either file as an incomplete task (blocker), even if code is correct.
 
 ### Skills catalog (all installed) and when to use each
@@ -27,10 +32,10 @@ Use these skills proactively based on task type.
 - `update-cursor-settings` (`.cursor/skills-cursor/update-cursor-settings/SKILL.md`) - changing editor/IDE settings, `settings.json`, formatting, autosave, or related config.
 - `agent-browser` (`.cursor/skills/agent-browser/SKILL.md`) - browser automation/testing (navigate, click, fill, screenshot, extract data).
 - `canvas-design` (`.cursor/skills/canvas-design/SKILL.md`) - generating static visual design artifacts (posters/artwork in `.png`/`.pdf`).
-- `devlog-loop` (`.cursor/skills/devlog-loop/SKILL.md`) - meaningful work logging in `DEVLOG.md` for traceability and handoff.
+- `devlog-loop` (`.cursor/skills/devlog-loop/SKILL.md`) - meaningful work logging in `.cursor/memory/DEVLOG.md` for traceability and handoff.
 - `find-skills` (`.cursor/skills/find-skills/SKILL.md`) - when user asks "is there a skill for X" or wants capability discovery/installation.
 - `frontend-design` (`.cursor/skills/frontend-design/SKILL.md`) - UI building/polish for React/web interfaces where visual quality and production finish matter.
-- `learning-scratchpad-loop` (`.cursor/skills/learning-scratchpad-loop/SKILL.md`) - persistent execution memory updates in `AGENT_SCRATCHPAD.md`.
+- `learning-scratchpad-loop` (`.cursor/skills/learning-scratchpad-loop/SKILL.md`) - persistent execution memory updates in `.cursor/memory/AGENT_SCRATCHPAD.md`.
 - `next-best-practices` (`.cursor/skills/next-best-practices/SKILL.md`) - Next.js architecture, routing, RSC boundaries, metadata, data handling.
 - `next-cache-components` (`.cursor/skills/next-cache-components/SKILL.md`) - Next.js 16 caching strategy (`use cache`, cache tags/lifetimes, PPR patterns).
 - `vercel-composition-patterns` (`.cursor/skills/vercel-composition-patterns/SKILL.md`) - React component API architecture and composition refactors at scale.

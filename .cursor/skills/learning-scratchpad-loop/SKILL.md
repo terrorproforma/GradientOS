@@ -14,11 +14,11 @@ Build and maintain a lightweight learning loop in-repo so each session starts sm
 5. Re-read before risky operations.
 6. Append concrete learnings before handoff.
 
-Use `/AGENT_SCRATCHPAD.md` as the default memory file unless the user asks for a different path.
+Use `.cursor/memory/AGENT_SCRATCHPAD.md` as the default memory file unless the user asks for a different path.
 
 ## Step 1: Initialize Scratchpad
 
-If `/AGENT_SCRATCHPAD.md` does not exist, create it from `references/scratchpad-template.md`.
+If `.cursor/memory/AGENT_SCRATCHPAD.md` does not exist, create it from `references/scratchpad-template.md`.
 
 Keep the structure stable so future sessions can parse it quickly.
 Set and record a file policy in the scratchpad:
@@ -30,7 +30,7 @@ Set and record a file policy in the scratchpad:
 
 At the beginning of each meaningful task:
 
-1. Read the latest entries in `/AGENT_SCRATCHPAD.md`.
+1. Read the latest entries in `.cursor/memory/AGENT_SCRATCHPAD.md`.
 2. Extract:
    - repeated mistakes to avoid
    - explicit user preferences

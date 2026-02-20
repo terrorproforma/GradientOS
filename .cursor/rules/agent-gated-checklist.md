@@ -9,14 +9,14 @@ alwaysApply: true
 
 - Scratchpad skill: `.cursor/skills/learning-scratchpad-loop/SKILL.md`
 - Scratchpad template: `.cursor/skills/learning-scratchpad-loop/references/scratchpad-template.md`
-- Scratchpad file: `AGENT_SCRATCHPAD.md`
+- Scratchpad file: `.cursor/memory/AGENT_SCRATCHPAD.md`
 - Devlog skill: `.cursor/skills/devlog-loop/SKILL.md`
 - Devlog template: `.cursor/skills/devlog-loop/references/devlog-entry-template.md`
-- Devlog file: `DEVLOG.md`
+- Devlog file: `.cursor/memory/DEVLOG.md`
 
 ## Gate 0 — Intake (MUST PASS BEFORE CODING)
 - [ ] Restate the task in 1–3 sentences (no invention).
-- [ ] Read `AGENT_SCRATCHPAD.md` and `DEVLOG.md` and apply relevant guardrails/preferences.
+- [ ] Read `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md` and apply relevant guardrails/preferences.
 - [ ] List explicit inputs/outputs + success criteria.
 - [ ] List ALL assumptions (runtime, versions, deps, data shape/units/timezone, auth, concurrency, persistence).
 - [ ] For each assumption: mark as (Given) / (Inferred) / (Unknown).
@@ -68,7 +68,7 @@ alwaysApply: true
 - [ ] Build succeeds.
 - [ ] Tests pass.
 - [ ] Lint/format checks pass (if repo uses them).
-- [ ] Append concise writebacks to `AGENT_SCRATCHPAD.md` and `DEVLOG.md`.
+- [ ] Append concise writebacks to `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md`.
 - [ ] Provide a short change log:
   - What changed
   - Why
@@ -80,5 +80,5 @@ alwaysApply: true
 
 # Pre-flight prompt (paste above new agent sessions)
 
-Before coding: read `AGENT_SCRATCHPAD.md` + `DEVLOG.md`, restate task, list assumptions, ask questions for unknowns, propose a 3–7 step plan, define DONE with tests/invariants, then implement minimal diff. No unrelated refactors. Verify with build/tests, append scratchpad/devlog writebacks, and report exact commands.
+Before coding: read `.cursor/memory/AGENT_SCRATCHPAD.md` + `.cursor/memory/DEVLOG.md`, restate task, list assumptions, ask questions for unknowns, propose a 3–7 step plan, define DONE with tests/invariants, then implement minimal diff. No unrelated refactors. Verify with build/tests, append scratchpad/devlog writebacks, and report exact commands.
 

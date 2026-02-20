@@ -250,6 +250,8 @@ class SimulationBackend(ActuatorBackend):
             self._raw_positions[actuator_id] = self._angle_to_raw(physical_angle, actuator_id)
     
     def read_single_actuator_position(self, actuator_id: int) -> Optional[int]:
+        if actuator_id is None:
+            return None
         if actuator_id in self._raw_positions:
             return self._raw_positions[actuator_id]
         if 0 <= actuator_id < len(self._actuator_ids):

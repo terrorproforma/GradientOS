@@ -7,21 +7,21 @@ alwaysApply: true
 
 For every meaningful task in this repository, apply both loops:
 
-- Scratchpad loop via `AGENT_SCRATCHPAD.md`
-- Devlog loop via `DEVLOG.md`
+- Scratchpad loop via `.cursor/memory/AGENT_SCRATCHPAD.md`
+- Devlog loop via `.cursor/memory/DEVLOG.md`
 
 ## Skill and file mapping (required)
 
 - Scratchpad skill: `.cursor/skills/learning-scratchpad-loop/SKILL.md`
 - Scratchpad template: `.cursor/skills/learning-scratchpad-loop/references/scratchpad-template.md`
-- Scratchpad file: `AGENT_SCRATCHPAD.md`
+- Scratchpad file: `.cursor/memory/AGENT_SCRATCHPAD.md`
 - Devlog skill: `.cursor/skills/devlog-loop/SKILL.md`
 - Devlog template: `.cursor/skills/devlog-loop/references/devlog-entry-template.md`
-- Devlog file: `DEVLOG.md`
+- Devlog file: `.cursor/memory/DEVLOG.md`
 
 ## Start-of-task requirements
 
-1. Read `AGENT_SCRATCHPAD.md` and `DEVLOG.md` before making substantial changes.
+1. Read `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md` before making substantial changes.
 2. Extract and apply:
    - explicit user preferences
    - repeated mistakes to avoid
@@ -38,7 +38,7 @@ For every meaningful task in this repository, apply both loops:
 
 Before handoff, append concise entries to both files:
 
-- `AGENT_SCRATCHPAD.md`: task summary, mistakes/fixes, user preferences, guardrails, risks/follow-ups.
-- `DEVLOG.md`: date/time, what changed, validation actually run, risks/follow-ups.
+- `.cursor/memory/AGENT_SCRATCHPAD.md`: task summary, mistakes/fixes, user preferences, guardrails, risks/follow-ups.
+- `.cursor/memory/DEVLOG.md`: date/time, what changed, validation actually run, risks/follow-ups.
 
 If no code changed but meaningful investigation happened, still log what was checked and verified.

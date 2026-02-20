@@ -104,8 +104,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._rt_num_axes: int = 0
 
         # Mapping: RTCore axis index -> GradientOS logical joint index (0-based).
-        # For bring-up you said the two EtherCAT test drives are on J3/J4, so if RTCore exposes 2 axes,
-        # we default to mapping axis0->joint3 and axis1->joint4 (indices 2,3). Override via env.
+        # Default policy is direct ordering axis0->J1, axis1->J2, ... up to min(num_axes, num_joints).
+        # For hardware bring-up/custom wiring, override via GRADIENT_RTCORE_CONTROL_JOINTS.
         self._axis_to_joint: list[int] = []
 
         # Command ring sequencing (producer-owned).
@@ -487,12 +487,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 f"does not match num_axes={num_axes}; using defaults."
             )
 
-        # Default mapping:
-        # - If we only have 2 RT axes and at least 4 logical joints, assume bring-up on J3/J4.
-        if num_axes == 2 and num_joints >= 4:
-            return [2, 3]
-
-        # Otherwise map axes 0..(num_axes-1) to joints 0..(num_axes-1).
+        # Default mapping policy: axis0..axisN maps to joint0..jointN in order.
         return list(range(min(num_axes, num_joints)))
 
     def _cmd_ring_offsets(self) -> tuple[int, int]:
