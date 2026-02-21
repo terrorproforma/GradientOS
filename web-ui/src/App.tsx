@@ -236,7 +236,7 @@ type WeldDraft = {
   activeSegmentEdgeId: string | null;
   workAngleDeg: number;
   travelAngleDeg: number;
-  tangentRollDeg: number;
+  spinAngleDeg: number;
   transitionClearanceMm: number;
   postAction: "none" | "return_to_start" | "lift";
 };
@@ -262,8 +262,8 @@ type WeldProgramRecord = {
     work_angle_deg?: number;
     travelAngleDeg?: number;
     travel_angle_deg?: number;
-    tangentRollDeg?: number;
-    tangent_roll_deg?: number;
+    spinAngleDeg?: number;
+    spin_angle_deg?: number;
     transitionClearanceMm?: number;
     transition_clearance_mm?: number;
     postAction?: "none" | "return_to_start" | "lift";
@@ -332,6 +332,8 @@ function angleFromPointer(
 }
 
 const SETTINGS_STORAGE_KEY = "gradient-ui:settings";
+// Keep initial visualizer identity stable before runtime snapshot hydration completes.
+const DEFAULT_VISUALIZER_ROBOT_ID = "gradient-05";
 const DEFAULT_STEP_TRANSFORM: StepTransform = {
   position: { x: 0, y: 0, z: 0 },
   rotationDeg: { x: 0, y: 0, z: 0 },
@@ -797,7 +799,7 @@ function normalizeWeldDraftRecord(
   const weldName = String(raw.weldName ?? raw.weld_name ?? `${weldType} weld`).trim() || `${weldType} weld`;
   const workAngleDeg = Number(raw.workAngleDeg ?? raw.work_angle_deg ?? 45);
   const travelAngleDeg = Number(raw.travelAngleDeg ?? raw.travel_angle_deg ?? 0);
-  const tangentRollDeg = Number(raw.tangentRollDeg ?? raw.tangent_roll_deg ?? 0);
+  const spinAngleDeg = Number(raw.spinAngleDeg ?? raw.spin_angle_deg ?? 0);
   const transitionClearanceMm = Number(
     raw.transitionClearanceMm ?? raw.transition_clearance_mm ?? 35,
   );
@@ -841,7 +843,7 @@ function normalizeWeldDraftRecord(
     activeSegmentEdgeId,
     workAngleDeg: Number.isFinite(workAngleDeg) ? workAngleDeg : 45,
     travelAngleDeg: Number.isFinite(travelAngleDeg) ? travelAngleDeg : 0,
-    tangentRollDeg: Number.isFinite(tangentRollDeg) ? tangentRollDeg : 0,
+    spinAngleDeg: Number.isFinite(spinAngleDeg) ? spinAngleDeg : 0,
     transitionClearanceMm:
       Number.isFinite(transitionClearanceMm) && transitionClearanceMm > 0
         ? transitionClearanceMm
@@ -1415,7 +1417,9 @@ type WeldPanelProps = {
   onSetWeldName: (value: string) => void;
   onSetWorkAngleDeg: (value: number) => void;
   onSetTravelAngleDeg: (value: number) => void;
-  onSetTangentRollDeg: (value: number) => void;
+  onSetSpinAngleDeg: (value: number) => void;
+  showEndEffectorFrame: boolean;
+  onShowEndEffectorFrameChange: (value: boolean) => void;
   onSetTransitionClearanceMm: (value: number) => void;
   onSetPostAction: (value: "none" | "return_to_start" | "lift") => void;
   onSetStartS: (value: number) => void;
@@ -1711,7 +1715,9 @@ function WeldPanel({
   onSetWeldName,
   onSetWorkAngleDeg,
   onSetTravelAngleDeg,
-  onSetTangentRollDeg,
+  onSetSpinAngleDeg,
+  showEndEffectorFrame,
+  onShowEndEffectorFrameChange,
   onSetTransitionClearanceMm,
   onSetPostAction,
   onSetStartS,
@@ -1885,16 +1891,30 @@ function WeldPanel({
             />
           </label>
         </div>
-        <label className={WELD_LABEL_CLASS}>
-          Tangent Roll (deg)
+        <div className="grid grid-cols-2 gap-2">
+          <label className={WELD_LABEL_CLASS}>
+            Spin Angle (deg)
+            <input
+              className={WELD_INPUT_CLASS}
+              type="number"
+              step="1"
+              value={Number((draft?.spinAngleDeg ?? 0).toFixed(1))}
+              onChange={(event) => onSetSpinAngleDeg(Number(event.target.value))}
+              disabled={!draft}
+            />
+          </label>
+        </div>
+        <div className="text-[11px] text-slate-400">
+          3D guide appears on selected weld segment (cyan=travel, blue=up, green=normal, orange=torch).
+        </div>
+        <label className="flex items-center gap-2 text-[11px] text-slate-300">
           <input
-            className={WELD_INPUT_CLASS}
-            type="number"
-            step="1"
-            value={Number((draft?.tangentRollDeg ?? 0).toFixed(1))}
-            onChange={(event) => onSetTangentRollDeg(Number(event.target.value))}
-            disabled={!draft}
+            type="checkbox"
+            className="h-3.5 w-3.5 rounded border border-slate-600 bg-slate-900 text-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+            checked={showEndEffectorFrame}
+            onChange={(event) => onShowEndEffectorFrameChange(event.target.checked)}
           />
+          Show tool tip / EE frame
         </label>
         <div className="grid grid-cols-2 gap-2">
           <label className={WELD_LABEL_CLASS}>
@@ -3188,7 +3208,9 @@ export default function App() {
   const [weldDraft, setWeldDraft] = useState<WeldDraft | null>(null);
   const [isPlanningWeld, setIsPlanningWeld] = useState(false);
   const [weldEditableWaypoints, setWeldEditableWaypoints] = useState<Point3[]>([]);
+  const [weldPreviewGhostJoints, setWeldPreviewGhostJoints] = useState<number[] | null>(null);
   const [weldPreviewCacheReady, setWeldPreviewCacheReady] = useState(false);
+  const [showEndEffectorFrame, setShowEndEffectorFrame] = useState(false);
   const [weldProgramName, setWeldProgramName] = useState("weld_program");
   const [savedWeldPrograms, setSavedWeldPrograms] = useState<string[]>([]);
   const [selectedWeldProgram, setSelectedWeldProgram] = useState("");
@@ -3226,18 +3248,66 @@ export default function App() {
   const activeRobotId = runtimeConfigSnapshot?.active?.robot?.robot_id ?? null;
   const activeToolId = runtimeConfigSnapshot?.active?.tool?.active_tool_id ?? null;
   const desiredRobotId = useMemo(
-    () =>
-      robotOptions.find((robot) => robot.name === selectedRobotName)?.robot_id ??
-      null,
+    () => {
+      const fromOptions = robotOptions.find((robot) => robot.name === selectedRobotName)?.robot_id;
+      if (fromOptions) {
+        return fromOptions;
+      }
+      const fallback = selectedRobotName.trim();
+      return fallback.length > 0 ? fallback : null;
+    },
     [robotOptions, selectedRobotName],
   );
-  const visualizerRobotId = activeRobotId ?? desiredRobotId;
+  const visualizerRobotId = activeRobotId ?? desiredRobotId ?? DEFAULT_VISUALIZER_ROBOT_ID;
   const visualizerToolId = activeToolId ?? selectedToolId ?? null;
+  const visualizerRuntimeTool = useMemo(() => {
+    const runtimeTool = runtimeConfigSnapshot?.active?.tool;
+    if (!runtimeTool || !runtimeTool.active_tool_id) {
+      return null;
+    }
+    const offset = runtimeTool.offset;
+    const mesh = runtimeTool.mesh;
+    const normalizedMesh =
+      mesh && typeof mesh.asset_path === "string" && mesh.asset_path.trim().length > 0
+        ? {
+            asset_path: mesh.asset_path,
+            scale: Number.isFinite(mesh.scale) ? mesh.scale : 1,
+            position_mm: {
+              x: Number(mesh.position_mm?.x ?? 0),
+              y: Number(mesh.position_mm?.y ?? 0),
+              z: Number(mesh.position_mm?.z ?? 0),
+            },
+            rotation_deg: {
+              x: Number(mesh.rotation_deg?.x ?? 0),
+              y: Number(mesh.rotation_deg?.y ?? 0),
+              z: Number(mesh.rotation_deg?.z ?? 0),
+            },
+          }
+        : null;
+    return {
+      tool_id: runtimeTool.active_tool_id,
+      display_name: runtimeTool.display_name || runtimeTool.active_tool_id,
+      offset: {
+        position_mm: {
+          x: Number(offset?.position_mm?.x ?? 0),
+          y: Number(offset?.position_mm?.y ?? 0),
+          z: Number(offset?.position_mm?.z ?? 0),
+        },
+        rotation_deg: {
+          x: Number(offset?.rotation_deg?.x ?? 0),
+          y: Number(offset?.rotation_deg?.y ?? 0),
+          z: Number(offset?.rotation_deg?.z ?? 0),
+        },
+      },
+      mesh: normalizedMesh,
+    };
+  }, [runtimeConfigSnapshot]);
   const visualizerTool = useMemo(
     () =>
+      visualizerRuntimeTool ??
       toolLibrary.find((tool) => tool.tool_id === visualizerToolId) ??
       null,
-    [toolLibrary, visualizerToolId],
+    [toolLibrary, visualizerToolId, visualizerRuntimeTool],
   );
   const availableToolTypes = useMemo(
     () =>
@@ -3744,6 +3814,16 @@ export default function App() {
         : [],
     [selectedTopologyEdge, activeWeldSegment],
   );
+  const weldAnglePreview = useMemo(() => {
+    if (activePanel !== "weld" || !weldDraft || !activeWeldSegment) {
+      return null;
+    }
+    return {
+      workAngleDeg: weldDraft.workAngleDeg,
+      travelAngleDeg: weldDraft.travelAngleDeg,
+      spinAngleDeg: weldDraft.spinAngleDeg,
+    };
+  }, [activePanel, weldDraft, activeWeldSegment]);
   const weldSelectedEdgeRows = useMemo(
     () =>
       weldDraft
@@ -3879,6 +3959,7 @@ export default function App() {
   const trajectoryRefreshInFlight = useRef(false);
   const lastTelemetrySourceTimeRef = useRef<number | null>(null);
   const lastAcceptedJointsRef = useRef<number[] | null>(null);
+  const lastAutoWeldAnglePreviewKeyRef = useRef<string>("");
 
   const disconnect = useCallback(() => {
     eventSourceRef.current?.close();
@@ -3903,6 +3984,7 @@ export default function App() {
     setWeldDraft(null);
     setIsPlanningWeld(false);
     setWeldEditableWaypoints([]);
+    setWeldPreviewGhostJoints(null);
     setWeldPreviewCacheReady(false);
     setSavedWeldPrograms([]);
     setSelectedWeldProgram("");
@@ -3957,6 +4039,35 @@ export default function App() {
             if (typeof s.led_alarm_condition === "number") sample.led_alarm_condition = s.led_alarm_condition;
             if (typeof s.unloading_bits === "string") sample.unloading_bits = s.unloading_bits;
             if (typeof s.led_alarm_bits === "string") sample.led_alarm_bits = s.led_alarm_bits;
+        const maybeEePose = maybeObj.ee_pose;
+        if (maybeEePose && typeof maybeEePose === "object") {
+          const eePoseObj = maybeEePose as Record<string, unknown>;
+          const position = eePoseObj.position_m;
+          const rotation = eePoseObj.rotation_matrix;
+          if (position && typeof position === "object" && Array.isArray(rotation) && rotation.length === 3) {
+            const posObj = position as Record<string, unknown>;
+            const rotRows = rotation as unknown[];
+            const parsedRows = rotRows.map((row) =>
+              Array.isArray(row) && row.length === 3
+                ? row.map((value) => Number(value))
+                : null,
+            );
+            const validRows =
+              parsedRows.length === 3 &&
+              parsedRows.every(
+                (row) => Array.isArray(row) && row.length === 3 && row.every((value) => Number.isFinite(value)),
+              );
+            const px = Number(posObj.x);
+            const py = Number(posObj.y);
+            const pz = Number(posObj.z);
+            if (validRows && Number.isFinite(px) && Number.isFinite(py) && Number.isFinite(pz)) {
+              eePoseValue = {
+                position_m: { x: px, y: py, z: pz },
+                rotation_matrix: parsedRows as [[number, number, number], [number, number, number], [number, number, number]],
+              };
+            }
+          }
+        }
             out[k] = sample;
           }
         }
@@ -4092,6 +4203,7 @@ export default function App() {
     setWeldSelectionMode(false);
     setWeldDraft(null);
     setWeldEditableWaypoints([]);
+    setWeldPreviewGhostJoints(null);
     setWeldPreviewCacheReady(false);
     setPendingWeldProgramRestore(null);
     if (file) {
@@ -4106,6 +4218,7 @@ export default function App() {
     setWeldSelectionMode(false);
     setWeldDraft(null);
     setWeldEditableWaypoints([]);
+    setWeldPreviewGhostJoints(null);
     setWeldPreviewCacheReady(false);
     setPendingWeldProgramRestore(null);
   }, []);
@@ -4145,6 +4258,7 @@ export default function App() {
         setTopologyModel(null);
         setWeldDraft(null);
         setWeldEditableWaypoints([]);
+        setWeldPreviewGhostJoints(null);
         setWeldPreviewCacheReady(false);
         setPendingWeldProgramRestore(null);
         return;
@@ -4213,12 +4327,14 @@ export default function App() {
           if (pendingWeldProgramRestore.previewPlan) {
             setPreviewPlan(pendingWeldProgramRestore.previewPlan);
             setPlannerPoints(pendingWeldProgramRestore.previewPlan.waypoints);
+            setWeldPreviewGhostJoints(null);
             setWeldPreviewCacheReady(false);
           } else {
             // Clear any previous preview/path so loading a program without a saved plan
             // does not leave stale geometry visible in the scene.
             setPreviewPlan(null);
             setPlannerPoints([]);
+            setWeldPreviewGhostJoints(null);
             setWeldPreviewCacheReady(false);
           }
           setPendingWeldProgramRestore(null);
@@ -4226,6 +4342,7 @@ export default function App() {
         }
         // Fresh STEP imports start with no selected weld edges.
         setWeldDraft(null);
+        setWeldPreviewGhostJoints(null);
       } catch (err) {
         if (cancelled) {
           return;
@@ -4233,6 +4350,7 @@ export default function App() {
         setTopologyModel(null);
         setWeldDraft(null);
         setWeldEditableWaypoints([]);
+        setWeldPreviewGhostJoints(null);
         setWeldPreviewCacheReady(false);
         setPendingWeldProgramRestore(null);
         setError(`Failed to load CAD topology: ${(err as Error).message}`);
@@ -4253,6 +4371,7 @@ export default function App() {
       if (points.length === 0) {
         setPreviewPlan(null);
         setPlannerPoints([]);
+        setWeldPreviewGhostJoints(null);
         setWeldPreviewCacheReady(false);
         return;
       }
@@ -4272,9 +4391,11 @@ export default function App() {
         const { plan, waypoints } = previewFromPlannerPayload(data);
         setPreviewPlan(plan);
         setPlannerPoints(waypoints);
+        setWeldPreviewGhostJoints(null);
         setWeldPreviewCacheReady(false);
       } catch (err) {
         setError(`Failed to plan trajectory: ${(err as Error).message}`);
+        setWeldPreviewGhostJoints(null);
       } finally {
         setIsPlanLoading(false);
       }
@@ -4320,6 +4441,7 @@ export default function App() {
     setPlannerPoints(nextPoints);
     if (nextPoints.length === 0) {
       setPreviewPlan(null);
+      setWeldPreviewGhostJoints(null);
       return;
     }
     await requestPlannerPreview(nextPoints);
@@ -4330,6 +4452,7 @@ export default function App() {
     setPreviewPlan(null);
     setPlannerPoints([]);
     setWeldEditableWaypoints([]);
+    setWeldPreviewGhostJoints(null);
     setWeldPreviewCacheReady(false);
     setIsPlanning(false);
   }, []);
@@ -4389,7 +4512,7 @@ export default function App() {
             options: {
               work_angle_deg: draft.workAngleDeg,
               travel_angle_deg: draft.travelAngleDeg,
-              tangent_roll_deg: draft.tangentRollDeg,
+              spin_angle_deg: draft.spinAngleDeg,
               transition_clearance_mm: draft.transitionClearanceMm,
               post_action: draft.postAction,
             },
@@ -4412,6 +4535,14 @@ export default function App() {
         setPreviewPlan(plan);
         setPlannerPoints(waypoints);
         setWeldEditableWaypoints(waypoints);
+        const ghostPose =
+          data &&
+          Array.isArray((data as { weld_preview_joint_pose?: unknown }).weld_preview_joint_pose)
+            ? ((data as { weld_preview_joint_pose: unknown[] }).weld_preview_joint_pose
+                .map((value) => Number(value))
+                .filter((value) => Number.isFinite(value)) as number[])
+            : [];
+        setWeldPreviewGhostJoints(ghostPose.length > 0 ? ghostPose : null);
         setWeldPreviewCacheReady(true);
         setIsPlanning(false);
         return plan;
@@ -4421,6 +4552,7 @@ export default function App() {
           ? " Try moving the STEP model closer to the robot workspace or adjusting start/end segment positions."
           : "";
         setError(`Failed to plan weld: ${detail}${hint}`);
+        setWeldPreviewGhostJoints(null);
         return null;
       } finally {
         setIsPlanningWeld(false);
@@ -4433,6 +4565,35 @@ export default function App() {
       stepTransformMatrix,
     ],
   );
+
+  useEffect(() => {
+    if (activePanel !== "weld" || !weldDraft || !activeWeldSegment || isPlanningWeld) {
+      return;
+    }
+    const autoPreviewKey = JSON.stringify({
+      modelId: weldDraft.modelId,
+      edgeId: activeWeldSegment.edgeId,
+      startS: clamp01(activeWeldSegment.startS),
+      endS: clamp01(activeWeldSegment.endS),
+      workAngleDeg: weldDraft.workAngleDeg,
+      travelAngleDeg: weldDraft.travelAngleDeg,
+      spinAngleDeg: weldDraft.spinAngleDeg,
+    });
+    if (lastAutoWeldAnglePreviewKeyRef.current === autoPreviewKey) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      lastAutoWeldAnglePreviewKeyRef.current = autoPreviewKey;
+      void requestWeldPreview(weldDraft);
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [activePanel, weldDraft, activeWeldSegment, isPlanningWeld, requestWeldPreview]);
+
+  useEffect(() => {
+    if (!weldDraft) {
+      lastAutoWeldAnglePreviewKeyRef.current = "";
+    }
+  }, [weldDraft]);
 
   const handleRunPreview = useCallback(async () => {
     if (!previewPlan || isPlanLoading || isRunningPreview) {
@@ -4510,7 +4671,7 @@ export default function App() {
           activeSegmentEdgeId: edgeId,
           workAngleDeg: current?.workAngleDeg ?? 45,
           travelAngleDeg: current?.travelAngleDeg ?? 0,
-          tangentRollDeg: current?.tangentRollDeg ?? 0,
+          spinAngleDeg: current?.spinAngleDeg ?? 0,
           transitionClearanceMm: current?.transitionClearanceMm ?? 35,
           postAction: current?.postAction ?? "return_to_start",
         };
@@ -4674,7 +4835,7 @@ export default function App() {
             weldName: weldDraft.weldName,
             workAngleDeg: weldDraft.workAngleDeg,
             travelAngleDeg: weldDraft.travelAngleDeg,
-            tangentRollDeg: weldDraft.tangentRollDeg,
+            spinAngleDeg: weldDraft.spinAngleDeg,
             transitionClearanceMm: weldDraft.transitionClearanceMm,
             postAction: weldDraft.postAction,
             segments: weldDraft.segments.map((segment) => ({
@@ -4825,6 +4986,7 @@ export default function App() {
       setPreviewPlan(plan);
       setPlannerPoints(plan.waypoints);
       setWeldEditableWaypoints(plan.waypoints);
+      setWeldPreviewGhostJoints(null);
       setWeldPreviewCacheReady(false);
       if (data?.trajectory?.weld && typeof data.trajectory.weld === "object") {
         const weld = data.trajectory.weld as Record<string, unknown>;
@@ -4840,8 +5002,8 @@ export default function App() {
             : {};
         const workAngleDeg = Number(options.work_angle_deg ?? 45);
         const travelAngleDeg = Number(options.travel_angle_deg ?? 0);
-        const tangentRollDeg = Number(
-          options.tangent_roll_deg ?? options.tangentRollDeg ?? 0,
+        const spinAngleDeg = Number(
+          options.spin_angle_deg ?? options.spinAngleDeg ?? 0,
         );
         const transitionClearanceMm = Number(options.transition_clearance_mm ?? 35);
         const postActionRaw =
@@ -4876,7 +5038,7 @@ export default function App() {
                 activeSegmentEdgeId: segments[0].edgeId,
                 workAngleDeg: Number.isFinite(workAngleDeg) ? workAngleDeg : 45,
                 travelAngleDeg: Number.isFinite(travelAngleDeg) ? travelAngleDeg : 0,
-                tangentRollDeg: Number.isFinite(tangentRollDeg) ? tangentRollDeg : 0,
+                spinAngleDeg: Number.isFinite(spinAngleDeg) ? spinAngleDeg : 0,
                 transitionClearanceMm:
                   Number.isFinite(transitionClearanceMm) && transitionClearanceMm > 0
                     ? transitionClearanceMm
@@ -4889,6 +5051,7 @@ export default function App() {
       setIsPlanning(false);
     } catch (err) {
       setError(`Failed to load trajectory: ${(err as Error).message}`);
+      setWeldPreviewGhostJoints(null);
     } finally {
       setIsLoadingSavedTrajectory(false);
     }
@@ -5002,6 +5165,26 @@ export default function App() {
   }, [normalisedVisionHost]);
 
   useEffect(() => {
+    setIsRuntimeConfigBusy(true);
+    setIsToolLibraryBusy(true);
+    Promise.allSettled([fetchRuntimeConfigSnapshot(), fetchToolLibrarySnapshot()])
+      .then((results) => {
+        const runtimeResult = results[0];
+        const toolResult = results[1];
+        if (runtimeResult.status === "rejected") {
+          setRuntimeConfigError((runtimeResult.reason as Error)?.message ?? "Failed to load runtime config.");
+        }
+        if (toolResult.status === "rejected") {
+          setToolLibraryError((toolResult.reason as Error)?.message ?? "Failed to load tool library.");
+        }
+      })
+      .finally(() => {
+        setIsRuntimeConfigBusy(false);
+        setIsToolLibraryBusy(false);
+      });
+  }, [fetchRuntimeConfigSnapshot, fetchToolLibrarySnapshot]);
+
+  useEffect(() => {
     if (!isSettingsOpen) {
       return;
     }
@@ -5016,7 +5199,7 @@ export default function App() {
   }, [fetchKinematicsSnapshot, isSettingsOpen]);
 
   useEffect(() => {
-    if (!isSettingsOpen && activePanel !== "tools") {
+    if (!isSettingsOpen) {
       return;
     }
     setIsRuntimeConfigBusy(true);
@@ -5027,10 +5210,10 @@ export default function App() {
       .finally(() => {
         setIsRuntimeConfigBusy(false);
       });
-  }, [activePanel, fetchRuntimeConfigSnapshot, isSettingsOpen]);
+  }, [fetchRuntimeConfigSnapshot, isSettingsOpen]);
 
   useEffect(() => {
-    if (!isSettingsOpen && activePanel !== "tools") {
+    if (!isSettingsOpen) {
       return;
     }
     setIsToolLibraryBusy(true);
@@ -5041,7 +5224,7 @@ export default function App() {
       .finally(() => {
         setIsToolLibraryBusy(false);
       });
-  }, [activePanel, fetchToolLibrarySnapshot, isSettingsOpen]);
+  }, [fetchToolLibrarySnapshot, isSettingsOpen]);
 
   // Lightweight API health probe to surface clearer 5xx reasons
   useEffect(() => {
@@ -5456,18 +5639,20 @@ export default function App() {
                     : current,
                 )
               }
-              onSetTangentRollDeg={(value) =>
+              onSetSpinAngleDeg={(value) =>
                 setWeldDraft((current) =>
                   current
                     ? {
                         ...current,
-                        tangentRollDeg: Number.isFinite(value)
+                        spinAngleDeg: Number.isFinite(value)
                           ? value
-                          : current.tangentRollDeg,
+                          : current.spinAngleDeg,
                       }
                     : current,
                 )
               }
+              showEndEffectorFrame={showEndEffectorFrame}
+              onShowEndEffectorFrameChange={setShowEndEffectorFrame}
               onSetTransitionClearanceMm={(value) =>
                 setWeldDraft((current) =>
                   current
@@ -5691,6 +5876,9 @@ export default function App() {
           weldStartPoint={weldStartPoint}
           weldStopPoint={weldStopPoint}
           weldSegmentPoints={weldSegmentPoints}
+          showEndEffectorFrame={showEndEffectorFrame}
+          weldAnglePreview={weldAnglePreview}
+          weldGhostJoints={weldPreviewGhostJoints}
           pathPoints={visualPathPoints}
           waypoints={visualWaypoints}
           highlightPathRange={selectedProgramPathRange}

@@ -4,6 +4,7 @@ import {
   useEffect,
   useImperativeHandle,
   useRef,
+  useState,
 } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
@@ -42,6 +43,13 @@ type ArmVisualizerProps = {
   weldStartPoint?: Point3 | null;
   weldStopPoint?: Point3 | null;
   weldSegmentPoints?: Point3[];
+  showEndEffectorFrame?: boolean;
+  weldAnglePreview?: {
+    workAngleDeg: number;
+    travelAngleDeg: number;
+    spinAngleDeg: number;
+  } | null;
+  weldGhostJoints?: number[] | null;
   pathPoints?: Point3[];
   waypoints?: Point3[];
   highlightPathRange?: { start: number; end: number } | null;
@@ -87,6 +95,62 @@ const TOPOLOGY_EDGE_HOVER_COLOR = 0xfacc15;
 const TOPOLOGY_EDGE_SELECTED_COLOR = 0x22c55e;
 const TOPOLOGY_EDGE_PICK_RADIUS_M = 0.0005; // 0.5 mm
 const TOPOLOGY_EDGE_SELECTED_RADIUS_M = 0.0006;
+const WELD_ANGLE_PREVIEW_WORK_LIMIT_DEG = 89;
+const WELD_ANGLE_PREVIEW_TRAVEL_LIMIT_DEG = 89;
+const WELD_ANGLE_PREVIEW_ROLL_LIMIT_DEG = 180;
+const WELD_ANGLE_PREVIEW_NORMAL_LIMIT_DEG = 180;
+const WELD_ANGLE_PREVIEW_VECTOR_LENGTH_M = 0.065;
+const WELD_ANGLE_PREVIEW_ARC_RADIUS_BASE_M = 0.018;
+const WELD_ANGLE_PREVIEW_LABEL_SCALE = 0.032;
+const WELD_ANGLE_PREVIEW_LABEL_OFFSET_M = 0.014;
+
+function clampNumber(value: number, min: number, max: number): number {
+  const safeValue = Number.isFinite(value) ? value : 0;
+  return Math.max(min, Math.min(max, safeValue));
+}
+
+function normalizeVector(
+  vector: THREE.Vector3,
+  fallback: THREE.Vector3,
+): THREE.Vector3 {
+  if (vector.lengthSq() <= 1e-12) {
+    return fallback.clone().normalize();
+  }
+  return vector.clone().normalize();
+}
+
+function createAngleArc(
+  origin: THREE.Vector3,
+  startDirection: THREE.Vector3,
+  axis: THREE.Vector3,
+  angleRad: number,
+  radius: number,
+  color: number,
+): THREE.Line | null {
+  if (!Number.isFinite(angleRad) || Math.abs(angleRad) <= 1e-4) {
+    return null;
+  }
+  const arcAxis = normalizeVector(axis, new THREE.Vector3(0, 0, 1));
+  const start = normalizeVector(startDirection, new THREE.Vector3(1, 0, 0));
+  const stepCount = Math.max(8, Math.min(64, Math.ceil(Math.abs(angleRad) / (Math.PI / 24))));
+  const points: THREE.Vector3[] = [];
+  for (let i = 0; i <= stepCount; i += 1) {
+    const t = i / stepCount;
+    const direction = start.clone().applyAxisAngle(arcAxis, angleRad * t).normalize();
+    points.push(origin.clone().addScaledVector(direction, radius));
+  }
+  const geometry = new THREE.BufferGeometry().setFromPoints(points);
+  const material = new THREE.LineBasicMaterial({
+    color,
+    transparent: true,
+    opacity: 0.95,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const line = new THREE.Line(geometry, material);
+  line.renderOrder = 36;
+  return line;
+}
 
 type OcctImporter = {
   ReadStepFile?: (
@@ -360,16 +424,30 @@ function createAxisLabelSprite(
   scale: number,
 ): THREE.Sprite {
   const canvas = document.createElement("canvas");
-  canvas.width = 128;
-  canvas.height = 128;
+  const canvasHeight = 128;
+  const fontPx = 64;
+  const horizontalPaddingPx = 14;
+  canvas.width = canvasHeight;
+  canvas.height = canvasHeight;
   const ctx = canvas.getContext("2d");
   if (ctx) {
+    const text = label.trim().length > 0 ? label : "?";
+    ctx.font = `700 ${fontPx}px sans-serif`;
+    const measuredWidth = ctx.measureText(text).width;
+    const desiredWidth = Math.ceil(
+      Math.max(
+        canvasHeight,
+        measuredWidth + horizontalPaddingPx * 2,
+      ),
+    );
+    canvas.width = Math.min(512, desiredWidth);
+    canvas.height = canvasHeight;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.fillStyle = `#${new THREE.Color(color).getHexString()}`;
-    ctx.font = "bold 82px sans-serif";
+    ctx.font = `700 ${fontPx}px sans-serif`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(label, canvas.width / 2, canvas.height / 2);
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
   }
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
@@ -380,7 +458,8 @@ function createAxisLabelSprite(
     depthWrite: false,
   });
   const sprite = new THREE.Sprite(material);
-  sprite.scale.set(scale, scale, scale);
+  const aspect = canvas.width / canvas.height;
+  sprite.scale.set(scale * aspect, scale, scale);
   sprite.renderOrder = 50;
   return sprite;
 }
@@ -449,7 +528,244 @@ function createAxisTripod(options: {
       group.add(label);
     }
   });
+function resolveEndEffectorFrameNode(root: THREE.Object3D): THREE.Object3D {
+  const findFirst = (predicate: (nameLower: string) => boolean): THREE.Object3D | null => {
+    let match: THREE.Object3D | null = null;
+    root.traverse((obj) => {
+      if (match) {
+        return;
+      }
+      const nameLower = (obj.name ?? "").toLowerCase();
+      if (nameLower && predicate(nameLower)) {
+        match = obj;
+      }
+    });
+    return match;
+  };
 
+  const tcpNode = findFirst((name) => name.startsWith("active-tool-tcp-"));
+  if (tcpNode) {
+    return tcpNode;
+  }
+  const toolNode = findFirst(
+    (name) => name === "tool0" || name === "tool_0" || name.includes("tcp"),
+  );
+  if (toolNode) {
+    return toolNode;
+  }
+  const flangeNode = findFirst((name) => name.includes("flange") || name.includes("wrist"));
+  if (flangeNode) {
+    return flangeNode;
+  }
+  const joint6Node = findFirst(
+    (name) => name === "joint6" || name === "joint_6" || name === "j6",
+  );
+  if (joint6Node) {
+    return joint6Node;
+  }
+  return root;
+}
+
+function findActiveToolTcpNode(root: THREE.Object3D): THREE.Object3D | null {
+  let match: THREE.Object3D | null = null;
+  root.traverse((obj) => {
+    if (match) {
+      return;
+    }
+    const nameLower = (obj.name ?? "").toLowerCase();
+    if (nameLower.startsWith("active-tool-tcp-")) {
+      match = obj;
+    }
+  });
+  return match;
+}
+
+
+  return group;
+}
+
+function isToolTcpNodeForTool(
+  node: THREE.Object3D | null | undefined,
+  tool: ArmVisualizerProps["activeTool"],
+): node is THREE.Object3D {
+  if (!node) {
+    return false;
+  }
+  const nameLower = (node.name ?? "").toLowerCase();
+  if (!nameLower.startsWith("active-tool-tcp-")) {
+    return false;
+  }
+  if (!tool?.tool_id) {
+    return true;
+  }
+  const toolToken = tool.tool_id.trim().toLowerCase();
+  if (!toolToken) {
+    return true;
+  }
+  return nameLower === `active-tool-tcp-${toolToken}` || nameLower === `active-tool-tcp-synth-${toolToken}`;
+}
+
+function findToolTcpNodeForTool(
+  root: THREE.Object3D,
+  tool: ArmVisualizerProps["activeTool"],
+): THREE.Object3D | null {
+  if (!tool?.tool_id) {
+    return null;
+  }
+  const exact = root.getObjectByName(`active-tool-tcp-${tool.tool_id}`);
+  if (exact) {
+    return exact;
+  }
+  const synth = root.getObjectByName(`active-tool-tcp-synth-${tool.tool_id}`);
+  if (synth) {
+    return synth;
+  }
+  return null;
+}
+
+function applySolverToolOffsetToNode(
+  node: THREE.Object3D,
+  offset:
+    | {
+        position_mm: { x: number; y: number; z: number };
+        rotation_deg: { x: number; y: number; z: number };
+      }
+    | undefined
+    | null,
+) {
+  const mm = offset?.position_mm ?? { x: 0, y: 0, z: 0 };
+  const deg = offset?.rotation_deg ?? { x: 0, y: 0, z: 0 };
+  node.position.set(Number(mm.x) / 1000, Number(mm.y) / 1000, Number(mm.z) / 1000);
+  const rx = THREE.MathUtils.degToRad(Number(deg.x));
+  const ry = THREE.MathUtils.degToRad(Number(deg.y));
+  const rz = THREE.MathUtils.degToRad(Number(deg.z));
+  // Match backend runtime._matrix_from_offset (SciPy as lower-case xyz):
+  // R = Rz * Ry * Rx (extrinsic XYZ convention).
+  const rot = new THREE.Matrix4()
+    .makeRotationZ(rz)
+    .multiply(new THREE.Matrix4().makeRotationY(ry))
+    .multiply(new THREE.Matrix4().makeRotationX(rx));
+  node.quaternion.setFromRotationMatrix(rot);
+}
+
+function buildSolverToolOffsetMatrix(
+  offset:
+    | {
+        position_mm: { x: number; y: number; z: number };
+        rotation_deg: { x: number; y: number; z: number };
+      }
+    | undefined
+    | null,
+): THREE.Matrix4 {
+  const probe = new THREE.Object3D();
+  applySolverToolOffsetToNode(probe, offset);
+  probe.updateMatrix();
+  return probe.matrix.clone();
+}
+
+function findJoint6Anchor(robot: URDFRobot): THREE.Object3D | null {
+  const jointsRecord = robot.joints as unknown as Record<string, THREE.Object3D | undefined>;
+  return (
+    jointsRecord?.joint6 ??
+    Object.entries(jointsRecord ?? {}).find(([name]) => {
+      const token = name.toLowerCase();
+      return token === "joint6" || token === "joint_6" || token === "j6";
+    })?.[1] ??
+    robot.getObjectByName("joint6") ??
+    null
+  );
+}
+
+function applyJointValuesToRobotHierarchy(root: THREE.Object3D, joints: number[]) {
+  const jointSetters = new Map<string, (value: number) => void>();
+  root.traverse((obj) => {
+    const asJoint = obj as THREE.Object3D & {
+      setJointValue?: (value: number) => void;
+    };
+    if (typeof asJoint.setJointValue !== "function") {
+      return;
+    }
+    const nameToken = (obj.name ?? "").toLowerCase();
+    const urdfToken = String((obj as { urdfName?: unknown }).urdfName ?? "").toLowerCase();
+    const token = nameToken || urdfToken;
+    if (!token) {
+      return;
+    }
+    jointSetters.set(token, asJoint.setJointValue.bind(asJoint));
+  });
+
+  joints.forEach((value, index) => {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    const candidates = [`joint${index + 1}`, `joint_${index + 1}`, `j${index + 1}`];
+    const setter = candidates
+      .map((candidate) => jointSetters.get(candidate))
+      .find((candidate): candidate is (value: number) => void => Boolean(candidate));
+    if (setter) {
+      setter(value);
+    }
+  });
+}
+
+function createEndEffectorFrameMarker(
+  label: string,
+  opacity: number,
+): THREE.Group {
+  const group = new THREE.Group();
+  group.name = `ee-frame-${label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+  const tripod = createAxisTripod({
+    length: 0.05,
+    radius: 0.0018,
+    headLength: 0.011,
+    headRadius: 0.0044,
+    includeLabels: true,
+    labelScale: 0.02,
+    labelOffset: 0.014,
+  });
+  tripod.traverse((obj) => {
+    if (obj instanceof THREE.Mesh) {
+      const mat = obj.material as THREE.MeshBasicMaterial;
+      mat.transparent = true;
+      mat.opacity = opacity;
+      mat.depthTest = false;
+      mat.depthWrite = false;
+      obj.renderOrder = 44;
+      return;
+    }
+    if (obj instanceof THREE.Sprite) {
+      const mat = obj.material as THREE.SpriteMaterial;
+      mat.transparent = true;
+      mat.opacity = opacity;
+      mat.depthTest = false;
+      mat.depthWrite = false;
+      obj.renderOrder = 45;
+    }
+  });
+  group.add(tripod);
+
+  const origin = new THREE.Mesh(
+    new THREE.SphereGeometry(0.0038, 14, 14),
+    new THREE.MeshBasicMaterial({
+      color: 0xe2e8f0,
+      transparent: true,
+      opacity,
+      depthTest: false,
+      depthWrite: false,
+    }),
+  );
+  origin.renderOrder = 46;
+  group.add(origin);
+
+  const caption = createAxisLabelSprite(label, 0xe2e8f0, 0.024);
+  caption.position.set(0, 0, 0.065);
+  const captionMaterial = caption.material as THREE.SpriteMaterial;
+  captionMaterial.transparent = true;
+  captionMaterial.opacity = opacity;
+  captionMaterial.depthTest = false;
+  captionMaterial.depthWrite = false;
+  caption.renderOrder = 46;
+  group.add(caption);
   return group;
 }
 
@@ -599,6 +915,9 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     weldStartPoint,
     weldStopPoint,
     weldSegmentPoints,
+    showEndEffectorFrame = false,
+    weldAnglePreview,
+    weldGhostJoints,
     pathPoints,
     waypoints,
     highlightPathRange,
@@ -622,6 +941,8 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   const defaultCameraOffsetCaptured = useRef(false);
   const isGroundedRef = useRef(false);
   const boundingCenterRef = useRef(new THREE.Vector3());
+  const liveToolTcpNodeRef = useRef<THREE.Object3D | null>(null);
+  const [toolTcpVersion, setToolTcpVersion] = useState(0);
   const pendingDynamicBoundsRef = useRef(false);
   const boundingWallsRef = useRef<THREE.Mesh[]>([]);
   const boundingEdgesRef = useRef<THREE.LineSegments | null>(null);
@@ -650,6 +971,9 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   const refreshTopologyEdgeVisualsRef = useRef<(() => void) | null>(null);
   const weldEndpointsGroupRef = useRef<THREE.Group | null>(null);
   const weldIndicatorRef = useRef<THREE.Group | null>(null);
+  const weldAnglePreviewGroupRef = useRef<THREE.Group | null>(null);
+  const weldEeFrameRef = useRef<THREE.Group | null>(null);
+  const weldGhostRobotRef = useRef<THREE.Object3D | null>(null);
   const onStepStatusChangeRef = useRef(onStepStatusChange);
   const activeToolRef = useRef<ArmVisualizerProps["activeTool"]>(activeTool);
   const activeToolSignatureRef = useRef<string>(buildActiveToolSignature(activeTool));
@@ -1121,49 +1445,69 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         disposeObject3D(previous);
         activeToolGroupRef.current = null;
       }
+      liveToolTcpNodeRef.current = null;
       if (!tool) {
+        setToolTcpVersion((value) => value + 1);
         return;
       }
-      const linksRecord = robot.links as unknown as Record<string, THREE.Object3D | undefined>;
-      const jointsRecord = robot.joints as unknown as Record<
-        string,
-        THREE.Object3D | undefined
-      >;
-      const joint6Anchor =
-        jointsRecord?.joint6 ??
-        Object.entries(jointsRecord ?? {}).find(([name]) => {
-          const token = name.toLowerCase();
-          return token === "joint6" || token === "joint_6" || token === "j6";
-        })?.[1] ??
-        robot.getObjectByName("joint6");
-      const flangeLikeLink = Object.entries(linksRecord).find(([name]) => {
-        const lower = name.toLowerCase();
-        return lower.includes("flange");
-      })?.[1];
-      // Mesh origin must be at J6 flange/joint frame (never TCP/tool tip).
-      const anchor = joint6Anchor ?? flangeLikeLink ?? robot;
+      const joint6Anchor = findJoint6Anchor(robot);
       if (!joint6Anchor) {
-        console.warn("[ArmVisualizer] joint6 anchor not found; using fallback anchor", {
-          fallback: anchor.name || "unnamed",
-        });
+        console.error("[ArmVisualizer] joint6 anchor not found; skipping active tool attach");
+        setToolTcpVersion((value) => value + 1);
+        return;
       }
+      // Mesh origin must be at J6 flange/joint frame (never TCP/tool tip).
+      const anchor = joint6Anchor;
       const toolRootGroup = new THREE.Group();
       toolRootGroup.name = `active-tool-${tool.tool_id}`;
+      
+      // Solver defines Z as the tool approach axis (DH convention).
+      // URDF might define joint axis differently (e.g. X for gradient-05).
+      // Rotate the solver's Z axis to align with the actual physical URDF joint axis.
+      const toolTcpMappingGroup = new THREE.Group();
+      toolTcpMappingGroup.name = `active-tool-tcp-map-${tool.tool_id}`;
+      const jointAxis = (anchor as any).axis instanceof THREE.Vector3 
+        ? (anchor as any).axis 
+        : new THREE.Vector3(0, 0, 1);
+      
+      if (Math.abs(jointAxis.x - 1.0) < 1e-5) {
+        // Map Solver DH frame to URDF frame where Joint Axis is X:
+        // Solver Z -> URDF X
+        // Solver X -> URDF -Z
+        // Solver Y -> URDF Y
+        const mappingMatrix = new THREE.Matrix4().set(
+          0,  0, 1, 0,
+          0,  1, 0, 0,
+         -1,  0, 0, 0,
+          0,  0, 0, 1
+        );
+        toolTcpMappingGroup.quaternion.setFromRotationMatrix(mappingMatrix);
+      } else if (Math.abs(jointAxis.y - 1.0) < 1e-5) {
+        // Map Solver DH frame to URDF frame where Joint Axis is Y:
+        // Solver Z -> URDF Y
+        // Solver X -> URDF X
+        // Solver Y -> URDF Z
+        const mappingMatrix = new THREE.Matrix4().set(
+          1, 0,  0, 0,
+          0, 0,  1, 0,
+          0, 1,  0, 0,
+          0, 0,  0, 1
+        );
+        toolTcpMappingGroup.quaternion.setFromRotationMatrix(mappingMatrix);
+      } else if (Math.abs(jointAxis.z - 1.0) > 1e-5) {
+        // Fallback for arbitrary axes
+        toolTcpMappingGroup.quaternion.setFromUnitVectors(
+          new THREE.Vector3(0, 0, 1),
+          jointAxis.clone().normalize()
+        );
+      }
+      toolRootGroup.add(toolTcpMappingGroup);
+
       // TCP/tool-tip frame (used by kinematic tool offset semantics).
       const toolTcpGroup = new THREE.Group();
       toolTcpGroup.name = `active-tool-tcp-${tool.tool_id}`;
-      const mm = tool.offset?.position_mm ?? { x: 0, y: 0, z: 0 };
-      const deg = tool.offset?.rotation_deg ?? { x: 0, y: 0, z: 0 };
-      toolTcpGroup.position.set(
-        Number(mm.x) / 1000,
-        Number(mm.y) / 1000,
-        Number(mm.z) / 1000,
-      );
-      toolTcpGroup.rotation.set(
-        (Number(deg.x) * Math.PI) / 180,
-        (Number(deg.y) * Math.PI) / 180,
-        (Number(deg.z) * Math.PI) / 180,
-      );
+      applySolverToolOffsetToNode(toolTcpGroup, tool.offset);
+
       // Tool offset is TCP-only. Mesh stays in J6 frame via toolRootGroup.
       const fallbackMarker = _createFallbackToolMarker();
       const hasMeshAsset =
@@ -1172,7 +1516,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       // Only show fallback when no mesh is configured or mesh loading fails.
       fallbackMarker.visible = !hasMeshAsset;
       toolTcpGroup.add(fallbackMarker);
-      toolRootGroup.add(toolTcpGroup);
+      toolTcpMappingGroup.add(toolTcpGroup);
       if (tool.mesh?.asset_path) {
         const meshPath = _resolveToolAssetPath(tool.mesh.asset_path);
         if (meshPath.toLowerCase().endsWith(".stl")) {
@@ -1233,6 +1577,8 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       }
       anchor.add(toolRootGroup);
       activeToolGroupRef.current = toolRootGroup;
+      liveToolTcpNodeRef.current = toolTcpGroup;
+      setToolTcpVersion((value) => value + 1);
     };
     attachActiveToolVisualRef.current = attachActiveToolVisual;
 
@@ -1486,6 +1832,24 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         disposeObject3D(weldEndpointsGroup);
         scene.remove(weldEndpointsGroup);
         weldEndpointsGroupRef.current = null;
+      }
+      const weldAnglePreviewGroup = weldAnglePreviewGroupRef.current;
+      if (weldAnglePreviewGroup) {
+        disposeObject3D(weldAnglePreviewGroup);
+        scene.remove(weldAnglePreviewGroup);
+        weldAnglePreviewGroupRef.current = null;
+      }
+      const weldEeFrame = weldEeFrameRef.current;
+      if (weldEeFrame) {
+        weldEeFrame.parent?.remove(weldEeFrame);
+        disposeObject3D(weldEeFrame);
+        weldEeFrameRef.current = null;
+      }
+      const weldGhostRobot = weldGhostRobotRef.current;
+      if (weldGhostRobot) {
+        disposeObject3D(weldGhostRobot);
+        scene.remove(weldGhostRobot);
+        weldGhostRobotRef.current = null;
       }
       boundingMarkersRef.current.forEach((marker) => {
         scene.remove(marker);
@@ -2090,6 +2454,329 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       }
     };
   }, [weldStartPoint, weldStopPoint, weldSegmentPoints, topologyEdges, stepTransform]);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) {
+      return;
+    }
+
+    const existing = weldAnglePreviewGroupRef.current;
+    if (existing) {
+      existing.parent?.remove(existing);
+      disposeObject3D(existing);
+      weldAnglePreviewGroupRef.current = null;
+    }
+
+    if (!weldAnglePreview) {
+      return;
+    }
+
+    const segmentSource =
+      Array.isArray(weldSegmentPoints) && weldSegmentPoints.length >= 2
+        ? weldSegmentPoints
+        : weldStartPoint && weldStopPoint
+          ? [weldStartPoint, weldStopPoint]
+          : [];
+    if (segmentSource.length < 2) {
+      return;
+    }
+
+    const topologyRoot = topologyEdgesGroupRef.current;
+    const topologyOffset = topologyRoot?.userData?.topologyOffset as
+      | { x: number; y: number; z: number }
+      | undefined;
+    topologyRoot?.updateMatrixWorld(true);
+    const toWorldPoint = (point: Point3): THREE.Vector3 => {
+      const local = topologyOffset
+        ? new THREE.Vector3(
+            point.x - topologyOffset.x,
+            point.y - topologyOffset.y,
+            point.z - topologyOffset.z,
+          )
+        : new THREE.Vector3(point.x, point.y, point.z);
+      if (!topologyRoot) {
+        return local;
+      }
+      return local.applyMatrix4(topologyRoot.matrixWorld);
+    };
+
+    const worldPoints = segmentSource.map((point) => toWorldPoint(point));
+    if (worldPoints.length < 2) {
+      return;
+    }
+
+    const anchorIndex = Math.max(
+      0,
+      Math.min(worldPoints.length - 2, Math.floor(worldPoints.length * 0.3)),
+    );
+    const anchor = worldPoints[anchorIndex].clone();
+    const nextPoint = worldPoints[anchorIndex + 1].clone();
+    const forward = normalizeVector(
+      nextPoint.sub(anchor),
+      new THREE.Vector3(1, 0, 0),
+    );
+    const worldUp = new THREE.Vector3(0, 0, 1);
+    const horizontalForward = normalizeVector(
+      forward.clone().sub(worldUp.clone().multiplyScalar(forward.dot(worldUp))),
+      forward,
+    );
+    const defaultNormal = normalizeVector(
+      new THREE.Vector3().crossVectors(worldUp, horizontalForward),
+      new THREE.Vector3(1, 0, 0),
+    );
+
+    const workRad = THREE.MathUtils.degToRad(
+      clampNumber(weldAnglePreview.workAngleDeg, -180, 180)
+    );
+    const travelRad = THREE.MathUtils.degToRad(
+      clampNumber(weldAnglePreview.travelAngleDeg, -180, 180)
+    );
+    const spinRad = THREE.MathUtils.degToRad(
+      clampNumber(weldAnglePreview.spinAngleDeg, -180, 180)
+    );
+
+    const normalAxis = defaultNormal;
+
+    // Apply the same 3-plane rotations as the backend
+    // Base Torch Z points down
+    const baseTorch = worldUp.clone().negate();
+    
+    // 1. Work Angle (Normal-Up plane, around Travel axis)
+    const workTorch = baseTorch.clone().applyAxisAngle(horizontalForward, workRad).normalize();
+    // 2. Travel Angle (Travel-Up plane, around Normal axis)
+    const travelTorch = workTorch.clone().applyAxisAngle(normalAxis, travelRad).normalize();
+    // 3. Spin Angle (Travel-Normal plane, around Up axis)
+    const finalTorch = travelTorch.clone().applyAxisAngle(worldUp, spinRad).normalize();
+
+    const group = new THREE.Group();
+    group.name = "weld-angle-preview";
+
+    const addArrow = (
+      direction: THREE.Vector3,
+      color: number,
+      length = WELD_ANGLE_PREVIEW_VECTOR_LENGTH_M,
+      radius = 0.0022,
+      headLength = 0.014,
+      headRadius = 0.0054,
+    ) => {
+      const arrow = createAxisArrow(direction, color, {
+        length,
+        radius,
+        headLength,
+        headRadius,
+      });
+      arrow.position.copy(anchor);
+      arrow.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          const material = obj.material as THREE.MeshBasicMaterial;
+          material.depthTest = false;
+          material.depthWrite = false;
+          material.transparent = true;
+          material.opacity = 0.96;
+          obj.renderOrder = 35;
+        }
+      });
+      group.add(arrow);
+    };
+
+    const addLabel = (text: string, direction: THREE.Vector3, color: number) => {
+      const label = createAxisLabelSprite(text, color, WELD_ANGLE_PREVIEW_LABEL_SCALE);
+      label.position
+        .copy(anchor)
+        .addScaledVector(direction.clone().normalize(), WELD_ANGLE_PREVIEW_VECTOR_LENGTH_M + WELD_ANGLE_PREVIEW_LABEL_OFFSET_M);
+      const material = label.material as THREE.SpriteMaterial;
+      material.depthTest = false;
+      material.depthWrite = false;
+      label.renderOrder = 37;
+      group.add(label);
+    };
+
+    addArrow(forward, 0x22d3ee);
+    addArrow(worldUp, 0x3b82f6, 0.052, 0.0021, 0.012, 0.0052);
+    addArrow(normalAxis, 0x22c55e, 0.054, 0.0021, 0.012, 0.0052);
+    addArrow(finalTorch, 0xf97316, 0.072, 0.0024, 0.015, 0.0059);
+    addLabel("Travel", forward, 0x22d3ee);
+    addLabel("Up", worldUp, 0x3b82f6);
+    addLabel("Normal", normalAxis, 0x22c55e);
+    addLabel("Torch", finalTorch, 0xf97316);
+
+    const workArc = createAngleArc(
+      anchor,
+      baseTorch,
+      horizontalForward,
+      workRad,
+      WELD_ANGLE_PREVIEW_ARC_RADIUS_BASE_M,
+      0xfacc15, // yellow
+    );
+    if (workArc) {
+      group.add(workArc);
+    }
+    const travelArc = createAngleArc(
+      anchor,
+      workTorch,
+      normalAxis,
+      travelRad,
+      WELD_ANGLE_PREVIEW_ARC_RADIUS_BASE_M + 0.006,
+      0xfb7185, // pink-red
+    );
+    if (travelArc) {
+      group.add(travelArc);
+    }
+    const spinArc = createAngleArc(
+      anchor,
+      travelTorch,
+      worldUp,
+      spinRad,
+      WELD_ANGLE_PREVIEW_ARC_RADIUS_BASE_M + 0.012,
+      0x34d399, // green
+    );
+    if (spinArc) {
+      group.add(spinArc);
+    }
+
+    scene.add(group);
+    weldAnglePreviewGroupRef.current = group;
+
+    return () => {
+      scene.remove(group);
+      disposeObject3D(group);
+    const robot = robotRef.current;
+      if (weldAnglePreviewGroupRef.current === group) {
+        weldAnglePreviewGroupRef.current = null;
+      }
+    };
+  }, [
+    weldAnglePreview,
+    weldSegmentPoints,
+    weldStartPoint,
+    weldStopPoint,
+    topologyEdges,
+    stepTransform,
+  ]);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    const robot = robotRef.current;
+    if (!scene || !robot) {
+      return;
+    }
+
+    const staleMarkers: THREE.Object3D[] = [];
+    scene.traverse((obj) => {
+      if ((obj.name ?? "").toLowerCase() === "ee-frame-ee") {
+        staleMarkers.push(obj);
+      }
+    });
+    staleMarkers.forEach((marker) => {
+      marker.parent?.remove(marker);
+      disposeObject3D(marker);
+    });
+    weldEeFrameRef.current = null;
+
+    if (!showEndEffectorFrame || !activeTool) {
+      return;
+    }
+
+    const liveEeNode = liveToolTcpNodeRef.current;
+    if (liveEeNode && isToolTcpNodeForTool(liveEeNode, activeTool)) {
+      const frame = createEndEffectorFrameMarker("EE", 0.9);
+      liveEeNode.add(frame);
+      weldEeFrameRef.current = frame;
+      return () => {
+        liveEeNode.remove(frame);
+        disposeObject3D(frame);
+        if (weldEeFrameRef.current === frame) {
+          weldEeFrameRef.current = null;
+        }
+      };
+    }
+  }, [showEndEffectorFrame, activeTool, robotId, toolTcpVersion]);
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    const robot = robotRef.current;
+    if (!scene || !robot) {
+      return;
+    }
+
+    const existing = weldGhostRobotRef.current;
+    if (existing) {
+      scene.remove(existing);
+      disposeObject3D(existing);
+      weldGhostRobotRef.current = null;
+    }
+
+    if (!weldAnglePreview || !Array.isArray(weldGhostJoints) || weldGhostJoints.length === 0) {
+      return;
+    }
+
+    const ghost = robot.clone(true) as THREE.Object3D;
+    ghost.name = "weld-preview-robot-ghost";
+    const staleEeFrames: THREE.Object3D[] = [];
+    ghost.traverse((obj) => {
+      const nameLower = (obj.name ?? "").toLowerCase();
+      if (nameLower.startsWith("ee-frame-")) {
+        staleEeFrames.push(obj);
+      }
+    });
+    staleEeFrames.forEach((frame) => frame.parent?.remove(frame));
+    applyJointValuesToRobotHierarchy(ghost, weldGhostJoints);
+    const ghostToolGroup = activeTool?.tool_id
+      ? ghost.getObjectByName(`active-tool-${activeTool.tool_id}`)
+      : null;
+    const ghostEeNode = ghostToolGroup
+      ? findToolTcpNodeForTool(ghostToolGroup, activeTool)
+      : null;
+    if (showEndEffectorFrame && ghostEeNode && isToolTcpNodeForTool(ghostEeNode, activeTool)) {
+      ghostEeNode.add(createEndEffectorFrameMarker("EE Ghost", 0.72));
+    }
+
+    ghost.traverse((obj: THREE.Object3D) => {
+      if (!(obj instanceof THREE.Mesh)) {
+        return;
+      }
+      const cloneMaterial = (material: THREE.Material) => {
+        const cloned = material.clone();
+        const stylable = cloned as THREE.Material & {
+          transparent?: boolean;
+          opacity?: number;
+          depthWrite?: boolean;
+          color?: THREE.Color;
+          emissive?: THREE.Color;
+        };
+        stylable.transparent = true;
+        stylable.opacity = 0.18;
+        stylable.depthWrite = false;
+        if (stylable.color) {
+          stylable.color = stylable.color.clone().lerp(new THREE.Color(0x67e8f9), 0.45);
+        }
+        if (stylable.emissive) {
+          stylable.emissive = new THREE.Color(0x0ea5e9).multiplyScalar(0.15);
+        }
+        return cloned;
+      };
+      if (Array.isArray(obj.material)) {
+        obj.material = obj.material.map((material) => cloneMaterial(material));
+      } else {
+        obj.material = cloneMaterial(obj.material);
+      }
+      obj.renderOrder = 32;
+      obj.castShadow = false;
+      obj.receiveShadow = false;
+    });
+
+    scene.add(ghost);
+    weldGhostRobotRef.current = ghost;
+
+    return () => {
+      scene.remove(ghost);
+      disposeObject3D(ghost);
+      if (weldGhostRobotRef.current === ghost) {
+        weldGhostRobotRef.current = null;
+      }
+    };
+  }, [weldGhostJoints, weldAnglePreview, robotId, activeTool, showEndEffectorFrame]);
 
   useEffect(() => {
     if (!joints || joints.length === 0) {

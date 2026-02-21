@@ -1247,8 +1247,8 @@ def create_app() -> FastAPI:
             "weldName": str(weld_draft_raw.get("weldName", weld_draft_raw.get("weld_name", f"{active_weld_type} weld"))).strip() or f"{active_weld_type} weld",
             "workAngleDeg": float(weld_draft_raw.get("workAngleDeg", weld_draft_raw.get("work_angle_deg", 45.0))),
             "travelAngleDeg": float(weld_draft_raw.get("travelAngleDeg", weld_draft_raw.get("travel_angle_deg", 0.0))),
-            "tangentRollDeg": float(
-                weld_draft_raw.get("tangentRollDeg", weld_draft_raw.get("tangent_roll_deg", 0.0))
+            "spinAngleDeg": float(
+                weld_draft_raw.get("spinAngleDeg", weld_draft_raw.get("spin_angle_deg", 0.0))
             ),
             "transitionClearanceMm": float(
                 weld_draft_raw.get("transitionClearanceMm", weld_draft_raw.get("transition_clearance_mm", 35.0))
@@ -1414,12 +1414,12 @@ def create_app() -> FastAPI:
             else ("lift" if post_action_raw == "lift" else "return_to_start")
         )
         try:
-            tangent_roll_deg = float(
-                weld_options.get("tangent_roll_deg", weld_options.get("tangentRollDeg", 0.0))
+            spin_angle_deg = float(
+                weld_options.get("spin_angle_deg", weld_options.get("spinAngleDeg", 0.0))
             )
         except Exception:
-            tangent_roll_deg = 0.0
-        weld_options["tangent_roll_deg"] = tangent_roll_deg
+            spin_angle_deg = 0.0
+        weld_options["spin_angle_deg"] = spin_angle_deg
 
         if sections:
             weld_points = [

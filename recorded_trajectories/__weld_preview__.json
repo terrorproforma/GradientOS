@@ -1,5 +1,5 @@
 {
-  "description": "Planned on 2026-02-21 01:36:53 via PLAN_WELD",
+  "description": "Planned on 2026-02-22 02:05:44 via PLAN_WELD",
   "loop": false,
   "orientation_euler_angles_deg": null,
   "moves": [
@@ -11,9 +11,9 @@
         0.0284
       ],
       "orientation_euler_deg": [
-        180.0,
-        -25.0,
-        0.0
+        115.0,
+        45.0,
+        180.0
       ]
     },
     {
@@ -24,8 +24,8 @@
         0.0284
       ],
       "orientation_euler_deg": [
-        180.0,
-        -25.0,
+        -65.0,
+        90.0,
         0.0
       ],
       "is_weld": true,
@@ -39,8 +39,8 @@
         0.5969
       ],
       "orientation_euler_deg": [
-        180.0,
-        -25.0,
+        -65.0,
+        90.0,
         0.0
       ]
     },
@@ -52,8 +52,8 @@
         0.5969
       ],
       "orientation_euler_deg": [
-        180.0,
-        -25.0,
+        -65.0,
+        90.0,
         0.0
       ]
     },
@@ -65,8 +65,8 @@
         0.5619
       ],
       "orientation_euler_deg": [
-        180.0,
-        -25.0,
+        -65.0,
+        90.0,
         0.0
       ]
     }
@@ -81,9 +81,11 @@
     "options": {
       "work_angle_deg": 0,
       "travel_angle_deg": 0,
-      "tangent_roll_deg": 0.0,
+      "spin_angle_deg": 0,
       "transition_clearance_mm": 35,
-      "post_action": "return_to_start"
+      "post_action": "return_to_start",
+      "tangent_roll_deg": 0.0,
+      "normal_angle_deg": 90.0
     }
   }
 }

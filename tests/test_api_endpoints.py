@@ -474,14 +474,14 @@ def test_trajectory_plan_weld(client):
             "end_s": 0.9,
             "weld_type": "fillet",
             "weld_name": "test weld",
-            "options": {"tangentRollDeg": 22.5},
+            "options": {"spinAngleDeg": 22.5},
         },
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["name"] == "__weld_preview__"
     assert body["trajectory"]["weld"]["type"] == "fillet"
-    assert body["trajectory"]["weld"]["options"]["tangent_roll_deg"] == pytest.approx(22.5)
+    assert body["trajectory"]["weld"]["options"]["spin_angle_deg"] == pytest.approx(22.5)
     assert body["source"]["mode"] == "edge_segment"
 
 
@@ -507,7 +507,7 @@ def test_weld_program_save_list_load(client):
                 "weldName": "demo weld",
                 "startS": 0.2,
                 "endS": 0.8,
-                "tangentRollDeg": 17.0,
+                "spinAngleDeg": 17.0,
             },
             "editable_waypoints": [{"x": 0.0, "y": 0.0, "z": 0.0}, {"x": 0.2, "y": 0.0, "z": 0.0}],
             "planned_trajectory": {"name": "__weld_preview__", "waypoints": [{"x": 0.0, "y": 0.0, "z": 0.0}]},
@@ -525,7 +525,7 @@ def test_weld_program_save_list_load(client):
     payload = load_resp.json()
     assert payload["name"] == "demo_program"
     assert payload["weld_draft"]["edgeId"] == "part_0:edge_00000"
-    assert payload["weld_draft"]["tangentRollDeg"] == pytest.approx(17.0)
+    assert payload["weld_draft"]["spinAngleDeg"] == pytest.approx(17.0)
     assert payload["step"]["filename"] == "fixture.step"
 
 

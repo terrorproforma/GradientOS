@@ -1696,7 +1696,7 @@ def _plan_preview_points_payload(
         start_angles: np.ndarray,
         work_angle_deg: float,
         travel_angle_deg: float,
-        tangent_roll_deg: float,
+        spin_angle_deg: float,
         tool_rotation_inv: np.ndarray,
     ) -> list[np.ndarray]:
         start_pose = ik_solver.get_fk_matrix(start_angles.tolist())
@@ -1707,9 +1707,9 @@ def _plan_preview_points_payload(
         )
         fallback_forward = _normalize(fallback_orientation[:, 0], np.array([1.0, 0.0, 0.0], dtype=float))
         world_up = np.array([0.0, 0.0, 1.0], dtype=float)
-        work_rad = np.deg2rad(np.clip(work_angle_deg, 0.0, 89.0))
-        travel_rad = np.deg2rad(np.clip(travel_angle_deg, -89.0, 89.0))
-        roll_rad = np.deg2rad(np.clip(tangent_roll_deg, -180.0, 180.0))
+        work_rad = np.deg2rad(np.clip(work_angle_deg, -180.0, 180.0))
+        travel_rad = np.deg2rad(np.clip(travel_angle_deg, -180.0, 180.0))
+        spin_rad = np.deg2rad(np.clip(spin_angle_deg, -180.0, 180.0))
         orientations: list[np.ndarray] = []
         last_forward = fallback_forward.copy()
         for idx, point in enumerate(path_points):
@@ -1721,19 +1721,38 @@ def _plan_preview_points_payload(
             horizontal_forward = _normalize(horizontal_forward, forward)
             side_axis = np.cross(world_up, horizontal_forward)
             side_axis = _normalize(side_axis, np.array([1.0, 0.0, 0.0], dtype=float))
-            torch_axis = (np.cos(work_rad) * horizontal_forward) - (np.sin(work_rad) * world_up)
-            torch_axis = _normalize(torch_axis, -world_up)
-            torch_axis = _rotate_about_axis(torch_axis, side_axis, travel_rad)
-            if abs(roll_rad) > 1e-9:
-                torch_axis = _rotate_about_axis(torch_axis, forward, roll_rad)
-            torch_axis = _normalize(torch_axis, -world_up)
-            y_axis = np.cross(torch_axis, forward)
-            y_axis = _normalize(y_axis, np.cross(torch_axis, fallback_forward))
-            x_axis = np.cross(y_axis, torch_axis)
+
+            # Base Torch Frame:
+            # Z = -world_up (torch points down)
+            # X = horizontal_forward (travel)
+            # Y = -side_axis (normal, but negated for right-handedness: X x Y = Z)
+            z_axis = -world_up.copy()
+            x_axis = horizontal_forward.copy()
+            y_axis = -side_axis.copy()
+
+            # Apply rigid rotations around the frame axes
+            # 1. Work Angle: Rotate around X (Travel). Sweeps Torch in Normal-Up plane.
+            z_axis = _rotate_about_axis(z_axis, horizontal_forward, work_rad)
+            y_axis = _rotate_about_axis(y_axis, horizontal_forward, work_rad)
+            x_axis = _rotate_about_axis(x_axis, horizontal_forward, work_rad)
+
+            # 2. Travel Angle: Rotate around Y (Normal). Sweeps Torch in Travel-Up plane.
+            # Using original side_axis for rotation base.
+            z_axis = _rotate_about_axis(z_axis, side_axis, travel_rad)
+            y_axis = _rotate_about_axis(y_axis, side_axis, travel_rad)
+            x_axis = _rotate_about_axis(x_axis, side_axis, travel_rad)
+
+            # 3. Spin Angle: Rotate around Z (Up). Sweeps Torch in Travel-Normal plane.
+            # Using original world_up for rotation base.
+            z_axis = _rotate_about_axis(z_axis, world_up, spin_rad)
+            y_axis = _rotate_about_axis(y_axis, world_up, spin_rad)
+            x_axis = _rotate_about_axis(x_axis, world_up, spin_rad)
+
+            z_axis = _normalize(z_axis, -world_up)
             x_axis = _normalize(x_axis, fallback_forward)
-            y_axis = np.cross(torch_axis, x_axis)
-            y_axis = _normalize(y_axis, np.array([0.0, 1.0, 0.0], dtype=float))
-            desired_torch_orientation = np.column_stack((x_axis, y_axis, torch_axis))
+            y_axis = _normalize(y_axis, -side_axis)
+            
+            desired_torch_orientation = np.column_stack((x_axis, y_axis, z_axis))
             # Convert desired world-frame torch pose to required flange/J6 pose
             # using the active tool definition's flange->tool rotation.
             orientation = desired_torch_orientation.dot(tool_rotation_inv)
@@ -1784,8 +1803,8 @@ def _plan_preview_points_payload(
         transition_clearance_m = transition_clearance_mm / 1000.0
         work_angle_deg = _safe_float(options.get("work_angle_deg", 45.0), 45.0)
         travel_angle_deg = _safe_float(options.get("travel_angle_deg", 0.0), 0.0)
-        tangent_roll_deg = _safe_float(
-            options.get("tangent_roll_deg", options.get("tangentRollDeg", 0.0)),
+        spin_angle_deg = _safe_float(
+            options.get("spin_angle_deg", options.get("spinAngleDeg", 0.0)),
             0.0,
         )
         post_action_raw = str(options.get("post_action", "return_to_start")).strip().lower()
@@ -1795,14 +1814,14 @@ def _plan_preview_points_payload(
             else "return_to_start"
         )
         options["post_action"] = post_action
-        options["tangent_roll_deg"] = tangent_roll_deg
+        options["spin_angle_deg"] = spin_angle_deg
         if isinstance(weld_metadata.get("options"), dict):
             weld_metadata["options"]["post_action"] = post_action
-            weld_metadata["options"]["tangent_roll_deg"] = tangent_roll_deg
+            weld_metadata["options"]["spin_angle_deg"] = spin_angle_deg
         else:
             weld_metadata["options"] = {
                 "post_action": post_action,
-                "tangent_roll_deg": tangent_roll_deg,
+                "spin_angle_deg": spin_angle_deg,
             }
         planned_sections = sections if isinstance(sections, list) and len(sections) > 0 else [
             {"kind": "weld", "points": points, "weld_type": weld_metadata.get("type")}
@@ -1833,7 +1852,7 @@ def _plan_preview_points_payload(
                         current_q,
                         work_angle_deg=work_angle_deg,
                         travel_angle_deg=travel_angle_deg,
-                        tangent_roll_deg=tangent_roll_deg,
+                        spin_angle_deg=spin_angle_deg,
                         tool_rotation_inv=active_tool_rotation_inv,
                     )
                     if entry_orientations:
@@ -1903,7 +1922,7 @@ def _plan_preview_points_payload(
                     current_q,
                     work_angle_deg=work_angle_deg,
                     travel_angle_deg=travel_angle_deg,
-                    tangent_roll_deg=tangent_roll_deg,
+                    spin_angle_deg=spin_angle_deg,
                     tool_rotation_inv=active_tool_rotation_inv,
                 )
                 joint_path = trajectory_execution._plan_high_fidelity_trajectory(
@@ -2166,6 +2185,19 @@ def _plan_preview_points_payload(
     if planning_warnings:
         payload["planning_warnings"] = planning_warnings
     if weld_metadata:
+        weld_preview_joint_pose = None
+        for planned_step in planned_steps:
+            if planned_step.get("type") != "move" or not bool(planned_step.get("weld_active", False)):
+                continue
+            step_path = planned_step.get("path") or []
+            if not step_path:
+                continue
+            sample_index = max(0, min(len(step_path) - 1, len(step_path) // 3))
+            joint_sample = np.array(step_path[sample_index], dtype=float).tolist()
+            weld_preview_joint_pose = [float(value) for value in joint_sample]
+            break
+        if weld_preview_joint_pose is not None:
+            payload["weld_preview_joint_pose"] = weld_preview_joint_pose
         payload["weld"] = weld_metadata
     return payload
 
