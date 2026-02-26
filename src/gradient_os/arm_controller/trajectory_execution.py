@@ -1121,7 +1121,8 @@ def _closed_loop_executor_thread(
                     max_err = max(errs)
                     joint_stats.append(f"J{j_idx+1}: mean {math.degrees(mean_err):.2f}°, max {math.degrees(max_err):.2f}°")
             if joint_stats:
-                print("[Pi CLC] Tracking error summary → " + "; ".join(joint_stats))
+                # Use ASCII arrow to avoid Unicode encoding issues on non-UTF-8 terminals
+                print("[Pi CLC] Tracking error summary -> " + "; ".join(joint_stats))
 
             # ------------------
             # Optional Charts
