@@ -6,6 +6,18 @@ type Props = {
 	onError?: (message: string) => void;
 };
 
+type JointInfoResponse = {
+	arm_deg?: number[];
+	gripper_deg?: number;
+};
+
+type CommissioningStatus = {
+	tone: "info" | "success" | "error";
+	message: string;
+};
+
+const JOINT_STEP_OPTIONS_DEG = [0.25, 1, 5] as const;
+
 function expSliderToMultiplier(v: number): number {
 	// v in [0..1000] → 10^((t*2)-1) with t=v/1000
 	const t = Math.max(0, Math.min(1000, v)) / 1000;
@@ -22,6 +34,11 @@ export function ControlPanel({ apiHost, onError }: Props) {
 	const [grip, setGrip] = useState<number>(0);
 	const gripTimerRef = useRef<number | null>(null);
 	const [busy, setBusy] = useState<boolean>(false);
+	const [jointAnglesDeg, setJointAnglesDeg] = useState<number[]>([]);
+	const [jointFeedbackError, setJointFeedbackError] = useState<string | null>(null);
+	const [jointStepDeg, setJointStepDeg] = useState<number>(1);
+	const [pendingJointAction, setPendingJointAction] = useState<string | null>(null);
+	const [commissioningStatus, setCommissioningStatus] = useState<CommissioningStatus | null>(null);
 	// Realtime jog state
 	const [jogEnabled, setJogEnabled] = useState<boolean>(false);
 	const [deadman, setDeadman] = useState<boolean>(true);
@@ -36,7 +53,22 @@ export function ControlPanel({ apiHost, onError }: Props) {
 	const linCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
 	const angCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
 
-	const post = useCallback(async (path: string, body?: unknown) => {
+	const reportRequestError = useCallback((err: unknown, fallback: string, silent: boolean) => {
+		const msg = (err as Error)?.message || fallback;
+		if (!silent) {
+			console.error("ControlPanel error:", err);
+		}
+		if (!silent) {
+			try {
+				onError?.(msg);
+			} catch {
+				// ignore
+			}
+		}
+		return msg;
+	}, [onError]);
+
+	const post = useCallback(async (path: string, body?: unknown, silent = false) => {
 		try {
 			const res = await fetch(`${apiHost}${path}`, {
 				method: "POST",
@@ -47,16 +79,33 @@ export function ControlPanel({ apiHost, onError }: Props) {
 				const msg = await res.text();
 				throw new Error(msg || `${res.status} ${res.statusText}`);
 			}
-		} catch (err) {
-			const msg = (err as Error)?.message || "request failed";
-			console.error("ControlPanel error:", err);
-			try {
-				onError?.(msg);
-			} catch {
-				// ignore
+			const contentType = res.headers.get("content-type") ?? "";
+			if (contentType.includes("application/json")) {
+				return await res.json();
 			}
+			return null;
+		} catch (err) {
+			reportRequestError(err, "request failed", silent);
+			return null;
 		}
-	}, [apiHost]);
+	}, [apiHost, reportRequestError]);
+
+	const getJson = useCallback(async <T,>(path: string, silent = false): Promise<T | null> => {
+		try {
+			const res = await fetch(`${apiHost}${path}`, {
+				method: "GET",
+				headers: { Accept: "application/json" },
+			});
+			if (!res.ok) {
+				const msg = await res.text();
+				throw new Error(msg || `${res.status} ${res.statusText}`);
+			}
+			return (await res.json()) as T;
+		} catch (err) {
+			reportRequestError(err, "request failed", silent);
+			return null;
+		}
+	}, [apiHost, reportRequestError]);
 
 	const handleGripChange = useCallback((value: number) => {
 		setGrip(value);
@@ -69,6 +118,44 @@ export function ControlPanel({ apiHost, onError }: Props) {
 			await post("/control/set-gripper", { angle_deg: value });
 		}, 80);
 	}, [post]);
+
+	const refreshJointAngles = useCallback(async (silent = true) => {
+		const payload = await getJson<JointInfoResponse>("/info/joints", silent);
+		if (!payload || !Array.isArray(payload.arm_deg)) {
+			if (!silent) {
+				setJointFeedbackError("Joint feedback unavailable.");
+			}
+			return false;
+		}
+		const nextAngles = payload.arm_deg.map((value) => Number(value));
+		setJointAnglesDeg(nextAngles);
+		setJointFeedbackError(null);
+		return true;
+	}, [getJson]);
+
+	useEffect(() => {
+		let disposed = false;
+		const tick = async () => {
+			const payload = await getJson<JointInfoResponse>("/info/joints", true);
+			if (disposed) {
+				return;
+			}
+			if (!payload || !Array.isArray(payload.arm_deg)) {
+				setJointFeedbackError("Waiting for joint feedback...");
+				return;
+			}
+			setJointAnglesDeg(payload.arm_deg.map((value) => Number(value)));
+			setJointFeedbackError(null);
+		};
+		void tick();
+		const timer = window.setInterval(() => {
+			void tick();
+		}, 500);
+		return () => {
+			disposed = true;
+			window.clearInterval(timer);
+		};
+	}, [getJson]);
 
 	// ------------------------
 	// Realtime jog helpers
@@ -163,6 +250,117 @@ export function ControlPanel({ apiHost, onError }: Props) {
 	const onDebugToggle = useCallback(async (enabled: boolean) => {
 		await post("/control/jog/debug", { enabled });
 	}, [post]);
+
+	const handleJointStep = useCallback(async (jointIndex: number, direction: 1 | -1) => {
+		if (pendingJointAction) {
+			return;
+		}
+		const jointNumber = jointIndex + 1;
+		const signedStepDeg = Number((jointStepDeg * direction).toFixed(3));
+		setPendingJointAction(`jog-${jointIndex}`);
+		setCommissioningStatus({
+			tone: "info",
+			message: `Jogging J${jointNumber} by ${signedStepDeg > 0 ? "+" : ""}${signedStepDeg.toFixed(3)} deg...`,
+		});
+		try {
+			if (jogEnabled) {
+				await stopJog();
+			}
+			const result = await post("/control/joint-jog", {
+				joint: jointNumber,
+				delta_deg: signedStepDeg,
+				wait_for_idle: true,
+			});
+			if (result) {
+				const refreshed = await refreshJointAngles(false);
+				setCommissioningStatus(
+					refreshed
+						? {
+							tone: "success",
+							message: `J${jointNumber} step complete. Live joint feedback refreshed.`,
+						}
+						: {
+							tone: "error",
+							message: `J${jointNumber} moved, but live feedback refresh did not succeed.`,
+						},
+				);
+			} else {
+				setCommissioningStatus({
+					tone: "error",
+					message: `Failed to jog J${jointNumber}. Check API/controller connectivity.`,
+				});
+			}
+		} finally {
+			setPendingJointAction(null);
+		}
+	}, [pendingJointAction, jogEnabled, stopJog, post, jointStepDeg, refreshJointAngles]);
+
+	const handleJointZero = useCallback(async (jointIndex: number) => {
+		if (pendingJointAction) {
+			return;
+		}
+		const jointNumber = jointIndex + 1;
+		const angleLabel = Number.isFinite(jointAnglesDeg[jointIndex] ?? Number.NaN)
+			? `${jointAnglesDeg[jointIndex].toFixed(2)} deg`
+			: "current feedback";
+		const confirmed = window.confirm(
+			`Capture J${jointNumber} at ${angleLabel} as logical zero?`,
+		);
+		if (!confirmed) {
+			return;
+		}
+		setPendingJointAction(`zero-${jointIndex}`);
+		setCommissioningStatus({
+			tone: "info",
+			message: `Capturing J${jointNumber} at ${angleLabel} as logical zero...`,
+		});
+		try {
+			if (jogEnabled) {
+				await stopJog();
+			}
+			const result = await post("/control/zero-joint", { joint: jointNumber });
+			if (result) {
+				const refreshed = await refreshJointAngles(false);
+				setCommissioningStatus(
+					refreshed
+						? {
+							tone: "success",
+							message: `Captured J${jointNumber} logical zero. Live feedback now reflects the updated offset.`,
+						}
+						: {
+							tone: "error",
+							message: `Captured J${jointNumber} logical zero, but live feedback refresh did not succeed.`,
+						},
+				);
+			} else {
+				setCommissioningStatus({
+					tone: "error",
+					message: `Failed to capture logical zero for J${jointNumber}.`,
+				});
+			}
+		} finally {
+			setPendingJointAction(null);
+		}
+	}, [pendingJointAction, jointAnglesDeg, jogEnabled, stopJog, post, refreshJointAngles]);
+
+	const handleRefreshJointFeedback = useCallback(async () => {
+		setCommissioningStatus({
+			tone: "info",
+			message: "Refreshing live joint feedback...",
+		});
+		const refreshed = await refreshJointAngles(false);
+		setCommissioningStatus(
+			refreshed
+				? {
+					tone: "success",
+					message: "Live joint feedback refreshed. You can now jog and capture zero from the current pose.",
+				}
+				: {
+					tone: "error",
+					message: "Joint feedback unavailable. Do not capture zero until live angles are visible.",
+				},
+		);
+	}, [refreshJointAngles]);
 
 	// ------------------------
 	// Incremental jog helpers
@@ -592,6 +790,141 @@ export function ControlPanel({ apiHost, onError }: Props) {
 					>
 						-Yaw
 					</button>
+				</div>
+			</div>
+			<div className="mb-3 rounded-lg border border-slate-700/60 bg-slate-950/30 p-2">
+				<div className="mb-2 flex items-center justify-between gap-2 text-xs text-slate-300/80">
+					<span className="font-semibold">Joint Commissioning</span>
+					<span className="rounded border border-amber-500/30 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-200/90">
+						RTCore cap 100 RPM
+					</span>
+				</div>
+				<div className="mb-2 text-[11px] leading-relaxed text-slate-400">
+					Use small relative steps while aligning joints for zero capture. This panel assumes the RTCore setup-time
+					safety clamp remains at <code className="rounded bg-slate-900/80 px-1 py-0.5 text-slate-200">--max-rpm 100</code>.
+				</div>
+				<div className="mb-2 rounded border border-amber-500/20 bg-amber-400/5 px-2 py-2 text-[11px] leading-relaxed text-amber-100/90">
+					Zero capture writes a persistent logical offset for the selected joint. Refresh feedback first, jog the joint
+					into alignment, then capture zero only when the live angle shown for that joint matches what you expect.
+				</div>
+				<div className="mb-2 flex items-center justify-between gap-2">
+					<span className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Joint Step</span>
+					<div className="flex items-center gap-2">
+						<button
+							type="button"
+							className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[11px] font-medium text-slate-200 transition hover:border-slate-500/80 hover:text-white"
+							onClick={() => {
+								void handleRefreshJointFeedback();
+							}}
+						>
+							Refresh
+						</button>
+						<div className="flex items-center gap-1">
+						{JOINT_STEP_OPTIONS_DEG.map((value) => (
+							<button
+								key={value}
+								type="button"
+								className={`rounded border px-2 py-1 text-[11px] font-medium tabular-nums transition ${
+									jointStepDeg === value
+										? "border-cyan-400/70 bg-cyan-400/15 text-cyan-100"
+										: "border-slate-700/70 bg-slate-900/60 text-slate-300 hover:border-slate-500/80 hover:text-slate-100"
+								}`}
+								onClick={() => setJointStepDeg(value)}
+							>
+								{value}°
+							</button>
+						))}
+						</div>
+					</div>
+				</div>
+				{jointFeedbackError ? (
+					<div className="mb-2 rounded border border-slate-700/60 bg-slate-900/70 px-2 py-1.5 text-[11px] text-slate-400">
+						{jointFeedbackError}
+					</div>
+				) : null}
+				{commissioningStatus ? (
+					<div
+						className={`mb-2 rounded border px-2 py-1.5 text-[11px] ${
+							commissioningStatus.tone === "success"
+								? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100"
+								: commissioningStatus.tone === "error"
+									? "border-rose-500/30 bg-rose-400/10 text-rose-100"
+									: "border-cyan-500/20 bg-cyan-400/10 text-cyan-100"
+						}`}
+					>
+						{commissioningStatus.message}
+					</div>
+				) : null}
+				<div className="space-y-1">
+					{Array.from({ length: jointAnglesDeg.length > 0 ? jointAnglesDeg.length : 6 }, (_, jointIndex) => {
+						const jointNumber = jointIndex + 1;
+						const angleDeg = jointAnglesDeg[jointIndex];
+						const angleLabel = Number.isFinite(angleDeg) ? `${angleDeg.toFixed(2)}°` : "--";
+						const isPending = pendingJointAction === `jog-${jointIndex}` || pendingJointAction === `zero-${jointIndex}`;
+						const hasLiveFeedback = Number.isFinite(angleDeg);
+						const controlsDisabled = pendingJointAction !== null;
+						const commissioningDisabled = controlsDisabled || !hasLiveFeedback;
+						return (
+							<div
+								key={jointNumber}
+								className="flex items-center gap-2 rounded border border-slate-700/60 bg-slate-900/45 px-2 py-1.5"
+							>
+								<div className="min-w-[3.25rem]">
+									<div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+										J{jointNumber}
+									</div>
+									<div className="tabular-nums text-sm font-semibold text-cyan-100">{angleLabel}</div>
+								</div>
+								<div className="ml-auto grid grid-cols-3 gap-1">
+									<button
+										type="button"
+										className="rounded border border-slate-700/70 bg-slate-950/60 px-2 py-1 text-xs font-semibold text-slate-200 transition hover:border-slate-500/80 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+										onClick={() => {
+											void handleJointStep(jointIndex, -1);
+										}}
+										disabled={commissioningDisabled}
+										title={
+											hasLiveFeedback
+												? `Jog J${jointNumber} by -${jointStepDeg} degrees`
+												: `Live joint feedback is required before jogging J${jointNumber}`
+										}
+									>
+										-{jointStepDeg}°
+									</button>
+									<button
+										type="button"
+										className="rounded border border-slate-700/70 bg-slate-950/60 px-2 py-1 text-xs font-semibold text-slate-200 transition hover:border-slate-500/80 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+										onClick={() => {
+											void handleJointStep(jointIndex, +1);
+										}}
+										disabled={commissioningDisabled}
+										title={
+											hasLiveFeedback
+												? `Jog J${jointNumber} by +${jointStepDeg} degrees`
+												: `Live joint feedback is required before jogging J${jointNumber}`
+										}
+									>
+										+{jointStepDeg}°
+									</button>
+									<button
+										type="button"
+										className="rounded border border-amber-500/40 bg-amber-400/10 px-2 py-1 text-xs font-semibold text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+										onClick={() => {
+											void handleJointZero(jointIndex);
+										}}
+										disabled={commissioningDisabled}
+										title={
+											hasLiveFeedback
+												? `Capture current J${jointNumber} position as logical zero`
+												: `Live joint feedback is required before zero capture on J${jointNumber}`
+										}
+									>
+										{isPending && pendingJointAction === `zero-${jointIndex}` ? "..." : "Zero"}
+									</button>
+								</div>
+							</div>
+						);
+					})}
 				</div>
 			</div>
 			<div className="flex items-center justify-between">

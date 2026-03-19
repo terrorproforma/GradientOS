@@ -1,6 +1,6 @@
+# Generated from systemd/ethercat-host/port-layout.env.
 [Match]
 MACAddress=c8:3e:a7:14:1c:75
 
 [Link]
 Name=ethercat0
-

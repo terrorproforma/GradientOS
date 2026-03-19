@@ -72,6 +72,36 @@ class Gradient05Config(RobotConfig):
             5: [5],
         }
 
+    @property
+    def actuator_encoder_counts_per_rev(self) -> list[int]:
+        """
+        Absolute encoder resolution per motor revolution.
+
+        Current Gradient-05 EtherCAT commissioning assumes 17-bit motor-side
+        encoder counts from the drive position objects.
+        """
+        return [131072] * 6
+
+    @property
+    def actuator_gear_ratios(self) -> list[float]:
+        """
+        Motor-revolutions to joint-revolution reduction ratios.
+
+        These values come from the current Gradient-05 EtherCAT bring-up notes
+        and are used by the RTCore backend to convert raw counts into radians.
+        """
+        return [100.0, 100.0, 100.0, 18.0, 20.0, 10.0]
+
+    @property
+    def actuator_position_signs(self) -> list[int]:
+        """
+        Positive joint-direction sign convention for raw encoder counts.
+
+        Keep this robot-defined rather than backend-defined so any future sign
+        flips from wiring or gearbox changes stay in the robot description.
+        """
+        return [1, 1, 1, 1, 1, 1]
+
     # =========================================================================
     # Joint Limits
     # =========================================================================

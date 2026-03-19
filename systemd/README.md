@@ -15,6 +15,10 @@ installing, removing, and managing the units.
   ./uninstall.sh
   ```
   Adjust the unit if you need custom environment variables (e.g. `SERIAL_PORT`).
+  The controller unit now `Wants=` / `After=` `gradient-rt-motion.service`, so a
+  normal controller service start will also pull in RTCore. RTCore in turn
+  `Requires=` `ethercat.service`, giving a single service chain for the EtherCAT
+  hardware stack once all units are installed.
 
 - `api/` – runs `gradient-api` to expose the FastAPI REST/SSE proxy. Scripts are
   analogous:
@@ -44,13 +48,25 @@ installing, removing, and managing the units.
   IgH is installed/configured on the host, this service will not start.
 
 - `ethercat-host/` – host-level EtherCAT prerequisites (NIC renaming, unmanaged
-  `ethercat0`, NIC tuning + IRQ pinning templates). Use:
+  `ethercat0`, managed uplink profile, NIC tuning + IRQ pinning templates). Use:
   ```bash
   cd systemd/ethercat-host
   ./install.sh
   ```
-  This installs templates into `/etc` and enables the tuning units. A reboot is
-  required for NIC renaming (`eth0/eth1` → `uplink0/ethercat0`).
+  The single source of truth for which physical port is the EtherCAT port is
+  `systemd/ethercat-host/port-layout.env`.
+  `install.sh` renders `/etc/ethercat.conf`, the `.link` files, and the
+  NetworkManager configs from that one file, including a generated
+  `gradient-uplink.nmconnection` profile for the non-EtherCAT NIC, then enables
+  the tuning units. A reboot is required for NIC renaming (`eth0/eth1` →
+  `uplink0/ethercat0` according to the selected mapping).
+  To cut over a live SSH session safely, start the helper **before** unplugging
+  the current uplink cable. It waits for carrier on the computed non-EtherCAT
+  NIC, then activates the staged managed uplink profile there:
+  ```bash
+  cd systemd/ethercat-host
+  sudo bash ./activate-uplink.sh
+  ```
 
 - `wifi/` – optional Wi‑Fi keepalive (auto-reconnect). Useful on flaky networks
   during bring-up (does not touch the EtherCAT NIC). Use:

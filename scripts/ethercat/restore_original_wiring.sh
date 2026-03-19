@@ -1,11 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# Restore the "appliance" assumption:
-# - Drive is wired to the dedicated EtherCAT NIC (eth0 -> ethercat0)
-# - IgH systemd unit binds via /etc/ethercat.conf (MAC c8:3e:a7:14:1c:75)
-#
-# Use after you've temporarily bound the master to a different NIC.
+# Restore the currently configured appliance EtherCAT role assignment.
+# The active port/MAC comes from /etc/ethercat.conf, which is now derived from
+# /etc/gradient-ethercat-host.env installed by systemd/ethercat-host/install.sh.
 
 echo "Stopping any running EtherCAT master modules..."
 sudo /usr/local/sbin/ethercatctl -c /etc/ethercat.conf stop || true

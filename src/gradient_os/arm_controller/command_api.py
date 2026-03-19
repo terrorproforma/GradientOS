@@ -961,8 +961,9 @@ def handle_get_position(sock: 'socket.socket', addr: tuple):
         euler_deg = R.from_matrix(pose_mx[:3, :3]).as_euler('xyz', degrees=True)
         euler_rounded = [round(float(e), 2) for e in euler_deg]
         
-        # Round joint angles for cleaner display
-        angles_rounded = [round(float(a), 4) for a in current_angles]
+        # Keep the wire format consistent with the API contract (`joints_deg`).
+        angles_deg = np.rad2deg(current_angles)
+        angles_rounded = [round(float(a), 4) for a in angles_deg]
 
         pos_str = ",".join(map(str, pos_rounded))
         euler_str = ",".join(map(str, euler_rounded))
@@ -979,7 +980,7 @@ def handle_get_position(sock: 'socket.socket', addr: tuple):
         except Exception as e:
             print(f"[Pi] Error sending CURRENT_POSE to {addr}: {e}")
     else:
-        print("[Pi] ERROR: Could not calculate current position (FK failed).")
+        print(f"[Pi] ERROR: Could not calculate current position (FK failed) for joints={current_angles}.")
         try:
             sock.sendto("ERROR,FK_FAILED".encode("utf-8"), addr)
         except Exception as e:
@@ -993,7 +994,7 @@ def handle_get_orientation(sock: 'socket.socket', addr: tuple):
     """
     print(f"[Pi] Received GET_ORIENTATION from {addr}.")
 
-    current_angles = utils.current_logical_joint_angles_rad
+    current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
 
     # Get the current orientation using Forward Kinematics
     current_pose_matrix = ik_solver.get_fk_matrix(current_angles)
@@ -1015,7 +1016,7 @@ def handle_get_orientation(sock: 'socket.socket', addr: tuple):
         except Exception as e:
             print(f"[Pi] Error sending CURRENT_ORIENTATION to {addr}: {e}")
     else:
-        print("[Pi] ERROR: Could not calculate current orientation (FK failed).")
+        print(f"[Pi] ERROR: Could not calculate current orientation (FK failed) for joints={current_angles}.")
         try:
             sock.sendto("ERROR,FK_FAILED".encode("utf-8"), addr)
         except Exception as e:

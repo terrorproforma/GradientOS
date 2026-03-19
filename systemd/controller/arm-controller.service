@@ -1,6 +1,7 @@
 [Unit]
 Description=Gradient Robotics Arm Controller
-After=network.target
+Wants=gradient-rt-motion.service
+After=network.target gradient-rt-motion.service
 
 StartLimitIntervalSec=120
 StartLimitBurst=3
@@ -11,15 +12,16 @@ Type=simple
 User=pi
 Group=pi
 
-WorkingDirectory=/home/pi/src/GradientOS
+WorkingDirectory=/home/pi/GradientOS
 
-Environment=PATH=/home/pi/src/GradientOS/.venv/bin:/home/pi/.local/bin:/home/pi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PATH=/home/pi/GradientOS/.venv/bin:/home/pi/.local/bin:/home/pi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/home/pi/src/GradientOS/src
+Environment=PYTHONPATH=/home/pi/GradientOS/src
+Environment=GRADIENT_RTCORE_AUTOSTART=1
 # Use for explicit serial port override instead of auto-detection
 # Environment=SERIAL_PORT=/dev/ttyUSB0
 
-ExecStart=/home/pi/src/GradientOS/run.sh
+ExecStart=/home/pi/GradientOS/run.sh
 
 Restart=always
 RestartSec=15
@@ -28,7 +30,7 @@ TimeoutStopSec=60
 
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/home/pi/src/GradientOS /home/pi/.cache /home/pi/.config
+ReadWritePaths=/home/pi/GradientOS /home/pi/.cache /home/pi/.config
 NoNewPrivileges=true
 PrivateTmp=true
 

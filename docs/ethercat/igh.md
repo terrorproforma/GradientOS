@@ -44,7 +44,7 @@ Example:
 
 ```bash
 sudo systemctl stop ethercat.service
-sudo /usr/local/sbin/ethercatctl -c ~/GradientOS/scripts/ethercat/ethercat-eth0.conf start
+sudo /usr/local/sbin/ethercatctl -c ~/GradientOS/scripts/ethercat/ethercat-eth1.conf start
 sudo ethercat master
 sudo ethercat slaves -v
 ```
@@ -73,9 +73,16 @@ driver: lan743x
 bus-info: 0001:03:00.0
 ```
 
-IgH is configured to use `DEVICE_MODULES="generic"`. During bring-up, EtherCAT discovery was confirmed
-working on `macb` (`eth0`) and repeatedly failed on `lan743x` (`eth1`), so the appliance wiring binds the
-master to the `eth0` MAC.
+IgH is configured to use `DEVICE_MODULES="generic"`. Earlier notes recorded a working setup on `macb`
+(`eth0`) and a failing setup on `lan743x` (`eth1`), but current live validation on this same RevPi with the
+present cable layout proved the slave chain is reachable on `eth1` (`lan743x`, MAC `c8:3e:a7:14:1c:76`):
+
+- temporary `ethercat-eth1.conf` showed `Slaves: 6`, non-zero RX frames, and zero lost frames,
+- the current host also uses `eth0` as its normal wired uplink,
+- so the default master binding was updated to `eth1` for the current appliance wiring.
+
+Conclusion: treat the older `eth0` note as historical, not universal. Trust the live probe for the current
+machine/wiring.
 
 ### Upstream references (canonical)
 

@@ -85,7 +85,7 @@ sudo cat /etc/ethercat.conf
 ```
 
 Expected:
-- `MASTER0_DEVICE="c8:3e:a7:14:1c:75"`
+- `MASTER0_DEVICE="c8:3e:a7:14:1c:76"`
 - `DEVICE_MODULES="generic"`
 
 After installation, verify:
@@ -114,8 +114,8 @@ Key signals:
 ### No-motion comms validation (IgH master ↔ slave)
 
 Prerequisites:
-- Drive is connected RevPi `eth0` (driver `macb`) → drive `CN3 (IN)` and is powered.
-- `ethercat.service` binds to `/etc/ethercat.conf` (MAC `c8:3e:a7:14:1c:75`).
+- Drive is connected RevPi `eth1` (driver `lan743x`) → drive `CN3 (IN)` and is powered.
+- `ethercat.service` binds to `/etc/ethercat.conf` (MAC `c8:3e:a7:14:1c:76`).
 
 Run:
 
@@ -186,8 +186,8 @@ If `ethercat master` shows:
 - the IgH master is **bound to the wrong NIC** for the current wiring (check `ethercat master` → `Main:` MAC)
 
 Extra sanity checks:
-- `ip -s link show dev ethercat0` (or `eth0` before NIC renaming takes effect) should show **RX packets > 0** once a slave is responding.
-- `sudo ethtool -S ethercat0` (or `eth0` pre-rename) should show **RX frames > 0** and should *not* show TX errors climbing 1:1 with TX frames. If RX stays at 0 and TX carrier errors climb with each frame, suspect **cable/port/device not replying** (not a PDO/DS402 issue).
+- `ip -s link show dev ethercat0` (or `eth1` before NIC renaming takes effect) should show **RX packets > 0** once a slave is responding.
+- `sudo ethtool -S ethercat0` (or `eth1` pre-rename) should show **RX frames > 0** and should *not* show TX errors climbing 1:1 with TX frames. If RX stays at 0 and TX carrier errors climb with each frame, suspect **cable/port/device not replying** (not a PDO/DS402 issue).
 
 Suggested first checks:
 
@@ -202,7 +202,7 @@ diagnosis without editing `/etc/ethercat.conf`:
 
 ```bash
 sudo systemctl stop ethercat.service
-sudo /usr/local/sbin/ethercatctl -c ~/GradientOS/scripts/ethercat/ethercat-eth0.conf start
+sudo /usr/local/sbin/ethercatctl -c ~/GradientOS/scripts/ethercat/ethercat-eth1.conf start
 sudo ethercat master
 sudo ethercat slaves -v
 ```
@@ -284,6 +284,25 @@ Example: if you mapped `axis0 -> J5` and want a tiny move on that axis:
 # j1,j2,j3,j4,j5,j6 (radians)
 0,0,0,0,0.01,0
 ```
+
+#### Capturing joint zero offsets
+
+Once a joint is physically placed at the pose you want to treat as logical zero,
+capture that offset through the controller API:
+
+```bash
+curl -X POST http://127.0.0.1:8000/control/zero-joint \
+  -H "Content-Type: application/json" \
+  -d '{"joint": 5}'
+```
+
+Notes:
+- This stores a **logical joint master offset** in repo-local state, it does **not**
+  write a vendor-specific zero into the EtherCAT drive EEPROM.
+- Offsets persist in `.gradient_joint_zero_offsets.json` and are reloaded by the
+  `ethercat_rtcore` backend on controller startup.
+- Zero joints one at a time after axis mapping/sign/scaling are confirmed with
+  `scripts/rtcore_jog.py` and before aggressive PID tuning or trajectory execution.
 
 #### Direct RTCore jog tool (no controller)
 

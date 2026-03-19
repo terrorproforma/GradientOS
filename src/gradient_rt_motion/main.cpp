@@ -67,6 +67,40 @@ void logf(const char* fmt, ...) {
   va_end(args);
 }
 
+uint32_t master_state_from_al_states(unsigned int al_states, bool link_up) {
+  if (!link_up) {
+    return gradient::ipc::v1::MASTER_ERROR;
+  }
+  if ((al_states & 0x8u) != 0u) {
+    return gradient::ipc::v1::MASTER_OP;
+  }
+  if ((al_states & 0x4u) != 0u) {
+    return gradient::ipc::v1::MASTER_SAFEOP;
+  }
+  if ((al_states & 0x2u) != 0u) {
+    return gradient::ipc::v1::MASTER_PREOP;
+  }
+  if ((al_states & 0x1u) != 0u) {
+    return gradient::ipc::v1::MASTER_INIT;
+  }
+  return gradient::ipc::v1::MASTER_INIT;
+}
+
+const char* al_state_label(uint8_t al_state) {
+  switch (al_state) {
+    case 0x01:
+      return "INIT";
+    case 0x02:
+      return "PREOP";
+    case 0x04:
+      return "SAFEOP";
+    case 0x08:
+      return "OP";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 size_t align_up(size_t value, size_t alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
@@ -98,10 +132,40 @@ struct Options {
   // Axis scaling (bring-up defaults; tuned via commissioning).
   // Per-axis lists can be provided via the CLI (comma-separated).
   std::array<AxisConfig, gradient::ipc::v1::GRADIENT_MAX_AXES> axis{};
+  std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_position{};
 
   // Safety: cap commanded motor speed (rpm). 0 disables clamping.
   double max_rpm = 100.0;
+
+  // EtherCAT bring-up policy.
+  uint16_t rx_pdo = gradient::a6ec::kRxPdo;
+  uint16_t tx_pdo = gradient::a6ec::kTxPdo;
+  bool use_dc = true;
+  bool disable_output_watchdog = false;
+  bool split_domains_per_axis = false;
+  bool explicit_pdo_config = false;
+  bool queue_split_domains_round_robin = false;
+  uint32_t wait_before_safeop_ms = 250;
+  uint32_t preop_to_safeop_timeout_ms = 5000;
+  uint32_t safeop_to_op_timeout_ms = 5000;
+  uint32_t startup_passive_ms = 0;
+  uint32_t startup_skip_domain_queue_ms = 0;
 };
+
+const char* pdo_profile_label(uint16_t rx_pdo, uint16_t tx_pdo) {
+  if (rx_pdo == 0x1701 && tx_pdo == 0x1B01) {
+    return "1701/1b01";
+  }
+  if (rx_pdo == 0x1702 && tx_pdo == 0x1B02) {
+    return "1702/1b02";
+  }
+  return "custom";
+}
+
+bool is_supported_pdo_profile(uint16_t rx_pdo, uint16_t tx_pdo) {
+  return (rx_pdo == 0x1701 && tx_pdo == 0x1B01) ||
+         (rx_pdo == 0x1702 && tx_pdo == 0x1B02);
+}
 
 bool parse_u32(const char* s, uint32_t* out) {
   if (!s || !*s) {
@@ -156,6 +220,21 @@ bool parse_i32(const char* s, int* out) {
     return false;
   }
   *out = static_cast<int>(v);
+  return true;
+}
+
+bool parse_u16_auto(const char* s, uint16_t* out) {
+  if (!s || !*s) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  unsigned long v = std::strtoul(s, &end, 0);
+  if (errno != 0 || end == s || *end != '\0' ||
+      v > static_cast<unsigned long>(std::numeric_limits<uint16_t>::max())) {
+    return false;
+  }
+  *out = static_cast<uint16_t>(v);
   return true;
 }
 
@@ -494,13 +573,60 @@ bool finalize_axis_config(Options* opt,
   return true;
 }
 
+bool finalize_slave_positions(Options* opt, const std::string& slave_positions_spec) {
+  if (!opt) {
+    return false;
+  }
+
+  for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+    opt->slave_position[i] = static_cast<uint16_t>(i);
+  }
+
+  if (slave_positions_spec.empty()) {
+    return true;
+  }
+
+  const auto toks = split_csv_strict(slave_positions_spec);
+  if (toks.size() != static_cast<size_t>(opt->num_axes)) {
+    logf("ERROR: --slave-positions list length must match --num-axes (%u)", opt->num_axes);
+    return false;
+  }
+
+  for (uint32_t i = 0; i < opt->num_axes; ++i) {
+    uint32_t pos = 0;
+    if (!parse_u32(toks[i].c_str(), &pos) ||
+        pos > static_cast<uint32_t>(std::numeric_limits<uint16_t>::max())) {
+      logf("ERROR: invalid slave position '%s' in --slave-positions", toks[i].c_str());
+      return false;
+    }
+    opt->slave_position[i] = static_cast<uint16_t>(pos);
+  }
+
+  for (uint32_t i = 0; i < opt->num_axes; ++i) {
+    for (uint32_t j = i + 1; j < opt->num_axes; ++j) {
+      if (opt->slave_position[i] == opt->slave_position[j]) {
+        logf("ERROR: duplicate slave position %u in --slave-positions",
+             static_cast<unsigned int>(opt->slave_position[i]));
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
 void print_usage(const char* argv0) {
   std::fprintf(
       stderr,
       "Usage: %s [--socket-path PATH] [--cycle-ns NS] [--num-axes N] "
       "[--counts-per-rev N[,N..]] [--gear-ratio R[,R..]] [--sign S[,S..]] "
       "[--axis-type T[,T..]] [--lead-m-per-rev M[,M..]] [--max-rpm RPM] "
-      "[--ipc-group NAME]\n\n"
+      "[--slave-positions P[,P..]] "
+      "[--rx-pdo ID] [--tx-pdo ID] [--no-dc] [--disable-output-watchdog] "
+      "[--split-domains-per-axis] [--queue-split-domains-round-robin] [--explicit-pdo-config] "
+      "[--wait-before-safeop-ms MS] [--preop-safeop-timeout-ms MS] "
+      "[--safeop-op-timeout-ms MS] [--startup-passive-ms MS] "
+      "[--startup-skip-domain-queue-ms MS] [--ipc-group NAME]\n\n"
       "Defaults:\n"
       "  --socket-path /run/gradient-rt-motion/ipc.sock\n"
       "  --cycle-ns     1000000\n"
@@ -510,6 +636,19 @@ void print_usage(const char* argv0) {
       "  --sign         +1\n"
       "  --axis-type    rotary\n"
       "  --max-rpm      100\n"
+      "  --slave-positions 0,1,2,...\n"
+      "  --rx-pdo       0x1702\n"
+      "  --tx-pdo       0x1B02\n"
+      "  --no-dc        disabled by default\n"
+      "  --disable-output-watchdog off\n"
+      "  --split-domains-per-axis off\n"
+      "  --queue-split-domains-round-robin off\n"
+      "  --explicit-pdo-config off\n"
+      "  --wait-before-safeop-ms 250\n"
+      "  --preop-safeop-timeout-ms 5000\n"
+      "  --safeop-op-timeout-ms 5000\n"
+      "  --startup-passive-ms 0\n"
+      "  --startup-skip-domain-queue-ms 0\n"
       "  --ipc-group    pi\n",
       argv0);
 }
@@ -698,6 +837,7 @@ int main(int argc, char** argv) {
   std::string sign_spec;
   std::string axis_type_spec;
   std::string lead_m_per_rev_spec;
+  std::string slave_positions_spec;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -751,6 +891,79 @@ int main(int argc, char** argv) {
       }
       continue;
     }
+    if (arg == "--slave-positions" && i + 1 < argc) {
+      slave_positions_spec = argv[++i];
+      continue;
+    }
+    if (arg == "--rx-pdo" && i + 1 < argc) {
+      if (!parse_u16_auto(argv[++i], &opt.rx_pdo)) {
+        logf("ERROR: invalid --rx-pdo");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--tx-pdo" && i + 1 < argc) {
+      if (!parse_u16_auto(argv[++i], &opt.tx_pdo)) {
+        logf("ERROR: invalid --tx-pdo");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--no-dc") {
+      opt.use_dc = false;
+      continue;
+    }
+    if (arg == "--disable-output-watchdog") {
+      opt.disable_output_watchdog = true;
+      continue;
+    }
+    if (arg == "--split-domains-per-axis") {
+      opt.split_domains_per_axis = true;
+      continue;
+    }
+    if (arg == "--queue-split-domains-round-robin") {
+      opt.queue_split_domains_round_robin = true;
+      continue;
+    }
+    if (arg == "--explicit-pdo-config") {
+      opt.explicit_pdo_config = true;
+      continue;
+    }
+    if (arg == "--wait-before-safeop-ms" && i + 1 < argc) {
+      if (!parse_u32(argv[++i], &opt.wait_before_safeop_ms)) {
+        logf("ERROR: invalid --wait-before-safeop-ms");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--preop-safeop-timeout-ms" && i + 1 < argc) {
+      if (!parse_u32(argv[++i], &opt.preop_to_safeop_timeout_ms)) {
+        logf("ERROR: invalid --preop-safeop-timeout-ms");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--safeop-op-timeout-ms" && i + 1 < argc) {
+      if (!parse_u32(argv[++i], &opt.safeop_to_op_timeout_ms)) {
+        logf("ERROR: invalid --safeop-op-timeout-ms");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--startup-passive-ms" && i + 1 < argc) {
+      if (!parse_u32(argv[++i], &opt.startup_passive_ms)) {
+        logf("ERROR: invalid --startup-passive-ms");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--startup-skip-domain-queue-ms" && i + 1 < argc) {
+      if (!parse_u32(argv[++i], &opt.startup_skip_domain_queue_ms)) {
+        logf("ERROR: invalid --startup-skip-domain-queue-ms");
+        return 2;
+      }
+      continue;
+    }
     if (arg == "--ipc-group" && i + 1 < argc) {
       opt.ipc_group = argv[++i];
       continue;
@@ -769,12 +982,23 @@ int main(int argc, char** argv) {
                             lead_m_per_rev_spec)) {
     return 2;
   }
+  if (!finalize_slave_positions(&opt, slave_positions_spec)) {
+    return 2;
+  }
+
+  if (!is_supported_pdo_profile(opt.rx_pdo, opt.tx_pdo)) {
+    logf("ERROR: unsupported PDO profile rx=0x%04x tx=0x%04x "
+         "(supported: 0x1701/0x1b01 or 0x1702/0x1b02)",
+         static_cast<unsigned int>(opt.rx_pdo),
+         static_cast<unsigned int>(opt.tx_pdo));
+    return 2;
+  }
 
 #if GRADIENT_HAVE_ECRT
   // A6-EC (CiA402 over EtherCAT) uses DC/SYNC0; the sync cycle must be a multiple
   // of 250 μs (manual ch8; otherwise the drive can raise Er74.0).
   constexpr uint64_t kA6ecDcQuantumNs = 250000; // 250 μs
-  if ((opt.cycle_ns % kA6ecDcQuantumNs) != 0) {
+  if (opt.use_dc && (opt.cycle_ns % kA6ecDcQuantumNs) != 0) {
     logf("ERROR: --cycle-ns (%llu) must be a multiple of %llu ns (250 us) for A6-EC DC/SYNC0",
          static_cast<unsigned long long>(opt.cycle_ns),
          static_cast<unsigned long long>(kA6ecDcQuantumNs));
@@ -907,8 +1131,19 @@ int main(int argc, char** argv) {
     uint32_t wkc_actual = 0;
     uint32_t wkc_expected = 0;
     uint32_t master_state = gradient::ipc::v1::MASTER_INIT;
+    uint32_t responding_slaves = 0;
+    uint32_t online_slaves = 0;
+    uint32_t operational_slaves = 0;
     int64_t dc_offset_ns = 0;
     int64_t cycle_jitter_ns = 0;
+    uint8_t link_up = 0;
+    uint8_t master_al_states = 0;
+    uint8_t domain_wc_state = 0;
+    uint8_t startup_ready = 0;
+    uint8_t startup_passive_active = 0;
+    uint8_t startup_skip_domain_queue_active = 0;
+    uint32_t startup_elapsed_ms = 0;
+    uint32_t startup_reset_count = 0;
     std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> pos_counts{};
     std::array<int16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> torque_raw{};
     std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> statusword{};
@@ -916,6 +1151,9 @@ int main(int argc, char** argv) {
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> mode_display{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ds402_state{};
     std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> di_bits{};
+    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_al_state{};
+    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_online{};
+    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_operational{};
   };
 
   std::atomic<bool> armed{false};
@@ -964,39 +1202,110 @@ int main(int argc, char** argv) {
     // intentionally "init-only" work; the cyclic loop below avoids allocation.
     ec_master_t* master = nullptr;
     ec_domain_t* domain = nullptr;
+    std::array<ec_domain_t*, gradient::ipc::v1::GRADIENT_MAX_AXES> axis_domain{};
     uint8_t* domain_pd = nullptr;
-    ec_master_state_t master_state{};
+    std::array<uint8_t*, gradient::ipc::v1::GRADIENT_MAX_AXES> axis_domain_pd{};
+    ec_master_state_t master_diag_state{};
     ec_domain_state_t domain_state{};
 
-    struct AxisOffsets {
-      unsigned int cw = 0;
-      unsigned int target_pos = 0;
-      unsigned int target_vel = 0;
-      unsigned int target_torque = 0;
-      unsigned int mode = 0;
-      unsigned int tp_func = 0;
-      unsigned int max_profile_vel = 0;
+    constexpr unsigned int kInvalidOffset = std::numeric_limits<unsigned int>::max();
+    constexpr size_t kMaxPdoRegsPerAxis = 16;
 
-      unsigned int err = 0;
-      unsigned int sw = 0;
-      unsigned int pos = 0;
-      unsigned int torque = 0;
-      unsigned int mode_disp = 0;
-      unsigned int tp_status = 0;
-      unsigned int tp_pos1 = 0;
-      unsigned int tp_pos2 = 0;
-      unsigned int di = 0;
+    struct AxisOffsets {
+      unsigned int cw = kInvalidOffset;
+      unsigned int target_pos = kInvalidOffset;
+      unsigned int target_vel = kInvalidOffset;
+      unsigned int target_torque = kInvalidOffset;
+      unsigned int mode = kInvalidOffset;
+      unsigned int tp_func = kInvalidOffset;
+      unsigned int max_profile_vel = kInvalidOffset;
+
+      unsigned int err = kInvalidOffset;
+      unsigned int sw = kInvalidOffset;
+      unsigned int pos = kInvalidOffset;
+      unsigned int torque = kInvalidOffset;
+      unsigned int mode_disp = kInvalidOffset;
+      unsigned int tp_status = kInvalidOffset;
+      unsigned int tp_pos1 = kInvalidOffset;
+      unsigned int tp_pos2 = kInvalidOffset;
+      unsigned int di = kInvalidOffset;
     };
 
     std::array<ec_slave_config_t*, gradient::ipc::v1::GRADIENT_MAX_AXES> sc{};
+    std::array<ec_slave_config_state_t, gradient::ipc::v1::GRADIENT_MAX_AXES> sc_state{};
     std::array<AxisOffsets, gradient::ipc::v1::GRADIENT_MAX_AXES> off{};
     std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> hold_target_counts{};
     std::array<bool, gradient::ipc::v1::GRADIENT_MAX_AXES> have_hold{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> fault_reset_left{};
+    struct SlaveDiagSnapshot {
+      bool valid = false;
+      bool online = false;
+      bool operational = false;
+      uint8_t al_state = 0;
+    };
+    struct MasterDiagSnapshot {
+      bool valid = false;
+      bool link_up = false;
+      unsigned int responding = 0;
+      unsigned int al_states = 0;
+      unsigned int domain_wc_state = 0;
+      unsigned int domain_working_counter = 0;
+      uint32_t online_slaves = 0;
+      uint32_t operational_slaves = 0;
+    };
+    std::array<SlaveDiagSnapshot, gradient::ipc::v1::GRADIENT_MAX_AXES> prev_slave_diag{};
+    MasterDiagSnapshot prev_master_diag{};
     constexpr uint8_t kFaultResetPulseCycles = 20; // ~20ms at 1kHz
+    constexpr uint64_t kStartupLogIntervalNs = 1000000000ULL; // 1s
+    constexpr uint64_t kStartupResetDelayNs = 1000000000ULL;  // 1s
+    constexpr uint64_t kStartupDetailedDiagBaseNs = 1500000000ULL;       // 1.5s
+    constexpr uint64_t kStartupDetailedDiagPostResumeNs = 1000000000ULL; // 1.0s
+    constexpr uint64_t kStartupTimeoutMinNs = 5000000000ULL;             // 5s
+    const uint64_t startup_timeout_ns =
+        std::max<uint64_t>(
+            kStartupTimeoutMinNs,
+            (static_cast<uint64_t>(opt.preop_to_safeop_timeout_ms) +
+             static_cast<uint64_t>(opt.safeop_to_op_timeout_ms)) *
+                1000000ULL);
+    const uint64_t startup_skip_domain_queue_ns =
+        static_cast<uint64_t>(opt.startup_skip_domain_queue_ms) * 1000000ULL;
+    const uint64_t startup_detailed_diag_ns =
+        (startup_skip_domain_queue_ns + kStartupDetailedDiagPostResumeNs >
+         kStartupDetailedDiagBaseNs)
+            ? (startup_skip_domain_queue_ns + kStartupDetailedDiagPostResumeNs)
+            : kStartupDetailedDiagBaseNs;
 
-    // Fixed A6-EC PDO config (16.2–16.4).
-    static ec_pdo_entry_info_t a6ec_entries[] = {
+    // Supported A6-EC PDO profiles from the vendor ESI.
+    static ec_pdo_entry_info_t a6ec_entries_1701_1b01[] = {
+        // RxPDO 0x1701 (4 entries)
+        {0x6040, 0x00, 16}, // Controlword
+        {0x607A, 0x00, 32}, // Target position
+        {0x60B8, 0x00, 16}, // Touch probe function
+        {0x60FE, 0x01, 32}, // Physical outputs
+        // TxPDO 0x1B01 (9 entries)
+        {0x603F, 0x00, 16}, // Error code
+        {0x6041, 0x00, 16}, // Statusword
+        {0x6064, 0x00, 32}, // Position actual value
+        {0x6077, 0x00, 16}, // Torque actual value
+        {0x60F4, 0x00, 32}, // Following error actual value
+        {0x60B9, 0x00, 16}, // Touch probe status
+        {0x60BA, 0x00, 32}, // Touch probe pos1 value
+        {0x60BC, 0x00, 32}, // Touch probe pos2 value
+        {0x60FD, 0x00, 32}, // Digital inputs
+    };
+
+    static ec_pdo_info_t a6ec_pdos_1701_1b01[] = {
+        {0x1701, 4, a6ec_entries_1701_1b01 + 0},
+        {0x1B01, 9, a6ec_entries_1701_1b01 + 4},
+    };
+
+    static ec_sync_info_t a6ec_syncs_1701_1b01[] = {
+        {2, EC_DIR_OUTPUT, 1, a6ec_pdos_1701_1b01 + 0, EC_WD_ENABLE},
+        {3, EC_DIR_INPUT, 1, a6ec_pdos_1701_1b01 + 1, EC_WD_DISABLE},
+        {0xff, EC_DIR_INVALID, 0, nullptr, EC_WD_DISABLE},
+    };
+
+    static ec_pdo_entry_info_t a6ec_entries_1702_1b02[] = {
         // RxPDO 0x1702 (7 entries)
         {0x6040, 0x00, 16}, // Controlword
         {0x607A, 0x00, 32}, // Target position
@@ -1017,113 +1326,596 @@ int main(int argc, char** argv) {
         {0x60FD, 0x00, 32}, // Digital inputs
     };
 
-    static ec_pdo_info_t a6ec_pdos[] = {
-        {gradient::a6ec::kRxPdo, 7, a6ec_entries + 0},
-        {gradient::a6ec::kTxPdo, 9, a6ec_entries + 7},
+    static ec_pdo_info_t a6ec_pdos_1702_1b02[] = {
+        {0x1702, 7, a6ec_entries_1702_1b02 + 0},
+        {0x1B02, 9, a6ec_entries_1702_1b02 + 7},
     };
 
-    static ec_sync_info_t a6ec_syncs[] = {
-        {2, EC_DIR_OUTPUT, 1, a6ec_pdos + 0, EC_WD_ENABLE},
-        {3, EC_DIR_INPUT, 1, a6ec_pdos + 1, EC_WD_DISABLE},
+    static ec_sync_info_t a6ec_syncs_1702_1b02[] = {
+        {2, EC_DIR_OUTPUT, 1, a6ec_pdos_1702_1b02 + 0, EC_WD_ENABLE},
+        {3, EC_DIR_INPUT, 1, a6ec_pdos_1702_1b02 + 1, EC_WD_DISABLE},
         {0xff, EC_DIR_INVALID, 0, nullptr, EC_WD_DISABLE},
     };
 
+    struct PdoProfileConfig {
+      const char* name = "custom";
+      uint16_t rx_pdo = 0;
+      uint16_t tx_pdo = 0;
+      const ec_sync_info_t* syncs = nullptr;
+      bool has_target_vel = false;
+      bool has_target_torque = false;
+      bool has_mode = false;
+      bool has_max_profile_vel = false;
+      bool has_mode_display = false;
+    };
+
+    static const PdoProfileConfig kPdoProfile1701_1b01{
+        "1701/1b01",
+        0x1701,
+        0x1B01,
+        a6ec_syncs_1701_1b01,
+        false,
+        false,
+        false,
+        false,
+        false,
+    };
+
+    static const PdoProfileConfig kPdoProfile1702_1b02{
+        "1702/1b02",
+        0x1702,
+        0x1B02,
+        a6ec_syncs_1702_1b02,
+        true,
+        true,
+        true,
+        true,
+        true,
+    };
+
+    const PdoProfileConfig* pdo_profile = nullptr;
+    if (opt.rx_pdo == kPdoProfile1701_1b01.rx_pdo &&
+        opt.tx_pdo == kPdoProfile1701_1b01.tx_pdo) {
+      pdo_profile = &kPdoProfile1701_1b01;
+    } else if (opt.rx_pdo == kPdoProfile1702_1b02.rx_pdo &&
+               opt.tx_pdo == kPdoProfile1702_1b02.tx_pdo) {
+      pdo_profile = &kPdoProfile1702_1b02;
+    }
+    if (!pdo_profile) {
+      logf("ERROR: unsupported PDO profile rx=0x%04x tx=0x%04x",
+           static_cast<unsigned int>(opt.rx_pdo),
+           static_cast<unsigned int>(opt.tx_pdo));
+      return;
+    }
+
+    std::array<ec_sync_info_t, 3> runtime_syncs{};
+    for (size_t i = 0; i < runtime_syncs.size(); ++i) {
+      runtime_syncs[i] = pdo_profile->syncs[i];
+    }
+    if (opt.disable_output_watchdog) {
+      runtime_syncs[0].watchdog_mode = EC_WD_DISABLE;
+    }
+
+    logf("EtherCAT bring-up config: pdo_profile=%s rx=0x%04x tx=0x%04x dc=%u "
+         "output_watchdog=%u split_domains_per_axis=%u queue_split_domains_round_robin=%u "
+         "explicit_pdo_config=%u "
+         "wait_before_safeop_ms=%u preop_safeop_timeout_ms=%u safeop_op_timeout_ms=%u "
+         "startup_passive_ms=%u startup_skip_domain_queue_ms=%u startup_diag_window_ms=%llu",
+         pdo_profile->name,
+         static_cast<unsigned int>(pdo_profile->rx_pdo),
+         static_cast<unsigned int>(pdo_profile->tx_pdo),
+         opt.use_dc ? 1u : 0u,
+         opt.disable_output_watchdog ? 0u : 1u,
+         opt.split_domains_per_axis ? 1u : 0u,
+         opt.queue_split_domains_round_robin ? 1u : 0u,
+         opt.explicit_pdo_config ? 1u : 0u,
+         opt.wait_before_safeop_ms,
+         opt.preop_to_safeop_timeout_ms,
+         opt.safeop_to_op_timeout_ms,
+         opt.startup_passive_ms,
+         opt.startup_skip_domain_queue_ms,
+         static_cast<unsigned long long>(startup_detailed_diag_ns / 1000000ULL));
+    for (uint32_t i = 0; i < opt.num_axes; ++i) {
+      logf("Axis%u -> EtherCAT slave position %u",
+           i,
+           static_cast<unsigned int>(opt.slave_position[i]));
+    }
+
     bool ecrt_ok = false;
     const uint32_t expected_wkc = 2 * opt.num_axes;
+    bool startup_ready = false;
+    bool startup_process_data_live_logged = false;
+    bool startup_ready_logged = false;
+    bool startup_timeout_logged = false;
+    bool startup_wait_logged = false;
+    bool startup_reset_issued = false;
+    uint32_t startup_reset_count = 0;
+    uint64_t startup_begin_ns = 0;
+    uint64_t startup_cycle_counter = 0;
+    uint64_t last_startup_log_ns = 0;
+    bool startup_passive_prev = false;
+    bool startup_skip_domain_queue_prev = false;
     // Per-axis safety clamps (max rpm -> counts/s) are computed in finalize_axis_config().
+
+    auto aggregate_domain_state = [&](ec_domain_state_t* out) {
+      if (!out) {
+        return;
+      }
+      *out = ec_domain_state_t{};
+      bool have_domain_state = false;
+      auto merge_domain_state = [&](ec_domain_t* dom) {
+        if (!dom) {
+          return;
+        }
+        ec_domain_state_t cur{};
+        ecrt_domain_state(dom, &cur);
+        if (!have_domain_state || cur.wc_state < out->wc_state) {
+          out->wc_state = cur.wc_state;
+        }
+        out->working_counter += cur.working_counter;
+        have_domain_state = true;
+      };
+      if (opt.split_domains_per_axis) {
+        for (uint32_t i = 0; i < opt.num_axes; ++i) {
+          merge_domain_state(axis_domain[i]);
+        }
+      } else {
+        merge_domain_state(domain);
+      }
+    };
+
+    auto log_phase_summary = [&](const char* phase, uint64_t elapsed_ns, uint64_t cycle) {
+      if (!master) {
+        return;
+      }
+      ec_master_state_t phase_master_state{};
+      ecrt_master_state(master, &phase_master_state);
+      ec_domain_state_t phase_domain_state{};
+      aggregate_domain_state(&phase_domain_state);
+
+      std::array<ec_slave_config_state_t, gradient::ipc::v1::GRADIENT_MAX_AXES> phase_sc_state{};
+      uint32_t phase_online_slaves = 0;
+      uint32_t phase_operational_slaves = 0;
+      for (uint32_t i = 0; i < opt.num_axes; ++i) {
+        if (sc[i] && ecrt_slave_config_state(sc[i], &phase_sc_state[i]) == 0) {
+          if (phase_sc_state[i].online) {
+            phase_online_slaves++;
+          }
+          if (phase_sc_state[i].operational) {
+            phase_operational_slaves++;
+          }
+        }
+      }
+
+      logf("EtherCAT phase=%s cycle=%llu elapsed_ms=%llu link_up=%u responding=%u/%u online=%u/%u "
+           "operational=%u/%u master_al=0x%x domain_wc=%u wkc=%u/%u",
+           phase,
+           static_cast<unsigned long long>(cycle),
+           static_cast<unsigned long long>(elapsed_ns / 1000000ULL),
+           phase_master_state.link_up ? 1u : 0u,
+           phase_master_state.slaves_responding,
+           opt.num_axes,
+           phase_online_slaves,
+           opt.num_axes,
+           phase_operational_slaves,
+           opt.num_axes,
+           phase_master_state.al_states,
+           static_cast<unsigned int>(phase_domain_state.wc_state),
+           static_cast<unsigned int>(phase_domain_state.working_counter),
+           expected_wkc);
+      for (uint32_t i = 0; i < opt.num_axes; ++i) {
+        if (!sc[i]) {
+          continue;
+        }
+        logf("EtherCAT phase=%s axis=%u slave_pos=%u online=%u operational=%u al=%s(0x%x)",
+             phase,
+             i,
+             static_cast<unsigned int>(opt.slave_position[i]),
+             phase_sc_state[i].online ? 1u : 0u,
+             phase_sc_state[i].operational ? 1u : 0u,
+             al_state_label(static_cast<uint8_t>(phase_sc_state[i].al_state)),
+             static_cast<unsigned int>(phase_sc_state[i].al_state));
+      }
+    };
+
+    auto log_registered_offsets = [&]() {
+      for (uint32_t i = 0; i < opt.num_axes; ++i) {
+        if (!sc[i]) {
+          continue;
+        }
+        logf("EtherCAT phase=pdo_register axis=%u slave_pos=%u offsets cw=%u target_pos=%u sw=%u pos=%u err=%u di=%u",
+             i,
+             static_cast<unsigned int>(opt.slave_position[i]),
+             off[i].cw,
+             off[i].target_pos,
+             off[i].sw,
+             off[i].pos,
+             off[i].err,
+             off[i].di);
+      }
+    };
+
+    auto fill_axis_regs = [&](uint32_t axis, auto& regs, size_t& reg_i) {
+      const uint16_t slave_pos = opt.slave_position[axis];
+      auto add_reg = [&](uint16_t index, uint8_t subindex, unsigned int* offset) {
+        regs[reg_i++] = {0,
+                         slave_pos,
+                         gradient::a6ec::kVendorId,
+                         gradient::a6ec::kProductCode,
+                         index,
+                         subindex,
+                         offset,
+                         nullptr};
+      };
+
+      add_reg(0x6040, 0x00, &off[axis].cw);
+      add_reg(0x607A, 0x00, &off[axis].target_pos);
+      if (pdo_profile->has_target_vel) {
+        add_reg(0x60FF, 0x00, &off[axis].target_vel);
+      }
+      if (pdo_profile->has_target_torque) {
+        add_reg(0x6071, 0x00, &off[axis].target_torque);
+      }
+      if (pdo_profile->has_mode) {
+        add_reg(0x6060, 0x00, &off[axis].mode);
+      }
+      add_reg(0x60B8, 0x00, &off[axis].tp_func);
+      if (pdo_profile->has_max_profile_vel) {
+        add_reg(0x607F, 0x00, &off[axis].max_profile_vel);
+      }
+
+      add_reg(0x603F, 0x00, &off[axis].err);
+      add_reg(0x6041, 0x00, &off[axis].sw);
+      add_reg(0x6064, 0x00, &off[axis].pos);
+      add_reg(0x6077, 0x00, &off[axis].torque);
+      if (pdo_profile->has_mode_display) {
+        add_reg(0x6061, 0x00, &off[axis].mode_disp);
+      }
+      add_reg(0x60B9, 0x00, &off[axis].tp_status);
+      add_reg(0x60BA, 0x00, &off[axis].tp_pos1);
+      add_reg(0x60BC, 0x00, &off[axis].tp_pos2);
+      add_reg(0x60FD, 0x00, &off[axis].di);
+    };
+
+    auto apply_pdo_profile = [&](uint32_t axis, uint16_t slave_pos) {
+      if (!opt.explicit_pdo_config) {
+        if (ecrt_slave_config_pdos(sc[axis], EC_END, runtime_syncs.data())) {
+          logf("ERROR: ecrt_slave_config_pdos failed for axis=%u slave_pos=%u", axis, slave_pos);
+          return false;
+        }
+        logf("EtherCAT config phase=slave_config_pdos axis=%u slave_pos=%u profile=%s mode=wrapper ok",
+             axis,
+             slave_pos,
+             pdo_profile->name);
+        return true;
+      }
+
+      for (size_t sync_i = 0; runtime_syncs[sync_i].index != 0xff; ++sync_i) {
+        const ec_sync_info_t& sync = runtime_syncs[sync_i];
+        if (ecrt_slave_config_sync_manager(sc[axis], sync.index, sync.dir, sync.watchdog_mode)) {
+          logf("ERROR: ecrt_slave_config_sync_manager failed for axis=%u slave_pos=%u sync=%u",
+               axis,
+               slave_pos,
+               static_cast<unsigned int>(sync.index));
+          return false;
+        }
+        if (ecrt_slave_config_pdo_assign_clear(sc[axis], sync.index)) {
+          logf("ERROR: ecrt_slave_config_pdo_assign_clear failed for axis=%u slave_pos=%u sync=%u",
+               axis,
+               slave_pos,
+               static_cast<unsigned int>(sync.index));
+          return false;
+        }
+        for (unsigned int pdo_i = 0; pdo_i < sync.n_pdos; ++pdo_i) {
+          const ec_pdo_info_t& pdo = sync.pdos[pdo_i];
+          if (ecrt_slave_config_pdo_assign_add(sc[axis], sync.index, pdo.index)) {
+            logf("ERROR: ecrt_slave_config_pdo_assign_add failed for axis=%u slave_pos=%u sync=%u pdo=0x%04x",
+                 axis,
+                 slave_pos,
+                 static_cast<unsigned int>(sync.index),
+                 static_cast<unsigned int>(pdo.index));
+            return false;
+          }
+        }
+      }
+
+      logf("EtherCAT config phase=slave_config_pdos axis=%u slave_pos=%u profile=%s mode=explicit_assign ok",
+           axis,
+           slave_pos,
+           pdo_profile->name);
+      return true;
+    };
+
+    auto register_axis_offsets_explicit = [&](uint32_t axis, ec_domain_t* target_domain) {
+      const uint16_t slave_pos = opt.slave_position[axis];
+      auto reg = [&](uint8_t sync_index,
+                     unsigned int entry_pos,
+                     unsigned int* offset,
+                     const char* field_name) {
+        const int rc =
+            ecrt_slave_config_reg_pdo_entry_pos(sc[axis], sync_index, 0, entry_pos, target_domain, nullptr);
+        if (rc < 0) {
+          logf("ERROR: ecrt_slave_config_reg_pdo_entry_pos failed for axis=%u slave_pos=%u "
+               "sync=%u entry_pos=%u field=%s rc=%d",
+               axis,
+               slave_pos,
+               static_cast<unsigned int>(sync_index),
+               entry_pos,
+               field_name,
+               rc);
+          return false;
+        }
+        *offset = static_cast<unsigned int>(rc);
+        return true;
+      };
+
+      if (!reg(2, 0, &off[axis].cw, "cw") ||
+          !reg(2, 1, &off[axis].target_pos, "target_pos")) {
+        return false;
+      }
+
+      if (pdo_profile == &kPdoProfile1702_1b02) {
+        if (!reg(2, 2, &off[axis].target_vel, "target_vel") ||
+            !reg(2, 3, &off[axis].target_torque, "target_torque") ||
+            !reg(2, 4, &off[axis].mode, "mode") ||
+            !reg(2, 5, &off[axis].tp_func, "tp_func") ||
+            !reg(2, 6, &off[axis].max_profile_vel, "max_profile_vel") ||
+            !reg(3, 0, &off[axis].err, "err") ||
+            !reg(3, 1, &off[axis].sw, "sw") ||
+            !reg(3, 2, &off[axis].pos, "pos") ||
+            !reg(3, 3, &off[axis].torque, "torque") ||
+            !reg(3, 4, &off[axis].mode_disp, "mode_disp") ||
+            !reg(3, 5, &off[axis].tp_status, "tp_status") ||
+            !reg(3, 6, &off[axis].tp_pos1, "tp_pos1") ||
+            !reg(3, 7, &off[axis].tp_pos2, "tp_pos2") ||
+            !reg(3, 8, &off[axis].di, "di")) {
+          return false;
+        }
+      } else if (pdo_profile == &kPdoProfile1701_1b01) {
+        if (!reg(2, 2, &off[axis].tp_func, "tp_func") ||
+            !reg(3, 0, &off[axis].err, "err") ||
+            !reg(3, 1, &off[axis].sw, "sw") ||
+            !reg(3, 2, &off[axis].pos, "pos") ||
+            !reg(3, 3, &off[axis].torque, "torque") ||
+            !reg(3, 5, &off[axis].tp_status, "tp_status") ||
+            !reg(3, 6, &off[axis].tp_pos1, "tp_pos1") ||
+            !reg(3, 7, &off[axis].tp_pos2, "tp_pos2") ||
+            !reg(3, 8, &off[axis].di, "di")) {
+          return false;
+        }
+      } else {
+        logf("ERROR: unsupported explicit PDO profile registration for axis=%u slave_pos=%u profile=%s",
+             axis,
+             slave_pos,
+             pdo_profile->name);
+        return false;
+      }
+
+      return true;
+    };
 
     master = ecrt_request_master(0);
     if (!master) {
       logf("ERROR: ecrt_request_master(0) failed");
     } else {
-      domain = ecrt_master_create_domain(master);
-      if (!domain) {
-        logf("ERROR: ecrt_master_create_domain failed");
+      logf("EtherCAT config phase=request_master ok");
+      bool have_domains = true;
+      if (opt.split_domains_per_axis) {
+        for (uint32_t i = 0; i < opt.num_axes; ++i) {
+          axis_domain[i] = ecrt_master_create_domain(master);
+          if (!axis_domain[i]) {
+            logf("ERROR: ecrt_master_create_domain failed for axis=%u slave_pos=%u",
+                 i,
+                 static_cast<unsigned int>(opt.slave_position[i]));
+            have_domains = false;
+            break;
+          }
+          logf("EtherCAT config phase=create_domain axis=%u slave_pos=%u ok",
+               i,
+               static_cast<unsigned int>(opt.slave_position[i]));
+        }
       } else {
+        domain = ecrt_master_create_domain(master);
+        if (!domain) {
+          logf("ERROR: ecrt_master_create_domain failed");
+          have_domains = false;
+        } else {
+          logf("EtherCAT config phase=create_domain ok");
+        }
+      }
+      if (have_domains) {
+        bool slave_config_ok = true;
         // Configure each slave at (alias=0, position=i).
         for (uint32_t i = 0; i < opt.num_axes; ++i) {
-          sc[i] = ecrt_master_slave_config(master, 0, i,
+          const uint16_t slave_pos = opt.slave_position[i];
+          sc[i] = ecrt_master_slave_config(master, 0, slave_pos,
                                            gradient::a6ec::kVendorId,
                                            gradient::a6ec::kProductCode);
           if (!sc[i]) {
-            logf("ERROR: ecrt_master_slave_config failed for pos=%u", i);
+            logf("ERROR: ecrt_master_slave_config failed for axis=%u slave_pos=%u", i, slave_pos);
+            slave_config_ok = false;
             break;
           }
+          logf("EtherCAT config phase=slave_config axis=%u slave_pos=%u ok", i, slave_pos);
+          log_phase_summary("after_slave_config", 0, 0);
 
-          // Assign PDOs and enable DC/SYNC0 (safe defaults; verify on hardware).
-          if (ecrt_slave_config_pdos(sc[i], EC_END, a6ec_syncs)) {
-            logf("ERROR: ecrt_slave_config_pdos failed for pos=%u", i);
+          // Give the drive a conservative PLC-like convergence window before SAFEOP/OP.
+#ifdef EC_HAVE_FLAGS
+          if (opt.wait_before_safeop_ms > 0) {
+            const int rc = ecrt_slave_config_flag(
+                sc[i], "WaitBeforeSAFEOPms", static_cast<int32_t>(opt.wait_before_safeop_ms));
+            if (rc != 0) {
+              logf("WARNING: ecrt_slave_config_flag(WaitBeforeSAFEOPms=%u) failed for axis=%u slave_pos=%u rc=%d",
+                   opt.wait_before_safeop_ms,
+                   i,
+                   slave_pos,
+                   rc);
+            }
+          }
+#endif
+#ifdef EC_HAVE_STATE_TIMEOUT
+          if (opt.preop_to_safeop_timeout_ms > 0) {
+            const int rc = ecrt_slave_config_state_timeout(
+                sc[i], EC_AL_STATE_PREOP, EC_AL_STATE_SAFEOP, opt.preop_to_safeop_timeout_ms);
+            if (rc != 0) {
+              logf("WARNING: ecrt_slave_config_state_timeout(PREOP->SAFEOP=%u ms) failed for axis=%u slave_pos=%u rc=%d",
+                   opt.preop_to_safeop_timeout_ms,
+                   i,
+                   slave_pos,
+                   rc);
+            }
+          }
+          if (opt.safeop_to_op_timeout_ms > 0) {
+            const int rc = ecrt_slave_config_state_timeout(
+                sc[i], EC_AL_STATE_SAFEOP, EC_AL_STATE_OP, opt.safeop_to_op_timeout_ms);
+            if (rc != 0) {
+              logf("WARNING: ecrt_slave_config_state_timeout(SAFEOP->OP=%u ms) failed for axis=%u slave_pos=%u rc=%d",
+                   opt.safeop_to_op_timeout_ms,
+                   i,
+                   slave_pos,
+                   rc);
+            }
+          }
+#endif
+
+          // Assign the requested PDO profile before activation.
+          if (!apply_pdo_profile(i, slave_pos)) {
+            slave_config_ok = false;
             break;
           }
+          log_phase_summary("after_slave_config_pdos", 0, 0);
 
-          // DC assign_activate 0x0300 (SYNC0). Shift left as 0 for now.
-          // TODO: tune sync0_shift based on measured line delay/jitter.
-          ecrt_slave_config_dc(sc[i], 0x0300, period, 0, 0, 0);
+          if (opt.use_dc) {
+            // DC assign_activate 0x0300 (SYNC0). Shift left as 0 for now.
+            // TODO: tune sync0_shift based on measured line delay/jitter.
+            const int rc = ecrt_slave_config_dc(sc[i], 0x0300, period, 0, 0, 0);
+            if (rc != 0) {
+              logf("ERROR: ecrt_slave_config_dc failed for axis=%u slave_pos=%u rc=%d",
+                   i,
+                   slave_pos,
+                   rc);
+              slave_config_ok = false;
+              break;
+            }
+            logf("EtherCAT config phase=slave_config_dc axis=%u slave_pos=%u assign_activate=0x0300 cycle_ns=%llu ok",
+                 i,
+                 slave_pos,
+                 static_cast<unsigned long long>(period));
+            log_phase_summary("after_slave_config_dc", 0, 0);
+          }
         }
 
-        // Register PDO entries -> domain offsets.
-        // NOTE: ec_pdo_entry_reg_t layout differs across some IgH versions.
-        // If compilation fails here once IgH is installed, adjust field count/order.
-        std::array<ec_pdo_entry_reg_t,
-                   (gradient::ipc::v1::GRADIENT_MAX_AXES * 16) + 1>
-            regs{};
-        size_t reg_i = 0;
-        for (uint32_t i = 0; i < opt.num_axes; ++i) {
-          const uint16_t pos = static_cast<uint16_t>(i);
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x6040, 0x00, &off[i].cw, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x607A, 0x00, &off[i].target_pos, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x60FF, 0x00, &off[i].target_vel, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x6071, 0x00, &off[i].target_torque, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x6060, 0x00, &off[i].mode, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x60B8, 0x00, &off[i].tp_func, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x607F, 0x00, &off[i].max_profile_vel, nullptr};
-
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x603F, 0x00, &off[i].err, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x6041, 0x00, &off[i].sw, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x6064, 0x00, &off[i].pos, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x6077, 0x00, &off[i].torque, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x6061, 0x00, &off[i].mode_disp, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x60B9, 0x00, &off[i].tp_status, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x60BA, 0x00, &off[i].tp_pos1, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x60BC, 0x00, &off[i].tp_pos2, nullptr};
-          regs[reg_i++] = {0, pos, gradient::a6ec::kVendorId, gradient::a6ec::kProductCode,
-                           0x60FD, 0x00, &off[i].di, nullptr};
-        }
-        regs[reg_i] = {};
-
-        if (ecrt_domain_reg_pdo_entry_list(domain, regs.data())) {
-          logf("ERROR: ecrt_domain_reg_pdo_entry_list failed");
-        } else {
-          if (ecrt_master_activate(master)) {
-            logf("ERROR: ecrt_master_activate failed");
+        if (slave_config_ok) {
+          // Register PDO entries -> domain offsets.
+          // NOTE: ec_pdo_entry_reg_t layout differs across some IgH versions.
+          // If compilation fails here once IgH is installed, adjust field count/order.
+          bool domain_regs_ok = true;
+          if (opt.explicit_pdo_config) {
+            for (uint32_t i = 0; i < opt.num_axes; ++i) {
+              ec_domain_t* target_domain = opt.split_domains_per_axis ? axis_domain[i] : domain;
+              if (!register_axis_offsets_explicit(i, target_domain)) {
+                domain_regs_ok = false;
+                break;
+              }
+              logf("EtherCAT config phase=domain_reg_pdo_entry_pos axis=%u slave_pos=%u ok",
+                   i,
+                   static_cast<unsigned int>(opt.slave_position[i]));
+            }
           } else {
-            domain_pd = ecrt_domain_data(domain);
-            if (!domain_pd) {
-              logf("ERROR: ecrt_domain_data returned null");
+            if (opt.split_domains_per_axis) {
+              for (uint32_t i = 0; i < opt.num_axes; ++i) {
+                std::array<ec_pdo_entry_reg_t, kMaxPdoRegsPerAxis + 1> regs{};
+                size_t reg_i = 0;
+                fill_axis_regs(i, regs, reg_i);
+                regs[reg_i] = {};
+                if (ecrt_domain_reg_pdo_entry_list(axis_domain[i], regs.data())) {
+                  logf("ERROR: ecrt_domain_reg_pdo_entry_list failed for axis=%u slave_pos=%u",
+                       i,
+                       static_cast<unsigned int>(opt.slave_position[i]));
+                  domain_regs_ok = false;
+                  break;
+                }
+                logf("EtherCAT config phase=domain_reg_pdo_entry_list axis=%u slave_pos=%u regs=%zu ok",
+                     i,
+                     static_cast<unsigned int>(opt.slave_position[i]),
+                     reg_i);
+              }
             } else {
-              ecrt_ok = true;
-              logf("IgH libecrt active (num_axes=%u, expected_wkc=%u)", opt.num_axes, expected_wkc);
+              std::array<ec_pdo_entry_reg_t,
+                         (gradient::ipc::v1::GRADIENT_MAX_AXES * kMaxPdoRegsPerAxis) + 1>
+                  regs{};
+              size_t reg_i = 0;
+              for (uint32_t i = 0; i < opt.num_axes; ++i) {
+                fill_axis_regs(i, regs, reg_i);
+              }
+              regs[reg_i] = {};
+              if (ecrt_domain_reg_pdo_entry_list(domain, regs.data())) {
+                logf("ERROR: ecrt_domain_reg_pdo_entry_list failed");
+                domain_regs_ok = false;
+              } else {
+                logf("EtherCAT config phase=domain_reg_pdo_entry_list ok regs=%zu", reg_i);
+              }
+            }
+          }
+          if (!domain_regs_ok) {
+          } else {
+            const uint64_t send_interval_us_u64 =
+                opt.cycle_ns <= 1000ULL ? 1ULL : ((opt.cycle_ns + 999ULL) / 1000ULL);
+            const size_t send_interval_us = static_cast<size_t>(send_interval_us_u64);
+            log_registered_offsets();
+            log_phase_summary("after_domain_reg_pdo_entry_list", 0, 0);
+            const int send_interval_rc = ecrt_master_set_send_interval(master, send_interval_us);
+            if (send_interval_rc != 0) {
+              logf("ERROR: ecrt_master_set_send_interval(%zu us) failed rc=%d",
+                   send_interval_us,
+                   send_interval_rc);
+            } else {
+              logf("EtherCAT config phase=set_send_interval send_interval_us=%zu ok",
+                   send_interval_us);
+            }
+            if (send_interval_rc != 0) {
+              // Do not activate if the master rejected the advertised cycle interval.
+            } else if (ecrt_master_activate(master)) {
+              logf("ERROR: ecrt_master_activate failed");
+            } else {
+              bool have_domain_pd = true;
+              if (opt.split_domains_per_axis) {
+                for (uint32_t i = 0; i < opt.num_axes; ++i) {
+                  axis_domain_pd[i] = ecrt_domain_data(axis_domain[i]);
+                  if (!axis_domain_pd[i]) {
+                    logf("ERROR: ecrt_domain_data returned null for axis=%u slave_pos=%u",
+                         i,
+                         static_cast<unsigned int>(opt.slave_position[i]));
+                    have_domain_pd = false;
+                    break;
+                  }
+                }
+              } else {
+                domain_pd = ecrt_domain_data(domain);
+                if (!domain_pd) {
+                  logf("ERROR: ecrt_domain_data returned null");
+                  have_domain_pd = false;
+                }
+              }
+              if (!have_domain_pd) {
+              } else {
+                ecrt_ok = true;
+                startup_begin_ns = now_monotonic_ns();
+                startup_cycle_counter = 0;
+                logf("IgH libecrt active (num_axes=%u, expected_wkc=%u)", opt.num_axes, expected_wkc);
+                log_phase_summary("after_master_activate", 0, 0);
+              }
             }
           }
         }
       }
     }
 #endif  // GRADIENT_HAVE_ECRT
+
+    // Initialization above can take seconds (EtherCAT config, activation, etc.).
+    // Rebase the absolute sleep schedule here so the cyclic loop does not try to
+    // "catch up" by blasting thousands of immediate iterations after startup.
+    next_ns = now_monotonic_ns();
 
     while (true) {
       // Measure wakeup jitter for the previous absolute sleep target (`next_ns`).
@@ -1148,22 +1940,53 @@ int main(int argc, char** argv) {
 #if GRADIENT_HAVE_ECRT
       if (ecrt_ok) {
         // --- EtherCAT cyclic loop (1 kHz) ---
-        const uint64_t now_ns = next_ns;
+        const uint64_t app_time_ns = next_ns;
+        const uint64_t diag_now_ns = wake_ns;
+        startup_cycle_counter++;
+        const uint64_t startup_elapsed_ns_pre =
+            startup_begin_ns != 0 && diag_now_ns >= startup_begin_ns ? (diag_now_ns - startup_begin_ns) : 0;
+        const bool startup_passive_active =
+            opt.startup_passive_ms > 0 &&
+            startup_elapsed_ns_pre < (static_cast<uint64_t>(opt.startup_passive_ms) * 1000000ULL);
+        const bool startup_skip_domain_queue_active =
+            startup_skip_domain_queue_ns > 0 &&
+            startup_elapsed_ns_pre < startup_skip_domain_queue_ns;
+
+        if (startup_passive_active != startup_passive_prev) {
+          logf("EtherCAT startup passive_outputs=%u cycle=%llu elapsed_ms=%llu",
+               startup_passive_active ? 1u : 0u,
+               static_cast<unsigned long long>(startup_cycle_counter),
+               static_cast<unsigned long long>(startup_elapsed_ns_pre / 1000000ULL));
+          startup_passive_prev = startup_passive_active;
+        }
+        if (startup_skip_domain_queue_active != startup_skip_domain_queue_prev) {
+          logf("EtherCAT startup domain_queue_suppressed=%u cycle=%llu elapsed_ms=%llu",
+               startup_skip_domain_queue_active ? 1u : 0u,
+               static_cast<unsigned long long>(startup_cycle_counter),
+               static_cast<unsigned long long>(startup_elapsed_ns_pre / 1000000ULL));
+          startup_skip_domain_queue_prev = startup_skip_domain_queue_active;
+        }
 
         // If a shutdown is requested (SIGINT/SIGTERM), disable all axes for a short
         // grace window while we still have cyclic communication. This reduces the
         // chance of the drive faulting when the master drops out of OP.
         if (g_stop.load(std::memory_order_relaxed) && !shutdown_active) {
           shutdown_active = true;
-          shutdown_until_ns = now_ns + kShutdownGraceNs;
+          shutdown_until_ns = diag_now_ns + kShutdownGraceNs;
           armed.store(false, std::memory_order_relaxed);
           axis_enable_mask.store(0, std::memory_order_relaxed);
           mode_of_operation.store(0, std::memory_order_relaxed);
         }
 
-        ecrt_master_application_time(master, now_ns);
+        ecrt_master_application_time(master, app_time_ns);
         ecrt_master_receive(master);
-        ecrt_domain_process(domain);
+        if (opt.split_domains_per_axis) {
+          for (uint32_t i = 0; i < opt.num_axes; ++i) {
+            ecrt_domain_process(axis_domain[i]);
+          }
+        } else {
+          ecrt_domain_process(domain);
+        }
 
         // Read latest targets (double-read seq).
         std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> target_counts{};
@@ -1194,69 +2017,104 @@ int main(int argc, char** argv) {
 
         // Per-axis DS402 sequencing + CSP targets.
         for (uint32_t i = 0; i < opt.num_axes; ++i) {
-          const uint16_t sw = EC_READ_U16(domain_pd + off[i].sw);
-          const uint16_t err = EC_READ_U16(domain_pd + off[i].err);
-          const int32_t pos = EC_READ_S32(domain_pd + off[i].pos);
-          const int16_t torque = EC_READ_S16(domain_pd + off[i].torque);
-          const uint8_t mode_disp = EC_READ_U8(domain_pd + off[i].mode_disp);
-          const uint32_t di = EC_READ_U32(domain_pd + off[i].di);
+          uint8_t* axis_pd = opt.split_domains_per_axis ? axis_domain_pd[i] : domain_pd;
+          const uint16_t sw = EC_READ_U16(axis_pd + off[i].sw);
+          const uint16_t err = EC_READ_U16(axis_pd + off[i].err);
+          const int32_t pos = EC_READ_S32(axis_pd + off[i].pos);
+          const int16_t torque = off[i].torque != kInvalidOffset
+                                     ? EC_READ_S16(axis_pd + off[i].torque)
+                                     : 0;
+          const uint8_t mode_disp = off[i].mode_disp != kInvalidOffset
+                                        ? EC_READ_U8(axis_pd + off[i].mode_disp)
+                                        : 0;
+          const uint32_t di = EC_READ_U32(axis_pd + off[i].di);
 
           (void)err; // TODO: publish/report faults.
 
           const gradient::ds402::State st = gradient::ds402::decode_statusword(sw);
-          const bool want_enable = is_armed && ((en_mask & (1u << i)) != 0u);
-          bool want_fault_reset = (fault_reset_left[i] > 0);
-          if (want_fault_reset && st != gradient::ds402::State::Fault) {
-            // Stop pulsing once the drive leaves FAULT (or if it never was in FAULT).
-            fault_reset_left[i] = 0;
-            want_fault_reset = false;
-          }
+          uint16_t cw = 0;
+          int32_t target_pos_out = pos;
+          int32_t target_vel_out = 0;
+          int16_t target_torque_out = 0;
+          int8_t mode_out = 0;
+          uint16_t tp_func_out = 0;
+          uint32_t max_profile_vel_out = 0;
 
-          // Hold-target logic:
-          // - While not operation-enabled (or not wanting enable), keep the target aligned to feedback
-          //   so we don't present a "big step" when DS402 transitions to OperationEnabled (manual: Er87.*).
-          // - Once operation-enabled, latch once, then track commanded targets with optional per-cycle clamp.
-          if (want_enable && st == gradient::ds402::State::OperationEnabled) {
-            if (!have_hold[i]) {
-              hold_target_counts[i] = pos;
-              have_hold[i] = true;
+          if (!startup_passive_active) {
+            const bool want_enable = is_armed && ((en_mask & (1u << i)) != 0u);
+            bool want_fault_reset = (fault_reset_left[i] > 0);
+            if (want_fault_reset && st != gradient::ds402::State::Fault) {
+              // Stop pulsing once the drive leaves FAULT (or if it never was in FAULT).
+              fault_reset_left[i] = 0;
+              want_fault_reset = false;
             }
-            if ((sp_mask & (1u << i)) != 0u) {
-              const int32_t desired = target_counts[i];
-              const int32_t max_step = opt.axis[i].max_step_counts_per_cycle;
-              if (max_step > 0) {
-                const int32_t cur = hold_target_counts[i];
-                const int64_t delta = static_cast<int64_t>(desired) - static_cast<int64_t>(cur);
-                if (delta > max_step) {
-                  hold_target_counts[i] = cur + max_step;
-                } else if (delta < -max_step) {
-                  hold_target_counts[i] = cur - max_step;
+
+            // Hold-target logic:
+            // - While not operation-enabled (or not wanting enable), keep the target aligned to feedback
+            //   so we don't present a "big step" when DS402 transitions to OperationEnabled (manual: Er87.*).
+            // - Once operation-enabled, latch once, then track commanded targets with optional per-cycle clamp.
+            if (want_enable && st == gradient::ds402::State::OperationEnabled) {
+              if (!have_hold[i]) {
+                hold_target_counts[i] = pos;
+                have_hold[i] = true;
+              }
+              if ((sp_mask & (1u << i)) != 0u) {
+                const int32_t desired = target_counts[i];
+                const int32_t max_step = opt.axis[i].max_step_counts_per_cycle;
+                if (max_step > 0) {
+                  const int32_t cur = hold_target_counts[i];
+                  const int64_t delta = static_cast<int64_t>(desired) - static_cast<int64_t>(cur);
+                  if (delta > max_step) {
+                    hold_target_counts[i] = cur + max_step;
+                  } else if (delta < -max_step) {
+                    hold_target_counts[i] = cur - max_step;
+                  } else {
+                    hold_target_counts[i] = desired;
+                  }
                 } else {
                   hold_target_counts[i] = desired;
                 }
-              } else {
-                hold_target_counts[i] = desired;
               }
+            } else {
+              // Track feedback until OP; keeps 0x607A aligned during state transitions.
+              hold_target_counts[i] = pos;
+              have_hold[i] = false;
             }
+
+            cw = gradient::ds402::controlword_for_enable(st, want_enable, want_fault_reset);
+            if (want_fault_reset && st == gradient::ds402::State::Fault && fault_reset_left[i] > 0) {
+              fault_reset_left[i]--;
+            }
+            target_pos_out = hold_target_counts[i];
+            target_vel_out = 0;
+            target_torque_out = 0;
+            mode_out = want_enable ? 8 : 0;
+            tp_func_out = 0;
+            max_profile_vel_out = opt.axis[i].max_profile_vel_counts_per_s;
           } else {
-            // Track feedback until OP; keeps 0x607A aligned during state transitions.
+            // During passive startup we still exchange cyclic PDO frames, but avoid
+            // DS402 state-driving writes so we can distinguish process-data transport
+            // problems from higher-level controlword/mode/target sequencing problems.
             hold_target_counts[i] = pos;
             have_hold[i] = false;
           }
 
-          const uint16_t cw = gradient::ds402::controlword_for_enable(st, want_enable, want_fault_reset);
-          if (want_fault_reset && st == gradient::ds402::State::Fault && fault_reset_left[i] > 0) {
-            fault_reset_left[i]--;
-          }
-
           // Outputs (RxPDO 0x1702).
-          EC_WRITE_U16(domain_pd + off[i].cw, cw);
-          EC_WRITE_S32(domain_pd + off[i].target_pos, hold_target_counts[i]);
-          EC_WRITE_S32(domain_pd + off[i].target_vel, 0);
-          EC_WRITE_S16(domain_pd + off[i].target_torque, 0);
-          EC_WRITE_S8(domain_pd + off[i].mode, want_enable ? 8 : 0);
-          EC_WRITE_U16(domain_pd + off[i].tp_func, 0);
-          EC_WRITE_U32(domain_pd + off[i].max_profile_vel, opt.axis[i].max_profile_vel_counts_per_s);
+          EC_WRITE_U16(axis_pd + off[i].cw, cw);
+          EC_WRITE_S32(axis_pd + off[i].target_pos, target_pos_out);
+          if (off[i].target_vel != kInvalidOffset) {
+            EC_WRITE_S32(axis_pd + off[i].target_vel, target_vel_out);
+          }
+          if (off[i].target_torque != kInvalidOffset) {
+            EC_WRITE_S16(axis_pd + off[i].target_torque, target_torque_out);
+          }
+          if (off[i].mode != kInvalidOffset) {
+            EC_WRITE_S8(axis_pd + off[i].mode, mode_out);
+          }
+          EC_WRITE_U16(axis_pd + off[i].tp_func, tp_func_out);
+          if (off[i].max_profile_vel != kInvalidOffset) {
+            EC_WRITE_U32(axis_pd + off[i].max_profile_vel, max_profile_vel_out);
+          }
 
           // Publish raw feedback (counts + status) for STATUS_SNAPSHOT.
           latest_feedback.pos_counts[i] = pos;
@@ -1268,33 +2126,271 @@ int main(int argc, char** argv) {
           latest_feedback.di_bits[i] = di;
         }
 
-        ecrt_domain_queue(domain);
+        if (!startup_skip_domain_queue_active) {
+          if (opt.split_domains_per_axis) {
+            if (opt.queue_split_domains_round_robin) {
+              const uint32_t axis_i = static_cast<uint32_t>((startup_cycle_counter - 1) % opt.num_axes);
+              ecrt_domain_queue(axis_domain[axis_i]);
+            } else {
+              for (uint32_t i = 0; i < opt.num_axes; ++i) {
+                ecrt_domain_queue(axis_domain[i]);
+              }
+            }
+          } else {
+            ecrt_domain_queue(domain);
+          }
+        }
 
         // DC sync helpers (13.4.4): keep reference clock stable.
-        static uint64_t dc_ref_sync_ctr = 0;
-        if ((dc_ref_sync_ctr++ % 1000ULL) == 0) { // ~1 Hz
-          ecrt_master_sync_reference_clock(master);
+        if (opt.use_dc) {
+          static uint64_t dc_ref_sync_ctr = 0;
+          if ((dc_ref_sync_ctr++ % 1000ULL) == 0) { // ~1 Hz
+            ecrt_master_sync_reference_clock(master);
+          }
+          ecrt_master_sync_slave_clocks(master);
         }
-        ecrt_master_sync_slave_clocks(master);
 
         ecrt_master_send(master);
 
         // Snapshot master/domain state for diagnostics (non-RT users consume at 10 Hz).
-        ecrt_master_state(master, &master_state);
-        ecrt_domain_state(domain, &domain_state);
+        ecrt_master_state(master, &master_diag_state);
+        aggregate_domain_state(&domain_state);
+        uint32_t online_slaves = 0;
+        uint32_t operational_slaves = 0;
+        for (uint32_t i = 0; i < opt.num_axes; ++i) {
+          sc_state[i] = ec_slave_config_state_t{};
+          if (sc[i] && ecrt_slave_config_state(sc[i], &sc_state[i]) == 0) {
+            if (sc_state[i].online) {
+              online_slaves++;
+            }
+            if (sc_state[i].operational) {
+              operational_slaves++;
+            }
+          }
+          latest_feedback.slave_online[i] = sc_state[i].online ? 1 : 0;
+          latest_feedback.slave_operational[i] = sc_state[i].operational ? 1 : 0;
+          latest_feedback.slave_al_state[i] = static_cast<uint8_t>(sc_state[i].al_state);
+        }
+
+        const uint64_t startup_elapsed_ns = startup_elapsed_ns_pre;
+        if (startup_elapsed_ns <= startup_detailed_diag_ns) {
+          MasterDiagSnapshot cur_master_diag{};
+          cur_master_diag.valid = true;
+          cur_master_diag.link_up = master_diag_state.link_up != 0;
+          cur_master_diag.responding = master_diag_state.slaves_responding;
+          cur_master_diag.al_states = master_diag_state.al_states;
+          cur_master_diag.domain_wc_state = static_cast<unsigned int>(domain_state.wc_state);
+          cur_master_diag.domain_working_counter =
+              static_cast<unsigned int>(domain_state.working_counter);
+          cur_master_diag.online_slaves = online_slaves;
+          cur_master_diag.operational_slaves = operational_slaves;
+
+          if (!prev_master_diag.valid ||
+              prev_master_diag.link_up != cur_master_diag.link_up ||
+              prev_master_diag.responding != cur_master_diag.responding ||
+              prev_master_diag.al_states != cur_master_diag.al_states ||
+              prev_master_diag.domain_wc_state != cur_master_diag.domain_wc_state ||
+              prev_master_diag.domain_working_counter != cur_master_diag.domain_working_counter ||
+              prev_master_diag.online_slaves != cur_master_diag.online_slaves ||
+              prev_master_diag.operational_slaves != cur_master_diag.operational_slaves) {
+            logf("EtherCAT startup transition cycle=%llu elapsed_ms=%llu passive_outputs=%u "
+                 "queue_suppressed=%u link_up=%u responding=%u/%u "
+                 "online=%u/%u operational=%u/%u master_al=0x%x domain_wc=%u wkc=%u/%u",
+                 static_cast<unsigned long long>(startup_cycle_counter),
+                 static_cast<unsigned long long>(startup_elapsed_ns / 1000000ULL),
+                 startup_passive_active ? 1u : 0u,
+                 startup_skip_domain_queue_active ? 1u : 0u,
+                 cur_master_diag.link_up ? 1u : 0u,
+                 cur_master_diag.responding,
+                 opt.num_axes,
+                 cur_master_diag.online_slaves,
+                 opt.num_axes,
+                 cur_master_diag.operational_slaves,
+                 opt.num_axes,
+                 cur_master_diag.al_states,
+                 cur_master_diag.domain_wc_state,
+                 cur_master_diag.domain_working_counter,
+                 expected_wkc);
+            prev_master_diag = cur_master_diag;
+          }
+
+          for (uint32_t i = 0; i < opt.num_axes; ++i) {
+            if (!sc[i]) {
+              continue;
+            }
+            SlaveDiagSnapshot cur_slave_diag{};
+            cur_slave_diag.valid = true;
+            cur_slave_diag.online = sc_state[i].online != 0;
+            cur_slave_diag.operational = sc_state[i].operational != 0;
+            cur_slave_diag.al_state = static_cast<uint8_t>(sc_state[i].al_state);
+            if (!prev_slave_diag[i].valid ||
+                prev_slave_diag[i].online != cur_slave_diag.online ||
+                prev_slave_diag[i].operational != cur_slave_diag.operational ||
+                prev_slave_diag[i].al_state != cur_slave_diag.al_state) {
+              logf("EtherCAT startup slave cycle=%llu elapsed_ms=%llu axis=%u slave_pos=%u online=%u "
+                   "operational=%u al=%s(0x%x)",
+                   static_cast<unsigned long long>(startup_cycle_counter),
+                   static_cast<unsigned long long>(startup_elapsed_ns / 1000000ULL),
+                   i,
+                   static_cast<unsigned int>(opt.slave_position[i]),
+                   cur_slave_diag.online ? 1u : 0u,
+                   cur_slave_diag.operational ? 1u : 0u,
+                   al_state_label(cur_slave_diag.al_state),
+                   static_cast<unsigned int>(cur_slave_diag.al_state));
+              prev_slave_diag[i] = cur_slave_diag;
+            }
+          }
+        }
+        const bool startup_process_data_live = domain_state.wc_state != EC_WC_ZERO;
+        const bool startup_all_operational = operational_slaves >= opt.num_axes;
+        if (startup_process_data_live && !startup_process_data_live_logged) {
+          startup_process_data_live_logged = true;
+          logf("EtherCAT startup process_data_live elapsed_ms=%llu passive_outputs=%u "
+               "queue_suppressed=%u responding=%u/%u online=%u/%u operational=%u/%u "
+               "master_al=0x%x domain_wc=%u wkc=%u/%u",
+               static_cast<unsigned long long>(startup_elapsed_ns / 1000000ULL),
+               startup_passive_active ? 1u : 0u,
+               startup_skip_domain_queue_active ? 1u : 0u,
+               master_diag_state.slaves_responding,
+               opt.num_axes,
+               online_slaves,
+               opt.num_axes,
+               operational_slaves,
+               opt.num_axes,
+               master_diag_state.al_states,
+               static_cast<unsigned int>(domain_state.wc_state),
+               static_cast<unsigned int>(domain_state.working_counter),
+               expected_wkc);
+        }
+        startup_ready = master_diag_state.link_up &&
+                        master_diag_state.slaves_responding >= opt.num_axes &&
+                        online_slaves >= opt.num_axes &&
+                        startup_all_operational &&
+                        startup_process_data_live;
+
+        const bool have_no_topology_progress =
+            master_diag_state.slaves_responding == 0 || online_slaves == 0;
+
+        if (!startup_ready && !startup_reset_issued &&
+            have_no_topology_progress &&
+            startup_elapsed_ns >= kStartupResetDelayNs) {
+          const int rc = ecrt_master_reset(master);
+          startup_reset_issued = true;
+          if (rc == 0) {
+            startup_reset_count++;
+          }
+          logf("EtherCAT startup reset attempt rc=%d elapsed_ms=%llu passive_outputs=%u "
+               "queue_suppressed=%u responding=%u/%u online=%u/%u "
+               "operational=%u/%u master_al=0x%x domain_wc=%u wkc=%u/%u",
+               rc,
+               static_cast<unsigned long long>(startup_elapsed_ns / 1000000ULL),
+               startup_passive_active ? 1u : 0u,
+               startup_skip_domain_queue_active ? 1u : 0u,
+               master_diag_state.slaves_responding,
+               opt.num_axes,
+               online_slaves,
+               opt.num_axes,
+               operational_slaves,
+               opt.num_axes,
+               master_diag_state.al_states,
+               static_cast<unsigned int>(domain_state.wc_state),
+               static_cast<unsigned int>(domain_state.working_counter),
+               expected_wkc);
+          log_phase_summary("startup_reset", startup_elapsed_ns, startup_cycle_counter);
+        }
+
+        if (!startup_ready &&
+            (!startup_wait_logged || startup_elapsed_ns - last_startup_log_ns >= kStartupLogIntervalNs)) {
+          startup_wait_logged = true;
+          last_startup_log_ns = startup_elapsed_ns;
+          logf("EtherCAT startup waiting elapsed_ms=%llu passive_outputs=%u queue_suppressed=%u "
+               "link_up=%u responding=%u/%u online=%u/%u "
+               "operational=%u/%u master_al=0x%x domain_wc=%u wkc=%u/%u slave0_al=%s",
+               static_cast<unsigned long long>(startup_elapsed_ns / 1000000ULL),
+               startup_passive_active ? 1u : 0u,
+               startup_skip_domain_queue_active ? 1u : 0u,
+               master_diag_state.link_up ? 1u : 0u,
+               master_diag_state.slaves_responding,
+               opt.num_axes,
+               online_slaves,
+               opt.num_axes,
+               operational_slaves,
+               opt.num_axes,
+               master_diag_state.al_states,
+               static_cast<unsigned int>(domain_state.wc_state),
+               static_cast<unsigned int>(domain_state.working_counter),
+               expected_wkc,
+               al_state_label(static_cast<uint8_t>(sc_state[0].al_state)));
+        }
+
+        if (startup_ready && !startup_ready_logged) {
+          startup_ready_logged = true;
+          logf("EtherCAT startup converged elapsed_ms=%llu passive_outputs=%u queue_suppressed=%u "
+               "responding=%u/%u online=%u/%u "
+               "operational=%u/%u master_al=0x%x domain_wc=%u wkc=%u/%u",
+               static_cast<unsigned long long>(startup_elapsed_ns / 1000000ULL),
+               startup_passive_active ? 1u : 0u,
+               startup_skip_domain_queue_active ? 1u : 0u,
+               master_diag_state.slaves_responding,
+               opt.num_axes,
+               online_slaves,
+               opt.num_axes,
+               operational_slaves,
+               opt.num_axes,
+               master_diag_state.al_states,
+               static_cast<unsigned int>(domain_state.wc_state),
+               static_cast<unsigned int>(domain_state.working_counter),
+               expected_wkc);
+        }
+
+        if (!startup_ready && !startup_timeout_logged && startup_elapsed_ns >= startup_timeout_ns) {
+          startup_timeout_logged = true;
+          logf("WARNING: EtherCAT startup did not converge within %llu ms: passive_outputs=%u "
+               "queue_suppressed=%u link_up=%u responding=%u/%u "
+               "online=%u/%u operational=%u/%u master_al=0x%x domain_wc=%u wkc=%u/%u",
+               static_cast<unsigned long long>(startup_timeout_ns / 1000000ULL),
+               startup_passive_active ? 1u : 0u,
+               startup_skip_domain_queue_active ? 1u : 0u,
+               master_diag_state.link_up ? 1u : 0u,
+               master_diag_state.slaves_responding,
+               opt.num_axes,
+               online_slaves,
+               opt.num_axes,
+               operational_slaves,
+               opt.num_axes,
+               master_diag_state.al_states,
+               static_cast<unsigned int>(domain_state.wc_state),
+               static_cast<unsigned int>(domain_state.working_counter),
+               expected_wkc);
+          log_phase_summary("startup_timeout", startup_elapsed_ns, startup_cycle_counter);
+          if (master_diag_state.slaves_responding > 0 && !startup_process_data_live) {
+            logf("WARNING: EtherCAT link is up and slaves respond, but process-data WKC is zero. "
+                 "Likely slave state/PDO configuration mismatch; inspect AL states and live PDO assignments.");
+          } else if (startup_process_data_live && !startup_all_operational) {
+            logf("WARNING: EtherCAT process-data is alive, but only %u/%u selected slaves are "
+                 "operational. Startup is still waiting for full OP.",
+                 operational_slaves,
+                 opt.num_axes);
+          }
+        }
 
         latest_feedback.wkc_actual = static_cast<uint32_t>(domain_state.working_counter);
-        // Latch an "expected" WKC from the observed steady-state to avoid confusing
-        // bring-up prints when IgH chooses a different datagram strategy.
-        static uint32_t wkc_expected_latched = 0;
-        if (latest_feedback.wkc_actual > wkc_expected_latched) {
-          wkc_expected_latched = latest_feedback.wkc_actual;
-        }
-        latest_feedback.wkc_expected = wkc_expected_latched;
+        latest_feedback.wkc_expected = expected_wkc;
         latest_feedback.master_state =
-            is_armed ? gradient::ipc::v1::MASTER_OP : gradient::ipc::v1::MASTER_SAFEOP;
+            master_state_from_al_states(master_diag_state.al_states, master_diag_state.link_up != 0);
+        latest_feedback.responding_slaves = master_diag_state.slaves_responding;
+        latest_feedback.online_slaves = online_slaves;
+        latest_feedback.operational_slaves = operational_slaves;
         // TODO: fill dc_offset_ns from IgH reference clock delta.
         latest_feedback.dc_offset_ns = 0;
+        latest_feedback.link_up = master_diag_state.link_up ? 1 : 0;
+        latest_feedback.master_al_states = static_cast<uint8_t>(master_diag_state.al_states);
+        latest_feedback.domain_wc_state = static_cast<uint8_t>(domain_state.wc_state);
+        latest_feedback.startup_ready = startup_ready ? 1 : 0;
+        latest_feedback.startup_passive_active = startup_passive_active ? 1 : 0;
+        latest_feedback.startup_skip_domain_queue_active = startup_skip_domain_queue_active ? 1 : 0;
+        latest_feedback.startup_elapsed_ms = static_cast<uint32_t>(startup_elapsed_ns / 1000000ULL);
+        latest_feedback.startup_reset_count = startup_reset_count;
         // Wakeup jitter relative to the requested absolute schedule.
         latest_feedback.cycle_jitter_ns = jitter_ns;
         static uint64_t fb_seq = 1;
@@ -1361,13 +2457,25 @@ int main(int argc, char** argv) {
 
       // Snapshot EtherCAT feedback if available (double-read seq).
       uint32_t wkc_actual = 0;
-      uint32_t wkc_expected = 0;
-      uint32_t master_state = armed.load(std::memory_order_relaxed)
-                                  ? gradient::ipc::v1::MASTER_SAFEOP
-                                  : gradient::ipc::v1::MASTER_INIT;
+      uint32_t wkc_expected = 2 * opt.num_axes;
+      uint32_t master_state = gradient::ipc::v1::MASTER_INIT;
+      uint32_t responding_slaves = 0;
+      uint32_t online_slaves = 0;
+      uint32_t operational_slaves = 0;
+      uint32_t startup_elapsed_ms = 0;
+      uint32_t startup_reset_count = 0;
+      uint8_t link_up = 0;
+      uint8_t master_al_states = 0;
+      uint8_t domain_wc_state = 0;
+      uint8_t startup_ready = 0;
+      uint8_t startup_passive_active = 0;
+      uint8_t startup_skip_domain_queue_active = 0;
       std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> pos_counts{};
       std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> statusword{};
       std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> error_code{};
+      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_al_state{};
+      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_online{};
+      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_operational{};
 
       bool have_fb = false;
       const uint64_t s1 = latest_feedback.seq.load(std::memory_order_acquire);
@@ -1375,9 +2483,23 @@ int main(int argc, char** argv) {
         wkc_actual = latest_feedback.wkc_actual;
         wkc_expected = latest_feedback.wkc_expected;
         master_state = latest_feedback.master_state;
+        responding_slaves = latest_feedback.responding_slaves;
+        online_slaves = latest_feedback.online_slaves;
+        operational_slaves = latest_feedback.operational_slaves;
+        startup_elapsed_ms = latest_feedback.startup_elapsed_ms;
+        startup_reset_count = latest_feedback.startup_reset_count;
+        link_up = latest_feedback.link_up;
+        master_al_states = latest_feedback.master_al_states;
+        domain_wc_state = latest_feedback.domain_wc_state;
+        startup_ready = latest_feedback.startup_ready;
+        startup_passive_active = latest_feedback.startup_passive_active;
+        startup_skip_domain_queue_active = latest_feedback.startup_skip_domain_queue_active;
         pos_counts = latest_feedback.pos_counts;
         statusword = latest_feedback.statusword;
         error_code = latest_feedback.error_code;
+        slave_al_state = latest_feedback.slave_al_state;
+        slave_online = latest_feedback.slave_online;
+        slave_operational = latest_feedback.slave_operational;
         const uint64_t s2 = latest_feedback.seq.load(std::memory_order_acquire);
         have_fb = (s1 == s2);
       }
@@ -1389,6 +2511,31 @@ int main(int argc, char** argv) {
       oss << "\"time_ns\":" << now_ns << ",";
       oss << "\"cycle_ns\":" << opt.cycle_ns << ",";
       oss << "\"num_axes\":" << opt.num_axes << ",";
+      oss << "\"pdo_profile\":\"" << pdo_profile_label(opt.rx_pdo, opt.tx_pdo) << "\",";
+      oss << "\"rx_pdo\":" << opt.rx_pdo << ",";
+      oss << "\"tx_pdo\":" << opt.tx_pdo << ",";
+      oss << "\"dc_enabled\":" << (opt.use_dc ? 1 : 0) << ",";
+      oss << "\"output_watchdog_enabled\":" << (opt.disable_output_watchdog ? 0 : 1) << ",";
+      oss << "\"split_domains_per_axis\":" << (opt.split_domains_per_axis ? 1 : 0) << ",";
+      oss << "\"queue_split_domains_round_robin\":"
+          << (opt.queue_split_domains_round_robin ? 1 : 0) << ",";
+      oss << "\"explicit_pdo_config\":" << (opt.explicit_pdo_config ? 1 : 0) << ",";
+      oss << "\"wait_before_safeop_ms\":" << opt.wait_before_safeop_ms << ",";
+      oss << "\"preop_to_safeop_timeout_ms\":" << opt.preop_to_safeop_timeout_ms << ",";
+      oss << "\"safeop_to_op_timeout_ms\":" << opt.safeop_to_op_timeout_ms << ",";
+      oss << "\"startup_passive_ms\":" << opt.startup_passive_ms << ",";
+      oss << "\"startup_passive_active\":" << static_cast<unsigned int>(startup_passive_active) << ",";
+      oss << "\"startup_skip_domain_queue_ms\":" << opt.startup_skip_domain_queue_ms << ",";
+      oss << "\"startup_skip_domain_queue_active\":"
+          << static_cast<unsigned int>(startup_skip_domain_queue_active) << ",";
+      oss << "\"slave_positions\":[";
+      for (uint32_t i = 0; i < opt.num_axes; ++i) {
+        if (i != 0) {
+          oss << ",";
+        }
+        oss << static_cast<unsigned int>(opt.slave_position[i]);
+      }
+      oss << "],";
       oss << "\"rt_cycle_counter\":" << cycles << ",";
       oss << "\"rt_hz\":" << hz << ",";
       oss << "\"rt_last_jitter_ns\":" << last_jitter << ",";
@@ -1398,8 +2545,17 @@ int main(int argc, char** argv) {
       oss << "\"axis_enable_mask\":" << en_mask << ",";
       oss << "\"have_feedback\":" << (have_fb ? 1 : 0) << ",";
       oss << "\"wkc_actual\":" << (have_fb ? wkc_actual : 0) << ",";
-      oss << "\"wkc_expected\":" << (have_fb ? wkc_expected : 0) << ",";
+      oss << "\"wkc_expected\":" << wkc_expected << ",";
       oss << "\"master_state\":" << master_state << ",";
+      oss << "\"responding_slaves\":" << responding_slaves << ",";
+      oss << "\"online_slaves\":" << online_slaves << ",";
+      oss << "\"operational_slaves\":" << operational_slaves << ",";
+      oss << "\"link_up\":" << static_cast<unsigned int>(link_up) << ",";
+      oss << "\"master_al_states\":" << static_cast<unsigned int>(master_al_states) << ",";
+      oss << "\"domain_wc_state\":" << static_cast<unsigned int>(domain_wc_state) << ",";
+      oss << "\"startup_ready\":" << static_cast<unsigned int>(startup_ready) << ",";
+      oss << "\"startup_elapsed_ms\":" << startup_elapsed_ms << ",";
+      oss << "\"startup_reset_count\":" << startup_reset_count << ",";
       oss << "\"axes\":[";
       for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
         if (i != 0) {
@@ -1408,7 +2564,10 @@ int main(int argc, char** argv) {
         oss << "{";
         oss << "\"pos_counts\":" << pos_counts[i] << ",";
         oss << "\"statusword\":" << statusword[i] << ",";
-        oss << "\"error_code\":" << error_code[i];
+        oss << "\"error_code\":" << error_code[i] << ",";
+        oss << "\"slave_online\":" << static_cast<unsigned int>(slave_online[i]) << ",";
+        oss << "\"slave_operational\":" << static_cast<unsigned int>(slave_operational[i]) << ",";
+        oss << "\"slave_al_state\":" << static_cast<unsigned int>(slave_al_state[i]);
         oss << "}";
       }
       oss << "]";
@@ -1719,7 +2878,7 @@ int main(int argc, char** argv) {
         sh.cycle_ns = opt.cycle_ns;
         sh.num_axes = opt.num_axes;
         sh.drive_profile_id = 0; // TODO: a6ec_ds402
-        sh.wkc_expected = 0;
+        sh.wkc_expected = 2 * opt.num_axes;
         ring_write(status_ring,
                    gradient::ipc::v1::MSG_STATUS_HELLO,
                    &sh,

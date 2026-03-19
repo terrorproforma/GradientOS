@@ -48,6 +48,23 @@ def _inum(x: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _al_state_name(x: Any) -> str:
+    state = _inum(x, 0)
+    if state == 0x01:
+        return "INIT"
+    if state == 0x02:
+        return "PREOP"
+    if state == 0x04:
+        return "SAFEOP"
+    if state == 0x08:
+        return "OP"
+    return "UNKNOWN"
+
+
+def _hex16(x: Any) -> str:
+    return f"0x{_inum(x, 0) & 0xFFFF:04x}"
+
+
 def _get_axis(m: dict[str, Any], axis: int) -> dict[str, Any]:
     axes = m.get("axes", [])
     if isinstance(axes, list) and 0 <= axis < len(axes):
@@ -55,6 +72,16 @@ def _get_axis(m: dict[str, Any], axis: int) -> dict[str, Any]:
         if isinstance(ent, dict):
             return ent
     return {}
+
+
+def _get_slave_positions(m: dict[str, Any]) -> str:
+    vals = m.get("slave_positions", [])
+    if not isinstance(vals, list):
+        return "[]"
+    out: list[str] = []
+    for ent in vals:
+        out.append(str(_inum(ent, 0)))
+    return "[" + ",".join(out) + "]"
 
 
 def main() -> int:
@@ -157,8 +184,25 @@ def main() -> int:
         # Multi-line, human-readable for Sampler textbox.
         num_axes = _inum(m.get("num_axes"), 0)
         cycle_ns = _inum(m.get("cycle_ns"), 0)
+        pdo_profile = str(m.get("pdo_profile") or "unknown")
         print(f"RTCore metrics ({args.path})")
         print(f"  cycle_ns={cycle_ns} num_axes={num_axes}")
+        print(
+            f"  profile={pdo_profile} rx_pdo={_hex16(m.get('rx_pdo'))} "
+            f"tx_pdo={_hex16(m.get('tx_pdo'))} dc_enabled={_inum(m.get('dc_enabled'), 0)} "
+            f"output_watchdog_enabled={_inum(m.get('output_watchdog_enabled'), 0)} "
+            f"split_domains_per_axis={_inum(m.get('split_domains_per_axis'), 0)} "
+            f"queue_split_domains_round_robin={_inum(m.get('queue_split_domains_round_robin'), 0)} "
+            f"explicit_pdo_config={_inum(m.get('explicit_pdo_config'), 0)} "
+            f"wait_before_safeop_ms={_inum(m.get('wait_before_safeop_ms'), 0)} "
+            f"preop_safeop_timeout_ms={_inum(m.get('preop_to_safeop_timeout_ms'), 0)} "
+            f"safeop_op_timeout_ms={_inum(m.get('safeop_to_op_timeout_ms'), 0)} "
+            f"startup_passive_ms={_inum(m.get('startup_passive_ms'), 0)} "
+            f"startup_passive_active={_inum(m.get('startup_passive_active'), 0)} "
+            f"startup_skip_domain_queue_ms={_inum(m.get('startup_skip_domain_queue_ms'), 0)} "
+            f"startup_skip_domain_queue_active={_inum(m.get('startup_skip_domain_queue_active'), 0)}"
+        )
+        print(f"  slave_positions={_get_slave_positions(m)}")
         print(f"  rt_hz={_fnum(m.get('rt_hz'), 0.0):.1f} rt_cycles={_inum(m.get('rt_cycle_counter'), 0)}")
         print(
             f"  rt_jitter_us(last/max)={abs(_inum(m.get('rt_last_jitter_ns'), 0))/1000.0:.1f}/"
@@ -169,6 +213,17 @@ def main() -> int:
             f"master_state={_inum(m.get('master_state'), 0)} armed={_inum(m.get('armed'), 0)} "
             f"enable_mask=0x{_inum(m.get('axis_enable_mask'), 0):x}"
         )
+        print(
+            f"  bus: link_up={_inum(m.get('link_up'), 0)} "
+            f"responding={_inum(m.get('responding_slaves'), 0)}/{num_axes} "
+            f"online={_inum(m.get('online_slaves'), 0)}/{num_axes} "
+            f"operational={_inum(m.get('operational_slaves'), 0)}/{num_axes} "
+            f"master_al=0x{_inum(m.get('master_al_states'), 0):x} "
+            f"domain_wc={_inum(m.get('domain_wc_state'), 0)} "
+            f"startup_ready={_inum(m.get('startup_ready'), 0)} "
+            f"startup_elapsed_ms={_inum(m.get('startup_elapsed_ms'), 0)} "
+            f"startup_resets={_inum(m.get('startup_reset_count'), 0)}"
+        )
         axes = m.get("axes", [])
         if isinstance(axes, list):
             for i, ent in enumerate(axes[:num_axes]):
@@ -177,7 +232,14 @@ def main() -> int:
                 err = _inum(ent.get("error_code"), 0)
                 sw = _inum(ent.get("statusword"), 0)
                 pos = _inum(ent.get("pos_counts"), 0)
-                print(f"  axis{i}: err=0x{err:04x} sw=0x{sw:04x} pos_counts={pos}")
+                slave_online = _inum(ent.get("slave_online"), 0)
+                slave_operational = _inum(ent.get("slave_operational"), 0)
+                slave_al_state = _inum(ent.get("slave_al_state"), 0)
+                print(
+                    f"  axis{i}: err=0x{err:04x} sw=0x{sw:04x} pos_counts={pos} "
+                    f"slave_online={slave_online} slave_operational={slave_operational} "
+                    f"slave_al={_al_state_name(slave_al_state)}(0x{slave_al_state:x})"
+                )
         return 0
 
     # Unknown metric: keep Sampler stable (numeric default).

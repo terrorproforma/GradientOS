@@ -581,6 +581,86 @@ def create_app() -> FastAPI:
         )
         return {"status": "ok"}
 
+    @api.post("/control/zero-joint", summary="Capture the current physical pose as logical zero for one joint")
+    async def control_zero_joint(payload: dict[str, Any]):
+        raw_joint = payload.get("joint", payload.get("joint_num"))
+        try:
+            joint = int(raw_joint)
+        except Exception:
+            raise HTTPException(status_code=400, detail="joint must be an integer")
+        if joint <= 0:
+            raise HTTPException(status_code=400, detail="joint must be >= 1")
+        detail = await run_in_threadpool(
+            _controller_call_or_503,
+            f"ZERO_JOINT,{joint}",
+            timeout=5.0,
+            expect_response=True,
+        )
+        return {"status": "ok", "joint": joint, "detail": detail}
+
+    @api.post("/control/joint-jog", summary="Jog one joint by a relative angle in degrees")
+    async def control_joint_jog(payload: dict[str, Any]):
+        raw_joint = payload.get("joint", payload.get("joint_num"))
+        try:
+            joint = int(raw_joint)
+        except Exception:
+            raise HTTPException(status_code=400, detail="joint must be an integer")
+        if joint <= 0:
+            raise HTTPException(status_code=400, detail="joint must be >= 1")
+        try:
+            delta_deg = float(payload.get("delta_deg"))
+        except Exception:
+            raise HTTPException(status_code=400, detail="delta_deg must be a number")
+        wait_for_idle = bool(payload.get("wait_for_idle", False))
+
+        detail = await run_in_threadpool(
+            _controller_call_or_503,
+            "GET_JOINT_ANGLES",
+            timeout=1.0,
+            expect_response=True,
+        )
+        parts = detail.split(",")
+        if not parts or parts[0] != "JOINT_ANGLES":
+            raise HTTPException(status_code=502, detail=f"Malformed joint reply: {detail}")
+        try:
+            angles = list(map(float, parts[1:]))
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"Invalid joint data: {exc}") from exc
+        if len(angles) < joint:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Joint {joint} unavailable in controller feedback.",
+            )
+
+        target_arm_deg = list(angles[:6])
+        target_arm_deg[joint - 1] = float(target_arm_deg[joint - 1]) + float(delta_deg)
+        # Raw comma-separated joint commands are interpreted by the controller as radians.
+        # `GET_JOINT_ANGLES` returns degrees for UI/API consumption, so convert back to
+        # radians here before handing the command to the controller.
+        target_arm_rad = [float(np.deg2rad(value)) for value in target_arm_deg]
+        cmd = ",".join(str(value) for value in target_arm_rad)
+        await run_in_threadpool(
+            _controller_call_or_503,
+            cmd,
+            timeout=2.0,
+            expect_response=False,
+        )
+        if wait_for_idle:
+            await run_in_threadpool(
+                _controller_call_or_503,
+                "WAIT_FOR_IDLE",
+                timeout=60.0,
+                expect_response=True,
+            )
+        return {
+            "status": "ok",
+            "joint": joint,
+            "delta_deg": delta_deg,
+            "target_arm_deg": target_arm_deg,
+            "target_arm_rad": target_arm_rad,
+            "waited_for_idle": wait_for_idle,
+        }
+
     @api.post("/control/rest", summary="Move all joints to predefined REST pose")
     async def control_rest():
         pose_cmd = ",".join(map(str, _resolve_rest_pose()))

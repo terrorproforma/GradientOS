@@ -99,7 +99,16 @@ fi
 
 echo ""
 echo "## EtherCAT NIC IRQ affinity (best-effort)"
-IFACE="${1:-ethercat0}"
+IFACE="${1:-}"
+if [ -z "${IFACE}" ] && [ -r /etc/gradient-ethercat-host.env ]; then
+  # shellcheck disable=SC1091
+  . /etc/gradient-ethercat-host.env
+  case "${ETHERCAT_PORT:-}" in
+    eth0) IFACE="eth0" ;;
+    eth1) IFACE="eth1" ;;
+  esac
+fi
+IFACE="${IFACE:-ethercat0}"
 if [ -f /proc/interrupts ]; then
   irqs="$(awk -v iface="${IFACE}" '$0 ~ iface { gsub(/:/,"",$1); print $1 }' /proc/interrupts)"
   if [ -n "${irqs}" ]; then

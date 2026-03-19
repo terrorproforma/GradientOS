@@ -620,3 +620,1150 @@
   - Re-ran tests, fixing and passing all `test_weld_tool_semantics.py` and `test_api_endpoints.py` assertions.
 - Follow-up notes / risks:
   - Previous trajectory parameters that used `normal_angle_deg` or `tangent_roll_deg` will default cleanly to 0 for the new `spin_angle_deg` mapping.
+
+## 2026-03-18 23:21 +00:00
+
+- Task summary:
+  - Implemented a usable zeroing workflow for the EtherCAT RTCore backend so physical joint poses can be captured as logical zero offsets during commissioning.
+- Changes:
+  - Added `src/gradient_os/joint_zero_offsets.py` to persist repo-local logical joint master offsets in `.gradient_joint_zero_offsets.json`.
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` to:
+    - load persisted joint zero offsets on startup,
+    - parse RTCore `STATUS_AXIS_CONFIG`,
+    - convert live `0x6064` counts into q-units for feedback,
+    - apply master offsets to commanded setpoints,
+    - capture and persist logical-joint zero from live EtherCAT feedback.
+  - Updated `src/gradient_os/run_controller.py` with backend-aware `ZERO_JOINT,<joint>` handling so logical-joint zeroing works even when RT axes are remapped for bring-up.
+  - Updated `src/gradient_os/api/main.py` with `POST /control/zero-joint`.
+  - Documented the workflow in `docs/ethercat/bringup.md`.
+  - Added regression coverage in `tests/test_gradient05_limits_and_backends.py` and `tests/test_api_endpoints.py`.
+- Validation:
+  - `./.venv/bin/python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_api_endpoints.py -q` (passed, 37 tests).
+  - `ReadLints` on edited Python files and tests reported no issues.
+- Follow-up notes / risks:
+  - Zero capture is software-level logical calibration, not drive EEPROM zeroing; mechanical phasing and DS402 commissioning remain RTCore/drive responsibilities.
+  - The new API expects the controller to be running with live RTCore feedback available; zero capture will fail cleanly if scaling/config snapshots have not arrived yet.
+
+## 2026-03-18 23:32 +00:00
+
+- Task summary:
+  - Wired EtherCAT commissioning into the web UI by adding per-joint jog and per-joint zero capture controls to the existing robot control panel.
+- Changes:
+  - Updated `src/gradient_os/api/main.py`:
+    - added `POST /control/joint-jog` which reads current joint angles from the controller, applies a relative delta to one joint, and sends the updated 6-joint target through the existing controller path.
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added live polling of `/info/joints`,
+    - added a `Joint Commissioning` section with step-size presets, current joint angle display, relative jog buttons, and `Zero` actions per joint,
+    - added a commissioning safety note that assumes RTCore is still running with `--max-rpm 100`.
+  - Updated `tests/test_api_endpoints.py` with `control/joint-jog` coverage.
+- Validation:
+  - `./.venv/bin/python -m pytest tests/test_api_endpoints.py -q` (passed, 29 tests).
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx`, `src/gradient_os/api/main.py`, and `tests/test_api_endpoints.py` reported no issues.
+  - `npm run build` in `web-ui` did not complete due existing environment/app issues outside this change:
+    - Node `18.20.4` is below Vite's required version,
+    - existing unresolved import `occt-import-js/dist/occt-import-js.wasm?url` from `src/ArmVisualizer.tsx`.
+  - `npx tsc --noEmit` also reports pre-existing `three`/`ArmVisualizer` typing issues unrelated to `ControlPanel.tsx`.
+- Follow-up notes / risks:
+  - Joint jog is implemented as small relative absolute-position updates using the controller's existing joint command path, not a new RT velocity loop; this is appropriate for commissioning/zeroing but distinct from Cartesian realtime jog.
+  - Once the web-ui build baseline is repaired, rerun full frontend build validation to confirm the commissioning panel in production bundling.
+
+## 2026-03-19 00:20 +00:00
+
+- Task summary:
+  - Brought up the RTCore/controller/API/web stack on the RevPi, validated the new joint commissioning UI path, and diagnosed the current EtherCAT hardware state.
+  - Added best-effort RTCore autostart for the `ethercat_rtcore` controller path and cleaned up systemd unit wiring/paths.
+- Changes:
+  - Updated `src/gradient_os/run_controller.py`:
+    - added best-effort RTCore service autostart when `ethercat_rtcore` is selected and `/run/gradient-rt-motion/ipc.sock` is missing,
+    - uses `systemctl` directly when root or `sudo -n systemctl` as non-root, failing soft with warnings.
+  - Updated `systemd/controller/arm-controller.service`:
+    - fixed repository paths from `/home/pi/src/GradientOS` to `/home/pi/GradientOS`,
+    - added `Wants=` / `After=` dependency on `gradient-rt-motion.service`,
+    - added `GRADIENT_RTCORE_AUTOSTART=1`.
+  - Updated `systemd/api/gradient-api.service`:
+    - fixed repository paths from `/home/pi/src/GradientOS` to `/home/pi/GradientOS`.
+  - Updated `systemd/README.md` to document the controller -> RTCore -> EtherCAT service chain.
+  - Reinstalled the RTCore service via `./systemd/rt-motion/install.sh`.
+  - Repaired local web dependency drift with `npm install` in `web-ui`, restoring local Vite from `7.1.10` to `5.4.21`.
+- Validation:
+  - `./.venv/bin/python -m py_compile src/gradient_os/run_controller.py` (passed).
+  - `ReadLints` on `src/gradient_os/run_controller.py` (no issues).
+  - Runtime bring-up:
+    - API healthy at `http://127.0.0.1:4000/health`,
+    - web UI dev server responding at `http://127.0.0.1:8000/`,
+    - controller runtime config reports `robot=gradient05`, `servo_backend=ethercat_rtcore`,
+    - RTCore journal confirmed controller IPC handshake after clean restart.
+  - Service/autostart proof:
+    - after stopping `gradient-rt-motion.service`, a fresh `./run.sh --robot gradient05` brought the RT motion service back up automatically.
+  - EtherCAT hardware findings:
+    - `sudo ethercat master` shows `Active: yes` but `Slaves: 0`, `Rx frames: 0`, `Frame loss: 100%`,
+    - `curl http://127.0.0.1:4000/info/all-positions` shows six exposed axes (`servo_id` `0..5`) but all raw positions remain `0`,
+    - `python3 scripts/sampler/rtcore_metrics.py summary` shows `num_axes=6`, 1kHz loop healthy, but no drive feedback.
+  - Device-busy diagnosis:
+    - `sudo fuser -v /dev/EtherCAT0` identified a stale manual RTCore child still holding the master device; killing it and restarting the service cleared the `ecrt_request_master(0) failed` error.
+- Follow-up notes / risks:
+  - The software stack is healthy, but the physical EtherCAT bus is not yet communicating; current evidence points to wiring/port/device-mode/no-reply issues rather than controller/API bugs.
+  - The updated controller/api service files were fixed in-repo; re-run `systemd/controller/install.sh` and `systemd/api/install.sh` if you want the installed service units on this host to pick up the new paths/dependencies.
+
+## 2026-03-19 00:23 +00:00
+
+- Task summary:
+  - Reviewed all in-repo EtherCAT docs plus scratchpad/devlog archives for prior working clues and cross-checked them against the live NIC binding on the RevPi.
+- Findings:
+  - `docs/ethercat/igh.md` and `docs/ethercat/bringup.md` both document the historical bring-up result:
+    - `eth0` (`macb`, MAC `c8:3e:a7:14:1c:75`) was the interface that worked with IgH `ec_generic`,
+    - `eth1` (`lan743x`, MAC `c8:3e:a7:14:1c:76`) repeatedly failed in that earlier setup.
+  - The current repo templates and live `/etc/ethercat.conf` therefore bind `MASTER0_DEVICE="c8:3e:a7:14:1c:75"`.
+  - Live host state now contradicts the old appliance assumption:
+    - `nmcli device status` shows `eth0` is the active wired uplink (`connected`, profile `Direct-PC`),
+    - `ip route` shows the default route via `eth0`,
+    - `ip -4 addr show dev eth0` shows the machine's active IPv4 addresses on `eth0`,
+    - `eth1` is currently disconnected.
+  - Installed link configs exist for the old intended naming (`/etc/systemd/network/10-ethercat0.link` for MAC `...:75`, `/etc/systemd/network/10-uplink0.link` for MAC `...:76`), but the live system still presents plain `eth0`/`eth1`, so the expected dedicated-port naming/policy is not active at runtime.
+  - Archive review did not surface a more specific later correction; the strongest historical clue remains the docs' explicit `eth0 worked / eth1 failed` note.
+- Validation:
+  - Read `docs/ethercat/igh.md`, `docs/ethercat/bringup.md`, `/etc/ethercat.conf`, and the repo's `ethercat-eth0.conf` / `ethercat-eth1.conf`.
+  - Checked live interfaces with `ip -br link`, `ip -4 addr`, `ip route`, `nmcli device status`, and `networkctl status`.
+- Follow-up notes / risks:
+  - If the current physical wiring really uses `eth0` for normal host networking and the drive chain is on `eth1`, then the present EtherCAT binding is likely wrong for this machine even though it matched the historical working notes.
+  - Best next diagnostic is a temporary bind swap using `scripts/ethercat/ethercat-eth1.conf` while the RTCore/controller are stopped, then compare `ethercat master` / `ethercat slaves -v` immediately.
+
+## 2026-03-19 00:39 +00:00
+
+- Task summary:
+  - Ran the temporary `eth1` EtherCAT binding test against the current physical wiring.
+- Validation:
+  - Stopped controller processes and RTCore, stopped `ethercat.service`, then started IgH with:
+    - `sudo /usr/local/sbin/ethercatctl -c /home/pi/GradientOS/scripts/ethercat/ethercat-eth1.conf start`
+  - `sudo ethercat master` result on `eth1` / MAC `c8:3e:a7:14:1c:76`:
+    - `Slaves: 6`
+    - `Rx frames: 19`
+    - `Lost frames: 0`
+    - `Frame loss [%]: 0.0`
+  - `sudo ethercat slaves -v` enumerated six slaves on the chain.
+- Follow-up notes / risks:
+  - This is the strongest proof so far that the live slave chain is currently wired to `eth1`, not the historically documented `eth0` path.
+  - The repo/default `/etc/ethercat.conf` binding to MAC `...:75` is therefore wrong for the current machine wiring and should be switched if we want normal controller/RTCore bring-up to work without the temporary config.
+
+## 2026-03-19 00:44:49 +00:00
+
+- Task summary:
+  - Switched the permanent EtherCAT binding from the historical `eth0` MAC to the validated `eth1` MAC in both the repo templates and the live host config, then restarted the normal EtherCAT/RTCore/controller path.
+- What changed:
+  - Updated repo templates:
+    - `systemd/ethercat-host/ethercat.conf`
+    - `systemd/ethercat-host/10-ethercat0.link`
+    - `systemd/ethercat-host/10-uplink0.link`
+    - `systemd/ethercat-host/10-unmanaged-ethercat.conf`
+    - `systemd/README.md`
+    - `systemd/ethercat-host/install.sh`
+    - `docs/ethercat/igh.md`
+    - `docs/ethercat/bringup.md`
+    - `scripts/ethercat/ethercat-eth0.conf`
+    - `scripts/ethercat/ethercat-eth1.conf`
+  - Updated live host files with root privileges:
+    - `/etc/ethercat.conf`
+    - `/etc/systemd/network/10-ethercat0.link`
+    - `/etc/systemd/network/10-uplink0.link`
+    - `/etc/NetworkManager/conf.d/10-unmanaged-ethercat.conf`
+- Validation:
+  - Restarted:
+    - `sudo systemctl restart ethercat.service`
+    - `sudo systemctl restart gradient-rt-motion.service`
+    - `./run.sh --robot gradient05`
+  - Verified API/controller path recovered:
+    - `curl http://127.0.0.1:4000/health` returned controller reachable
+    - `curl http://127.0.0.1:4000/info/runtime-config` still reports `servo_backend=ethercat_rtcore`
+  - Verified the corrected NIC is now in use:
+    - `sudo ethercat master` shows `Main: c8:3e:a7:14:1c:76 (attached)` with link up and RX traffic on the correct port
+  - Split test results:
+    - With `gradient-rt-motion.service` stopped, `sudo ethercat slaves -v` against the corrected `/etc/ethercat.conf` enumerated six slave slots again
+    - With RTCore running, `python3 scripts/sampler/rtcore_metrics.py summary` still shows `wkc=0/0`, all `pos_counts=0`, and the API `/info/all-positions` + `/info/joints` stay zeroed
+    - While RTCore owns the master, `ethercat` CLI matches zero selected slaves for SDO/PDO queries
+  - `ReadLints` on the edited repo files reported no linter errors.
+- Follow-up notes / risks:
+  - The wrong-NIC problem is fixed: `eth1` / MAC `...:76` is now the default slave-facing path for this machine.
+  - A separate RTCore/master-activation issue remains: the fieldbus is no longer pointed at the obviously wrong port, but RTCore still is not reaching non-zero WKC or live axis feedback.
+  - Historical notes that "`eth0` worked and `eth1` failed" should now be treated as stale or environment-specific for this host.
+
+## 2026-03-19 00:59:05 +00:00
+
+- Task summary:
+  - Investigated whether RTCore's zero-WKC behavior could be caused by CPU/core placement, and followed the evidence through host NIC tuning, IRQ routing, manual rescans, and reduced-axis RTCore tests.
+- What changed:
+  - Updated host tuning scripts in-repo:
+    - `systemd/ethercat-host/gradient-ethercat-nic-tune.sh`
+    - `systemd/ethercat-host/gradient-irq-affinity.sh`
+  - New behavior in those scripts:
+    - resolve the active EtherCAT NIC from `/etc/ethercat.conf` (device name or MAC) instead of blindly falling back to `eth0`
+    - use `/sys/class/net/<iface>/device/msi_irqs` for IRQ discovery when available
+    - write a plain hex mask (`c`) instead of `0xC`
+  - Installed the updated scripts to:
+    - `/usr/local/sbin/gradient-ethercat-nic-tune.sh`
+    - `/usr/local/sbin/gradient-irq-affinity.sh`
+    - then restarted both oneshot services
+- Validation:
+  - Confirmed RTCore thread placement:
+    - `rt-cycle` thread is on CPU3 with `SCHED_FIFO 90`
+    - process main/helper threads remain on CPUs 0-1
+  - Confirmed the core-adjacent misconfiguration:
+    - before the fix, `eth1` still had `GRO/GSO/TSO` enabled and `EEE status: enabled - inactive`
+    - after tuning the correct NIC, `eth1` shows `GRO/GSO/TSO` disabled and `EEE status: disabled`
+  - Confirmed IRQ-affinity limits on this platform:
+    - `gradient-irq-affinity.service` now discovers the `lan743x` MSI IRQs correctly, but writes still fail with `I/O error`
+    - `smp_affinity_list` for IRQs `190..195` remains `0-1`
+    - `irqaffinity=0,1` is present in `/proc/cmdline`
+  - Bus/runtime diagnostics:
+    - with the corrected NIC tuning applied, `ethercat master` under RTCore showed materially better RX and lower frame loss than before, but still not non-zero WKC
+    - bare manual path:
+      - `sudo /usr/local/sbin/ethercatctl -c /home/pi/GradientOS/scripts/ethercat/ethercat-eth1.conf start`
+      - then `sudo ethercat rescan`
+      - then `sudo ethercat slaves -v`
+      - recovered all six slave identities as `AS715N_sAxis_V0.10`
+    - reduced RTCore test:
+      - started `/usr/local/bin/gradient-rt-motion --socket-path /tmp/rt1/ipc.sock --num-axes 1 --max-rpm 100`
+      - this kept `ethercat master` at `Slaves: 6` with a real DC reference clock on `Slave 0`, much healthier RX, and lower frame loss than the 6-axis service run
+      - despite that, `/tmp/rt1/metrics.json` still reported `wkc=0/0` and zero feedback
+    - during the 1-axis RTCore run:
+      - `sudo ethercat slaves` showed all six slaves stuck in `INIT`
+      - `sudo ethercat pdos -p0` showed active PDOs `0x1701/0x1b01` on slave 0
+      - RTCore is hard-coded for `0x1702/0x1b02`
+  - Restored normal service path afterward:
+    - `ethercat.service` active
+    - `gradient-rt-motion.service` active
+    - API health check still returns controller reachable
+- Follow-up notes / risks:
+  - Current evidence does not support "wrong physical cores" as the primary root cause.
+  - The stronger lead is EtherCAT state/PDO sequencing under RTCore: slaves remain in `INIT` and the live PDO selection does not match RTCore's expected `0x1702/0x1b02`.
+  - Rescan and reduced-axis tests improve bus behavior enough to show this is not a dead link problem anymore.
+
+## 2026-03-19 01:10:41 +00:00
+
+- Task summary:
+  - Hardened RTCore startup diagnostics so EtherCAT bring-up reports real convergence state, then validated the new behavior live against the 6-axis service path.
+- What changed:
+  - Updated `src/gradient_rt_motion/main.cpp` to:
+    - publish configured `wkc_expected` instead of latching from observed traffic
+    - derive `master_state` from actual EtherCAT AL bits/link state instead of `armed`
+    - sample `ecrt_master_state()`, `ecrt_domain_state()`, and `ecrt_slave_config_state()` continuously
+    - track/responding slave count, online/operational counts, domain WC state, startup elapsed time, startup reset count, and per-axis slave AL state/online/operational flags
+    - emit startup-wait/reset/timeout log messages from the RT loop
+    - set `StatusHelloV1.wkc_expected` to the configured expected WKC
+  - Updated `scripts/sampler/rtcore_metrics.py` to print the new bus/startup diagnostics in `summary`.
+  - Rebuilt `src/gradient_rt_motion/gradient-rt-motion`, installed it to `/usr/local/bin/gradient-rt-motion`, and restarted `ethercat.service` + `gradient-rt-motion.service`.
+- Validation:
+  - Build/syntax:
+    - `make -C src/gradient_rt_motion`
+    - `python3 -m py_compile scripts/sampler/rtcore_metrics.py`
+    - `ReadLints` on the edited files reported no errors.
+  - Live diagnostics after restart:
+    - `python3 scripts/sampler/rtcore_metrics.py summary` now reports:
+      - `wkc=0/12` instead of misleading `0/0`
+      - `link_up`, `responding`, `online`, `operational`, `master_al`, `domain_wc`, `startup_elapsed_ms`, `startup_resets`
+      - per-axis `slave_online`, `slave_operational`, and `slave_al`
+  - Key journal evidence from the new RTCore logs:
+    - at startup, RTCore briefly sees:
+      - `link_up=1`
+      - `responding=6/6`
+      - `online=6/6`
+      - `operational=0/6`
+      - `master_al=0x1`
+      - `domain_wc=0`
+      - `slave0_al=INIT`
+    - within about 1 second, the same service instance falls back to:
+      - `responding=0/6`
+      - `online=0/6`
+      - `master_al=0x0`
+      - `domain_wc=0`
+    - timeout warning now clearly reports non-convergence after 5000 ms.
+  - Runtime/API:
+    - `curl http://127.0.0.1:4000/health` still reports controller reachable
+    - `/info/all-positions` remains zero, consistent with the zero-WKC condition
+    - `sudo ethercat master` still shows link up and some RX traffic but `Slaves: 0` under the 6-axis RTCore path
+- Follow-up notes / risks:
+  - The new diagnostics strongly support that the issue is not merely "startup is slow and needs more wait time." RTCore initially sees the topology, then loses it during/after configuration.
+  - This points more strongly at configuration/state transition behavior (for example PDO/DC/AL-state progression under RTCore) than at simple link discovery.
+
+## 2026-03-19 01:45:12 +00:00
+
+- Task summary:
+  - Prepared a fresh-instance handoff summary for the current EtherCAT/RTCore bring-up state.
+- Validation:
+  - Re-read the latest `DEVLOG` and `AGENT_SCRATCHPAD` EtherCAT sections to ensure the handoff reflects the current failure signature and file set.
+- Follow-up notes / risks:
+  - The next instance should start from the current diagnostics in `src/gradient_rt_motion/main.cpp` and `scripts/sampler/rtcore_metrics.py` rather than re-deriving the earlier NIC/core hypotheses.
+
+## 2026-03-19 01:55:44 +00:00
+
+- Task summary:
+  - Added explicit EtherCAT bring-up profile controls to RTCore, surfaced them in metrics, and used them for a new live split test against the zero-WKC failure.
+- What changed:
+  - Updated `src/gradient_rt_motion/main.cpp` to:
+    - add runtime EtherCAT bring-up options: `--rx-pdo`, `--tx-pdo`, `--no-dc`, `--wait-before-safeop-ms`, `--preop-safeop-timeout-ms`, `--safeop-op-timeout-ms`
+    - support two concrete vendor-ESI PDO profiles: `0x1701/0x1b01` and `0x1702/0x1b02`
+    - register/read/write PDO entries conditionally based on the selected profile instead of assuming every optional entry exists
+    - apply IgH startup timing knobs with `ecrt_slave_config_flag(..., "WaitBeforeSAFEOPms", ...)` and `ecrt_slave_config_state_timeout(...)`
+    - skip DC configuration/sync helpers when `--no-dc` is selected
+    - publish the active PDO/DC/timing policy into `metrics.json`
+  - Updated `scripts/sampler/rtcore_metrics.py` so `summary` prints the active `pdo_profile`, PDO IDs, DC state, and SAFEOP/OP timing policy.
+  - Rebuilt `src/gradient_rt_motion/gradient-rt-motion` and installed it to `/usr/local/bin/gradient-rt-motion`.
+- Validation:
+  - Build/syntax:
+    - `make -C src/gradient_rt_motion`
+    - `python3 -m py_compile scripts/sampler/rtcore_metrics.py`
+    - `ReadLints` on the edited files reported no errors.
+  - Default 6-axis service path after install:
+    - `sudo systemctl restart gradient-rt-motion.service`
+    - `python3 scripts/sampler/rtcore_metrics.py summary`
+    - still shows `profile=1702/1b02`, `dc_enabled=1`, `wkc=0/12`, `responding=0/6`, `online=0/6`, `master_al=0x0`
+    - journal still shows the same collapse: startup begins at `responding=6/6`, `online=6/6`, `slave0_al=INIT`, then falls to `0/6` by ~1 s
+  - New live split test:
+    - stopped `gradient-rt-motion.service`
+    - ran `sudo /usr/local/bin/gradient-rt-motion --socket-path /tmp/rtdiag/ipc.sock --num-axes 1 --max-rpm 100 --rx-pdo 0x1701 --tx-pdo 0x1b01 --no-dc`
+    - `sudo ethercat master` during that run showed `Slaves: 6`, a DC reference clock on `Slave 0`, non-zero RX traffic, and materially lower frame loss than the failing 6-axis service path
+    - `sudo ethercat slaves` showed all six slaves still present but stuck in `INIT`
+    - `sudo ethercat pdos -p0` confirmed the live `0x1701/0x1b01` layout under that diagnostic run
+    - RTCore logs during that run stayed at `responding=6/1`, `online=1/1`, `operational=0/1`, `master_al=0x1`, `slave0_al=INIT`, `wkc=0/2`
+  - Restored the normal service path afterward with `sudo systemctl start gradient-rt-motion.service`; `python3 scripts/sampler/rtcore_metrics.py summary` again reports the default 6-axis failure signature.
+- Follow-up notes / risks:
+  - The new split test weakens the earlier "wrong PDO IDs alone" hypothesis. Matching the live-visible `0x1701/0x1b01` profile and disabling DC improves topology stability in the reduced run, but it does not move the slave out of `INIT` or produce non-zero WKC.
+  - The strongest remaining lead is now AL-state/configuration sequencing under RTCore: something about activation/config progression is preventing the drive from leaving `INIT` and entering real process-data exchange even when topology is stable.
+
+## 2026-03-19 02:10:27 +00:00
+
+- Task summary:
+  - Measured the actual multi-slave breakpoint in RTCore bring-up and added a slave-position diagnostic option so individual slave positions can be probed without changing `num_axes`.
+- What changed:
+  - Updated `src/gradient_rt_motion/main.cpp` to:
+    - add `--slave-positions P[,P..]` so RTCore axes can target arbitrary EtherCAT slave positions instead of always `0..N-1`
+    - validate duplicate/length errors for that option
+    - use the configured slave positions for `ecrt_master_slave_config(...)` and PDO entry registration
+    - log the configured axis-to-slave-position mapping at startup
+    - publish `slave_positions` into `metrics.json`
+  - Updated `scripts/sampler/rtcore_metrics.py` so `summary` prints `slave_positions`.
+  - Rebuilt `src/gradient_rt_motion/gradient-rt-motion` and reinstalled `/usr/local/bin/gradient-rt-motion`.
+- Validation:
+  - Build/syntax:
+    - `make -C src/gradient_rt_motion`
+    - `python3 -m py_compile scripts/sampler/rtcore_metrics.py`
+    - `ReadLints` on the edited files reported no errors.
+  - Default profile breakpoint sweep (manual RTCore, no controller attached):
+    - `sudo systemctl stop gradient-rt-motion.service`
+    - `sudo /usr/local/bin/gradient-rt-motion --socket-path /tmp/rtprobe1/ipc.sock --num-axes 1 --max-rpm 100`
+      - `python3 scripts/sampler/rtcore_metrics.py --path /tmp/rtprobe1/metrics.json summary` showed `responding=6/1`, `online=1/1`, `master_al=0x1`, `slave0_al=INIT`, `wkc=0/2`, `startup_resets=0`
+      - `sudo ethercat master` showed `Slaves: 6` and a DC reference clock on `Slave 0`
+    - `sudo /usr/local/bin/gradient-rt-motion --socket-path /tmp/rtprobe2/ipc.sock --num-axes 2 --max-rpm 100`
+      - metrics showed collapse to `responding=0/2`, `online=0/2`, `master_al=0x0`, `wkc=0/4`, `startup_resets=1`
+      - `sudo ethercat master` showed `Slaves: 0`
+    - `sudo /usr/local/bin/gradient-rt-motion --socket-path /tmp/rtprobe3/ipc.sock --num-axes 3 --max-rpm 100`
+      - metrics likewise collapsed to `responding=0/3`, `online=0/3`, `master_al=0x0`, `wkc=0/6`, `startup_resets=1`
+  - Cross-check against lighter profile:
+    - `sudo /usr/local/bin/gradient-rt-motion --socket-path /tmp/rtprobe2alt/ipc.sock --num-axes 2 --max-rpm 100 --rx-pdo 0x1701 --tx-pdo 0x1b01 --no-dc`
+    - metrics still collapsed to `responding=0/2`, `online=0/2`, `wkc=0/4`, `startup_resets=1`
+  - Individual slave-position check:
+    - `sudo /usr/local/bin/gradient-rt-motion --socket-path /tmp/rtprobe_p1/ipc.sock --num-axes 1 --slave-positions 1 --max-rpm 100`
+    - metrics showed `slave_positions=[1]`, `responding=6/1`, `online=1/1`, `master_al=0x1`, `slave0_al=INIT`, `wkc=0/2`, `startup_resets=0`
+    - `sudo ethercat master` still showed `Slaves: 6`
+  - Restored the normal service path afterward with `sudo systemctl start gradient-rt-motion.service`; `python3 scripts/sampler/rtcore_metrics.py summary` again shows the default 6-axis failure signature.
+- Follow-up notes / risks:
+  - The practical breakpoint on this host is between one configured slave and two configured slaves.
+  - Because `slave position 1` alone behaves like `slave position 0` alone, the evidence now points away from a single bad slave and toward a multi-slave configuration/state-transition problem.
+
+## 2026-03-19 02:20:22 +00:00
+
+- Task summary:
+  - Ran the full two-slave pair sweep to determine whether only certain slave combinations collapse or whether the current failure is generic to any two configured slaves.
+- Validation:
+  - Stopped `gradient-rt-motion.service`.
+  - Swept all 15 unordered pairs via the new `--slave-positions` option:
+    - `0,1`
+    - `0,2`
+    - `0,3`
+    - `0,4`
+    - `0,5`
+    - `1,2`
+    - `1,3`
+    - `1,4`
+    - `1,5`
+    - `2,3`
+    - `2,4`
+    - `2,5`
+    - `3,4`
+    - `3,5`
+    - `4,5`
+  - For each pair, launched:
+    - `sudo timeout 8s /usr/local/bin/gradient-rt-motion --socket-path /tmp/rtpair_<a>_<b>/ipc.sock --num-axes 2 --slave-positions <a>,<b> --max-rpm 100`
+    - sampled `/tmp/rtpair_<a>_<b>/metrics.json`
+    - sampled `sudo ethercat master`
+    - sampled `sudo ethercat slaves`
+  - Result: every completed pair produced the same RTCore summary:
+    - `responding=0`
+    - `online=0`
+    - `operational=0`
+    - `master_al=0x0`
+    - `wkc=0/4`
+    - `startup_resets=1`
+  - Restored the normal service path afterward:
+    - `sudo systemctl start gradient-rt-motion.service`
+    - `python3 scripts/sampler/rtcore_metrics.py summary`
+    - service is active again and back to the known default 6-axis failure signature.
+- Follow-up notes / risks:
+  - There is no obvious "bad 2-slave pair" in the present 6-drive chain. The current failure appears generic to configuring any two slaves together.
+  - Combined with the user's historical note that two drives previously moved together on this hardware, this strengthens the case for a current RTCore bring-up/configuration regression or changed drive startup state rather than a fundamental fieldbus limitation.
+
+## 2026-03-19 02:21:58 +00:00
+
+- Task summary:
+  - Prepared a fresh-instance handoff after the full two-slave sweep narrowed the problem to a generic multi-slave RTCore bring-up failure.
+- Validation:
+  - Re-read the latest EtherCAT sections in `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md` to ensure the handoff reflects the current breakpoint and next-step direction.
+- Follow-up notes / risks:
+  - A fresh instance should start from the multi-slave breakpoint result and focus on staged multi-slave AL/config progression in `src/gradient_rt_motion/main.cpp`, not on rediscovering the earlier NIC binding or CPU-affinity work.
+
+## 2026-03-19 02:26:40 +00:00
+
+- Task summary:
+  - Added phase-level EtherCAT bring-up logging and per-slave startup transition logging in `src/gradient_rt_motion/main.cpp`, then rebuilt, manually probed a two-slave run, and reinstalled `/usr/local/bin/gradient-rt-motion` so the systemd service emits the same diagnostics.
+- Validation:
+  - `make -C src/gradient_rt_motion`
+  - `sudo systemctl stop gradient-rt-motion.service && sudo timeout 8s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtdiag_phase/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 ; sudo systemctl start gradient-rt-motion.service`
+  - Manual two-slave probe result:
+    - both selected slaves stayed `online=1`, `operational=0`, `al=INIT` through `ecrt_master_slave_config`, `ecrt_slave_config_pdos`, `ecrt_slave_config_dc`, PDO registration, and `ecrt_master_activate`
+    - collapse happened only during cyclic startup at about `448 ms` (`cycle=2123`), after activation/send had already begun
+  - `sudo install -m 0755 src/gradient_rt_motion/gradient-rt-motion /usr/local/bin/gradient-rt-motion`
+  - `sudo systemctl restart gradient-rt-motion.service`
+  - `python3 scripts/sampler/rtcore_metrics.py summary`
+    - service is active and back at the known default failure signature: `wkc=0/12`, `responding=0/6`, `online=0/6`, `operational=0/6`
+  - `sudo journalctl -u gradient-rt-motion.service --since "2026-03-19 02:25:49" --no-pager`
+    - normal 6-axis service run now shows the new detailed logs, including config-phase snapshots and per-slave startup transitions
+- Follow-up notes / risks:
+  - In the normal 6-axis service run, the collapse is slightly staggered: axes `0-1` drop to `UNKNOWN` at about `444 ms`, then axes `2-5` drop one cycle later at about `445 ms`.
+  - This narrows the breakpoint further: the system survives full static configuration/activation and fails only once cyclic exchange is underway, which is more consistent with a multi-slave runtime/state-sequencing bug than a pure `ecrt_master_slave_config()` or PDO-registration failure.
+
+## 2026-03-19 02:33:37 +00:00
+
+- Task summary:
+  - Fixed a startup scheduling bug in `src/gradient_rt_motion/main.cpp` that was making the RT loop "catch up" after long EtherCAT initialization, then re-ran the two-slave timing probes to see whether the collapse timing was real or an artifact.
+- Validation:
+  - Updated the cyclic-loop schedule to rebase `next_ns` after initialization and switched startup elapsed timing to use the real wake timestamp.
+  - `make -C src/gradient_rt_motion`
+  - `sudo timeout 8s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtdiag_phase_fix/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100`
+    - result after the fix: collapse still occurred at about `452 ms`, but the counters are now coherent (`cycle=453 elapsed_ms=452`) instead of showing impossible thousands of cycles in a few hundred ms
+  - `sudo timeout 6s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtdiag_wait0/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --wait-before-safeop-ms 0`
+    - collapse still occurred at about `456 ms`
+  - `sudo timeout 6s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtdiag_wait1000/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --wait-before-safeop-ms 1000`
+    - collapse still occurred at about `452 ms`
+  - Reinstalled the rebuilt binary and restarted the service:
+    - `sudo install -m 0755 src/gradient_rt_motion/gradient-rt-motion /usr/local/bin/gradient-rt-motion`
+    - `sudo systemctl restart gradient-rt-motion.service`
+    - immediate metrics showed clean 1 kHz timing (`rt_hz≈999`, max jitter only a few microseconds) before the known topology collapse reappeared
+- Follow-up notes / risks:
+  - The bad startup timing was real technical debt and is now fixed, but it was not the root cause of the EtherCAT collapse.
+  - Because the collapse timing does not move when `--wait-before-safeop-ms` is changed from `0` to `1000`, the present evidence points away from that explicit SAFEOP-delay knob and more toward a generic "first few hundred milliseconds of cyclic multi-slave process-data exchange never achieve non-zero WKC, then the master gives up and marks slaves offline" failure mode.
+
+## 2026-03-19 02:46:08 +00:00
+
+- Task summary:
+  - Added a configurable passive-startup mode to `src/gradient_rt_motion/main.cpp` and surfaced it in `scripts/sampler/rtcore_metrics.py`, then used it to separate DS402/output-writing behavior from lower-level multi-slave cyclic EtherCAT failure.
+- Validation:
+  - Added CLI/runtime knob:
+    - `--startup-passive-ms <ms>`
+    - during that window RTCore still runs `receive/process/queue/send`, but forces inert outputs (`cw=0`, `mode=0`, zero auxiliary outputs, aligned target position) instead of normal DS402 controlword/mode/target driving
+  - `make -C src/gradient_rt_motion`
+  - Control probe:
+    - `sudo timeout 6s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtdiag_passive0/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --startup-passive-ms 0`
+    - collapse still occurred at about `448 ms`
+  - Passive-output probe:
+    - `sudo timeout 6s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtdiag_passive1500/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --startup-passive-ms 1500`
+    - passive mode was active when the collapse happened (`passive_outputs=1` at cycle 1; topology dropped at about `448 ms`; passive mode only ended at `1500 ms`)
+  - Minimal-profile probe:
+    - `sudo timeout 6s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtdiag_minimal_passive/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --rx-pdo 0x1701 --tx-pdo 0x1b01 --no-dc --startup-passive-ms 1500`
+    - collapse still occurred at about `464 ms`
+  - Reinstalled the rebuilt binary and restarted the service:
+    - `sudo install -m 0755 src/gradient_rt_motion/gradient-rt-motion /usr/local/bin/gradient-rt-motion`
+    - `sudo systemctl restart gradient-rt-motion.service`
+    - immediate summary showed clean RT timing and all 6 slaves still visible in `INIT`
+    - a follow-up summary after ~1s returned to the default collapsed state (`responding=0/6`, `online=0/6`, `wkc=0/12`, `startup_resets=1`)
+- Follow-up notes / risks:
+  - The current evidence now points strongly away from RT scheduling and away from the higher-level DS402 output logic as the root cause.
+  - The remaining failure survives:
+    - normal 1702/1b02 profile
+    - lighter 1701/1b01 profile
+    - DC disabled
+    - passive/inert outputs during startup
+  - That narrows the likely root cause to lower-level multi-slave cyclic EtherCAT process-data handling: PDO/FMMU/sync-manager/watchdog/master activation/runtime behavior rather than PREEMPT_RT core placement or our controlword writes.
+
+## 2026-03-19 02:47:57 +00:00
+
+- Task summary:
+  - Added an output-watchdog toggle to the EtherCAT sync-manager config and used it to test whether the current `~450 ms` multi-slave collapse is caused by SM2 output watchdog behavior.
+- Validation:
+  - Added CLI/runtime knob:
+    - `--disable-output-watchdog`
+    - implementation copies the selected PDO profile sync table into a runtime buffer and flips the output sync-manager watchdog from `EC_WD_ENABLE` to `EC_WD_DISABLE`
+  - `make -C src/gradient_rt_motion`
+  - Probe:
+    - `sudo timeout 6s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtdiag_watchdog_off/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --startup-passive-ms 1500 --disable-output-watchdog`
+    - result: collapse still occurred at about `460 ms` while passive mode was still active
+  - Reinstalled the rebuilt binary and restarted the service:
+    - `sudo install -m 0755 src/gradient_rt_motion/gradient-rt-motion /usr/local/bin/gradient-rt-motion`
+    - `sudo systemctl restart gradient-rt-motion.service`
+    - immediate summary again showed clean RT timing and all 6 slaves visible in `INIT` before the known later collapse
+- Follow-up notes / risks:
+  - Disabling the output watchdog did not move the breakpoint, so the present evidence is now against:
+    - PREEMPT_RT/core placement
+    - RTCore DS402 controlword/mode/target writes
+    - DC sync configuration alone
+    - the explicit SAFEOP wait knob
+    - output sync-manager watchdog policy alone
+  - The remaining search area is the lower-level multi-slave cyclic process-data path itself: how libecrt/master activation plus multi-slave PDO/FMMU/sync-manager/runtime exchange behaves on this drive chain.
+
+## 2026-03-19 03:56:50 +00:00
+
+- Task summary:
+  - Added the upstream-documented `ecrt_master_set_send_interval()` call before activation and re-ran the same two-slave probe to test whether the master needed the explicit cyclic send interval to manage multi-slave datagram packing/scheduling correctly.
+- Validation:
+  - Updated `src/gradient_rt_motion/main.cpp` to call:
+    - `ecrt_master_set_send_interval(master, ceil(cycle_ns / 1000))`
+    - current 1 kHz loop therefore advertises `send_interval_us=1000`
+  - `make -C src/gradient_rt_motion`
+  - Probe:
+    - `sudo timeout 6s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtdiag_send_interval/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100`
+    - master accepted the setting and logged `EtherCAT config phase=set_send_interval send_interval_us=1000 ok`
+    - result: collapse still occurred at about `448 ms`, with `wkc=0/4`, `responding=0/2`, `online=0/2`
+  - Reinstalled the rebuilt binary and restarted the service:
+    - `sudo install -m 0755 src/gradient_rt_motion/gradient-rt-motion /usr/local/bin/gradient-rt-motion`
+    - `sudo systemctl restart gradient-rt-motion.service`
+    - immediate summary still showed healthy RT timing and all 6 slaves visible in `INIT` before the known later collapse
+- Follow-up notes / risks:
+  - The missing send-interval hint was worth adding because the IgH docs explicitly recommend it for the master FSM's frame-appending/scheduling decisions.
+  - But it did not change the failure, so the remaining bug is even more narrowly in the activated multi-slave process-data path, not in the master lacking the advertised cycle interval.
+
+## 2026-03-19 05:15:31 +00:00
+
+- Task summary:
+  - Added new multi-slave EtherCAT bring-up discriminators in `src/gradient_rt_motion/main.cpp` and `scripts/sampler/rtcore_metrics.py` to separate config-time setup from queued runtime domain traffic, then used them to push the failure boundary forward.
+- Validation:
+  - Updated RTCore/runtime metrics with:
+    - `--startup-skip-domain-queue-ms`
+    - `--split-domains-per-axis`
+    - `--queue-split-domains-round-robin`
+    - `--explicit-pdo-config`
+    - summary/metrics visibility for those bring-up modes
+  - `make -C src/gradient_rt_motion`
+  - Control probe:
+    - `sudo timeout 8s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtprobe_q0/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --startup-skip-domain-queue-ms 0`
+    - result: collapse at about `454 ms`; `responding=0/2`, `online=0/2`, `wkc=0/4`
+  - Queue-suppression probe:
+    - `sudo timeout 8s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtprobe_q1500/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --startup-skip-domain-queue-ms 1500`
+    - result: bus stayed alive through the full suppress window (`responding=6/2`, `online=2/2`, `slave_al=INIT` at `1000 ms`); `domain_queue_suppressed=0` logged at `1500 ms`; collapse began only after resume at about `1640 ms`
+  - Per-axis-domain probe:
+    - `sudo timeout 8s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtprobe_split/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --split-domains-per-axis`
+    - result: still collapsed at about `456 ms`
+  - Per-axis-domain + minimal-profile probe:
+    - `sudo timeout 8s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtprobe_split_min/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --split-domains-per-axis --rx-pdo 0x1701 --tx-pdo 0x1b01 --no-dc`
+    - result: still collapsed at about `456 ms`
+  - Explicit-PDO-config probes:
+    - initial low-level mapping path failed immediately on fixed PDOs: `ecrt_slave_config_pdo_mapping_add ... pdo=0x1702 entry=0x6040:00 bits=16`
+    - narrowed explicit mode to sync-manager + assignment only, but `ecrt_slave_config_reg_pdo_entry_pos()` still failed on the first output entry (`sync=2 entry_pos=0 field=cw rc=-2`)
+  - Round-robin queue probe:
+    - `sudo timeout 8s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtprobe_rr/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --split-domains-per-axis --queue-split-domains-round-robin`
+    - result: first multi-slave path that no longer collapsed; after `8 s`, metrics showed `responding=6/2`, `online=2/2`, `operational=0/2`, `master_al=0x1`, `wkc=0/4`, `startup_resets=0`
+  - Round-robin + minimal-profile probe:
+    - `sudo timeout 8s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtprobe_rr_min/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100 --split-domains-per-axis --queue-split-domains-round-robin --rx-pdo 0x1701 --tx-pdo 0x1b01 --no-dc`
+    - result: same stable-in-`INIT` behavior; no collapse, still `WKC=0/4`
+  - Reinstalled the rebuilt binary and restored the service:
+    - `sudo install -m 0755 src/gradient_rt_motion/gradient-rt-motion /usr/local/bin/gradient-rt-motion`
+    - `sudo systemctl start gradient-rt-motion.service`
+    - `systemctl is-active gradient-rt-motion.service` -> `active`
+- Follow-up notes / risks:
+  - Strongest current discriminator: queued application-domain traffic is required for the collapse; suppressing `ecrt_domain_queue()` keeps the two-slave topology alive until queueing resumes.
+  - Shared-domain packing is not the whole story, because per-axis domains still collapse when all configured domains are queued each cycle.
+  - There is now a useful partial workaround/test mode: per-axis domains plus round-robin queueing keeps the bus alive but does not produce non-zero WKC or leave `INIT`.
+  - Explicit low-level PDO configuration is not yet a viable replacement for `ecrt_slave_config_pdos()` on these fixed PDOs under the current libecrt registration model.
+  - Best next target is staged/limited runtime queueing and AL-state progression on top of the stable round-robin mode, not more time on PREEMPT_RT/core placement or simple wrapper-vs-wrapper toggles.
+
+## 2026-03-19 05:35:22 +00:00
+
+- Task summary:
+  - Collapsed the EtherCAT/uplink port role selection to a single repo config source so the host install/runtime path no longer depends on multiple static hardcoded templates for the active port choice.
+- Validation:
+  - Added single source of truth:
+    - `systemd/ethercat-host/port-layout.env`
+    - one-line role switch: `ETHERCAT_PORT="eth0|eth1"`
+  - Added renderer:
+    - `systemd/ethercat-host/render-generated-files.sh`
+    - generates `ethercat.conf`, `10-ethercat0.link`, `10-uplink0.link`, and `10-unmanaged-ethercat.conf`
+  - Updated host installer:
+    - `systemd/ethercat-host/install.sh`
+    - now renders temp copies from `port-layout.env`, installs `/etc/gradient-ethercat-host.env`, and installs generated `/etc/ethercat.conf` / `.link` / NetworkManager files from that one source
+  - Updated runtime helpers to consult the installed single-source config before name-order fallbacks:
+    - `systemd/ethercat-host/gradient-ethercat-nic-tune.sh`
+    - `systemd/ethercat-host/gradient-irq-affinity.sh`
+    - `scripts/ethercat/diagnose_host.sh`
+  - Updated repo-managed generated files/comments and host README to point back to `port-layout.env`
+  - Syntax checks:
+    - `bash -n systemd/ethercat-host/render-generated-files.sh systemd/ethercat-host/install.sh systemd/ethercat-host/gradient-ethercat-nic-tune.sh systemd/ethercat-host/gradient-irq-affinity.sh scripts/ethercat/diagnose_host.sh scripts/ethercat/restore_original_wiring.sh`
+  - Renderer dry-run:
+    - `bash systemd/ethercat-host/render-generated-files.sh --output-dir /tmp/tmp.qiFM7hit7I`
+    - verified generated outputs matched the intended current mapping (`eth1` -> `ethercat0`, `eth0` -> `uplink0`)
+  - Applied host install:
+    - `sudo bash systemd/ethercat-host/install.sh`
+    - installed `/etc/gradient-ethercat-host.env`
+    - regenerated `/etc/ethercat.conf`, `/etc/systemd/network/10-ethercat0.link`, and `/etc/NetworkManager/conf.d/10-unmanaged-ethercat.conf`
+  - Post-install verification:
+    - `/etc/gradient-ethercat-host.env` shows `ETHERCAT_PORT="eth1"`
+    - `/etc/ethercat.conf` shows generated binding `MASTER0_DEVICE="c8:3e:a7:14:1c:76"`
+    - `systemctl is-active ethercat.service gradient-rt-motion.service` -> both `active`
+- Follow-up notes / risks:
+  - The active host config is now centralized for code/runtime purposes, but several long-form docs/plans/rules still contain historical `eth0`/`eth1` assertions and should be cleaned up separately to avoid future confusion.
+  - Switching the active physical EtherCAT port is now a one-file change in the repo (`systemd/ethercat-host/port-layout.env`) followed by `install.sh`, rather than editing multiple host template files by hand.
+
+## 2026-03-19 05:52 +0000
+
+- Task summary:
+  - Performed the first clean live `eth0` retest using the new single-source host port config and verified the result at the raw master/slave layer before attempting more RTCore probe runs.
+- Changes:
+  - Updated `systemd/ethercat-host/port-layout.env`:
+    - switched `ETHERCAT_PORT` from `eth1` to `eth0`
+  - Applied the host config:
+    - `cd systemd/ethercat-host && sudo ./install.sh`
+  - Restarted the master:
+    - `sudo systemctl restart ethercat.service`
+- Validation:
+  - Live config files switched as expected:
+    - `/etc/gradient-ethercat-host.env` now shows `ETHERCAT_PORT="eth0"`
+    - `/etc/ethercat.conf` now shows `MASTER0_DEVICE="c8:3e:a7:14:1c:75"`
+  - Raw EtherCAT checks on `eth0`:
+    - `sudo ethercat master`
+    - result: `Main: c8:3e:a7:14:1c:75 (attached)`, `Slaves: 0`, `Rx frames: 0`, `Frame loss [%]: 100.0`
+    - `sudo ethercat slaves -v`
+    - result: no slaves listed
+  - Host diagnostics:
+    - `sudo ./scripts/ethercat/diagnose_host.sh`
+    - result: `eth0` is the currently `connected` NetworkManager interface (`Direct-PC`), `eth1` is `disconnected`, and both `ethercat.service` and `gradient-rt-motion.service` are `active`
+- Follow-up notes / risks:
+  - The clean `eth0` retest does not reproduce the earlier “stable in INIT then collapse after queued domain traffic” behavior yet; the bus currently fails one layer lower with zero discovered slaves and zero received frames.
+  - Because `gradient-rt-motion.service` is active, manual probe binaries should be treated as potentially contending with the installed RTCore instance unless the service is stopped first.
+  - Next useful branch is to reconcile current physical cabling/topology against the new `eth0` result before spending more time on multi-slave queue-shaping experiments.
+
+## 2026-03-19 06:00 +0000
+
+- Task summary:
+  - Corrected the prior `eth0` retest interpretation after the user clarified that the physical cable had **not** been swapped to the other port.
+- Changes:
+  - No code changes beyond repo-memory corrections.
+  - Marked the earlier `eth0` conclusion in `.cursor/memory/AGENT_SCRATCHPAD.md` as superseded by the missing physical recable.
+- Validation:
+  - User correction: the software-side port flip was performed, but the physical EtherCAT cable/path remained on the original port during the check.
+- Follow-up notes / risks:
+  - The previous `eth0` raw-master result is not a valid alternate-port EtherCAT comparison and should not be used to infer anything about `eth0` as an EtherCAT path.
+  - Future cross-port tests must explicitly include both steps: update `systemd/ethercat-host/port-layout.env` and physically move the cable/path before evaluating `ethercat master`, `ethercat slaves -v`, or RTCore probes.
+
+## 2026-03-19 06:34 +0000
+
+- Task summary:
+  - Implemented a generated NetworkManager uplink profile so the non-EtherCAT NIC can be staged as the managed SSH/API side from the same `port-layout.env` source of truth.
+- Changes:
+  - Updated `systemd/ethercat-host/port-layout.env`:
+    - added uplink profile settings (`UPLINK_NM_CONNECTION_ID`, IPv4/IPv6 method, address, DNS, autoconnect)
+  - Updated `systemd/ethercat-host/render-generated-files.sh`:
+    - now validates uplink profile settings
+    - renders `gradient-uplink.nmconnection`
+    - derives a deterministic profile UUID from the selected uplink MAC
+  - Updated `systemd/ethercat-host/install.sh`:
+    - installs `gradient-uplink.nmconnection` to `/etc/NetworkManager/system-connections/`
+    - no longer auto-loads the profile into NetworkManager during install, to avoid live duplicate-IP surprises on transitional setups
+  - Updated `systemd/README.md`:
+    - documents that `ethercat-host/install.sh` now installs a managed uplink profile in addition to the EtherCAT-side configs
+  - Regenerated repo-managed outputs in `systemd/ethercat-host/`, including:
+    - `ethercat.conf`
+    - `10-ethercat0.link`
+    - `10-uplink0.link`
+    - `10-unmanaged-ethercat.conf`
+    - `gradient-uplink.nmconnection`
+- Validation:
+  - `bash -n systemd/ethercat-host/render-generated-files.sh systemd/ethercat-host/install.sh`
+  - `bash systemd/ethercat-host/render-generated-files.sh`
+  - `sudo ./systemd/ethercat-host/install.sh`
+  - Confirmed generated uplink profile content in-repo:
+    - MAC `c8:3e:a7:14:1c:76`
+    - static IPv4 `192.168.1.50/24`
+    - DNS `1.1.1.1,8.8.8.8`
+  - Confirmed NetworkManager sees the staged profile:
+    - `nmcli connection show 'Gradient Uplink'`
+  - Corrected a live validation side effect:
+    - loading the profile immediately caused both `eth0` and `eth1` to hold `192.168.1.50/24`
+    - removed auto-load from `install.sh`
+    - deactivated the live `Gradient Uplink` connection via `sudo env DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket nmcli connection down 'Gradient Uplink'`
+    - verified `nmcli device status` returned to `eth0 connected`, `eth1 disconnected`
+- Follow-up notes / risks:
+  - The staged config now supports the intended future mapping (`ETHERCAT_PORT="eth0"` => `eth1` uplink), but that is still only a host-side/software staging step until the physical cable roles are moved to match.
+  - If a legacy static profile remains active on the old uplink NIC while the new static uplink profile is also activated, duplicate IP conflicts are possible; avoid running both on the same subnet simultaneously.
+
+## 2026-03-19 06:37 +0000
+
+- Task summary:
+  - Added the user-requested WiFi network as a saved NetworkManager profile and tested whether the host could associate to it without disturbing the wired management path.
+- Changes:
+  - Created a saved WiFi connection profile:
+    - `colonise the moon_5G-1`
+    - `connection.autoconnect=yes`
+    - `connection.autoconnect-priority=20`
+  - Lowered interference from old WiFi entries:
+    - set `Aussie Broadband 9745` and `Aussie Broadband 9745 1` to `connection.autoconnect=no`
+- Validation:
+  - `nmcli -f SSID,SECURITY,SIGNAL device wifi list ifname wlan0`
+    - confirmed the visible SSID string is `colonise the moon_5G-1`
+  - Activation attempts for the new WiFi profile failed twice:
+    - `nmcli connection up 'colonise the moon_5G-1'`
+    - NetworkManager log showed the connection reaches `associating` and then drops back to `disconnected`
+    - the failure occurs before DHCP/IP assignment, so it is not an IP/routing issue
+  - Restored a safe final state:
+    - deactivated `Aussie Broadband 9745`
+    - verified `nmcli device status` ends with `eth0 connected`, `eth1 disconnected`, `wlan0 disconnected`
+- Follow-up notes / risks:
+  - The requested WiFi network is now staged on the host, but it is not yet a working live path from this machine because association is failing at the supplicant/AP layer.
+  - That remaining WiFi issue is most likely one of: wrong credential, AP-side compatibility/policy, or a band/security quirk specific to this adapter/AP pair.
+  - No credential text was recorded in repo memory.
+
+## 2026-03-19 06:38 +0000
+
+- Task summary:
+  - Added an explicit uplink cutover helper so the intended target state is operationally clear: `eth0` dedicated to EtherCAT, `eth1` used as the managed uplink after the physical cable move.
+- Changes:
+  - Added `systemd/ethercat-host/activate-uplink.sh`
+    - reloads staged NetworkManager profiles
+    - deactivates any legacy active connection on the configured EtherCAT NIC
+    - activates the generated uplink profile (`Gradient Uplink`) on the computed non-EtherCAT NIC
+    - prints resulting device/IP status and reminds the operator to reboot if unmanaged-device policy has not yet taken effect
+  - Updated `systemd/README.md`
+    - documents `sudo bash ./activate-uplink.sh` as the post-cable-move cutover step
+  - Updated `systemd/ethercat-host/install.sh`
+    - prints the helper command in its next-step output
+- Validation:
+  - `bash -n systemd/ethercat-host/activate-uplink.sh systemd/ethercat-host/install.sh`
+  - `ReadLints` on touched files (no diagnostics)
+- Follow-up notes / risks:
+  - The helper is intentionally not auto-run during install; it should be run only after the uplink cable has been physically moved to the non-EtherCAT NIC.
+  - Current staged software goal remains `ETHERCAT_PORT="eth0"` => `eth1` uplink.
+
+## 2026-03-19 06:48 +0000
+
+- Task summary:
+  - Hardened the uplink cutover helper for the real remote-only workflow: start it while still connected on `eth0`, then move the cable and let the script complete on-box.
+- Changes:
+  - Updated `systemd/ethercat-host/activate-uplink.sh`
+    - added `--timeout SECONDS`
+    - waits for carrier on the computed uplink NIC before making the cutover
+    - keeps the current `eth0` path alone while waiting
+    - only deactivates the old connection on the EtherCAT NIC after the new uplink profile has been brought up
+  - Updated `systemd/README.md`
+    - now documents the helper as a pre-unplug cutover step
+  - Updated `systemd/ethercat-host/install.sh`
+    - next-step output now says to start the helper before moving the cable
+- Validation:
+  - `bash -n systemd/ethercat-host/activate-uplink.sh systemd/ethercat-host/install.sh`
+  - `ReadLints` on touched files (no diagnostics)
+- Follow-up notes / risks:
+  - This makes the script safe to launch from the current SSH session, but the SSH connection itself will still drop when the old `eth0` cable is physically unplugged; the point is that the script keeps running on the Pi and brings `eth1` up so a reconnect is possible.
+
+## 2026-03-19 06:53 +0000
+
+- Task summary:
+  - Confirmed the intended post-cutover host state is now live: `eth1` is the managed uplink and `eth0` is free for dedicated EtherCAT use.
+- Validation:
+  - User ran:
+    - `sudo env DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket nmcli connection down "Direct-PC"`
+  - Resulting network state:
+    - `nmcli device status` shows `eth1 connected` via `Gradient Uplink`
+    - `eth0 disconnected`
+    - `ip -4 addr show dev eth0` returns no IPv4 address
+    - `ip -4 addr show dev eth1` shows `192.168.1.50/24`
+  - EtherCAT state on the dedicated port:
+    - `sudo ethercat master`
+    - `Main: c8:3e:a7:14:1c:75 (attached)`
+    - `Slaves: 6`
+    - matched RX/TX traffic on the EtherCAT NIC
+- Follow-up notes / risks:
+  - This is the first clean confirmation in this session that the host networking goal is satisfied: uplink on `eth1`, EtherCAT on `eth0`.
+  - `wlan0` was still attempting to configure `Aussie Broadband 9745` in the attached terminal output; that WiFi churn is unrelated to the wired/EtherCAT cutover but should be cleaned up if it continues.
+
+## 2026-03-19 06:53 +0000
+
+- Task summary:
+  - Removed the old `Aussie Broadband` WiFi profiles so only the user-requested staged WiFi connection remains.
+- Validation:
+  - Deleted:
+    - `Aussie Broadband 9745`
+    - `Aussie Broadband 9745 1`
+  - Verified remaining saved connections include:
+    - `colonise the moon_5G-1`
+    - `Gradient Uplink`
+    - no remaining `Aussie Broadband` profiles
+  - Current device state after deletion:
+    - `eth1` connected via `Gradient Uplink`
+    - `eth0` disconnected
+    - `wlan0` attempting `colonise the moon_5G-1`
+- Follow-up notes / risks:
+  - The stale WiFi churn source is gone.
+  - The remaining WiFi profile is still staged but not yet proven to associate successfully on this host.
+
+## 2026-03-19 06:57 +0000
+
+- Task summary:
+  - Cleaned `eth0` back to a dedicated EtherCAT-only role after `Direct-PC` reactivated there unexpectedly.
+- Validation:
+  - Inspected `Direct-PC`:
+    - profile still targeted `eth0`
+    - `connection.autoconnect=yes` explained why it returned
+  - Applied cleanup:
+    - `sudo env DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket nmcli connection modify 'Direct-PC' connection.autoconnect no`
+    - `sudo env DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket nmcli connection down 'Direct-PC'`
+  - Verified final network state:
+    - `nmcli device status` shows `eth1 connected` via `Gradient Uplink`
+    - `eth0 disconnected`
+    - `ip -4 addr show dev eth0` returns no IPv4 address
+    - `ip -4 addr show dev eth1` still shows `192.168.1.50/24`
+  - Verified EtherCAT remained healthy on the dedicated NIC:
+    - `sudo ethercat master`
+    - `Main: c8:3e:a7:14:1c:75 (attached)`
+    - `Slaves: 6`
+    - matched RX/TX with near-zero current frame loss
+- Follow-up notes / risks:
+  - `Direct-PC` remains saved but no longer autoconnects. If you no longer need it at all, it can be deleted later.
+
+## 2026-03-19 06:59 +0000
+
+- Task summary:
+  - Deleted the obsolete `Direct-PC` wired profile so nothing remains that can reclaim `eth0` for normal IP networking.
+- Validation:
+  - Deleted:
+    - `Direct-PC`
+  - Verified remaining saved connections:
+    - `Gradient Uplink`
+    - `colonise the moon_5G-1`
+    - `Wired connection 2`
+  - Verified live device state:
+    - `eth1 connected` via `Gradient Uplink`
+    - `eth0 disconnected`
+    - `wlan0 disconnected`
+- Follow-up notes / risks:
+  - The old static `Direct-PC` path is fully gone now.
+  - `Wired connection 2` still exists as an unused saved profile for the other Ethernet interface; it is not active.
+
+## 2026-03-19 07:21 +0000
+
+- Task summary:
+  - Returned to RTCore debugging on the corrected `eth0` EtherCAT baseline and fixed misleading startup telemetry that had been making healthy-but-slow convergence look like failure.
+- Changes:
+  - Updated `src/gradient_rt_motion/main.cpp`:
+    - `startup_ready` now requires all selected slaves to be operational **and** process data to be live, rather than treating first nonzero `domain_wc` as full convergence
+    - added one-shot `EtherCAT startup process_data_live ...` logging for the first nonzero process-data/WKC event
+    - replaced the hardcoded 5 s startup warning threshold with one derived from the existing AL transition budgets (`preop_to_safeop_timeout_ms + safeop_to_op_timeout_ms`, minimum 5 s; currently 10 s)
+  - Rebuilt `src/gradient_rt_motion/gradient-rt-motion`
+  - Installed the rebuilt binary to `/usr/local/bin/gradient-rt-motion`
+  - Restarted `gradient-rt-motion.service`
+- Validation:
+  - Confirmed the stale terminal failure was just cwd-related:
+    - terminal was in `systemd/ethercat-host`, so `./src/gradient_rt_motion/gradient-rt-motion` failed with `No such file or directory`
+    - verified both binaries exist:
+      - `/home/pi/GradientOS/src/gradient_rt_motion/gradient-rt-motion`
+      - `/usr/local/bin/gradient-rt-motion`
+  - Clean 2-axis manual probe from repo root:
+    - `sudo timeout 15s ./src/gradient_rt_motion/gradient-rt-motion --socket-path /tmp/rtprobe_eth0_long2/ipc.sock --num-axes 2 --slave-positions 0,1 --max-rpm 100`
+    - first `process_data_live` at about `5419 ms` with `wkc=2/4`
+    - `1/2 operational` by about `6002 ms`
+    - `2/2 operational` by about `9641 ms`
+    - final convergence log: `operational=2/2`, `domain_wc=2`, `wkc=6/4`
+  - Supplemental discriminators on corrected `eth0` baseline:
+    - plain 2-axis 8 s probe no longer loses the bus; slaves stay responding/online and sit in `PREOP` before late partial recovery
+    - `--startup-skip-domain-queue-ms 1500` no longer acts like the old collapse discriminator; queue suppression still leaves the slaves in `PREOP`, then late partial WKC appears after the 5 s window
+    - `--split-domains-per-axis --queue-split-domains-round-robin` similarly shows late partial convergence instead of preventing a collapse
+  - Fresh 6-axis service after patched restart:
+    - `./scripts/sampler/rtcore_metrics.py --path /run/gradient-rt-motion/metrics.json summary`
+    - after ~15 s: `responding=6/6`, `online=6/6`, `operational=6/6`, `master_al=0x8`, `wkc=18/12`
+    - per-axis statuswords `0x1650`, no axis error codes
+  - Fresh 6-axis service journal after patched restart:
+    - startup waits in `PREOP` with `wkc=0/12` through ~5 s
+    - `process_data_live` at about `5423 ms` with `wkc=2/12`
+    - `1/6 operational` at about `6003 ms`
+    - `3/6 operational` at about `7004 ms`
+    - `5/6 operational` at about `8005 ms`
+    - full convergence `6/6 operational` at about `8201 ms`
+  - Build/lint:
+    - `make -C src/gradient_rt_motion`
+    - `ReadLints` on `src/gradient_rt_motion/main.cpp` (no diagnostics)
+- Follow-up notes / risks:
+  - The major reinterpretation is: on the correct `eth0` master port, RTCore does converge; the earlier “failure” was partly bad port assumptions and partly startup telemetry that declared success/failure too early.
+  - Remaining work should shift from port-role debugging to actual control-path validation: confirm the controller/API sees live feedback, then perform a very small enable/motion test while watching statuswords, error codes, and WKC.
+
+## 2026-03-19 07:39 +0000
+
+- Task summary:
+  - Hardened the controller startup path against RTCore's delayed EtherCAT convergence and restored live controller/API feedback on the `eth0` RTCore baseline.
+- Changes:
+  - Updated `src/gradient_os/run_controller.py`:
+    - added RTCore readiness polling against `/run/gradient-rt-motion/metrics.json` so the controller waits for `startup_ready=1` / all expected axes operational before backend init
+    - changed `GET_JOINT_ANGLES` to read fresh backend feedback via `servo_driver.get_current_arm_state_rad(verbose=False)` instead of replying from stale cached joint state
+    - when the requested IK backend is unavailable at runtime, the controller now records the actual fallback backend in `active_runtime_config`
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - waits briefly for RTCore status-axis-config + first status snapshot after IPC connect, so the controller does not treat a raw IPC handshake as fully usable feedback
+    - stores status-snapshot WKC/master state metadata for bring-up diagnostics
+    - wraps multi-turn rotary feedback into configured logical joint limits before handing it to FK/planning, which fixes large absolute encoder counts causing FK failures
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - changed `GET_ORIENTATION` to use a fresh servo/back-end read just like `GET_POSITION`
+    - improved FK failure logging to include the joint vector that failed
+  - Updated `src/gradient_os/ik_solver.py`:
+    - if the requested backend fails to initialize (e.g. `numeric` with missing `pyquik`), automatically fall back to another available backend instead of leaving the controller with a dead FK/IK path
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - added coverage for RTCore readiness gating, multi-turn feedback wrapping, and numeric->ikfast solver fallback
+- Validation:
+  - `ReadLints` on:
+    - `src/gradient_os/run_controller.py`
+    - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`
+    - `src/gradient_os/arm_controller/command_api.py`
+    - `src/gradient_os/ik_solver.py`
+    - `tests/test_gradient05_limits_and_backends.py`
+    - result: no diagnostics
+  - `./.venv/bin/pytest tests/test_gradient05_limits_and_backends.py -q`
+    - `13 passed`
+  - Manual live validation from repo root with RTCore already running:
+    - started controller via `PYTHONUNBUFFERED=1 ./run.sh`
+    - started API via `PYTHONUNBUFFERED=1 /home/pi/GradientOS/.venv/bin/gradient-api`
+    - controller now logs:
+      - `RTCore ready: startup_ready=1 operational=6/6 wkc=18/12`
+      - `Feedback ready: axis_config=1 snapshot=1 wkc=18/12 master_state=4`
+      - `IK backend: ikfast (source=runtime_fallback)` after numeric backend load failure
+    - `./scripts/sampler/rtcore_metrics.py --path /run/gradient-rt-motion/metrics.json summary`
+      - `armed=1`
+      - `enable_mask=0x3f`
+      - `responding=6/6`
+      - `online=6/6`
+      - `operational=6/6`
+      - `wkc=18/12`
+      - per-axis `error_code=0x0000`
+    - API checks:
+      - `/health` -> controller reachable
+      - `/info/all-positions` -> live raw counts for all 6 axes
+      - `/info/joints` -> live wrapped joint feedback instead of all-zero cached values
+      - `/info/pose` -> returns valid Cartesian pose again
+      - `/info/orientation` -> returns valid rotation matrix again
+      - `/info/runtime-config` -> reports active IK backend `ikfast` with `source=runtime_fallback` and `requested_backend=numeric`
+- Follow-up notes / risks:
+  - I did **not** command physical motion; only non-motion startup/feedback validation was performed.
+  - `runtime_config.compute_restart_required()` now reports `true` because desired policy still prefers `numeric` while the active controller had to fall back to `ikfast` on this host. To clear that, either install/fix `pyquik` or change the desired IK backend policy for this machine.
+
+## 2026-03-19 07:56 +0000
+
+- Task summary:
+  - Moved EtherCAT raw-count to radian conversion ownership into the robot definition surface for `gradient05`, so the RTCore Python backend now prefers robot-defined encoder/gear metadata instead of backend-local assumptions or RTCore's current placeholder runtime scaling.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/robots/base.py`:
+    - added robot-config properties exported via `get_config_dict()` for:
+      - `actuator_encoder_counts_per_rev`
+      - `actuator_gear_ratios`
+      - `actuator_position_signs`
+      - `actuator_counts_per_radian` (derived)
+  - Updated `src/gradient_os/arm_controller/robots/gradient05/config.py`:
+    - defined `actuator_encoder_counts_per_rev = [131072] * 6`
+    - defined joint gear ratios from the current EtherCAT bring-up notes:
+      - J1-J3 `100:1`
+      - J4 `18:1`
+      - J5 `20:1`
+      - J6 `10:1`
+    - defined positive-position signs as robot config data (`[1,1,1,1,1,1]`)
+    - kept `gradient05` robot policy on `numeric` IK (unchanged)
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - builds fallback axis scaling from robot config counts/gear/sign metadata
+    - prefers robot-defined scaling for raw feedback conversion even if RTCore publishes a mismatched placeholder axis-config snapshot
+    - logs a one-shot warning when runtime RTCore scaling differs from robot config
+    - removed the earlier joint-limit modulo/wrapping hack so feedback remains a continuous coordinate
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - fixed `GET_POSITION` to send joint angles in degrees to match the API field name `joints_deg`
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - extended Gradient-05 config coverage for counts/rev + gear ratios + signs
+    - added coverage that EtherCAT feedback conversion prefers robot-defined scaling over runtime placeholder scaling
+    - removed the multi-turn wrapping expectation
+- Validation:
+  - `ReadLints` on:
+    - `src/gradient_os/arm_controller/robots/base.py`
+    - `src/gradient_os/arm_controller/robots/gradient05/config.py`
+    - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`
+    - `src/gradient_os/arm_controller/command_api.py`
+    - `tests/test_gradient05_limits_and_backends.py`
+    - result: no diagnostics
+  - `./.venv/bin/pytest tests/test_gradient05_limits_and_backends.py -q`
+    - `13 passed`
+  - Manual live validation with RTCore service active:
+    - started controller via `PYTHONUNBUFFERED=1 ./run.sh`
+    - started API via `PYTHONUNBUFFERED=1 /home/pi/GradientOS/.venv/bin/gradient-api`
+    - controller logs now show:
+      - `RTCore ready: startup_ready=1 operational=6/6 wkc=18/12`
+      - `WARNING: RTCore axis scaling differs from robot config; keeping robot-config scaling for Python feedback conversion`
+    - API checks:
+      - `/info/joints` now reports robot-scaled live feedback (example axis2 about `-28.73 deg` from raw `-1046180` counts using the configured `100:1` ratio)
+      - `/info/pose` returns a valid pose again with `joints_deg` now actually in degrees
+    - `./scripts/sampler/rtcore_metrics.py --path /run/gradient-rt-motion/metrics.json summary`
+      - bus stayed healthy: `responding=6/6`, `online=6/6`, `operational=6/6`, `wkc=18/12`
+- Follow-up notes / risks:
+  - This only fixes the Python/controller-side interpretation of raw feedback. RTCore itself is still publishing placeholder axis scaling (`gear_ratio=1.0`) over IPC on this host, so the next cleanup step is to feed RTCore from the same robot-definition source of truth.
+  - I did **not** command physical motion in this pass.
+
+## 2026-03-19 08:25 +0000
+
+- Task summary:
+  - Recorded the user's fresh-session handoff as the authoritative baseline for the next phase of EtherCAT/controller work.
+- Changes:
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with reinforced guardrails and next-step priorities:
+    - `eth0` remains the dedicated EtherCAT master NIC and `eth1` remains uplink/management on this host
+    - RTCore startup on the correct path is slow but healthy (`process_data_live` about `5.4 s`, full `6/6 operational` about `8.2 s`)
+    - raw EtherCAT steady-state health remains `responding=6/6`, `online=6/6`, `operational=6/6`, `wkc=18/12`, `error_code=0x0000`
+    - robot mechanics must stay in robot config, not backend code
+    - `gradient05` remains a `numeric` IK robot by policy
+    - immediate next action is to verify UI joint jog controls are wired to the real controller/API path before changing RTCore scaling again
+    - J5 has a user-reported extra `22T -> 20T` belt stage after the `18:1` gearbox, but the ratio convention must be confirmed before editing config
+    - preserved the last useful live sanity point: J3 feedback about `-28.73 deg` from raw count `-1046180` under robot-config scaling
+- Validation:
+  - Read the latest `.cursor/memory/AGENT_SCRATCHPAD.md`
+  - Read the latest `.cursor/memory/DEVLOG.md`
+  - Compared both with the user's explicit handoff and merged only facts/guardrails from that handoff
+  - Retrieved local timestamp with `date '+%Y-%m-%d %H:%M %z'`
+- Follow-up notes / risks:
+  - No runtime controller/API/UI verification was performed in this pass.
+  - The next meaningful task should start with UI jog-path verification and user-observed per-joint motion data, not another blind RTCore scaling change.
+
+## 2026-03-19 08:44 +0000
+
+- Task summary:
+  - Tightened the web UI joint commissioning/zeroing workflow so it is safer and less misleading for real EtherCAT bring-up.
+- Changes:
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added a joint-commissioning status banner for info/success/error feedback
+    - added a `Refresh` button that explicitly re-reads `GET /info/joints`
+    - changed per-joint step jog requests to send `wait_for_idle: true` so the UI waits for the commanded step move to finish before refreshing joint angles
+    - disabled joint step and zero-capture buttons until that joint has live finite feedback
+    - added operator-facing warning copy that zero capture writes a persistent logical offset
+- Validation:
+  - Started manual live processes from repo root:
+    - `PYTHONUNBUFFERED=1 ./run.sh`
+    - `PYTHONUNBUFFERED=1 /home/pi/GradientOS/.venv/bin/gradient-api`
+    - `npm run dev` in `web-ui/`
+  - Confirmed live services:
+    - controller listening on UDP `3000`
+    - API serving on `http://0.0.0.0:4000`
+    - Vite serving on `http://localhost:8000/`
+  - Live API check:
+    - `curl -sf http://127.0.0.1:4000/info/joints`
+    - returned live arm angles including J3 about `-28.73`
+  - Frontend validation:
+    - `curl -sf http://127.0.0.1:8000`
+    - returned the Vite app HTML shell
+    - `ReadLints` on `web-ui/src/ControlPanel.tsx` -> no diagnostics
+    - `npm run build` in `web-ui/` -> success
+  - Backend regression:
+    - `./.venv/bin/pytest tests/test_api_endpoints.py -q`
+    - `29 passed`
+- Follow-up notes / risks:
+  - I did **not** trigger any real jog, home, rest, or zero-capture action from the web UI in this pass.
+  - The next step is a supervised live UI test with the user operating the panel and reporting which joint moved, direction, scaling, and whether API feedback tracked correctly.
+
+## 2026-03-19 08:57 +0000
+
+- Task summary:
+  - Investigated the user's live commissioning report that the J1 `+/-1°` UI buttons caused multi-joint physical motion, confirmed a degree/radian bug in the API joint-jog path, and fixed it.
+- Changes:
+  - Updated `src/gradient_os/api/main.py`:
+    - `/control/joint-jog` now converts `target_arm_deg` to `target_arm_rad` before sending the raw comma-separated controller command
+    - response payload now includes both `target_arm_deg` and `target_arm_rad` for easier debugging
+  - Updated `tests/test_api_endpoints.py`:
+    - tightened `test_control_joint_jog` so it asserts the controller command is radian-valued, not degree-valued
+- Validation:
+  - Confirmed root cause by code trace:
+    - `GET_JOINT_ANGLES` reply in `run_controller.py` is degree-based
+    - raw comma-separated controller joint command path in `run_controller.py` is interpreted as radians and handed to `servo_driver.set_servo_positions(...)`
+  - Probed current host environment:
+    - `"/home/pi/GradientOS/.venv/bin/python" -c "import pyquik"` equivalent check -> `ModuleNotFoundError: No module named 'pyquik'`
+    - repo contains only `src/numeric_solver/pyquik/CMakeLists.txt` and `bindings.cpp`, no built `pyquik` extension artifact in this checkout
+  - `./.venv/bin/pytest tests/test_api_endpoints.py -q`
+    - `29 passed`
+  - `ReadLints` on:
+    - `src/gradient_os/api/main.py`
+    - `tests/test_api_endpoints.py`
+    - result: no diagnostics
+  - Restarted manual processes after the fix:
+    - restarted API via `PYTHONUNBUFFERED=1 /home/pi/GradientOS/.venv/bin/gradient-api`
+    - observed controller was no longer running because the manual controller terminal ended with `^C`
+    - restarted controller via `PYTHONUNBUFFERED=1 ./run.sh`
+  - Live reachability after restart:
+    - UDP `GET_STATUS` -> `STATUS,gripper_present,False`
+    - `curl -s http://127.0.0.1:4000/health` -> controller reachable
+- Follow-up notes / risks:
+  - Do **not** use the old joint-jog behavior as evidence about joint signs/scaling; the observed multi-joint motion was explained by the degree/radian bug.
+  - `pyquik` is genuinely unavailable in the active host venv, so `numeric` IK fallback on this controller process is currently an environment/build issue, not a robot-policy issue.
+
+## 2026-03-19 09:13 +0000
+
+- Task summary:
+  - Restored the intended Windows-ICS uplink on `eth1`, populated the QuIK dependency repo at `src/numeric_solver/quik`, built the `pyquik` extension locally, and restarted the stack so `gradient05` is back on the `numeric` solver from robot policy.
+- Changes:
+  - Updated `systemd/ethercat-host/port-layout.env`:
+    - switched uplink profile defaults from the old static direct-link mode to DHCP/default-route mode for Windows ICS
+    - set:
+      - `UPLINK_IPV4_METHOD="auto"`
+      - `UPLINK_IPV4_NEVER_DEFAULT="false"`
+      - `UPLINK_IPV6_METHOD="ignore"`
+      - `UPLINK_IPV6_NEVER_DEFAULT="false"`
+  - Regenerated `systemd/ethercat-host/gradient-uplink.nmconnection` with `bash systemd/ethercat-host/render-generated-files.sh`
+  - Updated the live NetworkManager `Gradient Uplink` connection to match and reactivated it
+  - Initialized the intended dependency checkout:
+    - `git submodule update --init --recursive src/numeric_solver/quik`
+  - Installed native build prerequisites on the Pi:
+    - `cmake`
+    - `ninja-build`
+    - `libeigen3-dev`
+  - Applied a minimal local compile fix in `src/numeric_solver/quik/include/quik/Robot.hpp`:
+    - added `#include <iostream>` so inline `cout` usage compiles
+  - Built the Python binding:
+    - `cmake -S src/numeric_solver/pyquik -B build/pyquik -G Ninja`
+    - `cmake --build build/pyquik -j4`
+    - output module: `src/numeric_solver/pyquik/pyquik.cpython-311-aarch64-linux-gnu.so`
+- Validation:
+  - Network / ICS:
+    - before change: `eth1` had static `192.168.1.50/24`, no gateway, `ip route get 1.1.1.1` failed with `Network is unreachable`
+    - after change: `eth1` received `192.168.137.89/24`, gateway `192.168.137.1`, DNS `192.168.137.1`
+    - `getent hosts github.com` succeeded
+  - QuIK / pyquik:
+    - `git submodule status src/numeric_solver/quik` -> populated at `a9ebd1f21dfd3c9f0869140dfb0a4ae5a538cccc`
+    - `import numeric_solver.pyquik.pyquik` succeeded in `/home/pi/GradientOS/.venv/bin/python`
+    - `from numeric_solver.numeric_wrapper import init_numeric_solver; init_numeric_solver('gradient-05')` succeeded
+  - Runtime:
+    - restarted controller and API manually from repo root
+    - controller startup now logs `IK backend: numeric (source=robot_policy)`
+    - `curl -s http://127.0.0.1:4000/info/runtime-config` shows:
+      - `effective_backend: numeric`
+      - `source: robot_policy`
+      - `restart_required: false`
+    - `curl -s http://127.0.0.1:4000/info/joints` returned live joint data
+    - `curl -s http://127.0.0.1:4000/info/pose` returned a live pose
+- Follow-up notes / risks:
+  - The QuIK checkout now contains one local compile tweak (`Robot.hpp` include). If the submodule is updated later, recheck whether that include is still needed.
+  - I did **not** change the solver fallback policy in code yet; the immediate fix here was to make the requested `numeric` solver actually import and run in the controller environment.
+
+## 2026-03-19 09:16 +0000
+
+- Task summary:
+  - Prepared a fresh-AI handoff after the jog-path fix, ICS uplink repair, and QuIK/numeric-solver restoration.
+- Changes:
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the most important current-state guardrails:
+    - joint-jog degrees/radians bug is fixed and old motion observations from that buggy path should not be reused for scaling/sign conclusions
+    - `gradient05` should run on `numeric` per robot policy; silent fallback to `ikfast` is not acceptable unless explicitly allowed
+    - Windows ICS over `eth1` is now the intended working uplink path
+    - current manual runtime stack is controller + API from repo root, with RTCore still on `eth0`
+    - `numeric_solver.pyquik.pyquik` import path works even though top-level `import pyquik` still does not
+- Validation:
+  - Retrieved local timestamp with `date '+%Y-%m-%d %H:%M %z'`
+  - Wrote only factual handoff notes already validated in this session
+- Follow-up notes / risks:
+  - No new runtime mutation beyond memory writeback in this step.
+  - The next AI should begin from the repaired `numeric` + ICS baseline, not from the earlier fallback/static-uplink state.

@@ -53,6 +53,9 @@ except ImportError as e:
 # Get available servo backends from the registry
 AVAILABLE_SERVO_BACKENDS = backend_registry.list_available_backends()
 IK_BACKEND_CHOICES = ["ikfast", "numeric"]
+_DEFAULT_RTCORE_SOCKET_PATH = "/run/gradient-rt-motion/ipc.sock"
+_RTCORE_SERVICE_NAME = "gradient-rt-motion.service"
+_DEFAULT_RTCORE_METRICS_PATH = "/run/gradient-rt-motion/metrics.json"
 
 
 def _resolve_default_robot_name() -> str:
@@ -64,6 +67,168 @@ def _resolve_default_robot_name() -> str:
     if mapped in available:
         return mapped
     return available[0]
+
+
+def _run_service_command(args: list[str], *, require_root: bool = False) -> subprocess.CompletedProcess[str]:
+    cmd = list(args)
+    if require_root and os.geteuid() != 0:
+        cmd = ["sudo", "-n", *cmd]
+    return subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15.0,
+    )
+
+
+def _systemd_service_exists(service_name: str) -> bool:
+    proc = _run_service_command(["systemctl", "status", service_name], require_root=False)
+    if proc.returncode == 4:
+        return False
+    return True
+
+
+def _ensure_ethercat_rtcore_available() -> None:
+    autostart_enabled = os.environ.get("GRADIENT_RTCORE_AUTOSTART", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+    if not autostart_enabled:
+        print("[Controller] RTCore autostart disabled by GRADIENT_RTCORE_AUTOSTART.")
+        return
+
+    socket_path = os.environ.get("GRADIENT_RTCORE_SOCKET_PATH", _DEFAULT_RTCORE_SOCKET_PATH).strip() or _DEFAULT_RTCORE_SOCKET_PATH
+    if os.path.exists(socket_path):
+        return
+
+    if not _systemd_service_exists(_RTCORE_SERVICE_NAME):
+        print(
+            "[Controller] WARNING: RTCore socket is missing and "
+            f"{_RTCORE_SERVICE_NAME} is not installed. "
+            "Install it with systemd/rt-motion/install.sh or start gradient-rt-motion manually."
+        )
+        return
+
+    active = _run_service_command(["systemctl", "is-active", "--quiet", _RTCORE_SERVICE_NAME], require_root=True)
+    if active.returncode == 0:
+        return
+
+    print(f"[Controller] RTCore socket missing; attempting to start {_RTCORE_SERVICE_NAME}...")
+    started = _run_service_command(["systemctl", "start", _RTCORE_SERVICE_NAME], require_root=True)
+    if started.returncode != 0:
+        stderr = started.stderr.strip() or started.stdout.strip() or f"exit_code={started.returncode}"
+        print(
+            "[Controller] WARNING: Failed to start "
+            f"{_RTCORE_SERVICE_NAME}: {stderr}"
+        )
+        return
+
+    # Give systemd a brief moment to create the socket/runtime dir before backend init.
+    time.sleep(0.5)
+    if os.path.exists(socket_path):
+        print(f"[Controller] RTCore is available via {socket_path}.")
+    else:
+        print(
+            "[Controller] WARNING: RTCore start command returned success but "
+            f"{socket_path} is still missing."
+        )
+
+
+def _coerce_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _load_rtcore_metrics_snapshot(path: str) -> dict[str, object] | None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _rtcore_metrics_ready(metrics: dict[str, object] | None, *, expected_axes: int) -> tuple[bool, str]:
+    if not metrics:
+        return False, "metrics unavailable"
+
+    startup_ready = _coerce_int(metrics.get("startup_ready"), 0)
+    link_up = _coerce_int(metrics.get("link_up"), 0)
+    responding = _coerce_int(metrics.get("responding_slaves"), 0)
+    online = _coerce_int(metrics.get("online_slaves"), 0)
+    operational = _coerce_int(metrics.get("operational_slaves"), 0)
+    wkc_actual = _coerce_int(metrics.get("wkc_actual"), 0)
+    wkc_expected = _coerce_int(metrics.get("wkc_expected"), 0)
+
+    if link_up == 0:
+        return False, "link_up=0"
+    if responding < expected_axes:
+        return False, f"responding={responding}/{expected_axes}"
+    if online < expected_axes:
+        return False, f"online={online}/{expected_axes}"
+    if operational < expected_axes:
+        return False, f"operational={operational}/{expected_axes}"
+    if startup_ready == 0:
+        return False, (
+            f"startup_ready=0 operational={operational}/{expected_axes} "
+            f"wkc={wkc_actual}/{wkc_expected}"
+        )
+    if wkc_actual <= 0:
+        return False, f"wkc={wkc_actual}/{wkc_expected}"
+    return True, (
+        f"startup_ready=1 operational={operational}/{expected_axes} "
+        f"wkc={wkc_actual}/{wkc_expected}"
+    )
+
+
+def _wait_for_ethercat_rtcore_ready(expected_axes: int) -> None:
+    timeout_raw = os.environ.get("GRADIENT_RTCORE_READY_TIMEOUT_S", "15")
+    poll_raw = os.environ.get("GRADIENT_RTCORE_READY_POLL_S", "0.1")
+    metrics_path = (
+        os.environ.get("GRADIENT_RTCORE_METRICS", _DEFAULT_RTCORE_METRICS_PATH).strip()
+        or _DEFAULT_RTCORE_METRICS_PATH
+    )
+    try:
+        timeout_s = float(timeout_raw)
+    except Exception:
+        timeout_s = 15.0
+    try:
+        poll_s = max(0.05, float(poll_raw))
+    except Exception:
+        poll_s = 0.1
+
+    if timeout_s <= 0.0:
+        return
+
+    deadline = time.monotonic() + timeout_s
+    last_detail = ""
+    next_log_monotonic = 0.0
+
+    while time.monotonic() < deadline:
+        metrics = _load_rtcore_metrics_snapshot(metrics_path)
+        ready, detail = _rtcore_metrics_ready(metrics, expected_axes=expected_axes)
+        now = time.monotonic()
+        if ready:
+            print(f"[Controller] RTCore ready: {detail}")
+            return
+        if detail != last_detail or now >= next_log_monotonic:
+            print(f"[Controller] Waiting for RTCore readiness ({detail})")
+            last_detail = detail
+            next_log_monotonic = now + 1.0
+        time.sleep(poll_s)
+
+    final_metrics = _load_rtcore_metrics_snapshot(metrics_path)
+    _ready, final_detail = _rtcore_metrics_ready(final_metrics, expected_axes=expected_axes)
+    print(
+        "[Controller] WARNING: Proceeding before RTCore reported ready "
+        f"({final_detail})"
+    )
 
 
 def main():
@@ -246,12 +411,21 @@ Examples:
 
         # Keep asset resolution deterministic for the selected robot.
         os.environ["GRADIENT_ROBOT_ID"] = selected_robot.robot_id
-        ik_solver.configure(
+        ik_runtime = ik_solver.configure(
             robot_id=selected_robot.robot_id,
             backend_name=str(
                 active_runtime_config.get("ik_solver", {}).get("effective_backend", "")
             ),
         )
+        actual_ik_backend = str(ik_runtime.get("backend_name", "")).strip().lower()
+        if actual_ik_backend and actual_ik_backend != str(
+            active_runtime_config.get("ik_solver", {}).get("effective_backend", "")
+        ).strip().lower():
+            active_runtime_config["ik_solver"]["requested_backend"] = active_runtime_config["ik_solver"][
+                "effective_backend"
+            ]
+            active_runtime_config["ik_solver"]["effective_backend"] = actual_ik_backend
+            active_runtime_config["ik_solver"]["source"] = "runtime_fallback"
         print(
             "[Controller] IK backend: "
             f"{active_runtime_config['ik_solver']['effective_backend']} "
@@ -300,6 +474,10 @@ Examples:
         f"[Controller] Servo backend: {servo_backend} "
         f"(source={active_runtime_config['servo_backend']['source']})"
     )
+
+    if servo_backend == "ethercat_rtcore" and not bool(active_runtime_config and active_runtime_config.get("mode", {}).get("sim")):
+        _ensure_ethercat_rtcore_available()
+        _wait_for_ethercat_rtcore_ready(selected_robot.num_physical_actuators)
     
     # Set active backend CONFIG (loads constants like encoder resolution, register addresses).
     # Simulation now has its own config module (compatible constants/parsers) so
@@ -686,6 +864,45 @@ Examples:
                     except (ValueError, IndexError):
                         print("[Controller] Error: Invalid SET_ZERO command. Use 'SET_ZERO,JointNum'.")
 
+                elif command == "ZERO_JOINT":
+                    try:
+                        joint_num = int(parts[1])  # 1-based logical joint number
+                        logical_joint_index = joint_num - 1
+                        if logical_joint_index < 0 or logical_joint_index >= selected_robot.num_logical_joints:
+                            sock.sendto(
+                                f"ERROR,ZERO_JOINT,Joint number must be 1-{selected_robot.num_logical_joints}".encode("utf-8"),
+                                addr,
+                            )
+                            continue
+
+                        backend = backend_registry.get_active_backend()
+                        if backend and hasattr(backend, "set_logical_joint_current_position_as_zero"):
+                            ok = bool(backend.set_logical_joint_current_position_as_zero(logical_joint_index))
+                            if ok:
+                                sock.sendto(f"ACK,ZERO_JOINT,{joint_num}".encode("utf-8"), addr)
+                            else:
+                                sock.sendto(
+                                    f"ERROR,ZERO_JOINT,Failed to capture zero for joint {joint_num}".encode("utf-8"),
+                                    addr,
+                                )
+                            continue
+
+                        joint_to_servo_ids = selected_robot.logical_joint_to_actuator_ids
+                        servos_to_zero = joint_to_servo_ids.get(joint_num)
+                        if not servos_to_zero:
+                            sock.sendto(
+                                f"ERROR,ZERO_JOINT,Joint {joint_num} has no mapped actuators".encode("utf-8"),
+                                addr,
+                            )
+                            continue
+
+                        print(f"[Controller] ZERO_JOINT (Joint {joint_num}) falling back to actuator zeroing: {servos_to_zero}")
+                        for sid in servos_to_zero:
+                            servo_driver.set_current_position_as_hardware_zero(sid)
+                        sock.sendto(f"ACK,ZERO_JOINT,{joint_num}".encode("utf-8"), addr)
+                    except (ValueError, IndexError):
+                        sock.sendto("ERROR,ZERO_JOINT,BAD_ARGS".encode("utf-8"), addr)
+
                 elif command == "FACTORY_RESET":
                     try:
                         servo_id_to_reset = int(parts[1])
@@ -968,7 +1185,12 @@ Examples:
                         print("[Controller] Error parsing SET_JOG_DEBUG.")
 
                 elif command == "GET_JOINT_ANGLES":
-                    arm_deg = np.rad2deg(utils.current_logical_joint_angles_rad)
+                    try:
+                        current_angles_rad = servo_driver.get_current_arm_state_rad(verbose=False)
+                    except Exception as e:
+                        print(f"[Controller] WARNING: GET_JOINT_ANGLES live read failed: {e}")
+                        current_angles_rad = utils.current_logical_joint_angles_rad
+                    arm_deg = np.rad2deg(current_angles_rad)
                     reply = "JOINT_ANGLES," + ",".join(f"{deg:.2f}" for deg in arm_deg)
                     if utils.gripper_present:
                         gripper_deg = np.rad2deg(utils.current_gripper_angle_rad)

@@ -17,6 +17,7 @@ def patch_send(monkeypatch):
     responses = {
         "STOP": (True, "ACK,STOP"),
         "WAIT_FOR_IDLE": (True, "ACK,WAIT_FOR_IDLE"),
+        "ZERO_JOINT,3": (True, "ACK,ZERO_JOINT,3"),
         "GET_STATUS": (True, "STATUS,gripper_present,True"),
         "GET_POSITION": (
             True,
@@ -330,6 +331,37 @@ def test_control_home(client):
     resp = client.post("/control/home")
     assert resp.status_code == 200
     assert client.command_calls[-1] == ("0,0,0,0,0,0", 2.0, False)
+
+
+def test_control_zero_joint(client):
+    resp = client.post("/control/zero-joint", json={"joint": 3})
+    assert resp.status_code == 200
+    assert resp.json()["joint"] == 3
+    assert resp.json()["detail"] == "ACK,ZERO_JOINT,3"
+    assert client.command_calls[-1] == ("ZERO_JOINT,3", 5.0, True)
+
+
+def test_control_joint_jog(client):
+    resp = client.post("/control/joint-jog", json={"joint": 3, "delta_deg": 2.5})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["joint"] == 3
+    assert body["delta_deg"] == pytest.approx(2.5)
+    assert body["target_arm_deg"] == [1.0, 2.0, 5.5, 4.0, 5.0, 6.0]
+    assert body["target_arm_rad"] == pytest.approx([
+        0.017453292519943295,
+        0.03490658503988659,
+        0.09599310885968812,
+        0.06981317007977318,
+        0.08726646259971647,
+        0.10471975511965978,
+    ])
+    assert client.command_calls[-2] == ("GET_JOINT_ANGLES", 1.0, True)
+    assert client.command_calls[-1] == (
+        "0.017453292519943295,0.03490658503988659,0.09599310885968812,0.06981317007977318,0.08726646259971647,0.10471975511965978",
+        2.0,
+        False,
+    )
 
 
 def test_info_status(client):

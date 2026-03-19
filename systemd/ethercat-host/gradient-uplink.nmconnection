@@ -1,0 +1,19 @@
+# Generated from systemd/ethercat-host/port-layout.env.
+[connection]
+id=Gradient Uplink
+uuid=4455220e-9a5a-542f-9c9a-1acf7f9ede1a
+type=802-3-ethernet
+autoconnect=true
+
+[802-3-ethernet]
+mac-address=c8:3e:a7:14:1c:76
+
+[ipv4]
+method=auto
+never-default=false
+
+[ipv6]
+method=ignore
+never-default=false
+
+[proxy]

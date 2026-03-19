@@ -189,6 +189,7 @@ def _init_ikfast_backend():
 
     _solve_ik_impl = _ikfast_solve_ik
     _fk_matrix_impl = _ikfast_fk_matrix
+    return solver is not None
 
 
 def _init_numeric_backend():
@@ -251,17 +252,37 @@ def _init_numeric_backend():
 
     _solve_ik_impl = _numeric_solve_ik
     _fk_matrix_impl = _numeric_fk_matrix
+    return kin is not None and solver is not None
 
 
 def _init_backend():
-    if _BACKEND_NAME == "ikfast":
-        _init_ikfast_backend()
-    elif _BACKEND_NAME == "numeric":
-        _init_numeric_backend()
+    global _BACKEND_NAME
+    requested_backend = _BACKEND_NAME
+    if requested_backend == "ikfast":
+        if _init_ikfast_backend():
+            return
+    elif requested_backend == "numeric":
+        if _init_numeric_backend():
+            return
     elif _BACKEND_NAME == "trac":
         raise NotImplementedError("TRAC-IK backend not yet integrated.")
     else:
         raise ValueError(f"Unknown MINI_ARM_SOLVER backend '{_BACKEND_NAME}'")
+
+    fallback_order = [name for name in ("ikfast", "numeric") if name != requested_backend]
+    for fallback_backend in fallback_order:
+        print(
+            f"[IK Solver] Falling back from '{requested_backend}' to '{fallback_backend}'."
+        )
+        ok = _init_ikfast_backend() if fallback_backend == "ikfast" else _init_numeric_backend()
+        if ok:
+            _BACKEND_NAME = fallback_backend
+            os.environ["MINI_ARM_SOLVER"] = _BACKEND_NAME
+            return
+    print(
+        f"[IK Solver] WARNING: No usable kinematics backend is available "
+        f"(requested={requested_backend})."
+    )
 
 
 def configure(*, robot_id: str | None = None, backend_name: str | None = None) -> dict[str, str]:

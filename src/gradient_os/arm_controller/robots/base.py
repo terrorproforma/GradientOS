@@ -316,6 +316,52 @@ class RobotConfig(ABC):
         """
         actuator_id = self.actuator_ids[actuator_config_index]
         return actuator_id not in self.inverted_actuator_ids
+
+    @property
+    def actuator_encoder_counts_per_rev(self) -> list[int]:
+        """
+        Per-actuator encoder counts per motor revolution.
+
+        EtherCAT/RTCore backends consume this robot-specific metadata to convert
+        raw encoder counts into joint radians without hard-coding drivetrain
+        assumptions in backend code.
+        """
+        return [0] * self.num_physical_actuators
+
+    @property
+    def actuator_gear_ratios(self) -> list[float]:
+        """
+        Per-actuator motor-revolutions to joint-revolution reduction ratio.
+        """
+        return [1.0] * self.num_physical_actuators
+
+    @property
+    def actuator_position_signs(self) -> list[int]:
+        """
+        Per-actuator sign convention for raw-count to positive-joint motion.
+
+        Defaults to the historical inversion metadata so existing serial-backed
+        robots inherit a sensible convention without duplicating configuration.
+        """
+        inverted = set(self.inverted_actuator_ids)
+        return [-1 if actuator_id in inverted else 1 for actuator_id in self.actuator_ids]
+
+    @property
+    def actuator_counts_per_radian(self) -> list[float]:
+        """
+        Derived per-actuator counts-per-radian conversion for rotary joints.
+        """
+        counts_per_rev = list(self.actuator_encoder_counts_per_rev)
+        gear_ratios = list(self.actuator_gear_ratios)
+        out: list[float] = []
+        for idx in range(self.num_physical_actuators):
+            cpr = int(counts_per_rev[idx]) if idx < len(counts_per_rev) else 0
+            ratio = float(gear_ratios[idx]) if idx < len(gear_ratios) else 1.0
+            if cpr <= 0 or ratio <= 0.0:
+                out.append(0.0)
+            else:
+                out.append((float(cpr) * ratio) / (2.0 * math.pi))
+        return out
     
     # =========================================================================
     # Calibration
@@ -577,6 +623,10 @@ class RobotConfig(ABC):
             'logical_joint_limits_rad': self.logical_joint_limits_rad,
             'actuator_limits_rad': self.actuator_limits_rad,
             'actuator_mapping_ranges_rad': self.actuator_mapping_ranges_rad,
+            'actuator_encoder_counts_per_rev': self.actuator_encoder_counts_per_rev,
+            'actuator_gear_ratios': self.actuator_gear_ratios,
+            'actuator_position_signs': self.actuator_position_signs,
+            'actuator_counts_per_radian': self.actuator_counts_per_radian,
             'inverted_actuator_ids': self.inverted_actuator_ids,
             'logical_joint_master_offsets_rad': self.logical_joint_master_offsets_rad,
             'has_gripper': self.has_gripper,

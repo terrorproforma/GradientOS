@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ...actuator_interface import ActuatorBackend
+from ....joint_zero_offsets import load_joint_zero_offsets, save_joint_zero_offsets
 
 
 def _fourcc(a: str, b: str, c: str, d: str) -> int:
@@ -35,6 +36,7 @@ _ROLE_CONTROLLER = 1
 _GRADIENT_MAX_AXES = 16
 
 _MSG_STATUS_SNAPSHOT = 0x0202
+_MSG_STATUS_AXIS_CONFIG = 0x0203
 
 # Command ring message types (v1)
 _MSG_CMD_ARM = 0x0101
@@ -55,6 +57,8 @@ _MSG_HEADER_STRUCT = struct.Struct("<HHIQQ")  # 24 bytes
 _CMD_ARM_STRUCT = struct.Struct("<II")
 _CMD_AXIS_MASK_STRUCT = struct.Struct("<II")
 _CMD_SET_MODE_STRUCT = struct.Struct("<II")
+_AXIS_CONFIG_STRUCT = struct.Struct("<II16I16d16i16B16x16d")  # 424 bytes
+_STATUS_SNAPSHOT_HEADER_STRUCT = struct.Struct("<IIIIqqQ")
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -78,6 +82,13 @@ class _ShmHeader:
     setpoint_offset: int
 
 
+@dataclass(frozen=True)
+class _AxisConfig:
+    num_axes: int
+    counts_per_unit: list[float]
+    sign: list[int]
+
+
 class EthercatRTCoreBackend(ActuatorBackend):
     """
     ActuatorBackend proxy to the RTCore daemon (`gradient-rt-motion`).
@@ -97,7 +108,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._robot_config = robot_config
         self._socket_path = socket_path
 
+        self._robot_id = str(robot_config.get("robot_id", "unknown")).strip() or "unknown"
         self._num_joints = int(robot_config.get("num_logical_joints", 6))
+        self._master_offsets_rad = load_joint_zero_offsets(
+            self._robot_id,
+            num_joints=self._num_joints,
+            defaults=robot_config.get("logical_joint_master_offsets_rad", [0.0] * self._num_joints),
+        )
 
         self._initialized = False
         self._connected = False
@@ -138,9 +155,23 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         self._cmd_hdr: Optional[_ShmHeader] = None
         self._status_hdr: Optional[_ShmHeader] = None
+        self._robot_axis_config = self._build_axis_config_from_robot_config(robot_config)
+        self._runtime_axis_config: Optional[_AxisConfig] = None
+        self._axis_config: Optional[_AxisConfig] = self._robot_axis_config
+        self._axis_config_mismatch_logged = False
+        self._axis_config_event = threading.Event()
+        self._status_snapshot_event = threading.Event()
+        self._status_lock = threading.Lock()
+        if self._axis_config is not None:
+            self._axis_config_event.set()
 
         # Latest known axis counts from STATUS_SNAPSHOT (pos_counts per axis).
         self._axis_counts: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_statusword: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_error_code: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._last_wkc_expected = 0
+        self._last_wkc_actual = 0
+        self._last_master_state = 0
 
         # Latest commanded joint positions (radians) as a safe fallback for getters.
         self._last_joint_setpoint_rad: list[float] = [0.0] * self._num_joints
@@ -169,6 +200,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
     def shutdown(self) -> None:
         self._status_stop.set()
+        self._axis_config_event.clear()
+        self._status_snapshot_event.clear()
         if self._status_thread and self._status_thread.is_alive():
             self._status_thread.join(timeout=1.0)
 
@@ -242,14 +275,20 @@ class EthercatRTCoreBackend(ActuatorBackend):
         axis_q: list[float] = [0.0] * self._rt_num_axes
         for axis_i, joint_i in enumerate(self._axis_to_joint):
             if 0 <= joint_i < len(positions_rad):
-                axis_q[axis_i] = float(positions_rad[joint_i])
+                axis_q[axis_i] = float(positions_rad[joint_i]) + self._master_offset_for_joint(joint_i)
 
         axis_mask = (1 << self._rt_num_axes) - 1
         self._write_setpoint(axis_q, axis_mask=axis_mask)
 
     def get_joint_positions(self, verbose: bool = False) -> list[float]:
-        # We cannot convert counts->rad until axis scaling config is implemented.
-        # For now we return the last commanded setpoint (safe, deterministic).
+        if self._connected and self._axis_config is None:
+            # Give the status thread a brief chance to receive scaling data.
+            self._wait_for_feedback_ready(timeout_s=0.25, require_live_wkc=False)
+        if self._connected and self._axis_config is not None:
+            positions = self.raw_to_joint_positions(self.sync_read_positions())
+            if verbose:
+                print("[EtherCAT RTCore] get_joint_positions() (connected) -> live feedback")
+            return positions
         if verbose:
             state = "connected" if self._connected else "disconnected"
             print(f"[EtherCAT RTCore] get_joint_positions() ({state}) -> last setpoint")
@@ -291,8 +330,16 @@ class EthercatRTCoreBackend(ActuatorBackend):
         return {i: int(self._axis_counts[i]) for i in range(self._rt_num_axes)}
 
     def raw_to_joint_positions(self, raw_positions: dict[int, int]) -> list[float]:
-        # Until scaling is implemented, return current joint setpoint.
-        return list(self._last_joint_setpoint_rad)
+        positions = list(self._last_joint_setpoint_rad)
+        for axis_i, joint_i in enumerate(self._axis_to_joint):
+            raw = raw_positions.get(axis_i)
+            if raw is None or not (0 <= joint_i < self._num_joints):
+                continue
+            physical_q = self._axis_q_from_counts(axis_i, int(raw))
+            if physical_q is None:
+                continue
+            positions[joint_i] = physical_q - self._master_offset_for_joint(joint_i)
+        return positions
 
     def set_single_actuator_position(
         self,
@@ -321,8 +368,51 @@ class EthercatRTCoreBackend(ActuatorBackend):
         return int(self._axis_counts[actuator_id])
 
     def set_current_position_as_zero(self, actuator_id: int) -> bool:
-        # Not supported (calibration is drive/vendor specific and belongs in RTCore commissioning).
-        return False
+        axis_i = int(actuator_id)
+        if axis_i < 0 or axis_i >= len(self._axis_to_joint):
+            return False
+        joint_i = self._axis_to_joint[axis_i]
+        if joint_i < 0 or joint_i >= self._num_joints:
+            return False
+        return self.set_logical_joint_current_position_as_zero(joint_i)
+
+    def set_logical_joint_current_position_as_zero(self, logical_joint_index: int) -> bool:
+        joint_i = int(logical_joint_index)
+        if joint_i < 0 or joint_i >= self._num_joints:
+            print(f"[EtherCAT RTCore] WARNING: joint index out of range for zeroing: {joint_i}")
+            return False
+        if not self._connected:
+            print("[EtherCAT RTCore] WARNING: cannot zero joint while RTCore is disconnected")
+            return False
+
+        physical_samples: list[float] = []
+        for axis_i, mapped_joint in enumerate(self._axis_to_joint):
+            if mapped_joint != joint_i:
+                continue
+            physical_q = self._axis_q_from_counts(axis_i, int(self._axis_counts[axis_i]))
+            if physical_q is not None:
+                physical_samples.append(physical_q)
+
+        if not physical_samples:
+            print(
+                "[EtherCAT RTCore] WARNING: cannot zero joint"
+                f" {joint_i + 1}; no live scaled feedback available yet"
+            )
+            return False
+
+        new_offset = float(sum(physical_samples) / len(physical_samples))
+        self._master_offsets_rad[joint_i] = new_offset
+        self._last_joint_setpoint_rad[joint_i] = 0.0
+        save_joint_zero_offsets(
+            self._robot_id,
+            self._master_offsets_rad,
+            actor=f"ethercat_rtcore:joint{joint_i + 1}",
+        )
+        print(
+            "[EtherCAT RTCore] Captured logical zero:"
+            f" joint={joint_i + 1} physical_q={new_offset:.6f} rad"
+        )
+        return True
 
     def set_pid_gains(self, actuator_id: int, kp: int, ki: int, kd: int) -> bool:
         # Not supported here (should be RTCore commissioning / SDO templates).
@@ -448,6 +538,20 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         self._start_status_thread()
 
+        feedback_timeout_s = self._env_float("GRADIENT_RTCORE_FEEDBACK_READY_TIMEOUT_S", 2.0)
+        if feedback_timeout_s > 0.0:
+            if self._wait_for_feedback_ready(timeout_s=feedback_timeout_s, require_live_wkc=False):
+                print(
+                    "[EtherCAT RTCore] Feedback ready:"
+                    f" axis_config=1 snapshot=1 wkc={self._last_wkc_actual}/{self._last_wkc_expected}"
+                    f" master_state={self._last_master_state}"
+                )
+            else:
+                print(
+                    "[EtherCAT RTCore] WARNING: Timed out waiting for RTCore status feedback"
+                    f" ({self._feedback_ready_summary()})"
+                )
+
         # Mirror serial backend behavior: after init, the system is usable.
         if self._auto_arm:
             try:
@@ -489,6 +593,34 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         # Default mapping policy: axis0..axisN maps to joint0..jointN in order.
         return list(range(min(num_axes, num_joints)))
+
+    def _env_float(self, name: str, default: float) -> float:
+        raw = os.environ.get(name, str(default)).strip()
+        try:
+            return float(raw)
+        except Exception:
+            return float(default)
+
+    def _feedback_ready_summary(self) -> str:
+        with self._status_lock:
+            return (
+                f"axis_config={1 if self._axis_config is not None else 0} "
+                f"snapshot={1 if self._status_snapshot_event.is_set() else 0} "
+                f"wkc={self._last_wkc_actual}/{self._last_wkc_expected} "
+                f"master_state={self._last_master_state}"
+            )
+
+    def _wait_for_feedback_ready(self, timeout_s: float, *, require_live_wkc: bool) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while time.monotonic() <= deadline:
+            with self._status_lock:
+                have_axis_cfg = self._axis_config is not None
+                have_snapshot = self._status_snapshot_event.is_set()
+                live_wkc = self._last_wkc_actual > 0
+            if have_axis_cfg and have_snapshot and (live_wkc or not require_live_wkc):
+                return True
+            time.sleep(0.01)
+        return False
 
     def _cmd_ring_offsets(self) -> tuple[int, int]:
         assert self._cmd_hdr is not None
@@ -594,6 +726,105 @@ class EthercatRTCoreBackend(ActuatorBackend):
             setpoint_offset=int(setpoint_offset),
         )
 
+    def _parse_axis_config(self, payload: bytes) -> _AxisConfig:
+        (
+            num_axes,
+            _reserved0,
+            *rest,
+        ) = _AXIS_CONFIG_STRUCT.unpack_from(payload, 0)
+        idx = 0
+        idx += _GRADIENT_MAX_AXES  # counts_per_rev
+        idx += _GRADIENT_MAX_AXES  # gear_ratio
+        sign = [int(x) for x in rest[idx : idx + _GRADIENT_MAX_AXES]]
+        idx += _GRADIENT_MAX_AXES
+        idx += _GRADIENT_MAX_AXES  # axis_type
+        counts_per_unit = [float(x) for x in rest[idx : idx + _GRADIENT_MAX_AXES]]
+        return _AxisConfig(
+            num_axes=int(num_axes),
+            counts_per_unit=counts_per_unit,
+            sign=sign,
+        )
+
+    def _build_axis_config_from_robot_config(self, robot_config: dict) -> Optional[_AxisConfig]:
+        counts_per_radian = list(robot_config.get("actuator_counts_per_radian", []))
+        if not counts_per_radian:
+            counts_per_rev = list(robot_config.get("actuator_encoder_counts_per_rev", []))
+            gear_ratios = list(robot_config.get("actuator_gear_ratios", []))
+            counts_per_radian = []
+            for idx in range(max(len(counts_per_rev), len(gear_ratios))):
+                cpr = int(counts_per_rev[idx]) if idx < len(counts_per_rev) else 0
+                ratio = float(gear_ratios[idx]) if idx < len(gear_ratios) else 1.0
+                if cpr <= 0 or ratio <= 0.0:
+                    counts_per_radian.append(0.0)
+                else:
+                    counts_per_radian.append((float(cpr) * ratio) / (2.0 * 3.141592653589793))
+
+        if not counts_per_radian:
+            return None
+
+        signs_raw = list(robot_config.get("actuator_position_signs", []))
+        if not signs_raw:
+            inverted_ids = set(robot_config.get("inverted_actuator_ids", set()))
+            actuator_ids = list(robot_config.get("actuator_ids", []))
+            signs_raw = [-1 if actuator_id in inverted_ids else 1 for actuator_id in actuator_ids]
+
+        num_axes = min(
+            int(robot_config.get("num_physical_actuators", len(counts_per_radian))),
+            len(counts_per_radian),
+        )
+        if num_axes <= 0:
+            return None
+
+        counts_per_unit = [0.0] * _GRADIENT_MAX_AXES
+        signs = [0] * _GRADIENT_MAX_AXES
+        for idx in range(min(num_axes, _GRADIENT_MAX_AXES)):
+            counts_per_unit[idx] = float(counts_per_radian[idx])
+            raw_sign = int(signs_raw[idx]) if idx < len(signs_raw) else 1
+            signs[idx] = 1 if raw_sign >= 0 else -1
+
+        return _AxisConfig(
+            num_axes=min(num_axes, _GRADIENT_MAX_AXES),
+            counts_per_unit=counts_per_unit,
+            sign=signs,
+        )
+
+    def _maybe_warn_runtime_axis_config_mismatch(self, runtime_cfg: _AxisConfig) -> None:
+        if self._robot_axis_config is None or self._axis_config_mismatch_logged:
+            return
+        robot_cfg = self._robot_axis_config
+        compare_axes = min(robot_cfg.num_axes, runtime_cfg.num_axes, _GRADIENT_MAX_AXES)
+        for axis_i in range(compare_axes):
+            robot_cpu = float(robot_cfg.counts_per_unit[axis_i])
+            runtime_cpu = float(runtime_cfg.counts_per_unit[axis_i])
+            robot_sign = int(robot_cfg.sign[axis_i])
+            runtime_sign = int(runtime_cfg.sign[axis_i])
+            cpu_mismatch = abs(robot_cpu - runtime_cpu) > max(1.0, abs(robot_cpu) * 1e-3)
+            sign_mismatch = robot_sign != runtime_sign
+            if cpu_mismatch or sign_mismatch:
+                print(
+                    "[EtherCAT RTCore] WARNING: RTCore axis scaling differs from robot config; "
+                    f"keeping robot-config scaling for Python feedback conversion "
+                    f"(axis={axis_i} robot_cpu={robot_cpu:.6f} runtime_cpu={runtime_cpu:.6f} "
+                    f"robot_sign={robot_sign} runtime_sign={runtime_sign})"
+                )
+                self._axis_config_mismatch_logged = True
+                return
+
+    def _master_offset_for_joint(self, logical_joint_idx: int) -> float:
+        if 0 <= logical_joint_idx < len(self._master_offsets_rad):
+            return float(self._master_offsets_rad[logical_joint_idx])
+        return 0.0
+
+    def _axis_q_from_counts(self, axis_i: int, raw_counts: int) -> Optional[float]:
+        cfg = self._axis_config
+        if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
+            return None
+        sign = int(cfg.sign[axis_i])
+        counts_per_unit = float(cfg.counts_per_unit[axis_i])
+        if sign not in (-1, 1) or counts_per_unit <= 0.0:
+            return None
+        return float(raw_counts) / (float(sign) * counts_per_unit)
+
     def _start_status_thread(self) -> None:
         if self._status_thread and self._status_thread.is_alive():
             return
@@ -645,15 +876,47 @@ class EthercatRTCoreBackend(ActuatorBackend):
             mtype, _mflags, mbytes, _seq, _t_ns = _MSG_HEADER_STRUCT.unpack_from(blob, 0)
             payload = blob[_MSG_HEADER_STRUCT.size : min(msg_bytes, mbytes)]
 
-            if mtype == _MSG_STATUS_SNAPSHOT and len(payload) >= 40:
+            if mtype == _MSG_STATUS_AXIS_CONFIG and len(payload) >= _AXIS_CONFIG_STRUCT.size:
+                try:
+                    parsed_cfg = self._parse_axis_config(payload)
+                    self._runtime_axis_config = parsed_cfg
+                    if self._robot_axis_config is None:
+                        self._axis_config = parsed_cfg
+                    else:
+                        self._maybe_warn_runtime_axis_config_mismatch(parsed_cfg)
+                    self._axis_config_event.set()
+                except Exception:
+                    pass
+
+            if mtype == _MSG_STATUS_SNAPSHOT and len(payload) >= _STATUS_SNAPSHOT_HEADER_STRUCT.size:
                 # Snapshot layout:
                 #   0..39: header
                 #   40.. : axes[16] where each axis is 28 bytes; pos_counts at offset 0 in each axis
+                (
+                    _num_axes,
+                    wkc_expected,
+                    wkc_actual,
+                    master_state,
+                    _dc_offset_ns,
+                    _cycle_jitter_ns,
+                    _topology_hash,
+                ) = _STATUS_SNAPSHOT_HEADER_STRUCT.unpack_from(payload, 0)
+                with self._status_lock:
+                    self._last_wkc_expected = int(wkc_expected)
+                    self._last_wkc_actual = int(wkc_actual)
+                    self._last_master_state = int(master_state)
                 for axis_i in range(min(self._rt_num_axes, _GRADIENT_MAX_AXES)):
                     axis_off = 40 + axis_i * 28
-                    if axis_off + 4 <= len(payload):
-                        (pos_counts,) = struct.unpack_from("<i", payload, axis_off)
+                    if axis_off + 10 <= len(payload):
+                        pos_counts, _torque_raw, statusword, error_code = struct.unpack_from(
+                            "<ihHH",
+                            payload,
+                            axis_off,
+                        )
                         self._axis_counts[axis_i] = int(pos_counts)
+                        self._axis_statusword[axis_i] = int(statusword)
+                        self._axis_error_code[axis_i] = int(error_code)
+                self._status_snapshot_event.set()
 
             read_idx += 1
 

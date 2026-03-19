@@ -11,14 +11,14 @@ Type=simple
 User=pi
 Group=pi
 
-WorkingDirectory=/home/pi/src/GradientOS
+WorkingDirectory=/home/pi/GradientOS
 
-Environment=PATH=/home/pi/src/GradientOS/.venv/bin:/home/pi/.local/bin:/home/pi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+Environment=PATH=/home/pi/GradientOS/.venv/bin:/home/pi/.local/bin:/home/pi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 Environment=PYTHONUNBUFFERED=1
-Environment=PYTHONPATH=/home/pi/src/GradientOS/src
+Environment=PYTHONPATH=/home/pi/GradientOS/src
 Environment=GRADIENT_API_HOST=0.0.0.0
 
-ExecStart=/home/pi/src/GradientOS/.venv/bin/gradient-api
+ExecStart=/home/pi/GradientOS/.venv/bin/gradient-api
 
 Restart=always
 RestartSec=10
@@ -27,7 +27,7 @@ TimeoutStopSec=30
 
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/home/pi/src/GradientOS /home/pi/.cache /home/pi/.config
+ReadWritePaths=/home/pi/GradientOS /home/pi/.cache /home/pi/.config
 NoNewPrivileges=true
 PrivateTmp=true
 
