@@ -55,6 +55,20 @@ Use this file as persistent, repo-local execution memory.
 
 *(Session entries are cleared regularly. Chronological implementation logs belong in `.cursor/memory/DEVLOG.md`. Historical scratchpad entries are archived in `.cursor/memory/AGENT_SCRATCHPAD_ARCHIVE.md`)*
 
+### 2026-03-19 - EtherCAT stop/start sequencing
+- [user] For robot shutdown, the preferred normal outcome is a safe disarmed/ready fieldbus state, not blindly tearing down EtherCAT if that provokes drive faults.
+- [self] `ErC1.1` on the A6-EC drives maps to EtherCAT synchronization loss; if shutdown drops RTCore or `ethercat.service` after the drives are still synced, the panels will fault even if the brakes engaged safely.
+- [self] In `start-stack.sh`, make soft stop the default and reserve fieldbus teardown for an explicit hard-stop mode.
+- [self] Do not advance staged startup just because the controller UDP socket is alive; also gate on RTCore metrics showing all configured slaves responding, online, operational, and `startup_ready=1`.
+- [user] Servo fault-code references are drive-specific. Only apply A6-EC fault interpretation when the active servo backend matches the current EtherCAT/A6-EC path; otherwise keep probe output raw.
+- [self] Avoid calling `exit` directly from signal traps while `start-stack.sh` is blocked in `wait -n`; use a shutdown flag and let the supervise loop return normally so cleanup runs deterministically.
+- [user] The live launcher terminal should accept commands directly. Keep the command entry pinned at the top so telemetry/log spam does not bury the input line.
+- [self] If a script redirects stdout through `tee`, do not use `-t 1` to decide whether a terminal UI is available. Capture the real tty path early and bind the interactive UI to that device explicitly.
+- [self] A heredoc-fed `python - <<'PY'` script cannot also use stdin for live keyboard input. For terminal UIs, pass the tty path as an argument and rebind fd `0/1/2` to the tty from inside Python after the script has started.
+- [user] Prefer the lighter `scripts/rtcore_jog.py`-style line console over a full-screen embedded curses console when terminal control becomes brittle. Redrawing the active prompt is enough.
+- [tool] Live validation on 2026-03-19 confirmed the `start-stack.sh` line console accepts `stop` cleanly under active log spam; this pattern is validated on the robot terminal and should be preferred over the earlier curses attempt.
+- [self] Background children launched from bash can inherit ignored `SIGINT`, so a launcher-side `kill -INT` is not reliable for graceful shutdown. Prefer a controller-owned `SIGTERM` handler plus launcher-side `SIGTERM` as the primary graceful stop signal.
+
 ### 2026-02-21 - Gradient-05 limits/backend hardening
 - [self] When replacing structured config blocks from scripts, use explicit parser/validator steps plus `--dry-run` before writes; this avoids accidental regex-only blind edits.
 - [self] For backend mapping policy changes, add focused regression tests for both default behavior and env overrides in the same task to lock migration intent.
@@ -367,3 +381,45 @@ Use this file as persistent, repo-local execution memory.
 - [self] Remaining meaningful follow-up is policy hardening, not emergency repair:
   - remove or constrain silent solver fallback behavior so `gradient05` cannot quietly run on the wrong IK backend
   - re-run the smallest per-joint UI commissioning test now that both the jog unit bug and the numeric solver environment are fixed
+
+### 2026-03-19 - Unified startup supervisor
+- [user] The manual stack startup should be consolidated into one robust script, with a `--headless` mode that skips the web UI but still stages controller -> API startup.
+- [self] Keep `run.sh`, `run-api.sh`, and `run-web.sh` as the component entrypoints; put staging, health checks, log capture, and duplicate-process protection in a separate top-level supervisor (`start-stack.sh`) instead of duplicating launch logic.
+- [self] Source `./start.sh` once in the supervisor before launching children so the unified path matches the manual environment bootstrap the user relies on.
+- [self] For startup reliability, fail closed on pre-existing live services instead of silently starting duplicates. The first validation of `start-stack.sh` correctly refused startup when Vite was already serving on `127.0.0.1:8000`.
+- [tool] Durable startup traces now belong in `logs/startups/<timestamp>/` with per-service raw logs plus a launcher log and manifest; keep live log streaming in the terminal as well so operators still get immediate feedback.
+
+### 2026-03-19 - Startup shutdown + telemetry follow-up
+- [user] A stack shutdown is not safe enough if the EtherCAT drives remain energized/ready after the supervisor exits. The launcher must unwind the hardware into a non-active state, not just kill processes.
+- [self] For RTCore-backed controller shutdown, `SIGTERM` alone is not sufficient because the controller's Python `finally:` cleanup may not run. Prefer an in-band stop request first, then `SIGINT` so `run_controller.py` executes backend shutdown logic.
+- [self] `EthercatRTCoreBackend.shutdown()` must explicitly disable axes and disarm before IPC teardown; simply closing shared memory/socket resources can leave the robot physically enabled.
+- [tool] The telemetry-thread crash seen during startup was real: `backend_registry.get_telemetry_blocks()` assumed every backend had Feetech-style telemetry register constants. `ethercat_rtcore` does not, so backend telemetry support must be treated as optional instead of universal.
+- [self] After changing shutdown semantics in `start-stack.sh`, do a fresh end-to-end launcher run and stop to verify all three outcomes together:
+  - controller exits via graceful path
+  - API/web stop as expected
+  - physical robot is left de-energized / non-active
+
+### 2026-03-19 - Explicit power-down command path
+- [self] Relying on process exit alone is still too fragile for hardware-safe stop. The control stack needs an explicit in-band actuator power-down command that can be invoked before controller teardown.
+- [tool] Added `SAFE_POWER_DOWN` through the controller/API path so `start-stack.sh stop` can request de-energize over HTTP first and fall back to direct UDP if the API is already down.
+- [self] `./start-stack.sh stop` should attempt safe power-down even when launcher state is stale or absent; safety action should not depend solely on an active supervisor PID file.
+
+### 2026-03-19 - Hardware probe command
+- [user] The operator needs a direct way to probe the physical hardware state, not just process state.
+- [tool] `./start-stack.sh probe` now reads `/run/gradient-rt-motion/metrics.json` and reports a hardware-focused state summary (`ACTIVE`, `BUS_UP_DISARMED`, `FAULTED`, or `INACTIVE`) plus per-axis DS402/statusword/error/AL-state detail.
+- [self] Important live finding from the first probe run: software services can be down while the physical RTCore/drive state is still `ACTIVE` (`armed=1`, `enable_mask=0x3f`, `OperationEnabled` on all 6 axes). Do not assume “controller down” implies “robot safe.”
+
+### 2026-03-19 - Probe-driven shutdown sequencing
+- [user] The shutdown procedure should use the probe results and explicitly reason about driver state, EtherCAT master state, and RTCore state before deciding what to stop next.
+- [self] A safe full shutdown sequence is: probe -> request power-down through controller/API if available -> re-probe -> direct RTCore disarm if needed -> re-probe -> stop controller/API/web -> stop RTCore -> stop `ethercat.service` -> final probe/report.
+- [self] Direct RTCore disarm must not auto-arm while connecting; use the project venv with `GRADIENT_RTCORE_AUTO_ARM=0` for any emergency/disconnected power-down helper.
+
+### 2026-03-19 - Web shutdown must stop the whole process tree
+- [tool] Live restart failure reproduced after `./start-stack.sh stop`: the launcher logged `Stopping web (pid=117277)` but `ss -ltnp '( sport = :8000 )'` still showed a different `node`/Vite PID listening on `0.0.0.0:8000`.
+- [self] Root cause: the supervisor tracked/killed the wrapper PID, but Vite could survive as a child process and keep the port bound, so the next `./start-stack.sh` falsely looked like a duplicate external web service.
+- [tool] Fix in `start-stack.sh`: launch managed services under `setsid` when available and stop them via a helper that signals the full process group plus recursively discovered descendants before escalating.
+- [tool] Live validation after the fix:
+  - running the updated `./start-stack.sh stop` cleared the orphaned `:8000` listener without a second stop
+  - full start -> stop -> restart -> stop cycle succeeded
+  - controller shutdown showed `Shutdown signal received: SIGTERM` / `Shutdown requested.` with no SIGKILL warning
+- [self] Guardrail: when supervising dev servers or npm-based launchers, do not assume the recorded parent PID is the long-lived listener; validate stop logic against the actual bound port and descendant processes.

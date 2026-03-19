@@ -1,3 +1,152 @@
+## 2026-03-19 23:14 +0000
+
+- Task summary:
+  - Improved controller shutdown gracefulness by fixing the signal path used by `start-stack.sh`.
+- Changes:
+  - Updated `src/gradient_os/run_controller.py`:
+    - added shutdown signal handlers for `SIGTERM` and `SIGINT`,
+    - routed both signals into the existing `KeyboardInterrupt`/`finally` cleanup path so backend shutdown and socket close happen on graceful termination.
+  - Updated `start-stack.sh`:
+    - changed controller stop logic to send `SIGTERM` first instead of `SIGINT`,
+    - reduced the graceful wait window before escalation to `SIGKILL` from ~8s to ~3s.
+- Validation:
+  - `bash -n start-stack.sh` (passed).
+  - `.venv/bin/python -m py_compile src/gradient_os/run_controller.py` (passed).
+  - `ReadLints` on edited files (no diagnostics).
+- Follow-up notes / risks:
+  - This is the right fix for the observed ignored-`SIGINT` behavior, but the improved controller exit timing still needs one live robot shutdown run to confirm it now exits during the graceful `SIGTERM` window.
+
+## 2026-03-19 23:06 +0000
+
+- Task summary:
+  - Live-validated the final `start-stack.sh` terminal console and managed soft-stop flow on the robot terminal.
+- Validation:
+  - Reviewed the live terminal run:
+    - startup reached `startup_ready=1` and `operational=6/6`,
+    - the interactive line console accepted `command> stop` correctly under active log traffic,
+    - soft stop de-energized to `BUS_UP_DISARMED` while keeping RTCore/EtherCAT up.
+- Follow-up notes / risks:
+  - The only remaining rough edge observed in the live run is that the controller still required escalation from `SIGINT` to `SIGTERM` during shutdown; behavior is safe, but graceful controller exit can still be improved later.
+
+## 2026-03-19 22:53 +0000
+
+- Task summary:
+  - Replaced the full-screen launcher console with a simpler `rtcore_jog.py`-style line console after discussing whether an embedded curses UI was necessary.
+- Changes:
+  - Updated `start-stack.sh`:
+    - replaced the curses-based `run_interactive_console()` with a lighter line-oriented prompt model,
+    - added prompt-preserving `safe_print_line()` / `safe_print_block()` behavior modeled after `scripts/rtcore_jog.py`,
+    - added a background monitor thread that tails controller/API/web logs and redraws the current input prompt cleanly,
+    - preserved `stop`, `stop --hard`, `probe`, `status`, `help`, and `clear` command handling,
+    - used `_thread.interrupt_main()` so a supervised child exit can interrupt blocking `input()` and return control to the launcher.
+  - Updated `docs/README.md`:
+    - changed the console description from a pinned full-screen prompt to a line-oriented prompt that redraws cleanly during log streaming.
+- Validation:
+  - `bash -n start-stack.sh` (passed).
+  - `./start-stack.sh --help` (passed).
+- Follow-up notes / risks:
+  - This should be a better fit for the observed terminal behavior, but it still needs one live run to confirm typed commands and prompt redraws behave well under the current telemetry/log rate.
+
+## 2026-03-19 22:48 +0000
+
+- Task summary:
+  - Fixed the interactive console input bug after the terminal UI rendered successfully but would not accept typed commands.
+- Changes:
+  - Updated `start-stack.sh`:
+    - removed the shell-level stdin/stdout redirection of the embedded Python console process to the tty,
+    - passed the saved tty path into the Python console as an argument,
+    - rebound file descriptors `0/1/2` to the tty from inside Python after interpreter startup so the heredoc can still provide the script body while curses gets live keyboard input.
+- Validation:
+  - `bash -n start-stack.sh` (passed).
+- Follow-up notes / risks:
+  - This specifically fixes the stdin ownership issue revealed by the live screenshot, but the updated console still needs one live terminal run to confirm typed commands now appear and execute as expected.
+
+## 2026-03-19 22:45 +0000
+
+- Task summary:
+  - Fixed the interactive launcher console activation bug after the live terminal transcript showed typed `stop` characters still getting buried in the streamed logs.
+- Changes:
+  - Updated `start-stack.sh`:
+    - captured the original terminal device path with `tty` before stdout is redirected through `tee`,
+    - changed `interactive_console_enabled()` to require a real stdin TTY plus the saved terminal device, rather than checking `-t 1`,
+    - changed `run_interactive_console()` to attach stdin/stdout/stderr directly to the saved tty device so the curses console can own the real terminal while launcher logging still goes through `tee`.
+- Validation:
+  - `bash -n start-stack.sh` (passed).
+- Follow-up notes / risks:
+  - The logic is now aligned with the observed failure mode, but the corrected interactive console still needs one live terminal run to confirm the pinned command line actually appears and accepts `stop` cleanly.
+
+## 2026-03-19 22:37 +0000
+
+- Task summary:
+  - Added an in-terminal interactive command console to `start-stack.sh` so operators can type `stop` directly in the running launcher without losing the prompt in the telemetry stream.
+- Changes:
+  - Updated `start-stack.sh`:
+    - added `GRADIENT_STACK_INTERACTIVE_CONSOLE` (`auto` by default, `0` to disable),
+    - added terminal detection for the interactive console path,
+    - added a curses-based console UI that keeps `command> ...` pinned at the top and tails controller/API/web logs below it,
+    - added console commands: `stop`, `stop --hard`, `probe`, `status`, `help`, and `clear`,
+    - preserved non-interactive fallback supervision for non-TTY/dumb-terminal cases,
+    - logged console stop requests back into the launcher flow so the existing managed shutdown sequence still runs.
+  - Updated `docs/README.md`:
+    - documented the interactive terminal console behavior and supported commands.
+- Validation:
+  - `bash -n start-stack.sh` (passed).
+  - `./start-stack.sh --help` (passed).
+- Follow-up notes / risks:
+  - The interactive console path has not yet been live-tested against the actual robot terminal session; the shell syntax and surrounding control flow are validated, but the curses UI still needs one real run.
+
+## 2026-03-19 22:16 +0000
+
+- Task summary:
+  - Fixed the supervised `Ctrl-C` shutdown path in `start-stack.sh` after reviewing the latest live startup/soft-stop terminal log.
+- Changes:
+  - Updated `start-stack.sh`:
+    - added a `STOP_REQUESTED` flag,
+    - changed `handle_signal()` to mark shutdown intent instead of calling `exit` directly from the signal trap,
+    - changed `supervise_children()` to break out cleanly when a stop signal is requested so the normal `cleanup()` path performs the managed shutdown.
+- Validation:
+  - Reviewed the latest live run log:
+    - startup now waits for RTCore `startup_ready=1` and `operational=6/6` before advancing,
+    - soft stop now lands at `BUS_UP_DISARMED` while leaving RTCore/EtherCAT up.
+  - `bash -n start-stack.sh` (passed).
+- Follow-up notes / risks:
+  - The odd trailing `ntroller_readiness: command not found` message was not reproducible via a fresh `./start-stack.sh stop` after the stack was already disarmed; it likely came from the interrupted supervised launcher path that this signal-handling change addresses.
+
+## 2026-03-19 22:06 +0000
+
+- Task summary:
+  - Tightened the hardware probe so vendor-specific servo fault references are only advertised when the active backend matches the current EtherCAT/A6-EC path.
+- Changes:
+  - Updated `start-stack.sh`:
+    - passed `REPO_ROOT` into the embedded hardware-probe Python so it can detect whether the local A6-EC codebook exists,
+    - added `drive_fault_reference` metadata to probe JSON,
+    - made the human-readable `probe` output explicitly state whether vendor-specific drive fault references are applicable for the active servo backend, otherwise it reports `raw_only`.
+- Validation:
+  - `bash -n start-stack.sh` (passed).
+- Follow-up notes / risks:
+  - This change intentionally does not hard-decode `0x603F` into a single A6-EC panel code because the bus-fault code alone can be ambiguous across several manual entries.
+
+## 2026-03-19 21:52 +0000
+
+- Task summary:
+  - Refined `start-stack.sh` stop/start behavior after live robot feedback about A6-EC `ErC1.1` sync-loss faults and partial slave bring-up.
+- Changes:
+  - Updated `start-stack.sh`:
+    - added soft-stop default semantics for `./start-stack.sh stop`, which now leaves RTCore + EtherCAT running after the robot reaches `BUS_UP_DISARMED`,
+    - added `./start-stack.sh stop --hard` to explicitly continue through RTCore and `ethercat.service` shutdown,
+    - exported `GRADIENT_RTCORE_READY_TIMEOUT_S=30` by default when launched via `start-stack.sh`,
+    - added a launcher-side `wait_for_bus_operational` gate so startup does not advance past the controller stage until RTCore metrics report all configured slaves responding, online, operational, and `startup_ready=1`,
+    - avoided redundant SAFE_POWER_DOWN requests when the probe already shows the robot is no longer `ACTIVE`.
+  - Updated `docs/README.md`:
+    - documented the new soft-stop vs hard-stop behavior,
+    - documented the stricter full-bus readiness gate during startup.
+- Validation:
+  - `bash -n start-stack.sh` (passed).
+  - `./start-stack.sh --help` (passed; new CLI/help text rendered correctly).
+- Follow-up notes / risks:
+  - Live validation is still needed on hardware to confirm the default soft stop avoids `ErC1.1` while leaving the drives in the desired ready/disarmed state.
+  - If some boots legitimately take longer than 30s to get all slaves operational, increase `GRADIENT_RTCORE_READY_TIMEOUT_S` and/or `GRADIENT_STACK_BUS_READY_TIMEOUT_S` rather than allowing partial bring-up.
+
 ## 2026-02-16 00:14 +11:00
 
 - Task summary:
@@ -1767,3 +1916,275 @@
 - Follow-up notes / risks:
   - No new runtime mutation beyond memory writeback in this step.
   - The next AI should begin from the repaired `numeric` + ICS baseline, not from the earlier fallback/static-uplink state.
+
+## 2026-03-19 20:46 +0000
+
+- Task summary:
+  - Added a unified staged launcher for the local GradientOS stack so controller, API, and web UI no longer need to be started manually in separate terminals.
+  - Preserved live log streaming while also writing durable per-run startup logs for later debugging.
+- Changes:
+  - Added `start-stack.sh`:
+    - sources `./start.sh` before launching children so the unified path matches the manual environment bootstrap
+    - stages startup as controller -> API -> web UI
+    - supports `--headless` to skip the web UI and run controller + API only
+    - writes startup artifacts under `logs/startups/<timestamp>/`:
+      - `launcher.log`
+      - `controller.log`
+      - `api.log`
+      - `web.log`
+      - `manifest.json`
+    - maintains `logs/startups/latest/` as a pointer to the newest run
+    - performs readiness checks for:
+      - controller UDP `GET_STATUS`
+      - API `/health`
+      - API `/info/runtime-config`
+      - API `/info/joints`
+      - API `/info/pose`
+      - web UI HTTP root when not headless
+    - refuses to start duplicates if live controller/API/web services are already detected
+    - provides `status` and `stop` subcommands for launcher-managed runs
+  - Updated `docs/README.md`:
+    - documented `./start-stack.sh`
+    - documented `./start-stack.sh --headless`
+    - documented `status` / `stop`
+    - documented the `logs/startups/` log location
+- Validation:
+  - `bash -n ./start-stack.sh`
+    - passed
+  - `chmod +x ./start-stack.sh && ./start-stack.sh --help`
+    - passed
+  - `./start-stack.sh status`
+    - reported launcher state plus live probe results
+    - on this host at validation time:
+      - controller probe timed out
+      - API `127.0.0.1:4000` was not reachable
+      - web UI on `127.0.0.1:8000` was reachable
+  - `./start-stack.sh`
+    - correctly failed closed because the web UI was already running
+    - emitted:
+      - `existing live services detected: web@127.0.0.1:8000`
+      - `Refusing to start duplicates`
+  - `ReadLints` on:
+    - `start-stack.sh`
+    - `docs/README.md`
+    - result: no diagnostics
+- Follow-up notes / risks:
+  - I did **not** use the new launcher to start the live robot stack in this pass, because the request was to implement the startup path and there were already existing live/manual processes on the machine.
+  - `status` currently reflects the actual live probes, not terminal history; at validation time the web UI was up while controller/API were not.
+  - If desired next, the launcher can be extended with explicit pass-through args or a detached/background mode, but the current version is intentionally strict and foreground-supervised.
+
+## 2026-03-19 20:57 +0000
+
+- Task summary:
+  - Hardened shutdown handling for the new `start-stack.sh` path and fixed a real controller telemetry crash exposed by the first full startup run.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - added `_best_effort_safe_power_down()` that disables all RTCore axes and disarms before IPC teardown
+    - `shutdown()` now calls that safe power-down path before closing shared memory, eventfds, and sockets
+  - Updated `start-stack.sh`:
+    - added a graceful controller stop path that first tries `POST /control/stop`
+    - controller shutdown now prefers `SIGINT` over plain `SIGTERM` so `run_controller.py` can execute backend cleanup/finally logic
+    - shutdown ordering now keeps the API alive long enough to issue the stop request before controller teardown
+  - Updated `src/gradient_os/arm_controller/backends/registry.py`:
+    - `get_telemetry_blocks()` now treats backend register-telemetry support as optional
+    - `parse_telemetry_block()` now returns `{}` when the active backend does not implement parser helpers
+    - this prevents the `START_TELEMETRY` thread from crashing under `ethercat_rtcore`
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - added coverage that RTCore safe power-down disables axes and disarms
+    - added coverage that `ethercat_rtcore` reports no backend register telemetry blocks instead of crashing
+  - Updated `docs/README.md`:
+    - clarified that `start-stack.sh` now performs a graceful shutdown path rather than only killing processes
+- Validation:
+  - Investigated the user's captured startup log from `start-stack.sh`:
+    - expected/benign startup observations:
+      - one initial `Waiting for controller: timed out` before the controller finished binding UDP
+      - early `IKFast back-end initialised` print before the robot policy selected `numeric`
+    - real issue confirmed from the log:
+      - controller telemetry thread crashed on `AttributeError: module '...ethercat_rtcore.config' has no attribute 'TELEMETRY_BLOCK1_ADDRESS'`
+  - `bash -n ./start-stack.sh`
+    - passed
+  - `./.venv/bin/python -m pytest tests/test_gradient05_limits_and_backends.py -q`
+    - `15 passed`
+  - `ReadLints` on:
+    - `start-stack.sh`
+    - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`
+    - `src/gradient_os/arm_controller/backends/registry.py`
+    - `tests/test_gradient05_limits_and_backends.py`
+    - `docs/README.md`
+    - result: no diagnostics
+  - `./start-stack.sh status`
+    - current host state at validation time:
+      - launcher state file from run `20260319-205134` was stale
+      - controller still responded on UDP `3000`
+      - API and web were not reachable
+- Follow-up notes / risks:
+  - The graceful shutdown code was implemented after the user's first full startup run; that earlier run should not be used as evidence against the new shutdown path.
+  - A fresh launch -> controlled stop should be performed next to verify the physical EtherCAT drives really end in a non-active state with the updated backend shutdown behavior.
+
+## 2026-03-19 21:04 +0000
+
+- Task summary:
+  - Added an explicit actuator power-down command path so stack shutdown no longer depends only on the controller process exiting cleanly.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/actuator_interface.py`:
+    - added default `safe_power_down()` hook for backends
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - implemented public `safe_power_down()` that disables axes and disarms RTCore immediately
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added `handle_safe_power_down(...)`
+    - this issues a motion stop first, then invokes backend-specific power-down when available
+  - Updated `src/gradient_os/run_controller.py`:
+    - added UDP command `SAFE_POWER_DOWN`
+    - command replies `ACK,SAFE_POWER_DOWN,...`
+  - Updated `src/gradient_os/api/main.py`:
+    - added `POST /control/power-down`
+  - Updated `start-stack.sh`:
+    - added `/control/power-down` shutdown step
+    - added UDP fallback `SAFE_POWER_DOWN` when API is already unavailable
+    - `stop` now tries safe power-down even if launcher state is stale or absent
+  - Updated `tests/test_api_endpoints.py`:
+    - added coverage for `/control/power-down`
+    - added coverage for `/control/power-down` with `wait_for_idle`
+  - Updated `docs/README.md`:
+    - documented that launcher shutdown now issues explicit power-down/de-energize before teardown
+- Validation:
+  - `bash -n ./start-stack.sh`
+    - passed
+  - `./.venv/bin/python -m pytest tests/test_api_endpoints.py tests/test_gradient05_limits_and_backends.py -q`
+    - `46 passed`
+  - `ReadLints` on:
+    - `start-stack.sh`
+    - `src/gradient_os/api/main.py`
+    - `src/gradient_os/run_controller.py`
+    - `src/gradient_os/arm_controller/command_api.py`
+    - `src/gradient_os/arm_controller/actuator_interface.py`
+    - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`
+    - `tests/test_api_endpoints.py`
+    - `tests/test_gradient05_limits_and_backends.py`
+    - result: no diagnostics
+  - `./start-stack.sh status`
+    - current software state at check time:
+      - launcher state absent
+      - controller down
+      - API down
+      - web UI down
+- Follow-up notes / risks:
+  - I did **not** physically validate the new power-down command against the live robot in this pass; that still needs a fresh real-hardware start -> stop verification.
+  - The next hardware check should use the new `POST /control/power-down` / `./start-stack.sh stop` path and confirm the robot is no longer left energized.
+
+## 2026-03-19 21:07 +0000
+
+- Task summary:
+  - Added a first-class hardware probe command so the operator can inspect the physical RTCore/drive state directly from the launcher.
+- Changes:
+  - Updated `start-stack.sh`:
+    - added `probe` action (`./start-stack.sh probe`)
+    - probe reads `GRADIENT_RTCORE_METRICS` / `/run/gradient-rt-motion/metrics.json`
+    - probe reports:
+      - controller UDP availability
+      - API availability
+      - runtime-config summary when API is reachable
+      - physical state classification (`ACTIVE`, `BUS_UP_DISARMED`, `FAULTED`, `INACTIVE`)
+      - RTCore bus health (`link_up`, `responding`, `online`, `operational`, `wkc`, `startup_ready`, `master_al`)
+      - per-axis DS402 state, statusword, error code, slave online/operational flags, slave AL state, and raw position counts
+  - Updated `docs/README.md`:
+    - documented `./start-stack.sh probe`
+- Validation:
+  - `bash -n ./start-stack.sh`
+    - passed
+  - `./start-stack.sh probe`
+    - on this host at validation time reported:
+      - `controller_udp: down`
+      - `api_http: down`
+      - `physical_state: ACTIVE`
+      - `armed=1`
+      - `enable_mask=0x3f`
+      - `op_enabled_axes=6/6`
+      - bus healthy: `link_up=1`, `responding=6/6`, `online=6/6`, `operational=6/6`, `wkc=18/12`, `startup_ready=1`
+      - all six axes in `OperationEnabled` with `error_code=0x0000`
+  - `ReadLints` on:
+    - `start-stack.sh`
+    - `docs/README.md`
+    - result: no diagnostics
+- Follow-up notes / risks:
+  - This probe confirms a critical safety fact: the physical robot can remain fully active even when the controller/API processes are down.
+  - The next safety improvement should provide a direct RTCore disarm path that does not depend on a live controller process.
+
+## 2026-03-19 21:34 +0000
+
+- Task summary:
+  - Refactored `start-stack.sh stop` into a probe-driven shutdown sequence that explicitly reasons about driver state, RTCore state, and EtherCAT master state before escalating each shutdown phase.
+- Changes:
+  - Updated `start-stack.sh`:
+    - added JSON-form hardware probe internals so shutdown logic can consume the same RTCore/controller/API state that `./start-stack.sh probe` displays
+    - expanded human probe output to report:
+      - `driver_state`
+      - `ethercat_master_state`
+      - `rtcore_state`
+      - `physical_state`
+    - added probe parsing helpers used during shutdown decisions
+    - added direct RTCore disarm helper that:
+      - uses the project venv Python
+      - resolves the robot from runtime config
+      - connects to RTCore with `GRADIENT_RTCORE_AUTO_ARM=0`
+      - sends backend `safe_power_down()` without relying on a live controller process
+    - added service/process stop helpers for:
+      - `gradient-rt-motion.service`
+      - `ethercat.service`
+      - fallback manual RTCore PID stop
+    - replaced ad-hoc stop behavior with `perform_shutdown_sequence()`:
+      - initial probe snapshot
+      - controller/API power-down request when available
+      - direct RTCore disarm if the hardware is still active
+      - controller/API/web shutdown
+      - RTCore shutdown
+      - EtherCAT master shutdown
+      - final probe snapshot/report
+    - stale/absent launcher state now still attempts the full shutdown sequence using discovered controller/API/web PIDs where possible
+- Validation:
+  - `bash -n ./start-stack.sh`
+    - passed
+  - `./start-stack.sh probe`
+    - still passed after the refactor
+    - live host result at validation time:
+      - `driver_state: ACTIVE`
+      - `ethercat_master_state: OP`
+      - `rtcore_state: UP`
+      - `physical_state: ACTIVE`
+      - controller/API both down while hardware remained active
+  - `ReadLints` on:
+    - `start-stack.sh`
+    - `docs/README.md`
+    - result: no diagnostics
+- Follow-up notes / risks:
+  - I did **not** execute the live shutdown sequence in this pass because it would directly change the robot's physical state.
+  - The next live verification should be an intentional `./start-stack.sh stop` run while the robot is in a safe-to-de-energize condition, followed immediately by `./start-stack.sh probe`.
+
+## 2026-03-19 23:27 +0000
+
+- Task summary:
+  - Fixed the remaining `start-stack.sh stop` restart bug where the first stop could leave Vite listening on `:8000`, forcing a second cleanup stop before the next launch.
+- Changes:
+  - Updated `start-stack.sh`:
+    - added `pid_group_is_live`, `pid_group_id`, and recursive descendant collection helpers
+    - added `stop_pid_hierarchy()` so shutdown signals the full managed process group and known descendants instead of only the recorded parent PID
+    - routed web/api/controller external stop paths through the shared hierarchy stop helper
+    - started managed child services with `setsid` when available so each service gets its own process group for reliable teardown
+- Validation:
+  - `bash -n ./start-stack.sh`
+    - passed
+  - `ReadLints` on `start-stack.sh`
+    - no diagnostics
+  - `./start-stack.sh stop`
+    - cleared the previously orphaned `node`/Vite listener on `:8000`
+  - Live full-cycle check:
+    - `./start-stack.sh`
+    - `./start-stack.sh stop`
+    - `./start-stack.sh`
+    - `./start-stack.sh stop`
+    - restart succeeded on the first try with no duplicate-service refusal
+    - final `ss -ltnp '( sport = :8000 or sport = :4000 or sport = :3000 )'` showed no listeners on those stack ports
+    - final `./start-stack.sh probe` reported `physical_state: BUS_UP_DISARMED`
+    - controller logs showed `Shutdown signal received: SIGTERM` and `Shutdown requested.` during stop, with no SIGKILL warning emitted by the launcher
+- Follow-up notes / risks:
+  - The API still logs `ASGI callable returned without completing response.` during shutdown because in-flight requests are interrupted as the service is being stopped; this did not block the verified safe stop/restart flow.

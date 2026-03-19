@@ -544,6 +544,17 @@ def create_app() -> FastAPI:
         )
         return {"status": "ok", "detail": detail}
 
+    @api.post("/control/power-down", summary="Best-effort actuator power-down / de-energize")
+    async def control_power_down(payload: dict[str, Any] | None = None):
+        wait_for_idle = False
+        if isinstance(payload, dict):
+            wait_for_idle = bool(payload.get("wait_for_idle", False))
+        command = "SAFE_POWER_DOWN,wait" if wait_for_idle else "SAFE_POWER_DOWN"
+        detail = await run_in_threadpool(
+            _controller_call_or_503, command, timeout=5.0, expect_response=True
+        )
+        return {"status": "ok", "detail": detail, "waited_for_idle": wait_for_idle}
+
     @api.post(
         "/control/restart-controller",
         summary="Request graceful controller restart (external supervisor should restart process)",

@@ -16,6 +16,8 @@ from gradient_os.api.main import create_app
 def patch_send(monkeypatch):
     responses = {
         "STOP": (True, "ACK,STOP"),
+        "SAFE_POWER_DOWN": (True, "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"),
+        "SAFE_POWER_DOWN,wait": (True, "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"),
         "WAIT_FOR_IDLE": (True, "ACK,WAIT_FOR_IDLE"),
         "ZERO_JOINT,3": (True, "ACK,ZERO_JOINT,3"),
         "GET_STATUS": (True, "STATUS,gripper_present,True"),
@@ -319,6 +321,22 @@ def test_control_stop(client):
     resp = client.post("/control/stop")
     assert resp.status_code == 200
     assert resp.json()["detail"] == "ACK,STOP"
+
+
+def test_control_power_down(client):
+    resp = client.post("/control/power-down")
+    assert resp.status_code == 200
+    assert resp.json()["detail"] == "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"
+    assert resp.json()["waited_for_idle"] is False
+    assert client.command_calls[-1] == ("SAFE_POWER_DOWN", 5.0, True)
+
+
+def test_control_power_down_waits_when_requested(client):
+    resp = client.post("/control/power-down", json={"wait_for_idle": True})
+    assert resp.status_code == 200
+    assert resp.json()["detail"] == "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"
+    assert resp.json()["waited_for_idle"] is True
+    assert client.command_calls[-1] == ("SAFE_POWER_DOWN,wait", 5.0, True)
 
 
 def test_control_wait_for_idle(client):

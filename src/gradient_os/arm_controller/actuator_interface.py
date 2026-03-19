@@ -72,6 +72,17 @@ class ActuatorBackend(ABC):
         - Release any resources
         """
         pass
+
+    def safe_power_down(self) -> bool:
+        """
+        Best-effort transition to a non-active hardware state without requiring
+        the whole controller process to exit first.
+
+        Returns:
+            bool: True if the backend handled a hardware power-down/de-energize
+            action, False if no special power-down behavior is implemented.
+        """
+        return False
     
     @property
     @abstractmethod

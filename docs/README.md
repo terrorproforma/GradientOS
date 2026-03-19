@@ -69,6 +69,50 @@ source ./start.sh
 
 ## Run The Stack
 
+Preferred local launcher:
+
+```bash
+# Full staged startup with combined log streaming
+./start-stack.sh
+
+# Controller + API only
+./start-stack.sh --headless
+
+# Inspect the current launcher/process state
+./start-stack.sh status
+
+# Probe physical hardware / RTCore state
+./start-stack.sh probe
+
+# Soft-stop a stack started by start-stack.sh
+./start-stack.sh stop
+
+# Hard-stop including RTCore + EtherCAT master
+./start-stack.sh stop --hard
+```
+
+`start-stack.sh` sources `./start.sh`, then stages startup as controller -> API -> web UI.
+Each run writes durable logs under `logs/startups/<timestamp>/` and updates
+`logs/startups/latest/` to point at the newest run, while still streaming live logs in the
+terminal. Startup does not advance past the controller stage until the RTCore metrics report
+the full bus online and operational for all configured axes.
+
+When started from an interactive terminal, the launcher switches into a small in-terminal
+command console after startup completes. This is a line-oriented prompt in the style of
+`scripts/rtcore_jog.py`: service logs continue streaming, and the current input line is
+redrawn so the prompt does not get lost in the telemetry stream. Supported commands are
+`stop`, `stop --hard`, `probe`, `status`, `help`, and `clear`.
+
+`./start-stack.sh stop` is now the normal operator stop: it requests an explicit controller
+power-down/de-energize, waits for the hardware to reach `BUS_UP_DISARMED`, then stops the
+controller/API/web processes while leaving RTCore + EtherCAT alive so the drives stay on a
+clean synchronized bus instead of faulting on sync loss. Use `./start-stack.sh stop --hard`
+only when you truly want RTCore and `ethercat.service` torn down as well.
+
+`./start-stack.sh probe` is the hardware-focused view. It reads RTCore metrics directly and
+reports whether the physical system looks `ACTIVE`, `BUS_UP_DISARMED`, `FAULTED`, or
+`INACTIVE`, along with per-axis DS402 state, statusword, error code, and slave AL state.
+
 ### Linux/macOS
 
 ```bash

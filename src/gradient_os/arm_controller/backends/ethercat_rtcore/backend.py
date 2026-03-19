@@ -199,6 +199,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             return False
 
     def shutdown(self) -> None:
+        self._best_effort_safe_power_down()
         self._status_stop.set()
         self._axis_config_event.clear()
         self._status_snapshot_event.clear()
@@ -239,6 +240,25 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         self._connected = False
         self._initialized = False
+
+    def safe_power_down(self) -> bool:
+        self._best_effort_safe_power_down()
+        return True
+
+    def _best_effort_safe_power_down(self) -> None:
+        if not self._connected:
+            return
+
+        try:
+            axis_mask = (1 << self._rt_num_axes) - 1 if self._rt_num_axes > 0 else 0
+            if axis_mask:
+                self._send_cmd_axis_disable(axis_mask=axis_mask)
+            self._send_cmd_arm(False)
+            # Give the RTCore thread a brief window to consume the disable/disarm command
+            # before we tear down IPC resources on the Python side.
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"[EtherCAT RTCore] WARNING: safe power-down failed during shutdown: {e}")
 
     @property
     def num_joints(self) -> int:
@@ -682,6 +702,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
     def _send_cmd_axis_enable(self, axis_mask: int) -> None:
         self._cmd_ring_write(_MSG_CMD_AXIS_ENABLE, _CMD_AXIS_MASK_STRUCT.pack(int(axis_mask), 0))
+
+    def _send_cmd_axis_disable(self, axis_mask: int) -> None:
+        self._cmd_ring_write(_MSG_CMD_AXIS_DISABLE, _CMD_AXIS_MASK_STRUCT.pack(int(axis_mask), 0))
 
     def _send_cmd_set_mode(self, axis_mask: int, mode: int) -> None:
         self._cmd_ring_write(_MSG_CMD_SET_MODE, _CMD_SET_MODE_STRUCT.pack(int(axis_mask), int(mode)))

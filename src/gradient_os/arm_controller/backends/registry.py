@@ -325,11 +325,14 @@ def get_telemetry_blocks() -> list[tuple[int, int]]:
         list[tuple[int, int]]: List of (start_address, length) tuples
     """
     cfg = get_config()
-    return [
-        (cfg.TELEMETRY_BLOCK1_ADDRESS, cfg.TELEMETRY_BLOCK1_LENGTH),
-        (cfg.TELEMETRY_BLOCK2_ADDRESS, cfg.TELEMETRY_BLOCK2_LENGTH),
-        (cfg.TELEMETRY_BLOCK3_ADDRESS, cfg.TELEMETRY_BLOCK3_LENGTH),
-    ]
+    blocks: list[tuple[int, int]] = []
+    for block_index in range(1, 4):
+        addr = getattr(cfg, f"TELEMETRY_BLOCK{block_index}_ADDRESS", None)
+        length = getattr(cfg, f"TELEMETRY_BLOCK{block_index}_LENGTH", None)
+        if addr is None or length is None:
+            return []
+        blocks.append((int(addr), int(length)))
+    return blocks
 
 
 def parse_telemetry_block(block_index: int, data: bytes) -> dict:
@@ -344,13 +347,10 @@ def parse_telemetry_block(block_index: int, data: bytes) -> dict:
         dict: Parsed telemetry data
     """
     cfg = get_config()
-    
-    if block_index == 0:
-        return cfg.parse_telemetry_block1(data)
-    elif block_index == 1:
-        return cfg.parse_telemetry_block2(data)
-    elif block_index == 2:
-        return cfg.parse_telemetry_block3(data)
-    
+
+    parser = getattr(cfg, f"parse_telemetry_block{block_index + 1}", None)
+    if callable(parser):
+        return parser(data)
+
     return {}
 

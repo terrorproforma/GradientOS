@@ -22,6 +22,7 @@ from . import utils
 from . import servo_driver
 from . import trajectory_execution
 from . import pid_tuner
+from .backends import registry as backend_registry
 from ..kinematics import runtime as kinematics_runtime
 
 def _resolve_profile_params_for_speed_multiplier(speed_multiplier: float | int | str | None) -> tuple[float, float, float]:
@@ -1071,6 +1072,50 @@ def handle_wait_for_idle():
         print("[Controller] Move complete. Resuming.")
     else:
         print("[Controller] No move is currently running.")
+
+
+def handle_safe_power_down(wait_for_idle: bool = False) -> str:
+    """
+    Best-effort transition the active actuator backend into a non-active state.
+
+    For EtherCAT RTCore this is intended to de-energize the axes without relying
+    on the controller process exiting first.
+    """
+    print("[Controller] Received SAFE_POWER_DOWN command.")
+    try:
+        handle_stop_command()
+    except Exception as e:
+        print(f"[Controller] WARNING: STOP during safe power-down failed: {e}")
+
+    if wait_for_idle:
+        try:
+            handle_wait_for_idle()
+        except Exception as e:
+            print(f"[Controller] WARNING: WAIT_FOR_IDLE during safe power-down failed: {e}")
+
+    try:
+        backend = backend_registry.get_active_backend()
+    except Exception as e:
+        msg = f"NO_ACTIVE_BACKEND:{e}"
+        print(f"[Controller] WARNING: {msg}")
+        return msg
+
+    safe_power_down = getattr(backend, "safe_power_down", None)
+    if not callable(safe_power_down):
+        print("[Controller] Active backend does not implement safe_power_down().")
+        return "BACKEND_NOOP"
+
+    try:
+        handled = bool(safe_power_down())
+        if handled:
+            print("[Controller] Backend safe power-down command sent.")
+            return "POWER_DOWN_SENT"
+        print("[Controller] Backend reported no special power-down action.")
+        return "BACKEND_NOOP"
+    except Exception as e:
+        msg = f"POWER_DOWN_FAILED:{e}"
+        print(f"[Controller] WARNING: {msg}")
+        return msg
 
 
 # -----------------------------------------------------------------------------

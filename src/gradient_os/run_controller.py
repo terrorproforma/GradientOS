@@ -15,6 +15,7 @@ import time
 import traceback
 import sys
 import os
+import signal
 import numpy as np
 import argparse
 import threading
@@ -56,6 +57,19 @@ IK_BACKEND_CHOICES = ["ikfast", "numeric"]
 _DEFAULT_RTCORE_SOCKET_PATH = "/run/gradient-rt-motion/ipc.sock"
 _RTCORE_SERVICE_NAME = "gradient-rt-motion.service"
 _DEFAULT_RTCORE_METRICS_PATH = "/run/gradient-rt-motion/metrics.json"
+
+
+def _install_shutdown_signal_handlers() -> None:
+    def _handle_signal(signum, _frame):
+        signame = signal.Signals(signum).name
+        print(f"\n[Controller] Shutdown signal received: {signame}")
+        raise KeyboardInterrupt()
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(signum, _handle_signal)
+        except Exception:
+            pass
 
 
 def _resolve_default_robot_name() -> str:
@@ -250,6 +264,7 @@ def main():
     restart_requested = False
     restart_reason = ""
     active_runtime_config: dict[str, object] | None = None
+    _install_shutdown_signal_handlers()
 
     # Get list of available robots for help text
     available_robots = list_available_robots()
@@ -1204,6 +1219,16 @@ Examples:
                     command_api.handle_wait_for_idle()
                     try:
                         sock.sendto("ACK,WAIT_FOR_IDLE".encode("utf-8"), addr)
+                    except Exception:
+                        pass
+
+                elif command == "SAFE_POWER_DOWN":
+                    wait_for_idle = False
+                    if len(parts) > 1:
+                        wait_for_idle = parts[1].strip().lower() in {"1", "true", "yes", "on", "wait"}
+                    detail = command_api.handle_safe_power_down(wait_for_idle=wait_for_idle)
+                    try:
+                        sock.sendto(f"ACK,SAFE_POWER_DOWN,{detail}".encode("utf-8"), addr)
                     except Exception:
                         pass
 

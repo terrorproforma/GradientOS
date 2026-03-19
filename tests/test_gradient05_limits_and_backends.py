@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from gradient_os.arm_controller.backends import registry as backend_registry
 from gradient_os.arm_controller.backends.ethercat_rtcore.backend import (
     EthercatRTCoreBackend,
     _AxisConfig,
@@ -225,6 +226,40 @@ def test_ethercat_backend_zero_capture_persists_joint_offsets(monkeypatch, tmp_p
 
     loaded_offsets = load_joint_zero_offsets("gradient-05", num_joints=6)
     assert loaded_offsets[2] == pytest.approx(1.5)
+
+
+def test_ethercat_backend_safe_power_down_disables_axes_and_disarms(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 3
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        backend,
+        "_send_cmd_axis_disable",
+        lambda axis_mask: calls.append(("disable", axis_mask)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_send_cmd_arm",
+        lambda arm: calls.append(("arm", arm)),
+    )
+
+    backend._best_effort_safe_power_down()
+
+    assert calls == [("disable", 0x7), ("arm", False)]
+
+
+def test_registry_telemetry_blocks_are_optional_for_ethercat_backend():
+    backend_registry.set_active_backend("feetech")
+    assert len(backend_registry.get_telemetry_blocks()) == 3
+
+    backend_registry.set_active_backend("ethercat_rtcore")
+    assert backend_registry.get_telemetry_blocks() == []
+    assert backend_registry.parse_telemetry_block(0, b"\x00\x01") == {}
+
+    backend_registry.set_active_backend("feetech")
 
 
 def test_rtcore_metrics_ready_requires_full_startup_signal():
