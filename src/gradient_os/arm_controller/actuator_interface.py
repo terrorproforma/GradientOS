@@ -83,6 +83,16 @@ class ActuatorBackend(ABC):
             action, False if no special power-down behavior is implemented.
         """
         return False
+
+    def safe_power_up(self) -> bool:
+        """
+        Best-effort transition to an active/armed hardware state.
+
+        Returns:
+            bool: True if the backend handled a hardware power-up/enable action,
+            False if no special power-up behavior is implemented.
+        """
+        return False
     
     @property
     @abstractmethod
@@ -448,6 +458,19 @@ class ActuatorBackend(ABC):
         
         Returns:
             bool: True if restart command was sent successfully.
+        """
+        return False  # Default: not supported
+
+    def reset_faults(self, logical_joint_index: Optional[int] = None) -> bool:
+        """
+        Best-effort reset of active drive/controller faults.
+
+        Args:
+            logical_joint_index: Optional 0-based logical joint index to target.
+                If omitted, reset faults for all supported joints/axes.
+
+        Returns:
+            bool: True if a fault-reset request was sent successfully.
         """
         return False  # Default: not supported
 

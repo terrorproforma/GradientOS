@@ -9,6 +9,7 @@ pytest.importorskip("httpx")
 from contextlib import contextmanager
 from fastapi.testclient import TestClient
 
+from gradient_os.api import main as api_main
 from gradient_os.api.main import create_app
 
 
@@ -16,9 +17,12 @@ from gradient_os.api.main import create_app
 def patch_send(monkeypatch):
     responses = {
         "STOP": (True, "ACK,STOP"),
+        "SAFE_POWER_UP": (True, "ACK,SAFE_POWER_UP,POWER_UP_SENT"),
         "SAFE_POWER_DOWN": (True, "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"),
         "SAFE_POWER_DOWN,wait": (True, "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"),
         "WAIT_FOR_IDLE": (True, "ACK,WAIT_FOR_IDLE"),
+        "RESET_FAULTS": (True, "ACK,RESET_FAULTS,ALL"),
+        "RESET_FAULTS,1": (True, "ACK,RESET_FAULTS,JOINT,1"),
         "ZERO_JOINT,3": (True, "ACK,ZERO_JOINT,3"),
         "GET_STATUS": (True, "STATUS,gripper_present,True"),
         "GET_POSITION": (
@@ -105,6 +109,12 @@ def patch_send(monkeypatch):
             "robot_default_backend": "ethercat_rtcore",
             "override_backend": None,
         },
+        "drive_profile": {
+            "effective_profile": "a6ec_ds402",
+            "source": "backend_default",
+            "backend_default_profile": "a6ec_ds402",
+            "override_profile": None,
+        },
         "tool": {
             "active_tool_id": "identity",
             "display_name": "Identity (No Tool Offset)",
@@ -162,6 +172,8 @@ def patch_send(monkeypatch):
                     "weld": {},
                 }
             return True, f"ACK,SET_ACTIVE_TOOL,{runtime_state['tool']['active_tool_id']}"
+        if command.startswith("APPLY_JOINT_SETPOINT,"):
+            return True, "ACK,APPLY_JOINT_SETPOINT"
         if command.startswith("REQUEST_RESTART,"):
             reason = command.split(",", 1)[1] if "," in command else "api-request"
             return True, f"ACK,REQUEST_RESTART,{reason}"
@@ -345,6 +357,29 @@ def test_control_wait_for_idle(client):
     assert resp.json()["detail"] == "ACK,WAIT_FOR_IDLE"
 
 
+def test_control_reset_faults_all(client):
+    resp = client.post("/control/reset-faults")
+    assert resp.status_code == 200
+    assert resp.json()["detail"] == "ACK,RESET_FAULTS,ALL"
+    assert resp.json()["joint"] is None
+    assert client.command_calls[-1] == ("RESET_FAULTS", 5.0, True)
+
+
+def test_control_power_up(client):
+    resp = client.post("/control/power-up")
+    assert resp.status_code == 200
+    assert resp.json()["detail"] == "ACK,SAFE_POWER_UP,POWER_UP_SENT"
+    assert client.command_calls[-1] == ("SAFE_POWER_UP", 5.0, True)
+
+
+def test_control_reset_faults_joint(client):
+    resp = client.post("/control/reset-faults", json={"joint": 1})
+    assert resp.status_code == 200
+    assert resp.json()["detail"] == "ACK,RESET_FAULTS,JOINT,1"
+    assert resp.json()["joint"] == 1
+    assert client.command_calls[-1] == ("RESET_FAULTS,1", 5.0, True)
+
+
 def test_control_home(client):
     resp = client.post("/control/home")
     assert resp.status_code == 200
@@ -374,12 +409,33 @@ def test_control_joint_jog(client):
         0.08726646259971647,
         0.10471975511965978,
     ])
+    assert body["command_acknowledged"] is True
+    assert body["completion_scope"] == "direct_setpoint_ack"
+    assert body["waited_for_idle"] is False
     assert client.command_calls[-2] == ("GET_JOINT_ANGLES", 1.0, True)
-    assert client.command_calls[-1] == (
-        "0.017453292519943295,0.03490658503988659,0.09599310885968812,0.06981317007977318,0.08726646259971647,0.10471975511965978",
-        2.0,
-        False,
-    )
+    last_command, timeout_s, expect_response = client.command_calls[-1]
+    assert timeout_s == 2.0
+    assert expect_response is True
+    assert last_command.startswith("APPLY_JOINT_SETPOINT,")
+
+
+def test_control_joint_jog_surfaces_backend_rejection(client, monkeypatch):
+    def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
+        if command == "GET_JOINT_ANGLES":
+            return True, "JOINT_ANGLES,1,2,3,4,5,6,7"
+        if command.startswith("APPLY_JOINT_SETPOINT,"):
+            return False, "ERROR,APPLY_JOINT_SETPOINT,RTCore did not provide a setpoint slot"
+        return True, "ACK"
+
+    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
+
+    resp = client.post("/control/joint-jog", json={"joint": 1, "delta_deg": 1.0})
+
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == {
+        "code": "APPLY_JOINT_SETPOINT_REJECTED",
+        "message": "RTCore did not provide a setpoint slot",
+    }
 
 
 def test_info_status(client):
@@ -707,6 +763,32 @@ def test_runtime_config_patch_applies_tool_live_without_restart(client):
     assert patch_body["restart_required"] is False
     commands = [entry[0] for entry in client.command_calls]
     assert "SET_ACTIVE_TOOL,tig-torch-65deg" in commands
+
+
+def test_send_controller_command_uses_large_udp_receive_buffer(monkeypatch):
+    recv_sizes: list[int] = []
+
+    class FakeSocket:
+        def settimeout(self, _timeout):
+            return None
+
+        def sendto(self, _payload, _addr):
+            return None
+
+        def recvfrom(self, bufsize):
+            recv_sizes.append(int(bufsize))
+            return (b"RUNTIME_CONFIG,{}", ("127.0.0.1", 3000))
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("gradient_os.api.main._resolve_controller_endpoint", lambda: ("127.0.0.1", 3000))
+    monkeypatch.setattr("gradient_os.api.main.socket.socket", lambda *_args, **_kwargs: FakeSocket())
+
+    ok, detail = api_main._send_controller_command("GET_RUNTIME_CONFIG", timeout=1.0, expect_response=True)
+    assert ok is True
+    assert detail == "RUNTIME_CONFIG,{}"
+    assert recv_sizes == [api_main._CONTROLLER_REPLY_MAX_BYTES]
 
 
 def test_tools_library_crud_and_filter(client):

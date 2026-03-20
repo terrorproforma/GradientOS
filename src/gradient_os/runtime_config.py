@@ -7,6 +7,7 @@ from typing import Any
 
 from . import robot_assets
 from . import tool_library
+from .arm_controller.backends import registry as backend_registry
 from .arm_controller.robots import (
     get_robot_config,
     get_robot_name_by_id,
@@ -51,6 +52,7 @@ def _empty_runtime_config() -> dict[str, Any]:
             "overrides": {
                 "ik_solver_backend": None,
                 "servo_backend": None,
+                "drive_profile": None,
             },
         },
         "meta": {
@@ -87,6 +89,15 @@ def _normalize_ik_backend(raw: Any) -> str | None:
 
 
 def _normalize_servo_backend(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    token = str(raw).strip().lower()
+    if token in {"", "none", "null"}:
+        return None
+    return token
+
+
+def _normalize_drive_profile(raw: Any) -> str | None:
     if raw is None:
         return None
     token = str(raw).strip().lower()
@@ -132,6 +143,7 @@ def _normalize_runtime_config(raw: Any) -> dict[str, Any]:
                     overrides_obj.get("ik_solver_backend")
                 ),
                 "servo_backend": _normalize_servo_backend(overrides_obj.get("servo_backend")),
+                "drive_profile": _normalize_drive_profile(overrides_obj.get("drive_profile")),
             },
         },
         "meta": {
@@ -199,6 +211,10 @@ def update_runtime_config_desired(
             overrides["servo_backend"] = _normalize_servo_backend(
                 patch_overrides.get("servo_backend")
             )
+        if "drive_profile" in patch_overrides:
+            overrides["drive_profile"] = _normalize_drive_profile(
+                patch_overrides.get("drive_profile")
+            )
     desired["overrides"] = overrides
     current["desired"] = desired
     return save_runtime_config(current, actor=actor)
@@ -224,6 +240,7 @@ def resolve_effective_runtime(
     sim_mode: bool,
     requested_ik_solver_backend: str | None = None,
     requested_servo_backend: str | None = None,
+    requested_drive_profile: str | None = None,
     requested_active_tool_id: str | None = None,
     allow_unsafe_overrides: bool = False,
 ) -> dict[str, Any]:
@@ -243,6 +260,18 @@ def resolve_effective_runtime(
         if not sim_mode:
             effective_servo = override_servo
             servo_source = "dev_override"
+
+    backend_default_drive_profile = (
+        None
+        if sim_mode
+        else backend_registry.get_default_drive_profile_for_backend(effective_servo)
+    )
+    effective_drive_profile = backend_default_drive_profile
+    drive_profile_source = "sim_mode" if sim_mode else "backend_default"
+    override_drive_profile = _normalize_drive_profile(requested_drive_profile)
+    if override_drive_profile and allow_unsafe_overrides and not sim_mode:
+        effective_drive_profile = override_drive_profile
+        drive_profile_source = "dev_override"
 
     selected_tool = tool_library.resolve_active_tool(
         robot_id=robot.robot_id,
@@ -271,6 +300,16 @@ def resolve_effective_runtime(
             "robot_default_backend": robot.default_servo_backend,
             "override_backend": override_servo,
         },
+        "drive_profile": {
+            "configured_profile": effective_drive_profile,
+            "configured_source": drive_profile_source,
+            "live_profile": None,
+            "live_source": None,
+            "effective_profile": effective_drive_profile,
+            "source": drive_profile_source,
+            "backend_default_profile": backend_default_drive_profile,
+            "override_profile": override_drive_profile,
+        },
         "tool": {
             "active_tool_id": selected_tool.get("tool_id"),
             "display_name": selected_tool.get("display_name"),
@@ -285,35 +324,86 @@ def resolve_effective_runtime(
     }
 
 
+def attach_live_drive_profile(
+    runtime: dict[str, Any] | None,
+    live_profile: Any,
+    *,
+    live_source: str = "rtcore_status_hello",
+) -> dict[str, Any] | None:
+    if not isinstance(runtime, dict):
+        return runtime
+    drive = runtime.get("drive_profile")
+    drive_block = dict(drive) if isinstance(drive, dict) else {}
+
+    configured_profile = _normalize_drive_profile(
+        drive_block.get("configured_profile", drive_block.get("effective_profile"))
+    )
+    configured_source_raw = drive_block.get("configured_source", drive_block.get("source"))
+    configured_source = str(configured_source_raw).strip() if configured_source_raw is not None else ""
+    live_profile_token = _normalize_drive_profile(live_profile)
+
+    drive_block["configured_profile"] = configured_profile
+    drive_block["configured_source"] = configured_source or None
+    drive_block["live_profile"] = live_profile_token
+    drive_block["live_source"] = live_source if live_profile_token else None
+    drive_block["effective_profile"] = live_profile_token or configured_profile
+    drive_block["source"] = (live_source if live_profile_token else configured_source) or None
+    runtime["drive_profile"] = drive_block
+    return runtime
+
+
 def _active_fields(
     runtime: dict[str, Any] | None,
-) -> tuple[str | None, str | None, str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
     if not isinstance(runtime, dict):
-        return (None, None, None, None)
+        return (None, None, None, None, None)
     robot_name = runtime.get("robot", {}).get("name") if isinstance(runtime.get("robot"), dict) else None
     ik_backend = runtime.get("ik_solver", {}).get("effective_backend") if isinstance(runtime.get("ik_solver"), dict) else None
     servo_backend = runtime.get("servo_backend", {}).get("effective_backend") if isinstance(runtime.get("servo_backend"), dict) else None
+    drive_block = runtime.get("drive_profile", {}) if isinstance(runtime.get("drive_profile"), dict) else {}
+    drive_profile = (
+        drive_block.get("configured_profile", drive_block.get("effective_profile"))
+        if isinstance(drive_block, dict)
+        else None
+    )
     active_tool_id = runtime.get("tool", {}).get("active_tool_id") if isinstance(runtime.get("tool"), dict) else None
     return (
         str(robot_name) if isinstance(robot_name, str) else None,
         str(ik_backend) if isinstance(ik_backend, str) else None,
         str(servo_backend) if isinstance(servo_backend, str) else None,
+        str(drive_profile) if isinstance(drive_profile, str) else None,
         str(active_tool_id) if isinstance(active_tool_id, str) else None,
     )
 
 
 def compute_restart_required(active_runtime: dict[str, Any] | None, desired_config: dict[str, Any]) -> bool:
-    active_robot, active_ik, active_servo, _active_tool_id = _active_fields(active_runtime)
+    active_robot, active_ik, active_servo, active_drive_profile, _active_tool_id = _active_fields(active_runtime)
+    active_mode = active_runtime.get("mode", {}) if isinstance(active_runtime, dict) else {}
     desired_obj = desired_config.get("desired", {}) if isinstance(desired_config, dict) else {}
     desired_robot_name = _normalize_robot_name(desired_obj.get("robot"))
-    robot_cfg = get_robot_config(desired_robot_name)
-    desired_ik = robot_cfg.default_ik_solver_backend
-    desired_servo = robot_cfg.default_servo_backend
+    desired_overrides = desired_obj.get("overrides", {}) if isinstance(desired_obj.get("overrides"), dict) else {}
+    desired_allow_unsafe = resolve_allow_unsafe_overrides(
+        cli_flag=False,
+        desired_flag=bool(desired_obj.get("allow_unsafe_overrides", False)),
+    )
+    desired_runtime = resolve_effective_runtime(
+        robot_name=desired_robot_name,
+        sim_mode=bool(active_mode.get("sim", False)) if isinstance(active_mode, dict) else False,
+        requested_ik_solver_backend=desired_overrides.get("ik_solver_backend"),
+        requested_servo_backend=desired_overrides.get("servo_backend"),
+        requested_drive_profile=desired_overrides.get("drive_profile"),
+        requested_active_tool_id=desired_obj.get("active_tool_id"),
+        allow_unsafe_overrides=desired_allow_unsafe,
+    )
+    desired_ik = desired_runtime.get("ik_solver", {}).get("effective_backend")
+    desired_servo = desired_runtime.get("servo_backend", {}).get("effective_backend")
+    desired_drive_profile = desired_runtime.get("drive_profile", {}).get("effective_profile")
     if active_robot is None:
         return False
     return (
         active_robot != desired_robot_name
         or active_ik != desired_ik
         or active_servo != desired_servo
+        or active_drive_profile != desired_drive_profile
     )
 

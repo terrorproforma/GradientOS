@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ...actuator_interface import ActuatorBackend
+from .runtime import rtcore_drive_profile_id_to_name
 from ....joint_zero_offsets import load_joint_zero_offsets, save_joint_zero_offsets
 
 
@@ -35,6 +36,7 @@ _ROLE_CONTROLLER = 1
 
 _GRADIENT_MAX_AXES = 16
 
+_MSG_STATUS_HELLO = 0x0201
 _MSG_STATUS_SNAPSHOT = 0x0202
 _MSG_STATUS_AXIS_CONFIG = 0x0203
 
@@ -57,6 +59,7 @@ _MSG_HEADER_STRUCT = struct.Struct("<HHIQQ")  # 24 bytes
 _CMD_ARM_STRUCT = struct.Struct("<II")
 _CMD_AXIS_MASK_STRUCT = struct.Struct("<II")
 _CMD_SET_MODE_STRUCT = struct.Struct("<II")
+_STATUS_HELLO_STRUCT = struct.Struct("<QQQIIII")
 _AXIS_CONFIG_STRUCT = struct.Struct("<II16I16d16i16B16x16d")  # 424 bytes
 _STATUS_SNAPSHOT_HEADER_STRUCT = struct.Struct("<IIIIqqQ")
 
@@ -129,7 +132,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._cmd_seq = 1
 
         # Auto-arm on successful IPC connect (mirrors how serial servos become usable after init).
-        self._auto_arm = os.environ.get("GRADIENT_RTCORE_AUTO_ARM", "1").lower() not in ("0", "false", "no")
+        self._auto_arm = os.environ.get("GRADIENT_RTCORE_AUTO_ARM", "0").lower() not in ("0", "false", "no")
         # Optional: restrict which axes are armed/enabled on connect.
         # Examples:
         #   GRADIENT_RTCORE_AUTO_ARM_MASK=0x1   (only axis 0, i.e. slave position 0)
@@ -169,6 +172,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._axis_counts: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_statusword: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_error_code: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._rt_drive_profile_code = 0
+        self._rt_drive_profile_id: Optional[str] = None
         self._last_wkc_expected = 0
         self._last_wkc_actual = 0
         self._last_master_state = 0
@@ -240,9 +245,56 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         self._connected = False
         self._initialized = False
+        with self._status_lock:
+            self._rt_drive_profile_code = 0
+            self._rt_drive_profile_id = None
 
     def safe_power_down(self) -> bool:
         self._best_effort_safe_power_down()
+        return True
+
+    def safe_power_up(self) -> bool:
+        self._best_effort_safe_power_up()
+        return True
+
+    def get_live_drive_profile_id(self) -> Optional[str]:
+        with self._status_lock:
+            return self._rt_drive_profile_id
+
+    def reset_faults(self, logical_joint_index: Optional[int] = None) -> bool:
+        if not self._connected:
+            print("[EtherCAT RTCore] WARNING: cannot reset faults while RTCore is disconnected")
+            return False
+
+        if self._rt_num_axes <= 0:
+            print("[EtherCAT RTCore] WARNING: cannot reset faults without any configured axes")
+            return False
+
+        if logical_joint_index is None:
+            axis_mask = (1 << self._rt_num_axes) - 1
+            label = "all axes"
+        else:
+            joint_i = int(logical_joint_index)
+            if joint_i < 0 or joint_i >= self._num_joints:
+                print(f"[EtherCAT RTCore] WARNING: joint index out of range for fault reset: {joint_i}")
+                return False
+            axis_mask = 0
+            for axis_i, mapped_joint in enumerate(self._axis_to_joint):
+                if mapped_joint == joint_i:
+                    axis_mask |= (1 << axis_i)
+            if axis_mask == 0:
+                print(
+                    "[EtherCAT RTCore] WARNING: cannot reset faults for joint"
+                    f" {joint_i + 1}; no mapped RTCore axes"
+                )
+                return False
+            label = f"joint {joint_i + 1}"
+
+        self._send_cmd_fault_reset(axis_mask=axis_mask)
+        print(
+            "[EtherCAT RTCore] Fault reset requested:"
+            f" target={label} axis_mask=0x{axis_mask:x}"
+        )
         return True
 
     def _best_effort_safe_power_down(self) -> None:
@@ -259,6 +311,23 @@ class EthercatRTCoreBackend(ActuatorBackend):
             time.sleep(0.05)
         except Exception as e:
             print(f"[EtherCAT RTCore] WARNING: safe power-down failed during shutdown: {e}")
+
+    def _best_effort_safe_power_up(self) -> None:
+        if not self._connected:
+            return
+        try:
+            axis_mask_all = (1 << self._rt_num_axes) - 1 if self._rt_num_axes > 0 else 0
+            axis_mask = axis_mask_all
+            if self._auto_arm_mask is not None:
+                axis_mask = int(self._auto_arm_mask) & int(axis_mask_all)
+            if not axis_mask:
+                print("[EtherCAT RTCore] WARNING: safe power-up skipped; no axes selected")
+                return
+            self._send_cmd_arm(True)
+            self._send_cmd_set_mode(axis_mask=axis_mask, mode=_MODE_CSP)
+            self._send_cmd_axis_enable(axis_mask=axis_mask)
+        except Exception as e:
+            print(f"[EtherCAT RTCore] WARNING: safe power-up failed: {e}")
 
     @property
     def num_joints(self) -> int:
@@ -572,16 +641,11 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     f" ({self._feedback_ready_summary()})"
                 )
 
-        # Mirror serial backend behavior: after init, the system is usable.
+        # Default safety policy: connect disarmed unless the environment opts back
+        # into the legacy auto-arm behavior.
         if self._auto_arm:
             try:
-                axis_mask_all = (1 << self._rt_num_axes) - 1 if self._rt_num_axes > 0 else 0
-                axis_mask = axis_mask_all
-                if self._auto_arm_mask is not None:
-                    axis_mask = int(self._auto_arm_mask) & int(axis_mask_all)
-                self._send_cmd_arm(True)
-                self._send_cmd_set_mode(axis_mask=axis_mask, mode=_MODE_CSP)
-                self._send_cmd_axis_enable(axis_mask=axis_mask)
+                self._best_effort_safe_power_up()
             except Exception as e:
                 print(f"[EtherCAT RTCore] WARNING: auto-arm failed: {e}")
 
@@ -706,6 +770,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def _send_cmd_axis_disable(self, axis_mask: int) -> None:
         self._cmd_ring_write(_MSG_CMD_AXIS_DISABLE, _CMD_AXIS_MASK_STRUCT.pack(int(axis_mask), 0))
 
+    def _send_cmd_fault_reset(self, axis_mask: int) -> None:
+        self._cmd_ring_write(_MSG_CMD_FAULT_RESET, _CMD_AXIS_MASK_STRUCT.pack(int(axis_mask), 0))
+
     def _send_cmd_set_mode(self, axis_mask: int, mode: int) -> None:
         self._cmd_ring_write(_MSG_CMD_SET_MODE, _CMD_SET_MODE_STRUCT.pack(int(axis_mask), int(mode)))
 
@@ -766,6 +833,22 @@ class EthercatRTCoreBackend(ActuatorBackend):
             num_axes=int(num_axes),
             counts_per_unit=counts_per_unit,
             sign=sign,
+        )
+
+    def _parse_status_hello(self, payload: bytes) -> tuple[Optional[str], int, int]:
+        (
+            _build_id_hash,
+            _topology_hash,
+            _cycle_ns,
+            _num_axes,
+            drive_profile_code,
+            wkc_expected,
+            _reserved0,
+        ) = _STATUS_HELLO_STRUCT.unpack_from(payload, 0)
+        return (
+            rtcore_drive_profile_id_to_name(drive_profile_code),
+            int(drive_profile_code),
+            int(wkc_expected),
         )
 
     def _build_axis_config_from_robot_config(self, robot_config: dict) -> Optional[_AxisConfig]:
@@ -898,6 +981,16 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
             mtype, _mflags, mbytes, _seq, _t_ns = _MSG_HEADER_STRUCT.unpack_from(blob, 0)
             payload = blob[_MSG_HEADER_STRUCT.size : min(msg_bytes, mbytes)]
+
+            if mtype == _MSG_STATUS_HELLO and len(payload) >= _STATUS_HELLO_STRUCT.size:
+                try:
+                    live_profile_id, drive_profile_code, wkc_expected = self._parse_status_hello(payload)
+                    with self._status_lock:
+                        self._rt_drive_profile_code = int(drive_profile_code)
+                        self._rt_drive_profile_id = live_profile_id
+                        self._last_wkc_expected = int(wkc_expected)
+                except Exception:
+                    pass
 
             if mtype == _MSG_STATUS_AXIS_CONFIG and len(payload) >= _AXIS_CONFIG_STRUCT.size:
                 try:

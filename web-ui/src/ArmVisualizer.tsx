@@ -103,6 +103,7 @@ const WELD_ANGLE_PREVIEW_VECTOR_LENGTH_M = 0.065;
 const WELD_ANGLE_PREVIEW_ARC_RADIUS_BASE_M = 0.018;
 const WELD_ANGLE_PREVIEW_LABEL_SCALE = 0.032;
 const WELD_ANGLE_PREVIEW_LABEL_OFFSET_M = 0.014;
+const LIVE_BOUNDS_REFRESH_INTERVAL_MS = 20;
 
 function clampNumber(value: number, min: number, max: number): number {
   const safeValue = Number.isFinite(value) ? value : 0;
@@ -944,6 +945,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   const liveToolTcpNodeRef = useRef<THREE.Object3D | null>(null);
   const [toolTcpVersion, setToolTcpVersion] = useState(0);
   const pendingDynamicBoundsRef = useRef(false);
+  const lastLiveBoundsRefreshMsRef = useRef(0);
   const boundingWallsRef = useRef<THREE.Mesh[]>([]);
   const boundingEdgesRef = useRef<THREE.LineSegments | null>(null);
   const boundingMarkersRef = useRef<THREE.Object3D[]>([]);
@@ -1428,13 +1430,6 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       }
     };
 
-    const scheduleBoundingRefresh = () => {
-      if (!isGroundedRef.current) {
-        return;
-      }
-      pendingDynamicBoundsRef.current = true;
-    };
-
     const attachActiveToolVisual = (
       robot: URDFRobot,
       tool: ArmVisualizerProps["activeTool"],
@@ -1690,44 +1685,6 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
           ? Math.min((time - previousTimeRef.current) / 1000, 0.05)
           : 0.016;
       previousTimeRef.current = time ?? null;
-
-      const targetAngles = targetAnglesRef.current;
-      const robot = robotRef.current;
-      let jointsChanged = false;
-      if (robot && targetAngles && targetAngles.length > 0 && isGroundedRef.current) {
-        if (!currentAnglesRef.current) {
-          currentAnglesRef.current = targetAngles.slice();
-        }
-        const currentAngles = currentAnglesRef.current!;
-        const jointsMap = robot.joints;
-        const smoothing = 12; // rad/s tracking speed
-
-        for (let index = 0; index < targetAngles.length; index += 1) {
-          const jointName = `joint${index + 1}`;
-          const joint = jointsMap[jointName];
-          if (!joint) {
-            continue;
-          }
-          const currentValue =
-            typeof currentAngles[index] === "number" ? currentAngles[index] : 0;
-          const targetValue = targetAngles[index];
-          if (!Number.isFinite(targetValue)) {
-            continue;
-          }
-          const blend = Math.min(1, deltaSeconds * smoothing);
-          const blendFactor = Number.isFinite(blend) ? blend : 1;
-          const nextValue = currentValue + (targetValue - currentValue) * blendFactor;
-          if (Math.abs(nextValue - currentValue) > 1e-5) {
-            jointsChanged = true;
-          }
-          joint.setJointValue(nextValue);
-          currentAngles[index] = nextValue;
-        }
-      }
-
-      if (jointsChanged) {
-        scheduleBoundingRefresh();
-      }
 
       if (pendingDynamicBoundsRef.current) {
         pendingDynamicBoundsRef.current = false;
@@ -2782,22 +2739,31 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     if (!joints || joints.length === 0) {
       return;
     }
-    targetAnglesRef.current = joints.slice();
-    if (!currentAnglesRef.current) {
-      currentAnglesRef.current = joints.slice();
-    }
+    const nextAngles = joints.slice();
+    targetAnglesRef.current = nextAngles;
+    // The visualized robot should be a live digital twin of telemetry, not a
+    // smoothed approximation that lags behind the hardware.
+    currentAnglesRef.current = nextAngles.slice();
     if (!isGroundedRef.current) {
       return;
     }
     const robot = robotRef.current;
     if (robot) {
-      joints.forEach((value, index) => {
+      nextAngles.forEach((value, index) => {
         const joint = robot.joints[`joint${index + 1}`];
         if (joint) {
           joint.setJointValue(value);
         }
       });
-      pendingDynamicBoundsRef.current = true;
+      // Recomputing scene bounds on every telemetry packet makes the live view
+      // feel sluggish. Only refresh occasionally, and only if the bounds are visible.
+      if (showBoundingBoxRef.current) {
+        const nowMs = performance.now();
+        if (nowMs - lastLiveBoundsRefreshMsRef.current >= LIVE_BOUNDS_REFRESH_INTERVAL_MS) {
+          lastLiveBoundsRefreshMsRef.current = nowMs;
+          pendingDynamicBoundsRef.current = true;
+        }
+      }
     }
   }, [joints]);
 

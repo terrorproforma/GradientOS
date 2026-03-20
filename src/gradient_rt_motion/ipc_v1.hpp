@@ -307,6 +307,13 @@ enum : uint32_t {
   MASTER_ERROR = 5,
 };
 
+// StatusHelloV1.drive_profile_id values (v1).
+enum : uint32_t {
+  DRIVE_PROFILE_UNKNOWN = 0,
+  DRIVE_PROFILE_A6EC_DS402 = 1,
+  DRIVE_PROFILE_CIA402 = 2,
+};
+
 // AxisStatusV1.brake_state values (v1).
 enum : uint32_t {
   BRAKE_UNKNOWN = 0,

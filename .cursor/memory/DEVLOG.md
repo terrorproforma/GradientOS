@@ -1,3 +1,46 @@
+## 2026-03-20 01:13 +0000
+
+- Task summary:
+  - Implemented the first architecture slice of the servo-profile refactor: shared DS402/EtherCAT profile decoding, runtime drive-profile selection, and honest commissioning joint-jog acknowledgement semantics.
+- Changes:
+  - Added shared profile modules:
+    - `src/gradient_os/arm_controller/profiles/drive/cia402.py`
+    - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`
+    - `src/gradient_os/arm_controller/profiles/fieldbus/ethercat.py`
+    - `src/gradient_os/arm_controller/profiles/registry.py`
+  - Added `src/gradient_os/telemetry/drive_faults.py` to build normalized drive-fault snapshots from RTCore metrics.
+  - Updated `src/gradient_os/arm_controller/backends/registry.py` and `src/gradient_os/arm_controller/backends/ethercat_rtcore/config.py`:
+    - backend defaults now resolve shared `drive_profile` / `fieldbus_profile` ids,
+    - drive statusword + fault decoding now route through the shared profile registry instead of controller-local tables.
+  - Updated `src/gradient_os/runtime_config.py` and `src/gradient_os/arm_controller/robots/__init__.py`:
+    - runtime config now persists and resolves `desired.overrides.drive_profile`,
+    - active runtime payloads now expose `drive_profile`,
+    - restart-required checks now compare the fully resolved desired runtime, including overrides.
+  - Updated `src/gradient_os/run_controller.py` and `start-stack.sh`:
+    - removed embedded DS402 / EtherCAT AL decode tables,
+    - both controller telemetry and launcher probe now consume the shared drive-fault snapshot builder,
+    - controller startup logging now reports the active drive profile.
+  - Updated `src/gradient_os/arm_controller/command_api.py` and `src/gradient_os/api/main.py`:
+    - kept `WAIT_FOR_IDLE` trajectory-thread-scoped,
+    - added `APPLY_JOINT_SETPOINT` acknowledgement path for direct commissioning setpoints,
+    - `/control/joint-jog` now returns `direct_setpoint_ack` metadata instead of pretending it waited for planner idle.
+  - Updated `web-ui/src/App.tsx` and `web-ui/src/ControlPanel.tsx`:
+    - runtime/fault types now include `drive_profile`,
+    - commissioning messages now say backend accepted the setpoint and explicitly call out faulted / not-operation-enabled drive states,
+    - removed a stale orphaned `ee_pose` parsing fragment that was tripping TypeScript lints.
+  - Updated tests:
+    - `tests/test_runtime_config.py`
+    - `tests/test_api_endpoints.py`
+- Validation:
+  - `./.venv/bin/python -m pytest tests/test_runtime_config.py tests/test_api_endpoints.py -q` (passed, 39 tests).
+  - `./.venv/bin/python -m py_compile src/gradient_os/run_controller.py src/gradient_os/runtime_config.py src/gradient_os/api/main.py src/gradient_os/arm_controller/command_api.py src/gradient_os/arm_controller/backends/registry.py src/gradient_os/arm_controller/backends/ethercat_rtcore/config.py src/gradient_os/arm_controller/robots/__init__.py src/gradient_os/telemetry/drive_faults.py src/gradient_os/arm_controller/profiles/registry.py src/gradient_os/arm_controller/profiles/drive/cia402.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py src/gradient_os/arm_controller/profiles/fieldbus/ethercat.py` (passed).
+  - `bash -n start-stack.sh` (passed).
+  - `ReadLints` on edited Python/TS files (no diagnostics after cleanup).
+- Follow-up notes / risks:
+  - `src/gradient_rt_motion/main.cpp` still publishes `drive_profile_id = 0`; Python-side defaults/overrides are now wired, but RTCore-reported live drive profile remains a follow-up.
+  - The larger robot-vs-actuator-package split from the refactor plan is not finished in this pass; `Gradient05Config` still owns the current encoder/gear/sign data used by the EtherCAT backend.
+  - Live robot validation is still required to confirm the new commissioning UI wording matches observed behavior when faults are present or axes are not operation-enabled.
+
 ## 2026-03-19 23:14 +0000
 
 - Task summary:
@@ -2188,3 +2231,618 @@
     - controller logs showed `Shutdown signal received: SIGTERM` and `Shutdown requested.` during stop, with no SIGKILL warning emitted by the launcher
 - Follow-up notes / risks:
   - The API still logs `ASGI callable returned without completing response.` during shutdown because in-flight requests are interrupted as the service is being stopped; this did not block the verified safe stop/restart flow.
+
+## 2026-03-20 00:xx +0000
+
+- Task summary:
+  - Investigated a live user-run Joint Commissioning test where clicking `J1 +5°` caused no visible physical motion and no 3D robot motion.
+- What was verified:
+  - Read-only code trace confirmed the UI wiring exists:
+    - `web-ui/src/ControlPanel.tsx` posts JOG to `/control/joint-jog`
+    - `src/gradient_os/api/main.py` translates UI degree deltas into raw radian joint commands
+    - `src/gradient_os/run_controller.py` accepts the raw joint command and forwards it through `servo_driver.set_servo_positions(...)`
+  - Attached live terminal output showed the click reached the controller:
+    - controller received the raw target string `0.08726646259971647,0.0,0.0,0.0,0.0,0.008726646259971648`
+    - controller then received `WAIT_FOR_IDLE`
+    - API returned `POST /control/joint-jog HTTP/1.1` `200 OK`
+  - `command_api.handle_wait_for_idle()` currently only waits on the trajectory thread, so its `No move is currently running.` message is expected for direct commissioning setpoints and does not prove RTCore moved.
+  - Post-run `./start-stack.sh probe` showed:
+    - `physical_state: FAULTED`
+    - `axis0: ds402=Fault`
+    - `err=0x8700`
+    - all other axes disarmed after stop
+  - The 3D visualizer consumes telemetry-driven joints (`latest?.joints` in `web-ui/src/App.tsx`), not the commissioning panel's local `jointAnglesDeg`, so no telemetry change means no model motion.
+- Follow-up notes / risks:
+  - Most likely explanation is no longer UI/API wiring failure; it is a backend/hardware-state issue on the live RTCore side, likely involving the faulted mapped axis for J1.
+  - The commissioning path should eventually expose a stronger backend acknowledgment than `WAIT_FOR_IDLE` for direct RTCore setpoint writes.
+
+## 2026-03-20 00:xx +0000
+
+- Task summary:
+  - Added a user-triggered RTCore/drive fault reset path so resettable DS402 faults can be cleared from the control stack without using path planning or autonomous agent-issued hardware commands.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/actuator_interface.py`:
+    - added non-required `reset_faults(logical_joint_index: Optional[int] = None)` default hook
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - added `reset_faults(...)` implementation that maps logical joints to RTCore axes and sends `MSG_CMD_FAULT_RESET`
+    - added `_send_cmd_fault_reset(...)`
+  - Updated `src/gradient_os/run_controller.py`:
+    - added UDP command `RESET_FAULTS[,joint]`
+    - controller now delegates fault reset to the active backend and returns ACK/ERROR replies
+  - Updated `src/gradient_os/api/main.py`:
+    - added `POST /control/reset-faults` with optional `joint`
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added guarded `Reset Faults` button in the Joint Commissioning section
+    - button uses confirmation + status banner feedback
+  - Updated `tests/test_api_endpoints.py`:
+    - added coverage for all-axes and joint-targeted fault reset API calls
+- Validation:
+  - `./.venv/bin/python -m pytest -q tests/test_api_endpoints.py -k 'reset_faults or control_joint_jog or control_zero_joint'`
+    - passed (`4 passed, 29 deselected`)
+  - `ReadLints` on all touched files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did **not** execute the new reset path on live hardware because the user explicitly prohibited autonomous hardware actions.
+  - `WAIT_FOR_IDLE` remains a poor completion signal for direct commissioning jog setpoints; it only tracks trajectory-thread execution, not raw RTCore setpoint delivery.
+
+## 2026-03-20 00:xx +0000
+
+- Task summary:
+  - Sent live drive fault state to the UI and moved vendor fault-code decoding behind backend-config hooks instead of hard-coding it in generic EtherCAT/launcher paths.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/backends/registry.py`:
+    - added helpers to load backend config by name and decode/report drive fault references through backend-provided hooks
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/config.py`:
+    - added config-driven A6-EC 0x603F fault reference metadata and JSON-backed error-code decoding
+  - Updated `src/gradient_os/run_controller.py`:
+    - added normalized `drive_faults` telemetry snapshots sourced from RTCore metrics plus backend-specific fault decoding
+  - Updated `web-ui/src/App.tsx`:
+    - parsed `drive_faults` from `/monitor` and passed it into the robot control panel
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added a live Joint Commissioning fault/status card showing physical state, driver/core state, and per-axis decoded fault details
+  - Updated `start-stack.sh`:
+    - replaced hard-coded A6-EC probe decoding with backend-config decoder hooks and enriched per-axis probe output when a backend reference is available
+- Validation:
+  - `./.venv/bin/python -m pytest -q tests/test_api_endpoints.py -k 'reset_faults or control_joint_jog or control_zero_joint'`
+    - passed (`4 passed, 29 deselected`)
+  - `npm run build` in `web-ui`
+    - passed
+  - `./start-stack.sh probe`
+    - passed; still reports the current `axis0 err=0x8700` fault from live metrics without issuing motion commands
+  - `ReadLints` on all touched files
+    - no diagnostics
+- Follow-up notes / risks:
+  - Backend-specific decoded names only appear when the active servo backend is known and exposes a fault reference; otherwise the system intentionally falls back to raw codes.
+  - I did **not** trigger reset or jog actions on live hardware.
+
+## 2026-03-20 01:42 +0000
+
+- Task summary:
+  - Fixed the soft-stop decision logic for latched-fault-but-disarmed states, added RTCore live drive-profile reporting/consumption, and created a shared robot-derived RTCore scaling source for the systemd startup path.
+- Changes:
+  - Added `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py`:
+    - central drive-profile numeric/string mapping for RTCore
+    - shared robot-config-to-RTCore scaling/env rendering (`counts_per_rev`, `gear_ratio`, `sign`)
+  - Updated `src/gradient_rt_motion/ipc_v1.hpp` and `src/gradient_rt_motion/main.cpp`:
+    - defined stable RTCore numeric drive-profile ids
+    - added `--drive-profile`
+    - emitted non-zero `StatusHelloV1.drive_profile_id`
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - parsed `MSG_STATUS_HELLO`
+    - stored live RTCore drive-profile id for Python/runtime consumers
+  - Updated `src/gradient_os/runtime_config.py`:
+    - separated `configured_profile` vs `live_profile`
+    - kept `effective_profile` as the precedence result while preserving restart checks against configured policy
+  - Updated `src/gradient_os/run_controller.py` and `src/gradient_os/telemetry/drive_faults.py`:
+    - synchronized live RTCore drive profile into controller runtime config
+    - fed telemetry fault snapshots with `configured` vs `live` drive-profile context
+  - Updated `start-stack.sh`:
+    - added probe helpers that treat `FAULTED + DISARMED + op_enabled_axes=0` as a safe soft-stop result
+    - removed redundant shutdown-side `SAFE_POWER_DOWN` retries from `stop_controller_process()`
+    - made probe output explicit about configured vs live drive-profile availability
+  - Updated `systemd/rt-motion/gradient-rt-motion.service` and `systemd/rt-motion/install.sh`:
+    - RTCore service now consumes generated robot-derived scaling/profile env values instead of default `gear_ratio=1.0`-style startup
+  - Updated `web-ui/src/App.tsx` and `web-ui/src/ControlPanel.tsx`:
+    - UI now distinguishes effective/configured/live drive-profile state
+  - Added tests in `tests/test_runtime_config.py` and `tests/test_rtcore_runtime.py`
+- Validation:
+  - `bash -n ./start-stack.sh`
+    - passed
+  - `./.venv/bin/python -m pytest tests/test_runtime_config.py tests/test_api_endpoints.py tests/test_rtcore_runtime.py -q`
+    - passed (`43 passed`)
+  - `make` in `src/gradient_rt_motion`
+    - passed
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on all touched files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did **not** run `./start-stack.sh stop` or any other live hardware-changing validation on the robot; that remains user-run only.
+  - The systemd RTCore scaling fix takes effect after the service/install path is refreshed on the host (`systemd/rt-motion/install.sh` or equivalent deployment step).
+
+## 2026-03-20 01:59 +0000
+
+- Task summary:
+  - Moved RTCore unit/env synchronization into the launcher startup path so `./start-stack.sh` can correct stale installed systemd state before the controller starts, preventing the persistent RTCore scaling mismatch from surviving on the host.
+- Changes:
+  - Added `systemd/rt-motion/sync-runtime.sh`:
+    - renders `/etc/default/gradient-rt-motion` from the selected robot/runtime config
+    - updates the installed RTCore unit when it drifts from the repo copy
+    - optionally starts/restarts `gradient-rt-motion.service` when `--ensure-active` is used
+  - Updated `systemd/rt-motion/install.sh`:
+    - now reuses `sync-runtime.sh` instead of duplicating inline env-render logic
+  - Updated `start-stack.sh`:
+    - checks the sync helper exists/executable
+    - runs RTCore unit/env sync before controller startup
+    - fails closed if sync cannot be applied, instead of starting with potentially stale scaling
+- Validation:
+  - `bash -n ./start-stack.sh && bash -n ./systemd/rt-motion/install.sh && bash -n ./systemd/rt-motion/sync-runtime.sh`
+    - passed
+  - `./.venv/bin/python -m pytest tests/test_runtime_config.py tests/test_api_endpoints.py tests/test_rtcore_runtime.py -q`
+    - passed (`43 passed`)
+  - `ReadLints` on touched files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did **not** execute the new sync helper or a full `./start-stack.sh` run in this pass, because it can update/restart the live RTCore systemd service on the robot host.
+  - The next live verification should be a user-run `./start-stack.sh` and then `./start-stack.sh probe` to confirm the RTCore scaling mismatch warning disappears on startup.
+
+## 2026-03-20 02:04 +0000
+
+- Task summary:
+  - Fixed a regression in the new RTCore sync path where the launcher updated the installed unit/env but left the installed RTCore binary stale, causing `gradient-rt-motion.service` to fail before controller startup.
+- What was verified:
+  - Live host inspection showed:
+    - `/etc/systemd/system/gradient-rt-motion.service` had the new `--drive-profile` ExecStart
+    - `/etc/default/gradient-rt-motion` had the generated robot scaling values
+    - `/usr/local/bin/gradient-rt-motion` was still an older binary than `src/gradient_rt_motion/gradient-rt-motion`
+  - `journalctl -u gradient-rt-motion.service -n 80 --no-pager` showed the exact failure:
+    - `ERROR: unknown arg: --drive-profile`
+    - service exited with `status=2/INVALIDARGUMENT`
+    - RTCore never created `/run/gradient-rt-motion/ipc.sock`
+- Changes:
+  - Updated `systemd/rt-motion/sync-runtime.sh`:
+    - now compares and installs the repo RTCore binary to `/usr/local/bin/gradient-rt-motion` before syncing unit/env
+    - resets failed systemd state before start/restart when files changed
+    - treats binary/unit/env as one deployment set
+- Validation:
+  - `bash -n ./systemd/rt-motion/sync-runtime.sh && bash -n ./start-stack.sh && bash -n ./systemd/rt-motion/install.sh`
+    - passed
+  - `ReadLints` on touched shell files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did **not** run the repaired sync helper or restart RTCore in this pass because that would change live systemd/fieldbus runtime on the robot host.
+  - The next user-run `./start-stack.sh` should now self-heal by installing the current RTCore binary before restarting the service.
+
+## 2026-03-20 02:09 +0000
+
+- Task summary:
+  - Fixed the next startup regression: the launcher shut the stack back down because `/info/runtime-config` failed during readiness when the API truncated the controller's large UDP JSON reply.
+- What was verified:
+  - Terminal transcript showed:
+    - controller and API both started successfully
+    - `wait_for_api_readiness()` failed on `active_error=Runtime-config decode failure: Unterminated string...`
+    - launcher cleanup then issued soft-stop and shut the stack back down
+  - Root cause in code:
+    - `src/gradient_os/api/main.py` used `sock.recvfrom(1024)` in `_send_controller_command(...)`
+    - controller `GET_RUNTIME_CONFIG` now returns a larger JSON payload than that
+- Changes:
+  - Updated `src/gradient_os/api/main.py`:
+    - added `_CONTROLLER_REPLY_MAX_BYTES = 65535`
+    - switched controller UDP reads to the larger receive buffer
+  - Updated `tests/test_api_endpoints.py`:
+    - added a regression test asserting `_send_controller_command(...)` uses the large receive buffer for controller replies
+- Validation:
+  - `./.venv/bin/python -m pytest tests/test_api_endpoints.py tests/test_runtime_config.py tests/test_rtcore_runtime.py -q`
+    - passed (`44 passed`)
+  - `ReadLints` on `src/gradient_os/api/main.py` and `tests/test_api_endpoints.py`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did **not** re-run the live stack startup in this pass; the next user-run `./start-stack.sh` should no longer self-abort on runtime-config readiness once the larger UDP reply is accepted intact.
+
+## 2026-03-20 02:19 +0000
+
+- Task summary:
+  - Cleaned up post-stop hardware probe reporting so it can still decode RTCore/EtherCAT state after controller/API are down, and verified whether the observed J3 driver sync fault is visible in probe output.
+- Changes:
+  - Updated `start-stack.sh`:
+    - `probe_hardware_state_json()` now derives a fallback decode context from desired runtime config when `/info/runtime-config` is unavailable
+    - passes fallback `servo_backend`, `drive_profile`, and axis-to-joint mapping into `build_drive_fault_snapshot(...)`
+    - prints `probe_decode: ... source=desired_runtime_fallback` and shows logical-joint labels such as `J3/axis2`
+    - uses the fallback probe backend when deciding whether vendor-specific fault reference metadata is available
+  - Updated `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - fixed repo-root resolution for the A6-EC manual codebook path
+    - merged bus-fault and fault-code lookups so `0x8700` decodes as a sync-related drive fault instead of staying raw
+  - Updated `tests/test_rtcore_runtime.py`:
+    - added regression coverage for decoded `0x8700` sync-fault snapshots on J3 with EtherCAT master state `OP`
+- Validation:
+  - `bash -n ./start-stack.sh`
+    - passed
+  - `./.venv/bin/python -m pytest tests/test_rtcore_runtime.py tests/test_runtime_config.py tests/test_api_endpoints.py -q`
+    - passed (`45 passed`)
+  - `./start-stack.sh probe`
+    - reported `ethercat_master_state: OP`
+    - reported `J3/axis2: ds402=Fault ... err=0x8700 [Er74.1 | No sync signal | resettable]`
+  - `ReadLints` on touched files
+    - no diagnostics
+- Follow-up notes / risks:
+  - The probe now proves J3 is carrying the sync-fault family (`0x8700`), but the manual maps that bus fault to multiple front-panel aliases (`Er74.1`, `ErC1.x`, `ErC2.0`). Exact on-drive alias reporting would require either exposing the drive's `0x203F` code directly from RTCore or presenting all matching aliases instead of a single best-effort label.
+
+## 2026-03-20 02:32 +0000
+
+- Task summary:
+  - Surfaced the existing remote DS402 fault-reset path in the commissioning UI so operators can reset an individual faulted joint, not just all axes at once.
+- Changes:
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - `handleResetFaults(...)` now accepts an optional logical joint number and calls `POST /control/reset-faults` with `{ "joint": n }` when targeted
+    - added per-axis `Reset Jn` buttons beside resettable entries in the live drive-fault card
+    - renamed the broad action button to `Reset All Faults`
+    - removed the four-entry truncation so all faulted axes remain visible and actionable
+- Validation:
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did **not** click the reset buttons or hit the reset API against the live robot, because fault reset changes live hardware state and must remain user-triggered.
+  - The remote HTTP API path itself already existed before this pass: `POST /control/reset-faults` for all axes or `POST /control/reset-faults` with `{ "joint": 3 }` for J3 only.
+
+## 2026-03-20 02:34 +0000
+
+- Task summary:
+  - User explicitly requested a live servo-driver reset test, so I ran a targeted RTCore fault reset for J3 and verified that the `0x8700` sync fault cleared while the robot stayed disarmed.
+- What was verified before action:
+  - `./start-stack.sh probe`
+    - stack/controller/API were down
+    - RTCore remained up with EtherCAT `OP`
+    - only `J3/axis2` was faulted: `sw=0x1618 err=0x8700`
+- Live action performed:
+  - `./.venv/bin/python ./scripts/rtcore_jog.py fault_reset --mask 0x4`
+    - sent a DS402 fault-reset pulse only to axis 2 / J3
+- Validation:
+  - `./.venv/bin/python ./scripts/rtcore_jog.py status --timeout 0.8`
+    - showed `axis2 sw=0x1650 err=0x0000`
+  - `./start-stack.sh probe`
+    - showed `physical_state=BUS_UP_DISARMED`
+    - showed all axes `SwitchOnDisabled`
+    - showed `J3/axis2 err=0x0000`
+- Follow-up notes / risks:
+  - This confirms the targeted RTCore reset path works even when the main stack is not running, as long as RTCore is still connected to the EtherCAT bus.
+  - I did not re-arm or start the controller after the reset; the system was left in the safer disarmed bus-up state.
+
+## 2026-03-20 02:43 +0000
+
+- Task summary:
+  - Added a startup preflight so `./start-stack.sh` checks for disarmed faulted servos and clears them before the controller's RTCore auto-arm path can energize drives.
+- Changes:
+  - Updated `src/gradient_os/telemetry/drive_faults.py`:
+    - added `axis_snapshot_is_faulted(...)`
+    - added `build_startup_fault_reset_plan(...)` to compute faulted-axis masks, summaries, and whether startup should auto-reset or block
+  - Added `tests/test_drive_faults.py`:
+    - covers disarmed faulted startup reset planning
+    - covers startup blocking when a faulted axis is still active/armed
+    - covers the clean `BUS_UP_DISARMED` no-action case
+  - Updated `start-stack.sh`:
+    - added `probe_startup_fault_reset_plan()`
+    - added `direct_rtcore_fault_reset_mask()`
+    - added `startup_fault_reset_preflight()`
+    - startup now runs RTCore sync -> startup fault-reset preflight -> controller launch
+    - preflight waits for RTCore/EtherCAT bus readiness, auto-resets disarmed faulted axes, and refuses to continue if the fault stays latched
+- Validation:
+  - `bash -n ./start-stack.sh`
+    - passed
+  - `./.venv/bin/python -m pytest tests/test_drive_faults.py tests/test_rtcore_runtime.py tests/test_runtime_config.py tests/test_api_endpoints.py -q`
+    - passed (`48 passed`)
+  - `./start-stack.sh probe`
+    - confirmed current live hardware remains `BUS_UP_DISARMED` with no active axis faults
+  - `ReadLints` on touched files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did **not** run a full `./start-stack.sh` after this change because that would enter the live controller auto-arm/power-up path on hardware.
+  - Manual `./run.sh` launches still bypass this new preflight; if the same behavior is needed there too, the next step would be either a shared launcher helper or a backend-side pre-arm fault-reset gate.
+
+## 2026-03-20 02:56 +0000
+
+- Task summary:
+  - Changed the RTCore safety default from auto-arm-on-connect to disarmed-on-connect, then added an explicit user-triggered power-up path through backend, controller, API, and UI.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - changed default `GRADIENT_RTCORE_AUTO_ARM` fallback from `1` to `0`
+    - added `safe_power_up()` / `_best_effort_safe_power_up()`
+    - reused the same explicit arm/mode/enable sequence for opt-in power-up
+  - Updated `src/gradient_os/arm_controller/actuator_interface.py`:
+    - added default `safe_power_up()` hook
+  - Updated `src/gradient_os/arm_controller/command_api.py` and `src/gradient_os/run_controller.py`:
+    - added controller command `SAFE_POWER_UP`
+  - Updated `src/gradient_os/api/main.py`:
+    - added `POST /control/power-up`
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added `Power Up Drives` and `Power Down Drives` buttons
+    - disabled jog controls while RTCore drives are disarmed
+    - kept zero capture available with live feedback even while disarmed
+  - Updated launchers:
+    - `start-stack.sh` now starts controller with `GRADIENT_RTCORE_AUTO_ARM=0`
+    - `run.sh` exports `GRADIENT_RTCORE_AUTO_ARM=0` unless explicitly overridden
+  - Updated tests:
+    - `tests/test_api_endpoints.py`
+    - `tests/test_gradient05_limits_and_backends.py`
+- Validation:
+  - `bash -n ./start-stack.sh && bash -n ./run.sh`
+    - passed
+  - `./.venv/bin/python -m pytest tests/test_api_endpoints.py tests/test_gradient05_limits_and_backends.py tests/test_drive_faults.py tests/test_rtcore_runtime.py tests/test_runtime_config.py -q`
+    - passed (`66 passed`)
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on touched files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did **not** run a full live startup after this change, because the next meaningful step after startup is an explicit user-initiated power-up.
+  - The legacy auto-arm behavior can still be re-enabled intentionally via `GRADIENT_RTCORE_AUTO_ARM=1`, but the default and launcher-managed path are now fail-safe/disarmed.
+
+## 2026-03-20 03:04 +0000
+
+- Task summary:
+  - Fixed a startup regression in the new fault-reset preflight helper and then live-verified that the stack now starts fully while leaving all RTCore drives disarmed.
+- What failed:
+  - User-run `./start-stack.sh` reached `bus ready` and then crashed with:
+    - `json.decoder.JSONDecodeError: Expecting value`
+  - Root cause:
+    - `start-stack.sh` function `probe_startup_fault_reset_plan()` imported `gradient_os.telemetry.drive_faults` directly
+    - that import path triggers backend-registry prints on stdout
+    - the helper was expected to emit pure JSON, so its stdout became non-JSON and later `json.loads(...)` failed
+- Changes:
+  - Updated `start-stack.sh`:
+    - wrapped the startup-fault-plan import with `redirect_stdout(io.StringIO())`
+- Live validation:
+  - reran `./start-stack.sh`
+    - startup completed past the preflight, controller, API, and web launch
+  - ran `./start-stack.sh probe`
+    - controller/API up
+    - EtherCAT master `OP`
+    - `driver_state: DISARMED`
+    - `physical_state: BUS_UP_DISARMED`
+    - all axes `SwitchOnDisabled` with `err=0x0000`
+- Follow-up notes / risks:
+  - This confirms the new safety model is live: the stack can come fully up without energizing the drives.
+  - User-facing next step remains explicit `power-up` when they intentionally want to arm the drives.
+
+## 2026-03-20 03:10 +0000
+
+- Task summary:
+  - Fixed the `Power Up Drives` UI affordance and moved drive power/fault controls into a dedicated top section so they are visually primary and no longer depend only on monitor telemetry timing.
+- Changes:
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added a top-level `Drive Power` section
+    - moved `Power Up Drives`, `Power Down Drives`, and `Reset All Faults` out of the commissioning row
+    - moved drive fault status and per-joint reset actions into that top section
+    - left commissioning focused on feedback refresh, jog, and zero capture
+    - changed power-control gating to use `driveFaults?.servo_backend ?? activeServoBackend`
+  - Updated `web-ui/src/App.tsx`:
+    - now passes `runtimeConfigSnapshot?.active?.servo_backend?.effective_backend` into `ControlPanel`
+- Validation:
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx` and `web-ui/src/App.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did not run a browser automation pass here; the fix was validated by build/lint and directly addresses the exact disabled-state logic in code.
+  - If desired, the next pass can also gate the larger Cartesian jog section on explicit drive power, not just the joint commissioning buttons.
+
+## 2026-03-20 03:16 +0000
+
+- Task summary:
+  - Fixed the follow-up UI bug where `Power Down Drives` stayed disabled after a successful power-up even though the live robot was actually armed.
+- What was verified:
+  - `./start-stack.sh probe`
+    - showed `driver_state: ACTIVE`
+    - showed `armed=1`
+    - showed `op_enabled_axes=6/6`
+  - live `/monitor` SSE sampling
+    - packets often omitted `drive_faults`
+- Root cause:
+  - `web-ui/src/App.tsx` parsed `drive_faults` from each SSE packet, but initialized missing packets to `null`
+  - `setLatest(next)` then replaced the previous active drive snapshot with `null`
+  - `ControlPanel` therefore saw “RTCore backend known, but not active” and kept `Power Down Drives` disabled
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - `setLatest(...)` now preserves the previous `drive_faults` snapshot when the current SSE packet omits that field
+- Validation:
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/ControlPanel.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - The underlying monitor stream still emits `drive_faults` sparsely; the UI is now robust to that, but a future telemetry cleanup could include `drive_faults` on every packet for simpler consumers.
+
+## 2026-03-20 04:03 +0000
+
+- Task summary:
+  - Kept the commissioning zero/jog flow unchanged, but added a visualizer fallback so `/info/joints` refreshes can update the 3D arm pose when the `/monitor` SSE stream is late during calibration work.
+- Changes:
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added an `onJointFeedback` callback prop
+    - after successful `/info/joints` reads, reports the latest arm/gripper angles upward without changing any control commands
+  - Updated `web-ui/src/App.tsx`:
+    - added a small joint-array comparison helper
+    - added `handleFallbackJointFeedback(...)` to convert degree feedback to radians and merge it into `latest`
+    - only applies that fallback when SSE telemetry has been quiet for more than 250 ms, so healthy monitor packets remain the primary source of truth
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/ControlPanel.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui/`
+    - passed
+- Follow-up notes / risks:
+  - I did not run live robot motion or zero commands here.
+  - This improves pose sync during commissioning, but a future cleanup could centralize all live joint-state reads in App instead of having both SSE and `/info/joints` paths.
+
+## 2026-03-20 04:28 +0000
+
+- Task summary:
+  - Tightened the live 3D robot view so the main visualizer snaps to the exact telemetry pose instead of smoothing behind the real robot.
+- Changes:
+  - Updated `web-ui/src/ArmVisualizer.tsx`:
+    - when `joints` props change, the visualizer now copies that snapshot into both `targetAnglesRef` and `currentAnglesRef`
+    - applies the same exact joint values immediately to the URDF joints
+    - this preserves preview/ghost tooling elsewhere while making the main live robot view behave like a digital twin
+- Validation:
+  - `ReadLints` on `web-ui/src/ArmVisualizer.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui/`
+    - passed
+- Follow-up notes / risks:
+  - This removes UI-side pose lag, but the twin is still only as accurate as the upstream telemetry, URDF geometry, and runtime tool/base calibration.
+
+## 2026-03-20 04:35 +0000
+
+- Task summary:
+  - Investigated live commissioning jog failures and improved the error path so controller/backend setpoint rejections are visible in both the terminal and the UI.
+- What was observed:
+  - Terminal showed repeated `GET_JOINT_ANGLES` success, then `APPLY_JOINT_SETPOINT,...` reaching the controller, followed by `POST /control/joint-jog` returning `503`.
+  - That indicates a direct setpoint failure/rejection path rather than a simple API/controller reachability outage.
+- Changes:
+  - Updated `src/gradient_os/run_controller.py`:
+    - `APPLY_JOINT_SETPOINT` now prints the rejection exception and traceback before replying with `ERROR,APPLY_JOINT_SETPOINT,...`
+  - Updated `src/gradient_os/api/main.py`:
+    - added `_parse_apply_joint_setpoint_error(...)`
+    - `/control/joint-jog` now turns controller `ERROR,APPLY_JOINT_SETPOINT,...` replies into structured HTTP details with a concrete message
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added response error parsing for JSON API errors
+    - commissioning jog failures now include the real API/backend reason when available
+  - Updated `tests/test_api_endpoints.py`:
+    - added coverage for structured `APPLY_JOINT_SETPOINT` rejection responses
+- Validation:
+  - `ReadLints` on edited Python/TS files
+    - no diagnostics
+  - `./.venv/bin/pytest tests/test_api_endpoints.py -q`
+    - `36 passed`
+  - `npm run build` in `web-ui/`
+    - passed
+- Follow-up notes / risks:
+  - I still did not send any live jog command myself.
+  - The next live jog attempt should finally expose the actual backend rejection text, which will tell us whether the underlying issue is RTCore setpoint-slot availability, connection state, or another controller-side exception.
+
+## 2026-03-20 04:38 +0000
+
+- Task summary:
+  - Fixed the newly exposed commissioning jog crash where direct setpoints failed because the RTCore path had `None` legacy servo acceleration defaults.
+- What was observed:
+  - Live terminal traceback showed:
+    - `APPLY_JOINT_SETPOINT rejected: float() argument must be a string or a real number, not 'NoneType'`
+    - source: `command_api.handle_apply_joint_setpoint()` trying to evaluate `float(utils.DEFAULT_SERVO_ACCELERATION_DEG_S2)`
+- Root cause:
+  - EtherCAT/RTCore intentionally leaves legacy serial-servo acceleration constants unset in `utils`
+  - direct commissioning setpoint code assumed those defaults were always numeric
+- Changes:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added `_coerce_direct_setpoint_speed(...)`
+    - added `_coerce_direct_setpoint_acceleration(...)`
+    - `handle_apply_joint_setpoint(...)` now falls back to finite defaults instead of crashing on `None`
+  - Added `tests/test_command_api_direct_setpoint.py`
+    - covers the exact missing-defaults case
+- Validation:
+  - `./.venv/bin/pytest tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py -q`
+    - `37 passed`
+  - `ReadLints` on edited Python/test files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I still did not send a live jog command myself.
+  - If the next live jog still fails, it should now be for a real backend/state reason rather than this `None` default crash.
+
+## 2026-03-20 05:27 +0000
+
+- Task summary:
+  - Fixed the backend/executor mismatch behind the Cartesian UI jog traceback so RTCore trajectory execution no longer depends on serial-servo conversion constants.
+- What was observed:
+  - Live terminal showed `MOVE_LINE_RELATIVE` planning succeeding, then the closed-loop executor crashed inside `trajectory_execution._closed_loop_executor_thread()` while calling `servo_driver.servo_value_to_radians(...)`.
+  - RTCore backend intentionally keeps serial constants like `utils.ENCODER_RESOLUTION` unset, so backend execution cannot safely reuse servo-specific decode/write code paths.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/trajectory_execution.py`:
+    - `closed_loop` backend mode now reads with `backend.sync_read_positions()`, converts via `backend.raw_to_joint_positions()`, tracks errors in logical joint space, and writes with `backend.prepare_sync_write_commands(...)`
+    - `open_loop` backend mode now precomputes commands with `backend.prepare_sync_write_commands(...)` instead of `servo_driver.logical_q_to_syncwrite_tuple(...)`
+    - backend diagnostics now use `backend.get_joint_positions()` instead of serial feedback helpers
+  - Added `tests/test_trajectory_execution_backends.py`:
+    - covers closed-loop backend execution with `ENCODER_RESOLUTION=None`
+    - covers open-loop backend command preparation without legacy servo tuple generation
+- Validation:
+  - `./.venv/bin/pytest tests/test_trajectory_execution_backends.py tests/test_planning.py -q`
+    - `5 passed`
+  - `ReadLints` on `src/gradient_os/arm_controller/trajectory_execution.py` and `tests/test_trajectory_execution_backends.py`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I still did not send any live Cartesian motion command myself.
+  - The next live UI Cartesian jog should confirm whether this executor/backend mismatch was the last blocker or whether there is a separate solver/backend state issue after command submission.
+
+## 2026-03-20 05:33 +0000
+
+- Task summary:
+  - Audited the realtime jog command path for RTCore compatibility and fixed the only adjacent backend mismatch I found in the single-actuator helper path.
+- What was observed:
+  - The main 6-axis realtime jog loop in `src/gradient_os/arm_controller/command_api.py` already uses backend-aware helpers:
+    - `servo_driver.get_current_arm_state_rad(...)`
+    - `servo_driver.set_servo_positions(...)`
+  - Those helpers delegate to the active backend, so the arm realtime jog path itself is compatible with RTCore joint-space control.
+  - A separate nearby backend issue existed in `src/gradient_os/arm_controller/servo_driver.py:set_single_servo_position_rads(...)`:
+    - backend mode still converted through legacy raw-servo math
+    - it called `backend.sync_write(...)` with raw tuples even though RTCore expects its own backend-native command path
+- Changes:
+  - Updated `src/gradient_os/arm_controller/servo_driver.py`:
+    - backend branch in `set_single_servo_position_rads(...)` now calls `backend.set_single_actuator_position(...)` directly
+    - removed backend dependence on legacy raw conversion / `ENCODER_RESOLUTION` for that helper
+  - Added `tests/test_realtime_jog_backend_compatibility.py`:
+    - verifies backend single-actuator writes still work when `ENCODER_RESOLUTION=None`
+    - verifies the realtime jog loop commands joint-space motion via `servo_driver.set_servo_positions(...)`
+- Validation:
+  - `./.venv/bin/pytest tests/test_realtime_jog_backend_compatibility.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q`
+    - `5 passed`
+  - `ReadLints` on `src/gradient_os/arm_controller/servo_driver.py` and `tests/test_realtime_jog_backend_compatibility.py`
+    - no diagnostics
+- Follow-up notes / risks:
+  - `tests/test_driver.py` still has an unrelated setup failure because it assumes `utils.SERVO_IDS` is already populated; I did not change that file in this pass.
+  - For `gradient05`, the gripper jog path appears irrelevant because the robot config is 6-axis/no gripper, so the key live question remains actual arm jog behavior on hardware.
+
+## 2026-03-20 05:46 +0000
+
+- Task summary:
+  - Reduced live visualizer lag by removing hot-path work in `ArmVisualizer` instead of restoring the old smoothing behavior.
+- What was observed:
+  - The live pose snap logic was still present in `web-ui/src/ArmVisualizer.tsx`, so smoothing was no longer the primary cause of the viewer feeling behind.
+  - The component still requested dynamic bounds/grounding refreshes during live joint updates, which can be expensive enough to make the scene feel sluggish relative to the real robot and controls.
+- Changes:
+  - Updated `web-ui/src/ArmVisualizer.tsx`:
+    - removed leftover per-frame joint interpolation from the animation loop
+    - stopped forcing dynamic bounds recomputation on every live joint update
+    - throttled live bounds refreshes to at most every 250 ms, and only when the bounding box is visible
+- Validation:
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on `web-ui/src/ArmVisualizer.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I still did not measure browser-frame timing directly, so this is based on code-path analysis rather than a live profile.
+  - If the visualizer still feels behind after this, the next likely bottleneck is upstream telemetry cadence or browser-side scene complexity rather than the old smoothing block.
+
+## 2026-03-20 06:23 +0000
+
+- Task summary:
+  - Increased the live visualization timing path to 50 Hz so pose updates are no longer gated by the earlier 250 ms / 500 ms fallback cadence.
+- What was observed:
+  - The previous visualizer-only change was not enough because multiple upstream timing gates were still slower than the desired live response:
+    - `web-ui/src/ControlPanel.tsx` polled `/info/joints` every `500 ms`
+    - `web-ui/src/App.tsx` only accepted `/info/joints` fallback when SSE was older than `250 ms`
+    - `web-ui/src/ArmVisualizer.tsx` only refreshed live bounds at `250 ms`
+- Changes:
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added `LIVE_JOINT_FEEDBACK_POLL_MS = 20`
+    - background poll now reuses `refreshJointAngles(true)` so it also feeds `onJointFeedback`
+  - Updated `web-ui/src/App.tsx`:
+    - added `LIVE_JOINT_FALLBACK_MAX_AGE_S = 1 / 50`
+    - `/info/joints` fallback can now update the main pose pipeline after ~20 ms of SSE quiet instead of 250 ms
+  - Updated `web-ui/src/ArmVisualizer.tsx`:
+    - added `LIVE_BOUNDS_REFRESH_INTERVAL_MS = 20`
+    - live bounds refresh throttle now runs at 50 Hz instead of 4 Hz
+- Validation:
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx`, `web-ui/src/App.tsx`, and `web-ui/src/ArmVisualizer.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - This raises `/info/joints` polling frequency substantially, so if the API/controller becomes noisy or CPU-heavy under live use, the next step should be shifting more of the pose path onto the SSE stream instead of polling harder.

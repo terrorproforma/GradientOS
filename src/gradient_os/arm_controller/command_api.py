@@ -25,6 +25,28 @@ from . import pid_tuner
 from .backends import registry as backend_registry
 from ..kinematics import runtime as kinematics_runtime
 
+_DIRECT_SETPOINT_FALLBACK_SPEED = 500
+_DIRECT_SETPOINT_FALLBACK_ACCELERATION_DEG_S2 = 500.0
+
+
+def _coerce_direct_setpoint_speed(value: int | float | str | None) -> int:
+    try:
+        if value is None:
+            raise TypeError("missing speed")
+        return int(value)
+    except Exception:
+        return _DIRECT_SETPOINT_FALLBACK_SPEED
+
+
+def _coerce_direct_setpoint_acceleration(value: float | int | str | None) -> float:
+    try:
+        if value is None:
+            raise TypeError("missing acceleration")
+        return float(value)
+    except Exception:
+        return _DIRECT_SETPOINT_FALLBACK_ACCELERATION_DEG_S2
+
+
 def _resolve_profile_params_for_speed_multiplier(speed_multiplier: float | int | str | None) -> tuple[float, float, float]:
     """
     Normalize a speed multiplier and derive profile velocity/acceleration.
@@ -1061,7 +1083,11 @@ def handle_move_line_relative(dx: float, dy: float, dz: float, speed: float = 1.
 
 def handle_wait_for_idle():
     """
-    This is a blocking call that waits until the currently running trajectory is finished.
+    Block until the currently running planner/trajectory thread finishes.
+
+    Direct commissioning setpoints sent via `servo_driver.set_servo_positions(...)`
+    do not run through this thread, so this call intentionally does not imply that a
+    one-shot joint setpoint has been applied or completed on hardware.
     """
     # Check if a trajectory thread exists and is running
     if utils.trajectory_state.get("is_running") and utils.trajectory_state.get("thread"):
@@ -1072,6 +1098,37 @@ def handle_wait_for_idle():
         print("[Controller] Move complete. Resuming.")
     else:
         print("[Controller] No move is currently running.")
+
+
+def handle_apply_joint_setpoint(
+    arm_angles_rad: list[float],
+    *,
+    gripper_rad: float | None = None,
+    speed: int | None = None,
+    acceleration: float | None = None,
+) -> dict[str, object]:
+    """
+    Send a direct joint/gripper setpoint and return once the backend accepts it.
+
+    This is intentionally an acknowledgement path, not a trajectory-completion path.
+    """
+    resolved_speed = _coerce_direct_setpoint_speed(
+        speed if speed is not None else utils.DEFAULT_SERVO_SPEED
+    )
+    resolved_acceleration = _coerce_direct_setpoint_acceleration(
+        acceleration
+        if acceleration is not None
+        else utils.DEFAULT_SERVO_ACCELERATION_DEG_S2
+    )
+    servo_driver.set_servo_positions(arm_angles_rad, resolved_speed, resolved_acceleration)
+    if gripper_rad is not None:
+        handle_set_gripper_state(np.rad2deg(gripper_rad), resolved_speed, resolved_acceleration)
+    return {
+        "accepted": True,
+        "completion_scope": "direct_setpoint_ack",
+        "speed": resolved_speed,
+        "acceleration": resolved_acceleration,
+    }
 
 
 def handle_safe_power_down(wait_for_idle: bool = False) -> str:
@@ -1114,6 +1171,36 @@ def handle_safe_power_down(wait_for_idle: bool = False) -> str:
         return "BACKEND_NOOP"
     except Exception as e:
         msg = f"POWER_DOWN_FAILED:{e}"
+        print(f"[Controller] WARNING: {msg}")
+        return msg
+
+
+def handle_safe_power_up() -> str:
+    """
+    Best-effort transition the active actuator backend into an armed/energized state.
+    """
+    print("[Controller] Received SAFE_POWER_UP command.")
+    try:
+        backend = backend_registry.get_active_backend()
+    except Exception as e:
+        msg = f"NO_ACTIVE_BACKEND:{e}"
+        print(f"[Controller] WARNING: {msg}")
+        return msg
+
+    safe_power_up = getattr(backend, "safe_power_up", None)
+    if not callable(safe_power_up):
+        print("[Controller] Active backend does not implement safe_power_up().")
+        return "BACKEND_NOOP"
+
+    try:
+        handled = bool(safe_power_up())
+        if handled:
+            print("[Controller] Backend safe power-up command sent.")
+            return "POWER_UP_SENT"
+        print("[Controller] Backend reported no special power-up action.")
+        return "BACKEND_NOOP"
+    except Exception as e:
+        msg = f"POWER_UP_FAILED:{e}"
         print(f"[Controller] WARNING: {msg}")
         return msg
 

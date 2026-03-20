@@ -251,6 +251,41 @@ def test_ethercat_backend_safe_power_down_disables_axes_and_disarms(monkeypatch,
     assert calls == [("disable", 0x7), ("arm", False)]
 
 
+def test_ethercat_backend_safe_power_up_arms_sets_mode_and_enables(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 3
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        backend,
+        "_send_cmd_arm",
+        lambda arm: calls.append(("arm", arm)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_send_cmd_set_mode",
+        lambda axis_mask, mode: calls.append(("mode", (axis_mask, mode))),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_send_cmd_axis_enable",
+        lambda axis_mask: calls.append(("enable", axis_mask)),
+    )
+
+    backend._best_effort_safe_power_up()
+
+    assert calls == [("arm", True), ("mode", (0x7, 8)), ("enable", 0x7)]
+
+
+def test_ethercat_backend_defaults_to_disarmed_connect(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.delenv("GRADIENT_RTCORE_AUTO_ARM", raising=False)
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    assert backend._auto_arm is False
+
+
 def test_registry_telemetry_blocks_are_optional_for_ethercat_backend():
     backend_registry.set_active_backend("feetech")
     assert len(backend_registry.get_telemetry_blocks()) == 3

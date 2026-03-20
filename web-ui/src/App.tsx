@@ -76,6 +76,69 @@ type ServoSample = {
   led_alarm_bits?: string;
 };
 
+type DriveFaultReference = {
+  profile_id?: string;
+  label?: string;
+  source_path?: string;
+  source_path_relative?: string;
+  available?: boolean;
+};
+
+type DriveFaultDetail = {
+  error_code_hex?: string;
+  profile_id?: string;
+  decoded?: boolean;
+  code?: string;
+  name?: string;
+  class?: string | null;
+  resettable?: boolean;
+};
+
+type DriveFaultAxis = {
+  axis: number;
+  logical_joint?: number | null;
+  ds402_state: string;
+  statusword: number;
+  error_code: number;
+  slave_online?: boolean;
+  slave_operational?: boolean;
+  slave_al_state?: number;
+  slave_al_state_name?: string;
+  pos_counts?: number;
+  fault?: DriveFaultDetail | null;
+};
+
+type DriveFaultSnapshot = {
+  servo_backend?: string | null;
+  drive_profile?: string | null;
+  configured_drive_profile?: string | null;
+  live_drive_profile?: string | null;
+  drive_profile_source?: string | null;
+  fieldbus_profile?: string | null;
+  reference?: DriveFaultReference | null;
+  physical_state?: string;
+  driver_state?: string;
+  ethercat_master_state?: string;
+  rtcore_state?: string;
+  armed?: number;
+  axis_enable_mask?: number;
+  axis_enable_mask_hex?: string;
+  op_enabled_axes?: number;
+  num_axes?: number;
+  faulted_axes?: number;
+  link_up?: number;
+  responding?: number;
+  online?: number;
+  operational?: number;
+  startup_ready?: number;
+  wkc_actual?: number;
+  wkc_expected?: number;
+  master_al?: number;
+  master_al_hex?: string;
+  axes?: DriveFaultAxis[];
+  metrics_path?: string;
+};
+
 type TelemetryEvent = {
   timestamp: number;
   raw: string;
@@ -83,9 +146,24 @@ type TelemetryEvent = {
   gripper?: number;
   servos?: Record<string, ServoSample>;
   alerts?: Alert[];
+  drive_faults?: DriveFaultSnapshot | null;
   weld_active?: boolean;
   weld_type?: string;
 };
+
+const LIVE_JOINT_FALLBACK_MAX_AGE_S = 1 / 50;
+
+function areJointArraysClose(a: number[] | undefined, b: number[]): boolean {
+  if (!Array.isArray(a) || a.length !== b.length) {
+    return false;
+  }
+  for (let index = 0; index < b.length; index += 1) {
+    if (Math.abs((a[index] ?? 0) - b[index]) > 1e-5) {
+      return false;
+    }
+  }
+  return true;
+}
 
 type Axis3 = { x: number; y: number; z: number };
 
@@ -139,6 +217,7 @@ type RobotPolicyOption = {
   version: string;
   default_servo_backend: string;
   default_ik_solver_backend: string;
+  default_drive_profile?: string | null;
 };
 
 type ActiveRuntimeConfig = {
@@ -163,6 +242,16 @@ type ActiveRuntimeConfig = {
     robot_default_backend: string;
     override_backend?: string | null;
   };
+  drive_profile?: {
+    configured_profile?: string | null;
+    configured_source?: string | null;
+    live_profile?: string | null;
+    live_source?: string | null;
+    effective_profile?: string | null;
+    source?: string;
+    backend_default_profile?: string | null;
+    override_profile?: string | null;
+  };
   tool?: {
     active_tool_id: string;
     display_name: string;
@@ -184,6 +273,7 @@ type RuntimeConfigSnapshot = {
     overrides?: {
       ik_solver_backend?: string | null;
       servo_backend?: string | null;
+      drive_profile?: string | null;
     };
   };
   meta?: {
@@ -2610,7 +2700,7 @@ function SettingsDialog({
                   </div>
                   <div className="text-xs text-slate-400">
                     {activeRuntimeConfig
-                      ? `active ${activeRuntimeConfig.robot.display_name} · IK ${activeRuntimeConfig.ik_solver.effective_backend}`
+                      ? `active ${activeRuntimeConfig.robot.display_name} · IK ${activeRuntimeConfig.ik_solver.effective_backend} · drive ${activeRuntimeConfig.drive_profile?.effective_profile ?? "none"} (${activeRuntimeConfig.drive_profile?.source ?? "unknown"})`
                       : "Active controller runtime unavailable"}
                   </div>
                 </div>
@@ -2648,9 +2738,23 @@ function SettingsDialog({
                 <span className="font-semibold text-cyan-100">
                   {selectedRobot?.default_servo_backend ?? "unknown"}
                 </span>
+                {" · "}
+                Drive profile:{" "}
+                <span className="font-semibold text-cyan-100">
+                  {selectedRobot?.default_drive_profile ?? "none"}
+                </span>
               </div>
+              {activeRuntimeConfig?.drive_profile ? (
+                <div className="mt-2 text-[11px] text-slate-400">
+                  Active RT drive profile: {activeRuntimeConfig.drive_profile.effective_profile ?? "none"} from{" "}
+                  {activeRuntimeConfig.drive_profile.source ?? "unknown"}.
+                  {" "}Configured: {activeRuntimeConfig.drive_profile.configured_profile ?? "none"}.
+                  {" "}Live: {activeRuntimeConfig.drive_profile.live_profile ?? "unavailable"}.
+                </div>
+              ) : null}
               {activeRuntimeConfig?.ik_solver?.source === "dev_override" ||
-              activeRuntimeConfig?.servo_backend?.source === "dev_override" ? (
+              activeRuntimeConfig?.servo_backend?.source === "dev_override" ||
+              activeRuntimeConfig?.drive_profile?.source === "dev_override" ? (
                 <div className="mt-2 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-100">
                   Controller is running with development overrides, not strict robot policy.
                 </div>
@@ -4000,7 +4104,8 @@ export default function App() {
     let joints: number[] | undefined;
     let gripper: number | undefined;
     let servos: Record<string, ServoSample> | undefined;
-    let parsedAlerts: Alert[] | undefined;
+      let parsedAlerts: Alert[] | undefined;
+      let driveFaultsValue: DriveFaultSnapshot | null = null;
     let weldActiveValue: boolean | undefined;
     let weldTypeValue: string | undefined;
     let sourceTimeSec: number | undefined;
@@ -4039,35 +4144,6 @@ export default function App() {
             if (typeof s.led_alarm_condition === "number") sample.led_alarm_condition = s.led_alarm_condition;
             if (typeof s.unloading_bits === "string") sample.unloading_bits = s.unloading_bits;
             if (typeof s.led_alarm_bits === "string") sample.led_alarm_bits = s.led_alarm_bits;
-        const maybeEePose = maybeObj.ee_pose;
-        if (maybeEePose && typeof maybeEePose === "object") {
-          const eePoseObj = maybeEePose as Record<string, unknown>;
-          const position = eePoseObj.position_m;
-          const rotation = eePoseObj.rotation_matrix;
-          if (position && typeof position === "object" && Array.isArray(rotation) && rotation.length === 3) {
-            const posObj = position as Record<string, unknown>;
-            const rotRows = rotation as unknown[];
-            const parsedRows = rotRows.map((row) =>
-              Array.isArray(row) && row.length === 3
-                ? row.map((value) => Number(value))
-                : null,
-            );
-            const validRows =
-              parsedRows.length === 3 &&
-              parsedRows.every(
-                (row) => Array.isArray(row) && row.length === 3 && row.every((value) => Number.isFinite(value)),
-              );
-            const px = Number(posObj.x);
-            const py = Number(posObj.y);
-            const pz = Number(posObj.z);
-            if (validRows && Number.isFinite(px) && Number.isFinite(py) && Number.isFinite(pz)) {
-              eePoseValue = {
-                position_m: { x: px, y: py, z: pz },
-                rotation_matrix: parsedRows as [[number, number, number], [number, number, number], [number, number, number]],
-              };
-            }
-          }
-        }
             out[k] = sample;
           }
         }
@@ -4078,6 +4154,9 @@ export default function App() {
         const maybeObj = parsed as Record<string, unknown>;
         if (Array.isArray(maybeObj.alerts)) {
           parsedAlerts = maybeObj.alerts as Alert[];
+        }
+        if (maybeObj.drive_faults && typeof maybeObj.drive_faults === "object") {
+          driveFaultsValue = maybeObj.drive_faults as DriveFaultSnapshot;
         }
         if (typeof maybeObj.weld_active === "boolean") {
           weldActiveValue = maybeObj.weld_active;
@@ -4097,6 +4176,7 @@ export default function App() {
       gripper,
       servos,
       alerts: parsedAlerts,
+      drive_faults: driveFaultsValue,
       weld_active: weldActiveValue,
       weld_type: weldTypeValue,
     };
@@ -4132,7 +4212,13 @@ export default function App() {
       lastAcceptedJointsRef.current = joints.slice();
     }
 
-    setLatest(next);
+    setLatest((prev) => ({
+      ...next,
+      // The monitor stream only includes drive fault snapshots on some packets.
+      // Preserve the last known drive-power state between those updates so the
+      // power controls do not flicker back to an indeterminate/disarmed UI.
+      drive_faults: next.drive_faults ?? prev?.drive_faults ?? null,
+    }));
     // Merge alerts into state (keep last 20)
     if (Array.isArray(next.alerts) && next.alerts.length > 0) {
       setAlerts((prev) => {
@@ -4174,6 +4260,53 @@ export default function App() {
       disconnect();
     }
   }, [disconnect, handleMessage, isConnected, normalizedApiHost]);
+
+  const handleFallbackJointFeedback = useCallback(
+    (anglesDeg: number[], gripperDeg?: number) => {
+      const nextJoints = anglesDeg
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value))
+        .map((value) => THREE.MathUtils.degToRad(value));
+      if (nextJoints.length === 0) {
+        return;
+      }
+
+      const lastTelemetrySec = lastTelemetrySourceTimeRef.current;
+      const nowSec = Date.now() / 1000;
+      // Only fall back when the monitor stream is visibly late; otherwise let
+      // the primary SSE telemetry remain the single source of truth.
+      if (lastTelemetrySec !== null && nowSec - lastTelemetrySec < LIVE_JOINT_FALLBACK_MAX_AGE_S) {
+        return;
+      }
+
+      const nextGripper =
+        typeof gripperDeg === "number" && Number.isFinite(gripperDeg)
+          ? THREE.MathUtils.degToRad(gripperDeg)
+          : undefined;
+
+      lastAcceptedJointsRef.current = nextJoints.slice();
+      setLatest((prev) => {
+        if (
+          areJointArraysClose(prev?.joints, nextJoints) &&
+          (nextGripper === undefined || Math.abs((prev?.gripper ?? 0) - nextGripper) <= 1e-5)
+        ) {
+          return prev;
+        }
+        return {
+          timestamp: Date.now(),
+          raw: prev?.raw ?? "fallback:/info/joints",
+          joints: nextJoints,
+          gripper: nextGripper ?? prev?.gripper,
+          servos: prev?.servos,
+          alerts: prev?.alerts,
+          drive_faults: prev?.drive_faults ?? null,
+          weld_active: prev?.weld_active,
+          weld_type: prev?.weld_type,
+        };
+      });
+    },
+    [],
+  );
 
   const toggleConnection = useCallback(() => {
     if (isConnected) {
@@ -5975,7 +6108,13 @@ export default function App() {
             >
               <ChevronDown size={14} />
             </button>
-            <ControlPanel apiHost={normalizedApiHost} onError={(m) => setError(m)} />
+            <ControlPanel
+              apiHost={normalizedApiHost}
+              driveFaults={latest?.drive_faults ?? null}
+              activeServoBackend={runtimeConfigSnapshot?.active?.servo_backend?.effective_backend ?? null}
+              onJointFeedback={handleFallbackJointFeedback}
+              onError={(m) => setError(m)}
+            />
           </div>
         )}
       </main>

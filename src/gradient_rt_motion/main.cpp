@@ -128,6 +128,7 @@ struct Options {
   std::string ipc_group = "pi";
   uint64_t cycle_ns = 1000000; // 1 kHz
   uint32_t num_axes = 6;       // default arm axes for early scaffolding
+  uint32_t drive_profile_id = gradient::ipc::v1::DRIVE_PROFILE_A6EC_DS402;
 
   // Axis scaling (bring-up defaults; tuned via commissioning).
   // Per-axis lists can be provided via the CLI (comma-separated).
@@ -236,6 +237,41 @@ bool parse_u16_auto(const char* s, uint16_t* out) {
   }
   *out = static_cast<uint16_t>(v);
   return true;
+}
+
+bool parse_drive_profile_token(const std::string& token, uint32_t* out) {
+  if (!out) {
+    return false;
+  }
+  std::string t = token;
+  const size_t first = t.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) {
+    return false;
+  }
+  const size_t last = t.find_last_not_of(" \t\r\n");
+  t = t.substr(first, last - first + 1);
+  if (t.empty()) {
+    return false;
+  }
+  for (char& c : t) {
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');
+    }
+  }
+  if (t == "a6ec_ds402" || t == "a6ec" || t == "a6ec-ds402") {
+    *out = gradient::ipc::v1::DRIVE_PROFILE_A6EC_DS402;
+    return true;
+  }
+  if (t == "cia402" || t == "cia") {
+    *out = gradient::ipc::v1::DRIVE_PROFILE_CIA402;
+    return true;
+  }
+  uint32_t numeric = 0;
+  if (parse_u32(t.c_str(), &numeric)) {
+    *out = numeric;
+    return true;
+  }
+  return false;
 }
 
 std::string trim_ascii_ws(const std::string& s) {
@@ -620,7 +656,7 @@ void print_usage(const char* argv0) {
       stderr,
       "Usage: %s [--socket-path PATH] [--cycle-ns NS] [--num-axes N] "
       "[--counts-per-rev N[,N..]] [--gear-ratio R[,R..]] [--sign S[,S..]] "
-      "[--axis-type T[,T..]] [--lead-m-per-rev M[,M..]] [--max-rpm RPM] "
+      "[--axis-type T[,T..]] [--lead-m-per-rev M[,M..]] [--drive-profile ID] [--max-rpm RPM] "
       "[--slave-positions P[,P..]] "
       "[--rx-pdo ID] [--tx-pdo ID] [--no-dc] [--disable-output-watchdog] "
       "[--split-domains-per-axis] [--queue-split-domains-round-robin] [--explicit-pdo-config] "
@@ -635,6 +671,7 @@ void print_usage(const char* argv0) {
       "  --gear-ratio   1.0\n"
       "  --sign         +1\n"
       "  --axis-type    rotary\n"
+      "  --drive-profile a6ec_ds402\n"
       "  --max-rpm      100\n"
       "  --slave-positions 0,1,2,...\n"
       "  --rx-pdo       0x1702\n"
@@ -882,6 +919,13 @@ int main(int argc, char** argv) {
     }
     if (arg == "--lead-m-per-rev" && i + 1 < argc) {
       lead_m_per_rev_spec = argv[++i];
+      continue;
+    }
+    if (arg == "--drive-profile" && i + 1 < argc) {
+      if (!parse_drive_profile_token(argv[++i], &opt.drive_profile_id)) {
+        logf("ERROR: invalid --drive-profile (expected a6ec_ds402, cia402, or numeric id)");
+        return 2;
+      }
       continue;
     }
     if (arg == "--max-rpm" && i + 1 < argc) {
@@ -2877,7 +2921,7 @@ int main(int argc, char** argv) {
         sh.topology_hash = topology_hash;
         sh.cycle_ns = opt.cycle_ns;
         sh.num_axes = opt.num_axes;
-        sh.drive_profile_id = 0; // TODO: a6ec_ds402
+        sh.drive_profile_id = opt.drive_profile_id;
         sh.wkc_expected = 2 * opt.num_axes;
         ring_write(status_ring,
                    gradient::ipc::v1::MSG_STATUS_HELLO,

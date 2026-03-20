@@ -55,6 +55,12 @@ Use this file as persistent, repo-local execution memory.
 
 *(Session entries are cleared regularly. Chronological implementation logs belong in `.cursor/memory/DEVLOG.md`. Historical scratchpad entries are archived in `.cursor/memory/AGENT_SCRATCHPAD_ARCHIVE.md`)*
 
+### 2026-03-20 - Servo profile refactor
+- [user] DS402 / EtherCAT AL decoding must live in shared profile code, not in `src/gradient_os/run_controller.py` or `start-stack.sh`.
+- [self] For runtime policy changes, `compute_restart_required()` must compare the fully resolved desired runtime, including unsafe backend/profile overrides; comparing only robot defaults hides real restart requirements.
+- [self] Keep `WAIT_FOR_IDLE` explicitly trajectory-thread-scoped. Direct commissioning setpoints should return backend acceptance and let the UI describe `accepted` vs `faulted` / `not operation-enabled`, rather than claiming the move completed.
+- [tool] `ReadLints` on large TS files can expose stale orphaned code outside the new edit. In this task `web-ui/src/App.tsx` had an old `ee_pose` fragment referencing undefined names and needed cleanup before handoff.
+
 ### 2026-03-19 - EtherCAT stop/start sequencing
 - [user] For robot shutdown, the preferred normal outcome is a safe disarmed/ready fieldbus state, not blindly tearing down EtherCAT if that provokes drive faults.
 - [self] `ErC1.1` on the A6-EC drives maps to EtherCAT synchronization loss; if shutdown drops RTCore or `ethercat.service` after the drives are still synced, the panels will fault even if the brakes engaged safely.
@@ -423,3 +429,207 @@ Use this file as persistent, repo-local execution memory.
   - full start -> stop -> restart -> stop cycle succeeded
   - controller shutdown showed `Shutdown signal received: SIGTERM` / `Shutdown requested.` with no SIGKILL warning
 - [self] Guardrail: when supervising dev servers or npm-based launchers, do not assume the recorded parent PID is the long-lived listener; validate stop logic against the actual bound port and descendant processes.
+
+### 2026-03-20 - No autonomous joint commands on live robot
+- [user] Hard safety rule: do **not** send any joint commands when connected to the live industrial robot. Any motion-capable test must be run by the user.
+- [self] Operational boundary: restrict my actions to read-only inspection, passive UI verification, log review, and non-motion code/test analysis unless the user explicitly changes this rule.
+- [self] Guardrail: even seemingly small commissioning actions like joint jog, home, rest, or zero-adjacent flows must be treated as user-run-only when they can reach live hardware.
+
+### 2026-03-20 - Joint commissioning click reached controller but produced no motion
+- [user] Live report: clicking `+5°` on J1 in the Joint Commissioning panel produced no visible physical motion and no 3D-view robot motion.
+- [tool] Attached terminal evidence showed the full request chain did fire: controller received the raw radian target string, then `WAIT_FOR_IDLE`, and the API returned `POST /control/joint-jog HTTP/1.1 200 OK`.
+- [self] Important nuance: `WAIT_FOR_IDLE` currently only watches the trajectory thread in `command_api.handle_wait_for_idle()`. The commissioning jog path sends a direct backend setpoint through `servo_driver.set_servo_positions(...)`, so `No move is currently running.` is expected for this path and is **not** a reliable confirmation of RTCore motion completion.
+- [tool] Post-run probe showed `physical_state: FAULTED` with `axis0: ds402=Fault err=0x8700`, while the stop snapshot from the same session showed `driver_state=ACTIVE` but only `op_enabled_axes=5/6`.
+- [self] Working hypothesis for next session: the UI/API/controller wiring is intact, but J1 commissioning can still be a no-op at the hardware layer when the mapped RTCore axis is faulted/not fully operation-enabled. Also, the 3D view is driven by telemetry (`latest?.joints`), not the commissioning panel's local state, so it will remain static if no joint-state update arrives.
+
+### 2026-03-20 - User-triggered drive fault reset path
+- [user] Requirement: when a drive is faulted but resettable, provide a way for the user to reset the drivers; do not have the agent execute the reset autonomously.
+- [self] Clarification recorded: the Joint Commissioning jog path does **not** use planner/path-execution threads; it sends a direct RTCore setpoint. Only the follow-up `WAIT_FOR_IDLE` call was trajectory-oriented and therefore misleading.
+- [tool] Implemented a manual reset path through:
+  - `ActuatorBackend.reset_faults(...)`
+  - `EthercatRTCoreBackend.reset_faults(...)` using RTCore `MSG_CMD_FAULT_RESET`
+  - controller UDP command `RESET_FAULTS[,joint]`
+  - API endpoint `POST /control/reset-faults`
+  - a guarded `Reset Faults` button in `web-ui/src/ControlPanel.tsx`
+- [self] Guardrail: even though fault reset is non-motion, it still changes live hardware state; I must not trigger it myself on the real robot. Only the user should click/use it.
+
+### 2026-03-20 - Fault visibility must reach the UI
+- [user] Faults should be sent to the UI so the operator can see them directly during commissioning.
+- [user] Error-code handling is servo-driver-specific and independent of the EtherCAT master/RTCore path; do not hard-code vendor fault maps in generic bring-up logic when backend config can provide them.
+- [tool] Added backend-config fault decoding hooks in `backends/registry.py` and `backends/ethercat_rtcore/config.py`, then reused that decoder in both controller telemetry and `start-stack.sh probe`.
+- [tool] Added `drive_faults` to the `/monitor` telemetry payload and surfaced it in `web-ui/src/ControlPanel.tsx` as a live commissioning fault/status card with per-axis decoded fault lines when available.
+- [self] Guardrail: protocol-state decoding like DS402 state is generic, but vendor/manual error-code naming must come from the active servo backend config or remain raw.
+
+### 2026-03-20 - Soft-stop safety vs latched-fault semantics
+- [self] For `./start-stack.sh stop`, do not key success only off `physical_state`. A final probe with `physical_state=FAULTED` can still be a safe soft-stop result when `armed=0`, `axis_enable_mask=0`, and `op_enabled_axes=0`.
+- [self] Avoid duplicate `SAFE_POWER_DOWN` timeout noise by keeping stop policy in `perform_shutdown_sequence()` and making `stop_controller_process()` a pure process-stop helper. If another stop path needs retries, define them explicitly in one place.
+- [tool] The clean contract that kept Python/UI/probe aligned was: runtime config exposes both `configured_profile` and `live_profile`, while `effective_profile` is `live_profile` when RTCore `STATUS_HELLO` is available and otherwise falls back to configured/default policy.
+- [tool] RTCore scaling should come from one shared helper that renders systemd startup args from the robot config (`counts_per_rev`, `gear_ratio`, `sign`) instead of trusting placeholder RTCore defaults or recomputing different rules in multiple places.
+- [self] Safe validation boundary remains unchanged: build/test/syntax/probe analysis are fine, but do not run live motion-capable stop/jog/reset actions on the industrial robot unless the user explicitly asks.
+
+### 2026-03-20 - RTCore mismatch was installed-unit drift
+- [tool] On this host, the repo service file had already been updated for env-driven RTCore scaling, but `/etc/systemd/system/gradient-rt-motion.service` was still the old `ExecStart=/usr/local/bin/gradient-rt-motion` unit and `/etc/default/gradient-rt-motion` was missing. The runtime mismatch warning therefore persisted even though the repo code looked fixed.
+- [self] Guardrail: when a warning involves systemd-managed binaries/config, inspect the installed unit files under `/etc` instead of assuming the repo copy is what the machine is actually running.
+- [tool] Durable fix: put the RTCore unit/env reconciliation into the startup path (`start-stack.sh` calling `systemd/rt-motion/sync-runtime.sh --ensure-active`) so stale installed files cannot silently survive across sessions.
+
+### 2026-03-20 - Sync unit and binary together
+- [self] New regression I introduced: syncing the installed RTCore unit/env without also updating `/usr/local/bin/gradient-rt-motion` broke startup completely on this host because the installed binary was older and did not support `--drive-profile`.
+- [tool] Concrete symptom from `journalctl -u gradient-rt-motion.service`: `ERROR: unknown arg: --drive-profile`, followed by missing `/run/gradient-rt-motion/ipc.sock`, controller `metrics unavailable`, and launcher startup timeout.
+- [self] Guardrail: for systemd-managed native binaries, treat unit file, env file, and installed binary as one atomic deployment set. Never roll forward the unit args alone.
+
+### 2026-03-20 - Large runtime-config replies can exceed 1024 bytes
+- [tool] After adding `configured_profile`/`live_profile` fields and richer tool/runtime metadata, the controller's `GET_RUNTIME_CONFIG` UDP reply became large enough to exceed the API's old `recvfrom(1024)` buffer.
+- [self] Concrete failure mode: `/info/runtime-config` returned `active_error=Runtime-config decode failure: Unterminated string...`, `wait_for_api_readiness()` treated that as fatal, and `start-stack.sh` then soft-stopped the stack during cleanup even though controller/API themselves had started.
+- [self] Guardrail: when a UDP command carries JSON payloads, size the receive buffer for realistic payload growth (`65535` here), not legacy tiny status strings.
+
+### 2026-03-20 - Post-stop probe should fall back to desired runtime context
+- [user] Asked to clean up the misleading post-stop probe and specifically asked whether J3 driver code `ErC2.0` was being picked up.
+- [self] Mistake in the earlier probe path: once controller/API were down, I let probe decoding depend on live runtime-config only, which made `servo_backend=None` and mislabeled the fieldbus as `DOWN` even while RTCore metrics still showed `link_up=1`, `operational=6/6`, and `wkc=18/12`.
+- [tool] Fix in `start-stack.sh`: `probe_hardware_state_json()` now falls back to desired runtime config when live runtime-config is unavailable, passes axis-to-joint mapping into `build_drive_fault_snapshot(...)`, and prints `probe_decode: ... source=desired_runtime_fallback` so the operator can see why decoding still works after shutdown.
+- [tool] Validation: read-only `./start-stack.sh probe` now reports `ethercat_master_state: OP`, labels the faulted drive as `J3/axis2`, and keeps RTCore/EtherCAT reporting consistent after controller/API stop.
+- [tool] Additional fix in `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`: corrected the repo-root path used for the A6-EC manual codebook so the decoder stops silently missing `docs/resources/a6ec_manual_codes.json`.
+- [self] Important nuance: A6-EC bus fault `0x8700` maps to a sync-fault family in the manual, not a single unique front-panel alias. The probe can confirm the J3 drive is on the `0x8700` sync-fault family, but exact front-panel `0x203F` aliases like `ErC2.0` require care when presenting them.
+- [self] Guardrail: when probe/UI decoding depends on runtime metadata that may disappear during shutdown, add an explicit fallback source label rather than silently pretending the bus/backend is unavailable.
+
+### 2026-03-20 - Remote fault reset should be per-joint, not only global
+- [user] Requested a practical remote way to reset servo drivers because many commissioning faults clear with a simple driver reset.
+- [self] Important context rediscovered from prior work: the backend/controller/API remote reset path already existed, so the missing piece was operator discoverability and per-joint targeting in the UI rather than backend protocol support.
+- [tool] Improved `web-ui/src/ControlPanel.tsx` so the drive-fault panel:
+  - shows all current faulted axes instead of truncating after four
+  - exposes `Reset Jn` buttons for resettable faults with a mapped logical joint
+  - renames the old broad action to `Reset All Faults` for clarity
+- [self] Guardrail: when the system already has a safe backend capability, prefer surfacing it clearly in the operator workflow instead of building a second parallel reset mechanism.
+
+### 2026-03-20 - Targeted RTCore fault reset works while stack is down
+- [user] Explicitly asked me to run the remote reset and verify the result on live hardware.
+- [tool] Baseline before reset from `./start-stack.sh probe`: stack down, RTCore up, EtherCAT `OP`, `physical_state=FAULTED`, and only `J3/axis2` faulted with `sw=0x1618 err=0x8700`.
+- [tool] Direct RTCore recovery path works without controller/API: `./.venv/bin/python ./scripts/rtcore_jog.py fault_reset --mask 0x4` cleared the J3 fault while the robot remained disarmed.
+- [tool] Verification after reset:
+  - `./.venv/bin/python ./scripts/rtcore_jog.py status --timeout 0.8` showed `axis2 sw=0x1650 err=0x0000`
+  - `./start-stack.sh probe` showed all six axes `SwitchOnDisabled` with `err=0x0000` and `physical_state=BUS_UP_DISARMED`
+- [self] Guardrail: when the main stack is down but RTCore remains up, a targeted `fault_reset --mask` pulse is the least invasive live recovery check compared with restarting the whole stack.
+
+### 2026-03-20 - Startup should clear disarmed drive faults before controller auto-arm
+- [user] New requirement: during startup, check for faulted servos at the safe point and reset them before any power-up sequence begins.
+- [self] Important architectural finding: the controller-side `EthercatRTCoreBackend` still auto-arms on connect by default, so the safest insertion point for startup fault reset is **before** launching the controller, not after controller readiness.
+- [tool] Implemented a startup preflight in `start-stack.sh`:
+  - waits for RTCore/EtherCAT bus readiness while the stack is still down
+  - builds a tested `build_startup_fault_reset_plan(...)` from the probe payload
+  - auto-resets only faulted axes that are present while the robot is still disarmed
+  - aborts startup if a fault remains latched after the reset timeout, rather than auto-arming into a bad state
+- [tool] Added Python tests in `tests/test_drive_faults.py` for:
+  - disarmed faulted axis -> auto-reset plan
+  - still-active faulted axis -> block startup
+  - clean bus-up disarmed state -> no action
+- [self] Guardrail: when startup behavior touches live power-state transitions, prefer a fail-closed preflight that runs before controller auto-arm over “fix it after init” logic inside the already-arming backend path.
+
+### 2026-03-20 - Safe default is disarmed, with explicit user power-up
+- [user] Safety preference: the system should not auto-arm on startup; arming should be an explicit user action.
+- [self] Correction to prior approach: a startup fault-reset preflight alone was not sufficient, because the backend still auto-armed immediately after connect. Safe startup requires changing the default power policy, not just inserting more checks before it.
+- [tool] Implemented the new default:
+  - `EthercatRTCoreBackend` now defaults `GRADIENT_RTCORE_AUTO_ARM` to `0`
+  - `start-stack.sh` explicitly launches the controller with `GRADIENT_RTCORE_AUTO_ARM=0`
+  - `run.sh` also exports `GRADIENT_RTCORE_AUTO_ARM=0` unless something explicitly overrides it
+- [tool] Added explicit user-triggered power-up path:
+  - backend `safe_power_up()`
+  - controller UDP command `SAFE_POWER_UP`
+  - API endpoint `POST /control/power-up`
+  - UI buttons `Power Up Drives` / `Power Down Drives`
+- [self] Guardrail: when removing an unsafe default like auto-arm, always add a clear explicit replacement action in the same pass so operators are not forced into hidden or ad-hoc recovery workflows.
+
+### 2026-03-20 - Startup preflight helper must suppress import-time stdout
+- [tool] Regression found during live `./start-stack.sh`: the new `probe_startup_fault_reset_plan()` helper imported `gradient_os.telemetry.drive_faults` without redirecting stdout, and import-time backend registration logs polluted the helper's JSON output.
+- [self] Concrete failure mode: launcher got past `bus ready`, then crashed with `json.decoder.JSONDecodeError: Expecting value` while parsing the plan payload because the string started with log text instead of JSON.
+- [tool] Fix in `start-stack.sh`: wrap the `build_startup_fault_reset_plan` import in `redirect_stdout(io.StringIO())`, matching the earlier probe helper hardening.
+- [tool] Live validation after the fix:
+  - `./start-stack.sh` completed startup
+  - `./start-stack.sh probe` showed controller/API up, EtherCAT `OP`, and `driver_state: DISARMED` / `physical_state: BUS_UP_DISARMED`
+- [self] Guardrail: any inline Python helper in shell that emits machine-readable JSON must silence import-time stdout from project modules, especially registry/bootstrap code that prints on import.
+
+### 2026-03-20 - Critical power controls should not depend only on telemetry timing
+- [user] Reported that `Power Up Drives` was not clickable and that power controls belong at the top in their own section, not under commissioning.
+- [self] Likely cause confirmed in UI code: the power buttons were enabled/disabled solely from `driveFaults?.servo_backend`, so they could render disabled while monitor telemetry lagged even though runtime-config already knew the active backend was `ethercat_rtcore`.
+- [tool] UI fix in `web-ui/src/ControlPanel.tsx` and `web-ui/src/App.tsx`:
+  - added `activeServoBackend` prop from runtime-config as a fallback source for enabling explicit drive-power controls
+  - moved `Power Up Drives`, `Power Down Drives`, and `Reset All Faults` into a dedicated top-level `Drive Power` section
+  - moved drive fault details/reset actions into that same top section
+  - left joint commissioning focused on refresh/jog/zero only
+- [self] Guardrail: high-priority safety controls should be grouped in their own dedicated section and should not become unavailable just because a secondary telemetry panel has not populated yet.
+
+### 2026-03-20 - Keep drive power state sticky across sparse SSE packets
+- [user] Live report after power-up: brakes/drives armed fine, but `Power Down Drives` stayed unavailable in the UI.
+- [tool] Live verification proved the backend state was correct: `./start-stack.sh probe` showed `driver_state: ACTIVE`, `armed=1`, and `op_enabled_axes=6/6`.
+- [self] Root cause in frontend telemetry handling: `/monitor` only includes `drive_faults` on some packets, but `App.tsx` was overwriting `latest.drive_faults` with `null` on every packet that omitted the field. The power section then fell back to “not active” even while hardware stayed armed.
+- [tool] Fix in `web-ui/src/App.tsx`: preserve the last known `drive_faults` snapshot until a newer packet explicitly replaces it.
+- [self] Guardrail: for sparse/optional telemetry sub-blocks, merge with previous UI state instead of treating omission as an authoritative null.
+
+### 2026-03-20 - Calibration feedback and 3D pose must share a fallback path
+- [user] Next task is individual joint calibration/zero testing, with the requirement that the 3D visualizer reflect the robot pose during commissioning.
+- [self] Important split in the current UI: `ControlPanel.tsx` refreshes `/info/joints` in degrees for zero/jog feedback, while `ArmVisualizer` follows `latest.joints` from `/monitor` SSE in radians. If SSE lags, the calibration numbers can update before the 3D arm does.
+- [tool] Updated `web-ui/src/ControlPanel.tsx` and `web-ui/src/App.tsx` so successful `/info/joints` refreshes report back into App as a fallback joint source, converted to radians and applied only when the SSE stream has been quiet for more than 250 ms.
+- [self] Guardrail: when a commissioning panel reads live robot state through a side channel, either unify it with the main visualization state or explicitly use it as a stale-telemetry fallback so operator numbers and 3D pose cannot drift apart.
+
+### 2026-03-20 - Live digital twin should not smooth away real pose
+- [user] Explicit preference: the 3D visualization should be the perfect digital twin of the robot's real position.
+- [self] Root cause in `web-ui/src/ArmVisualizer.tsx`: even after receiving fresh live joints, the render loop still interpolated toward `targetAnglesRef` using `smoothing = 12`, which can make the model visibly chase the robot instead of matching the sample exactly.
+- [tool] Fix in `web-ui/src/ArmVisualizer.tsx`: when live `joints` props change, set both `targetAnglesRef` and `currentAnglesRef` to the exact telemetry snapshot and apply those joint values immediately to the URDF hierarchy.
+- [self] Guardrail: for a live robot pose view, do not smooth or animate away the primary telemetry sample; save interpolation for previews/ghosts, not the main digital twin.
+
+### 2026-03-20 - Commissioning jog failures need explicit backend reasons
+- [user] Reported a live joint jog failure; terminal showed `APPLY_JOINT_SETPOINT` reached the controller, but the API still returned `503 Service Unavailable`.
+- [self] Diagnostic conclusion: that pattern means the problem is not basic controller reachability. It is either a controller-side `ERROR,APPLY_JOINT_SETPOINT,...` reply or a missing ACK on the direct setpoint path.
+- [tool] Improvements added:
+  - `src/gradient_os/run_controller.py` now logs the actual exception and traceback when `APPLY_JOINT_SETPOINT` is rejected
+  - `src/gradient_os/api/main.py` now converts `ERROR,APPLY_JOINT_SETPOINT,...` into a structured HTTP error with a concrete message
+  - `web-ui/src/ControlPanel.tsx` now parses JSON error payloads and shows the real jog failure reason in the commissioning status instead of only saying "connectivity"
+- [self] Guardrail: when live motion commands can fail for stateful backend reasons, never hide them behind generic transport wording; surface the backend rejection text all the way to the operator and terminal.
+
+### 2026-03-20 - RTCore commissioning path must not depend on legacy servo accel defaults
+- [user] New terminal traceback exposed the real cause of jog failure: `handle_apply_joint_setpoint()` tried `float(utils.DEFAULT_SERVO_ACCELERATION_DEG_S2)` while that value was `None`.
+- [self] Root cause: the EtherCAT/RTCore backend intentionally clears legacy serial-servo constants in `utils`, so direct commissioning code cannot assume those defaults are always populated.
+- [tool] Fix in `src/gradient_os/arm_controller/command_api.py`:
+  - added coercion helpers for direct setpoint speed/acceleration
+  - missing/invalid defaults now fall back to finite commissioning-safe values instead of crashing
+  - added `tests/test_command_api_direct_setpoint.py` to lock in the `None`-defaults case
+- [self] Guardrail: when code runs on both serial-servo and RTCore backends, never read legacy servo defaults without a finite fallback or backend-aware resolution path.
+
+### 2026-03-20 - Trajectory executors must stay backend-native under RTCore
+- [user] Cartesian jog from the UI hit a live closed-loop executor traceback while following a planned move.
+- [self] Root cause in `src/gradient_os/arm_controller/trajectory_execution.py`: backend mode was still running serial-servo executor logic, decoding RTCore axis counts through `servo_driver.servo_value_to_radians(...)` and preparing legacy raw servo sync-write tuples even though RTCore intentionally leaves serial constants like `utils.ENCODER_RESOLUTION` unset.
+- [tool] Fix in `src/gradient_os/arm_controller/trajectory_execution.py`:
+  - `closed_loop` backend path now reads raw counts with `backend.sync_read_positions()`, converts them with `backend.raw_to_joint_positions()`, records joint-space telemetry/errors directly, and writes commands via `backend.prepare_sync_write_commands(...)`
+  - `open_loop` backend path now also precomputes commands with `backend.prepare_sync_write_commands(...)` and uses `backend.get_joint_positions()` for diagnostics instead of serial helpers
+  - added `tests/test_trajectory_execution_backends.py` to lock in backend execution with `ENCODER_RESOLUTION=None`
+- [self] Guardrail: when an `ActuatorBackend` is active, trajectory executors should only use backend conversion/write hooks; bypassing them with servo-specific math will eventually break on RTCore or any backend that does not emulate serial-servo constants.
+
+### 2026-03-20 - Realtime arm jog is backend-safe, but single-actuator backend writes must avoid legacy raw conversion
+- [user] Asked whether realtime jog commands are compatible with the RTCore/EtherCAT backend.
+- [self] Audit result: the main 6-axis realtime jog loop in `src/gradient_os/arm_controller/command_api.py` is compatible because it reads with `servo_driver.get_current_arm_state_rad(...)` and writes with `servo_driver.set_servo_positions(...)`, both of which delegate to the active backend in joint space.
+- [self] Remaining mismatch found nearby: `src/gradient_os/arm_controller/servo_driver.py:set_single_servo_position_rads(...)` still used legacy raw-servo conversion and `backend.sync_write(...)` in backend mode, which could fail when RTCore leaves `utils.ENCODER_RESOLUTION` unset and does not accept raw servo tuples.
+- [tool] Fix:
+  - `set_single_servo_position_rads(...)` now calls `backend.set_single_actuator_position(...)` directly in backend mode
+  - added `tests/test_realtime_jog_backend_compatibility.py` to cover:
+    - backend single-actuator writes with `ENCODER_RESOLUTION=None`
+    - the realtime jog loop issuing joint-space `servo_driver.set_servo_positions(...)` commands without touching legacy encoder constants
+- [self] Guardrail: if a helper is meant to work across backends, never synthesize legacy raw servo tuples in backend mode when the interface already has a dedicated actuator-level API.
+
+### 2026-03-20 - Live visualizer lag was dominated by bounds refreshes, not just smoothing
+- [user] Observed that the robot animation still felt laggy and suggested restoring the older smoothing behavior.
+- [self] Inspection result in `web-ui/src/ArmVisualizer.tsx`: the live pose already snapped directly to incoming telemetry, but the component still triggered dynamic bounds/grounding refreshes during live joint updates. That expensive per-update work can make the viewer feel behind even when the joint angles themselves are applied immediately.
+- [tool] Fix in `web-ui/src/ArmVisualizer.tsx`:
+  - removed leftover per-frame joint interpolation logic from the render loop
+  - stopped forcing dynamic bounds recomputation on every live telemetry update
+  - now throttles live bounds refresh to visible-bounds mode only, at most every 250 ms
+- [self] Guardrail: when the main goal is a live digital twin, do not reintroduce smoothing to mask performance problems; first remove expensive nonessential work from the live telemetry hot path.
+
+### 2026-03-20 - Live pose tuning may need coordinated timing across poll, fallback, and bounds refresh
+- [user] Reported that the visualizer still felt laggy and explicitly asked to try 50 Hz because 250 ms gating felt too slow.
+- [self] Important system-level lesson: there were multiple timing gates, not just one:
+  - `ControlPanel.tsx` background `/info/joints` poll was still `500 ms`
+  - `App.tsx` fallback from `/info/joints` into main visualizer state required the SSE stream to be quiet for `250 ms`
+  - `ArmVisualizer.tsx` live bounds refresh was throttled to `250 ms`
+- [tool] Tuning pass:
+  - `ControlPanel.tsx` background joint poll now runs at `20 ms` and reuses `refreshJointAngles(true)` so it also feeds `onJointFeedback`
+  - `App.tsx` live fallback delay now uses `1 / 50` seconds
+  - `ArmVisualizer.tsx` live bounds refresh interval now uses `20 ms`
+- [self] Guardrail: when tuning live pose latency, adjust the whole pipeline consistently; a fast render loop cannot fix a slower upstream poll/fallback gate.

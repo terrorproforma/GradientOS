@@ -26,8 +26,10 @@
 #   from gradient_os.arm_controller.backends import registry
 #   encoder_resolution = registry.get_encoder_resolution()
 
-from typing import Optional, TYPE_CHECKING, Type, Callable
+from typing import Optional, TYPE_CHECKING, Callable
 import importlib
+
+from ..profiles import registry as profile_registry
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -154,6 +156,25 @@ def get_config() -> 'ModuleType':
             "No servo backend configured. Call set_active_backend() at startup."
         )
     return _active_backend_config
+
+
+def get_config_for_backend(backend_name: str) -> Optional['ModuleType']:
+    """
+    Load the config module for a specific backend without changing active state.
+
+    Args:
+        backend_name: Backend name (e.g., "feetech", "ethercat_rtcore")
+
+    Returns:
+        Optional[ModuleType]: Imported config module, or None if unavailable.
+    """
+    module_path = BACKEND_CONFIG_MODULES.get(backend_name)
+    if not module_path:
+        return None
+    try:
+        return importlib.import_module(module_path)
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -353,4 +374,214 @@ def parse_telemetry_block(block_index: int, data: bytes) -> dict:
         return parser(data)
 
     return {}
+
+
+def _profile_attr_from_backend(
+    backend_name: Optional[str],
+    *attr_names: str,
+) -> Optional[str]:
+    if not backend_name:
+        return None
+    cfg = get_config_for_backend(backend_name)
+    if cfg is None:
+        return None
+    for attr_name in attr_names:
+        raw = getattr(cfg, attr_name, None)
+        token = str(raw).strip() if raw is not None else ""
+        if token:
+            return token
+    return None
+
+
+def get_default_drive_profile_for_backend(backend_name: Optional[str]) -> Optional[str]:
+    return _profile_attr_from_backend(
+        backend_name,
+        "DEFAULT_DRIVE_PROFILE_ID",
+        "DRIVE_FAULT_PROFILE_ID",
+    )
+
+
+def get_default_fieldbus_profile_for_backend(backend_name: Optional[str]) -> Optional[str]:
+    return _profile_attr_from_backend(
+        backend_name,
+        "DEFAULT_FIELDBUS_PROFILE_ID",
+    )
+
+
+def resolve_drive_profile_for_backend(
+    backend_name: Optional[str],
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[str]:
+    requested = str(drive_profile_id).strip().lower() if drive_profile_id else ""
+    if requested:
+        return requested
+    default_profile = get_default_drive_profile_for_backend(backend_name)
+    return str(default_profile).strip().lower() if default_profile else None
+
+
+def resolve_fieldbus_profile_for_backend(
+    backend_name: Optional[str],
+    *,
+    fieldbus_profile_id: Optional[str] = None,
+) -> Optional[str]:
+    requested = str(fieldbus_profile_id).strip().lower() if fieldbus_profile_id else ""
+    if requested:
+        return requested
+    default_profile = get_default_fieldbus_profile_for_backend(backend_name)
+    return str(default_profile).strip().lower() if default_profile else None
+
+
+def get_drive_fault_reference_metadata_for_backend_and_profile(
+    backend_name: Optional[str],
+    drive_profile_id: Optional[str],
+) -> Optional[dict]:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.get_drive_fault_reference_metadata(effective_profile)
+        if isinstance(payload, dict):
+            return payload
+    if not backend_name:
+        return None
+    cfg = get_config_for_backend(backend_name)
+    if cfg is None:
+        return None
+    getter = getattr(cfg, "get_drive_fault_reference_metadata", None)
+    if callable(getter):
+        try:
+            payload = getter()
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def get_drive_fault_reference_metadata_for_backend(
+    backend_name: Optional[str],
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    return get_drive_fault_reference_metadata_for_backend_and_profile(
+        backend_name,
+        drive_profile_id,
+    )
+
+
+def describe_drive_fault_code_for_backend(
+    backend_name: Optional[str],
+    error_code: int,
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Decode a backend-specific drive error code using backend config metadata.
+
+    Args:
+        backend_name: Backend name, or None.
+        error_code: Raw drive/controller error code.
+
+    Returns:
+        Optional[dict]: Decoded fault details, or None if unavailable.
+    """
+    if not backend_name:
+        return None
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.describe_drive_fault_code(effective_profile, int(error_code))
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    cfg = get_config_for_backend(backend_name)
+    if cfg is None:
+        return None
+    decoder = getattr(cfg, "describe_drive_fault_code", None)
+    if callable(decoder):
+        try:
+            payload = decoder(int(error_code))
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def decode_drive_statusword_for_backend(
+    backend_name: Optional[str],
+    statusword: int,
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> dict:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    payload = profile_registry.decode_drive_statusword(effective_profile, int(statusword))
+    if isinstance(payload, dict):
+        return payload
+    sw = int(statusword) & 0xFFFF
+    return {
+        "profile_id": effective_profile,
+        "decoded": False,
+        "state": "UNKNOWN",
+        "statusword": sw,
+        "statusword_hex": f"0x{sw:04x}",
+    }
+
+
+def decode_fieldbus_state_for_backend(
+    backend_name: Optional[str],
+    value: int,
+    *,
+    fieldbus_profile_id: Optional[str] = None,
+) -> dict:
+    effective_profile = resolve_fieldbus_profile_for_backend(
+        backend_name,
+        fieldbus_profile_id=fieldbus_profile_id,
+    )
+    payload = profile_registry.decode_fieldbus_state(effective_profile, int(value))
+    if isinstance(payload, dict):
+        return payload
+    state = int(value) & 0xFF
+    return {
+        "profile_id": effective_profile,
+        "decoded": False,
+        "state": state,
+        "state_hex": f"0x{state:02x}",
+        "name": "UNKNOWN",
+    }
+
+
+def describe_fieldbus_master_state_for_backend(
+    backend_name: Optional[str],
+    *,
+    link_up: int,
+    responding: int,
+    operational: int,
+    num_axes: int,
+    fieldbus_profile_id: Optional[str] = None,
+) -> Optional[str]:
+    effective_profile = resolve_fieldbus_profile_for_backend(
+        backend_name,
+        fieldbus_profile_id=fieldbus_profile_id,
+    )
+    return profile_registry.describe_fieldbus_master_state(
+        effective_profile,
+        link_up=link_up,
+        responding=responding,
+        operational=operational,
+        num_axes=num_axes,
+    )
+
+
+def get_drive_fault_reference_metadata() -> Optional[dict]:
+    """Get fault reference metadata for the active backend."""
+    return get_drive_fault_reference_metadata_for_backend(_active_backend_name)
+
+
+def describe_drive_fault_code(error_code: int) -> Optional[dict]:
+    """Decode a drive fault code for the active backend."""
+    return describe_drive_fault_code_for_backend(_active_backend_name, error_code)
 

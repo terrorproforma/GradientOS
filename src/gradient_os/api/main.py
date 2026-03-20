@@ -44,6 +44,7 @@ _REST_POSE_COMMAND = ",".join(str(value) for value in _REST_POSE_RAD)
 _ALLOWED_WELD_TYPES = {"fillet", "butt", "lap", "tack/spot", "custom"}
 _PROJECT_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _WELD_PROGRAM_DIR = os.path.join(_PROJECT_ROOT_DIR, "recorded_trajectories", "weld_programs")
+_CONTROLLER_REPLY_MAX_BYTES = 65535
 
 
 def _default_controller_port() -> int:
@@ -67,7 +68,7 @@ def _probe_controller(timeout: float = 0.5) -> Tuple[bool, str]:
         sock.settimeout(max(0.05, timeout))
         try:
             sock.sendto(payload, (host, port))
-            data, _addr = sock.recvfrom(1024)
+            data, _addr = sock.recvfrom(_CONTROLLER_REPLY_MAX_BYTES)
         except socket.timeout:
             return False, f"Timed out waiting for controller response at {host}:{port}"
         except OSError as exc:
@@ -96,7 +97,7 @@ def _send_controller_command(
             if not expect_response:
                 return True, ""
         try:
-            data, _addr = sock.recvfrom(1024)
+            data, _addr = sock.recvfrom(_CONTROLLER_REPLY_MAX_BYTES)
         except socket.timeout:
             return False, f"No response for command '{message}'"
         except OSError as exc:
@@ -427,6 +428,35 @@ def create_app() -> FastAPI:
             )
         return HTTPException(status_code=503, detail=detail)
 
+    def _parse_apply_joint_setpoint_error(detail: str) -> HTTPException:
+        prefix = "ERROR,APPLY_JOINT_SETPOINT,"
+        if detail.startswith(prefix):
+            message = detail[len(prefix) :].strip() or "Controller rejected direct joint setpoint."
+            lowered = message.lower()
+            if any(token in lowered for token in ("missing", "must be", "expected", "invalid")):
+                status_code = 400
+            elif any(
+                token in lowered
+                for token in (
+                    "not connected",
+                    "setpoint slot",
+                    "cmd ring",
+                    "overflow",
+                    "did not report a valid num_axes",
+                )
+            ):
+                status_code = 503
+            else:
+                status_code = 409
+            return HTTPException(
+                status_code=status_code,
+                detail={
+                    "code": "APPLY_JOINT_SETPOINT_REJECTED",
+                    "message": message,
+                },
+            )
+        return HTTPException(status_code=503, detail=detail)
+
     def _controller_kinematics_call(command: str, timeout: float = 2.0) -> dict[str, Any]:
         ok, detail = _send_controller_command(command, timeout=timeout, expect_response=True)
         if not ok:
@@ -555,6 +585,13 @@ def create_app() -> FastAPI:
         )
         return {"status": "ok", "detail": detail, "waited_for_idle": wait_for_idle}
 
+    @api.post("/control/power-up", summary="Best-effort actuator power-up / arm")
+    async def control_power_up():
+        detail = await run_in_threadpool(
+            _controller_call_or_503, "SAFE_POWER_UP", timeout=5.0, expect_response=True
+        )
+        return {"status": "ok", "detail": detail}
+
     @api.post(
         "/control/restart-controller",
         summary="Request graceful controller restart (external supervisor should restart process)",
@@ -578,12 +615,34 @@ def create_app() -> FastAPI:
             "reason": reason,
         }
 
-    @api.post("/control/wait-for-idle", summary="Block until motion completes")
+    @api.post("/control/wait-for-idle", summary="Block until planner/trajectory motion completes")
     async def control_wait_for_idle():
         detail = await run_in_threadpool(
             _controller_call_or_503, "WAIT_FOR_IDLE", timeout=60.0, expect_response=True
         )
-        return {"status": "ok", "detail": detail}
+        return {
+            "status": "ok",
+            "detail": detail,
+            "completion_scope": "trajectory_thread",
+        }
+
+    @api.post("/control/reset-faults", summary="Request DS402/drive fault reset")
+    async def control_reset_faults(payload: dict[str, Any] | None = None):
+        joint: int | None = None
+        if isinstance(payload, dict) and payload.get("joint", payload.get("joint_num")) is not None:
+            raw_joint = payload.get("joint", payload.get("joint_num"))
+            try:
+                joint = int(raw_joint)
+            except Exception:
+                raise HTTPException(status_code=400, detail="joint must be an integer")
+            if joint <= 0:
+                raise HTTPException(status_code=400, detail="joint must be >= 1")
+
+        command = f"RESET_FAULTS,{joint}" if joint is not None else "RESET_FAULTS"
+        detail = await run_in_threadpool(
+            _controller_call_or_503, command, timeout=5.0, expect_response=True
+        )
+        return {"status": "ok", "detail": detail, "joint": joint}
 
     @api.post("/control/home", summary="Move all joints to zero position")
     async def control_home():
@@ -649,27 +708,32 @@ def create_app() -> FastAPI:
         # `GET_JOINT_ANGLES` returns degrees for UI/API consumption, so convert back to
         # radians here before handing the command to the controller.
         target_arm_rad = [float(np.deg2rad(value)) for value in target_arm_deg]
-        cmd = ",".join(str(value) for value in target_arm_rad)
-        await run_in_threadpool(
-            _controller_call_or_503,
-            cmd,
-            timeout=2.0,
-            expect_response=False,
-        )
-        if wait_for_idle:
-            await run_in_threadpool(
+        try:
+            detail = await run_in_threadpool(
                 _controller_call_or_503,
-                "WAIT_FOR_IDLE",
-                timeout=60.0,
+                "APPLY_JOINT_SETPOINT," + _encode_payload_b64({"arm_angles_rad": target_arm_rad}),
+                timeout=2.0,
                 expect_response=True,
             )
+        except HTTPException as exc:
+            detail_text = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
+            raise _parse_apply_joint_setpoint_error(detail_text) from exc
+        command_acknowledged = detail.startswith("ACK,APPLY_JOINT_SETPOINT")
         return {
             "status": "ok",
             "joint": joint,
             "delta_deg": delta_deg,
             "target_arm_deg": target_arm_deg,
             "target_arm_rad": target_arm_rad,
-            "waited_for_idle": wait_for_idle,
+            "detail": detail,
+            "command_acknowledged": command_acknowledged,
+            "completion_scope": "direct_setpoint_ack",
+            "wait_for_idle_requested": wait_for_idle,
+            "waited_for_idle": False,
+            "completion_note": (
+                "WAIT_FOR_IDLE only tracks planner/trajectory motion; "
+                "direct commissioning setpoints now return after backend acceptance."
+            ),
         }
 
     @api.post("/control/rest", summary="Move all joints to predefined REST pose")

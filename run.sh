@@ -29,6 +29,7 @@ if [[ -d "${VENV_BIN}" ]]; then
   export PATH="${VENV_BIN}:${PATH}"
 fi
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
+export GRADIENT_RTCORE_AUTO_ARM="${GRADIENT_RTCORE_AUTO_ARM:-0}"
 
 if [[ ! -x "${VENV_PY}" ]]; then
   echo "[gradient-robotics] ERROR: Missing ${VENV_PY}" >&2

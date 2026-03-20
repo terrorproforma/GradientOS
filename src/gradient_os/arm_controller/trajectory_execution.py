@@ -987,9 +987,22 @@ def _open_loop_executor_thread(
     # ----------------------------------------------
     # Pre-allocate Sync-Write command buffers
     # ----------------------------------------------
-    precomputed_cmds: list[list[tuple[int,int,int,int]]] = [
-        servo_driver.logical_q_to_syncwrite_tuple(q, utils.ENCODER_RESOLUTION, 0) for q in joint_path
-    ]
+    backend = _get_backend()
+    use_backend = backend is not None and backend.is_initialized
+    try:
+        executor_speed = max(0, int(utils.ENCODER_RESOLUTION))
+    except Exception:
+        executor_speed = 4095
+
+    if use_backend:
+        precomputed_cmds: list[list[tuple]] = [
+            backend.prepare_sync_write_commands(list(q), speed=executor_speed, accel=0)
+            for q in joint_path
+        ]
+    else:
+        precomputed_cmds = [
+            servo_driver.logical_q_to_syncwrite_tuple(q, utils.ENCODER_RESOLUTION, 0) for q in joint_path
+        ]
 
     # ----------------------------------------------
     #  Timing buffers
@@ -1012,9 +1025,7 @@ def _open_loop_executor_thread(
 
             # --- Actuation (WRITE) ---
             w_t0 = time.perf_counter()
-            backend = _get_backend()
-            if backend and _use_backend():
-                # Backend expects a list of (servo_id, position, speed, accel) tuples.
+            if use_backend:
                 backend.sync_write(cmd)
             else:
                 servo_protocol.sync_write_goal_pos_speed_accel(cmd)
@@ -1032,7 +1043,10 @@ def _open_loop_executor_thread(
             if diagnostics_enabled:
                 # For diagnostics, read back the position to calculate tracking error.
                 # This adds overhead and is NOT part of a true open-loop system.
-                actual_q = servo_driver.get_current_arm_state_rad(verbose=False)
+                if use_backend:
+                    actual_q = backend.get_joint_positions(verbose=False)
+                else:
+                    actual_q = servo_driver.get_current_arm_state_rad(verbose=False)
                 target_q = joint_path[i]
                 for j_idx in range(utils.NUM_LOGICAL_JOINTS):
                     error = target_q[j_idx] - actual_q[j_idx]
@@ -1146,12 +1160,21 @@ def _closed_loop_executor_thread(
         _target_angles_per_joint: list[list[float]] = [[] for _ in range(utils.NUM_LOGICAL_JOINTS)]
         _actual_angles_per_joint: list[list[float]] = [[] for _ in range(utils.NUM_LOGICAL_JOINTS)]
 
-        # We need a mapping from logical joint index back to the physical servos to command.
-        # This is dynamically built from robot config.
-        logical_to_physical_map = _build_logical_to_physical_index_map()
-        all_physical_servo_ids = [utils.SERVO_IDS[i] for i in range(utils.NUM_PHYSICAL_SERVOS)]
-        PRIMARY_FB_IDS = _build_primary_feedback_ids()
-        twin_motor_pairs = _get_twin_motor_pairs()
+        backend = _get_backend()
+        use_backend = backend is not None and backend.is_initialized
+        logical_to_physical_map: dict[int, list[int]] = {}
+        PRIMARY_FB_IDS: list[int] = []
+        twin_motor_pairs: list[tuple[int, int]] = []
+        if not use_backend:
+            # Legacy servo backends still use physical-servo feedback and sync-write tuples.
+            logical_to_physical_map = _build_logical_to_physical_index_map()
+            PRIMARY_FB_IDS = _build_primary_feedback_ids()
+            twin_motor_pairs = _get_twin_motor_pairs()
+
+        try:
+            executor_speed = max(0, int(utils.ENCODER_RESOLUTION))
+        except Exception:
+            executor_speed = 4095
 
         # Integral accumulators for steady-state error compensation (gravity, bias)
         integral_error_rad = [0.0 for _ in range(utils.NUM_LOGICAL_JOINTS)]
@@ -1173,8 +1196,7 @@ def _closed_loop_executor_thread(
             # Use a fixed but small timeout to ensure full packets arrive; setting
             # too low leads to intermittent Sync Read failures.
             per_cycle_timeout = max(0.01, time_step * 0.8)
-            backend = _get_backend()
-            if backend and _use_backend():
+            if use_backend:
                 raw_positions = backend.sync_read_positions(timeout_s=per_cycle_timeout)
             else:
                 raw_positions = servo_protocol.sync_read_positions(
@@ -1183,6 +1205,18 @@ def _closed_loop_executor_thread(
                     poll_delay_s=0.0,
                 )
             _read_durations.append(time.perf_counter() - read_t0)
+
+            actual_joint_positions: list[float] = []
+            if use_backend:
+                try:
+                    actual_joint_positions = list(backend.raw_to_joint_positions(raw_positions))
+                except Exception as exc:
+                    print(f"[Pi CLC] WARNING: Backend joint feedback conversion failed: {exc}")
+                    try:
+                        actual_joint_positions = list(backend.get_joint_positions(verbose=False))
+                    except Exception as fallback_exc:
+                        print(f"[Pi CLC] WARNING: Backend joint feedback fallback failed: {fallback_exc}")
+                        actual_joint_positions = []
 
             # ------------------------------------------------------------
             #  Feedback synthesis for twin-motor joints
@@ -1211,109 +1245,139 @@ def _closed_loop_executor_thread(
 
                 return int(round(max(0, min(encoder_max, raw))))
 
-            # --- Twin motor mirroring (dynamically from robot config) ---
-            for primary_id, secondary_id in twin_motor_pairs:
-                if primary_id in raw_positions and secondary_id not in raw_positions:
-                    primary_idx = utils.SERVO_IDS.index(primary_id)
-                    secondary_idx = utils.SERVO_IDS.index(secondary_id)
-                    angle_rad = servo_driver.servo_value_to_radians(raw_positions[primary_id], primary_idx)
-                    raw_positions[secondary_id] = _angle_to_raw(angle_rad, secondary_idx)
-
-            # Record target vs actual angles per logical joint using primary IDs
-            try:
-                # Build primary_ids dict from the PRIMARY_FB_IDS list
-                primary_ids = {i: PRIMARY_FB_IDS[i] for i in range(len(PRIMARY_FB_IDS))}
-                for logical_joint_index in range(utils.NUM_LOGICAL_JOINTS):
-                    target_angle_rad = target_q_step[logical_joint_index]
-                    _target_angles_per_joint[logical_joint_index].append(target_angle_rad)
-                    primary_id = primary_ids.get(logical_joint_index)
-                    if primary_id and primary_id in raw_positions:
-                        config_index = utils.SERVO_IDS.index(primary_id)
-                        actual_angle = servo_driver.servo_value_to_radians(raw_positions[primary_id], config_index)
-                        # Undo master offset to get logical angle
-                        actual_angle -= utils.LOGICAL_JOINT_MASTER_OFFSETS_RAD[logical_joint_index]
-                        _actual_angles_per_joint[logical_joint_index].append(actual_angle)
-                    else:
-                        # If missing, repeat last or 0.0
-                        last = _actual_angles_per_joint[logical_joint_index][-1] if _actual_angles_per_joint[logical_joint_index] else 0.0
-                        _actual_angles_per_joint[logical_joint_index].append(last)
-            except Exception:
-                pass
-
             # --- Control Law (Calculate Error and Correction) ---
             commands_for_sync_write = []
             
             compute_t0 = time.perf_counter()
 
-            for logical_joint_index, target_angle_rad in enumerate(target_q_step):
-                # This logic mirrors set_servo_positions to find the target physical angle.
-                angle_with_master_offset = target_angle_rad + utils.LOGICAL_JOINT_MASTER_OFFSETS_RAD[logical_joint_index]
-                target_physical_angle_rad = angle_with_master_offset
+            if use_backend:
+                for logical_joint_index, target_angle_rad in enumerate(target_q_step):
+                    _target_angles_per_joint[logical_joint_index].append(target_angle_rad)
 
-                # NOTE: Previous versions applied a *2 scaling here to compensate for a
-                # 2:1 belt gear ratio on the J1 (base) joint. The current hardware is
-                # direct-drive (1:1), so this extra scaling would cause the base to
-                # rotate twice as far as commanded during closed-loop execution,
-                # leading to exaggerated Y-axis motion.  The scaling has therefore
-                # been removed.
+                    fallback_angle = (
+                        _actual_angles_per_joint[logical_joint_index][-1]
+                        if _actual_angles_per_joint[logical_joint_index]
+                        else 0.0
+                    )
+                    try:
+                        actual_angle = float(actual_joint_positions[logical_joint_index])
+                        if not math.isfinite(actual_angle):
+                            actual_angle = fallback_angle
+                    except Exception:
+                        actual_angle = fallback_angle
 
-                # For each physical servo associated with this logical joint...
-                for physical_servo_config_index in logical_to_physical_map[logical_joint_index]:
-                    servo_id = utils.SERVO_IDS[physical_servo_config_index]
-                    
-                    # 1. Get the actual angle of this specific servo from the feedback data
-                    actual_raw_pos = raw_positions.get(servo_id)
-                    if actual_raw_pos is None:
-                        print(f"[Pi CLC] WARNING: Missing feedback for servo {servo_id}. Skipping correction.")
-                        continue # Skip this servo if feedback failed
-                    
-                    actual_physical_angle_rad = servo_driver.servo_value_to_radians(actual_raw_pos, physical_servo_config_index)
+                    _actual_angles_per_joint[logical_joint_index].append(actual_angle)
 
-                    # 2. Calculate the error
-                    error_rad = target_physical_angle_rad - actual_physical_angle_rad
-                    
-                    # Collect telemetry: absolute error per logical joint
+                    error_rad = target_angle_rad - actual_angle
                     _abs_errors_per_joint[logical_joint_index].append(abs(error_rad))
-                    
-                    # 3. Calculate the corrected command
-                    # Update integral term (anti-windup clamped)
                     integral_error_rad[logical_joint_index] += error_rad * time_step
                     if integral_error_rad[logical_joint_index] > utils.CORRECTION_INTEGRAL_CLAMP_RAD:
                         integral_error_rad[logical_joint_index] = utils.CORRECTION_INTEGRAL_CLAMP_RAD
                     elif integral_error_rad[logical_joint_index] < -utils.CORRECTION_INTEGRAL_CLAMP_RAD:
                         integral_error_rad[logical_joint_index] = -utils.CORRECTION_INTEGRAL_CLAMP_RAD
 
-                    # Commanded Angle = Target + Kp * Error + Ki * ∫Error dt
-                    # Software PID correction intentionally disabled. We command the planned target
-                    # to let inner servo PID be the only stabilizing loop during tuning.
-                    commanded_physical_angle_rad = target_physical_angle_rad
-                    
-                    # 4. Convert the final commanded angle to a raw servo value
-                    # This block is the same as in set_servo_positions
-                    min_urdf_rad, max_urdf_rad = utils.URDF_JOINT_LIMITS[physical_servo_config_index]
-                    angle_clamped_to_urdf = max(min_urdf_rad, min(max_urdf_rad, commanded_physical_angle_rad))
-                    
-                    min_map_rad, max_map_rad = utils.EFFECTIVE_MAPPING_RANGES[physical_servo_config_index]
-                    angle_for_norm = max(min_map_rad, min(max_map_rad, angle_clamped_to_urdf))
-                    normalized_value = (angle_for_norm - min_map_rad) / (max_map_rad - min_map_rad)
-                    encoder_max = utils.ENCODER_RESOLUTION
-                    
-                    raw_servo_value = (normalized_value * encoder_max) if utils._is_servo_direct_mapping(physical_servo_config_index) else ((1.0 - normalized_value) * encoder_max)
-                    
-                    final_servo_pos_value = int(round(raw_servo_value))
-                    
-                    # Add to the command list. Speed is max and Accel is none (0)
-                    # because the path is timed by the closed-loop executor itself.
-                    commands_for_sync_write.append((servo_id, final_servo_pos_value, encoder_max, 0))
+                commands_for_sync_write = backend.prepare_sync_write_commands(
+                    list(target_q_step),
+                    speed=executor_speed,
+                    accel=0,
+                )
+            else:
+                # --- Twin motor mirroring (dynamically from robot config) ---
+                for primary_id, secondary_id in twin_motor_pairs:
+                    if primary_id in raw_positions and secondary_id not in raw_positions:
+                        primary_idx = utils.SERVO_IDS.index(primary_id)
+                        secondary_idx = utils.SERVO_IDS.index(secondary_id)
+                        angle_rad = servo_driver.servo_value_to_radians(raw_positions[primary_id], primary_idx)
+                        raw_positions[secondary_id] = _angle_to_raw(angle_rad, secondary_idx)
+
+                # Record target vs actual angles per logical joint using primary IDs
+                try:
+                    # Build primary_ids dict from the PRIMARY_FB_IDS list
+                    primary_ids = {i: PRIMARY_FB_IDS[i] for i in range(len(PRIMARY_FB_IDS))}
+                    for logical_joint_index in range(utils.NUM_LOGICAL_JOINTS):
+                        target_angle_rad = target_q_step[logical_joint_index]
+                        _target_angles_per_joint[logical_joint_index].append(target_angle_rad)
+                        primary_id = primary_ids.get(logical_joint_index)
+                        if primary_id and primary_id in raw_positions:
+                            config_index = utils.SERVO_IDS.index(primary_id)
+                            actual_angle = servo_driver.servo_value_to_radians(raw_positions[primary_id], config_index)
+                            # Undo master offset to get logical angle
+                            actual_angle -= utils.LOGICAL_JOINT_MASTER_OFFSETS_RAD[logical_joint_index]
+                            _actual_angles_per_joint[logical_joint_index].append(actual_angle)
+                        else:
+                            # If missing, repeat last or 0.0
+                            last = _actual_angles_per_joint[logical_joint_index][-1] if _actual_angles_per_joint[logical_joint_index] else 0.0
+                            _actual_angles_per_joint[logical_joint_index].append(last)
+                except Exception:
+                    pass
+
+                for logical_joint_index, target_angle_rad in enumerate(target_q_step):
+                    # This logic mirrors set_servo_positions to find the target physical angle.
+                    angle_with_master_offset = target_angle_rad + utils.LOGICAL_JOINT_MASTER_OFFSETS_RAD[logical_joint_index]
+                    target_physical_angle_rad = angle_with_master_offset
+
+                    # NOTE: Previous versions applied a *2 scaling here to compensate for a
+                    # 2:1 belt gear ratio on the J1 (base) joint. The current hardware is
+                    # direct-drive (1:1), so this extra scaling would cause the base to
+                    # rotate twice as far as commanded during closed-loop execution,
+                    # leading to exaggerated Y-axis motion.  The scaling has therefore
+                    # been removed.
+
+                    # For each physical servo associated with this logical joint...
+                    for physical_servo_config_index in logical_to_physical_map[logical_joint_index]:
+                        servo_id = utils.SERVO_IDS[physical_servo_config_index]
+                        
+                        # 1. Get the actual angle of this specific servo from the feedback data
+                        actual_raw_pos = raw_positions.get(servo_id)
+                        if actual_raw_pos is None:
+                            print(f"[Pi CLC] WARNING: Missing feedback for servo {servo_id}. Skipping correction.")
+                            continue # Skip this servo if feedback failed
+                        
+                        actual_physical_angle_rad = servo_driver.servo_value_to_radians(actual_raw_pos, physical_servo_config_index)
+
+                        # 2. Calculate the error
+                        error_rad = target_physical_angle_rad - actual_physical_angle_rad
+                        
+                        # Collect telemetry: absolute error per logical joint
+                        _abs_errors_per_joint[logical_joint_index].append(abs(error_rad))
+                        
+                        # 3. Calculate the corrected command
+                        # Update integral term (anti-windup clamped)
+                        integral_error_rad[logical_joint_index] += error_rad * time_step
+                        if integral_error_rad[logical_joint_index] > utils.CORRECTION_INTEGRAL_CLAMP_RAD:
+                            integral_error_rad[logical_joint_index] = utils.CORRECTION_INTEGRAL_CLAMP_RAD
+                        elif integral_error_rad[logical_joint_index] < -utils.CORRECTION_INTEGRAL_CLAMP_RAD:
+                            integral_error_rad[logical_joint_index] = -utils.CORRECTION_INTEGRAL_CLAMP_RAD
+
+                        # Commanded Angle = Target + Kp * Error + Ki * ∫Error dt
+                        # Software PID correction intentionally disabled. We command the planned target
+                        # to let inner servo PID be the only stabilizing loop during tuning.
+                        commanded_physical_angle_rad = target_physical_angle_rad
+                        
+                        # 4. Convert the final commanded angle to a raw servo value
+                        # This block is the same as in set_servo_positions
+                        min_urdf_rad, max_urdf_rad = utils.URDF_JOINT_LIMITS[physical_servo_config_index]
+                        angle_clamped_to_urdf = max(min_urdf_rad, min(max_urdf_rad, commanded_physical_angle_rad))
+                        
+                        min_map_rad, max_map_rad = utils.EFFECTIVE_MAPPING_RANGES[physical_servo_config_index]
+                        angle_for_norm = max(min_map_rad, min(max_map_rad, angle_clamped_to_urdf))
+                        normalized_value = (angle_for_norm - min_map_rad) / (max_map_rad - min_map_rad)
+                        encoder_max = utils.ENCODER_RESOLUTION
+                        
+                        raw_servo_value = (normalized_value * encoder_max) if utils._is_servo_direct_mapping(physical_servo_config_index) else ((1.0 - normalized_value) * encoder_max)
+                        
+                        final_servo_pos_value = int(round(raw_servo_value))
+                        
+                        # Add to the command list. Speed is max and Accel is none (0)
+                        # because the path is timed by the closed-loop executor itself.
+                        commands_for_sync_write.append((servo_id, final_servo_pos_value, encoder_max, 0))
 
             _compute_durations.append(time.perf_counter() - compute_t0)
 
             # --- Actuation (Write) ---
             if commands_for_sync_write:
                 write_t0 = time.perf_counter()
-                backend = _get_backend()
-                if backend and _use_backend():
-                    # Backend expects a list of (servo_id, position, speed, accel) tuples.
+                if use_backend:
                     backend.sync_write(commands_for_sync_write)
                 else:
                     servo_protocol.sync_write_goal_pos_speed_accel(commands_for_sync_write)

@@ -4,6 +4,7 @@ set -euo pipefail
 
 SERVICE_NAME="gradient-rt-motion.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
+ENV_PATH="/etc/default/gradient-rt-motion"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
@@ -16,10 +17,8 @@ make -C "${REPO_ROOT}/src/gradient_rt_motion"
 echo "Installing RTCore binary to /usr/local/bin/gradient-rt-motion..."
 sudo install -m 0755 "${REPO_ROOT}/src/gradient_rt_motion/gradient-rt-motion" /usr/local/bin/gradient-rt-motion
 
-sudo cp "${SCRIPT_DIR}/${SERVICE_NAME}" "${SERVICE_PATH}"
-
-echo "Reloading systemd daemon..."
-sudo systemctl daemon-reload
+echo "Syncing RTCore unit + runtime environment..."
+"${SCRIPT_DIR}/sync-runtime.sh"
 
 echo "Enabling service..."
 sudo systemctl enable "${SERVICE_NAME}"

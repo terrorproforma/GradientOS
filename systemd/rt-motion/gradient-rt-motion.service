@@ -16,7 +16,13 @@ User=root
 # privileges in RTCore while keeping the Python layer unprivileged.
 Group=pi
 
-ExecStart=/usr/local/bin/gradient-rt-motion
+Environment=GRADIENT_RT_NUM_AXES=6
+Environment=GRADIENT_RT_COUNTS_PER_REV=131072
+Environment=GRADIENT_RT_GEAR_RATIO=1
+Environment=GRADIENT_RT_SIGN=1
+Environment=GRADIENT_RT_DRIVE_PROFILE=a6ec_ds402
+EnvironmentFile=-/etc/default/gradient-rt-motion
+ExecStart=/usr/local/bin/gradient-rt-motion --num-axes ${GRADIENT_RT_NUM_AXES} --counts-per-rev ${GRADIENT_RT_COUNTS_PER_REV} --gear-ratio ${GRADIENT_RT_GEAR_RATIO} --sign ${GRADIENT_RT_SIGN} --drive-profile ${GRADIENT_RT_DRIVE_PROFILE}
 
 # RT scheduling + memory locking (actual thread policy is set in RTCore).
 LimitRTPRIO=95

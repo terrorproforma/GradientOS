@@ -45,6 +45,7 @@ try:
     from . import runtime_config
     from . import tool_library
     from .telemetry import alerts as _alerts
+    from .telemetry.drive_faults import build_drive_fault_snapshot as _build_normalized_drive_fault_snapshot
     from .kinematics import runtime as kinematics_runtime
 except ImportError as e:
     print(f"Error importing arm_controller package: {e}")
@@ -60,9 +61,14 @@ _DEFAULT_RTCORE_METRICS_PATH = "/run/gradient-rt-motion/metrics.json"
 
 
 def _install_shutdown_signal_handlers() -> None:
+    signal_seen = {"raised": False}
+
     def _handle_signal(signum, _frame):
         signame = signal.Signals(signum).name
         print(f"\n[Controller] Shutdown signal received: {signame}")
+        if signal_seen["raised"]:
+            return
+        signal_seen["raised"] = True
         raise KeyboardInterrupt()
 
     for signum in (signal.SIGTERM, signal.SIGINT):
@@ -166,6 +172,92 @@ def _load_rtcore_metrics_snapshot(path: str) -> dict[str, object] | None:
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _rtcore_metrics_path() -> str:
+    return os.environ.get("GRADIENT_RTCORE_METRICS", _DEFAULT_RTCORE_METRICS_PATH).strip() or _DEFAULT_RTCORE_METRICS_PATH
+
+
+def _build_drive_fault_snapshot(
+    servo_backend: str,
+    *,
+    drive_profile: str | None = None,
+    configured_drive_profile: str | None = None,
+    live_drive_profile: str | None = None,
+    fieldbus_profile: str | None = None,
+    backend_instance: object | None = None,
+) -> dict[str, object] | None:
+    metrics = _load_rtcore_metrics_snapshot(_rtcore_metrics_path())
+    if not metrics:
+        return None
+    axis_to_joint_raw = getattr(backend_instance, "_axis_to_joint", None)
+    axis_to_joint = axis_to_joint_raw if isinstance(axis_to_joint_raw, list) else []
+    snapshot = _build_normalized_drive_fault_snapshot(
+        metrics=metrics,
+        servo_backend=servo_backend,
+        drive_profile=drive_profile,
+        configured_drive_profile=configured_drive_profile,
+        live_drive_profile=live_drive_profile,
+        fieldbus_profile=fieldbus_profile,
+        axis_to_joint=axis_to_joint,
+        socket_present=os.path.exists(os.path.join(os.path.dirname(_rtcore_metrics_path()), "ipc.sock")),
+    )
+    snapshot["metrics_path"] = _rtcore_metrics_path()
+    return snapshot
+
+
+def _sync_live_rtcore_drive_profile(
+    active_runtime_config: dict[str, object] | None,
+    backend_instance: object | None,
+) -> None:
+    if not isinstance(active_runtime_config, dict):
+        return
+    live_profile = None
+    getter = getattr(backend_instance, "get_live_drive_profile_id", None) if backend_instance is not None else None
+    if callable(getter):
+        try:
+            live_profile = getter()
+        except Exception:
+            live_profile = None
+    runtime_config.attach_live_drive_profile(active_runtime_config, live_profile)
+
+
+def _attach_drive_faults_to_telemetry_message(
+    msg: dict[str, object],
+    *,
+    active_runtime_config: dict[str, object] | None,
+    servo_backend: str,
+    backend_instance: object | None,
+) -> None:
+    if not isinstance(msg, dict):
+        return
+    _sync_live_rtcore_drive_profile(active_runtime_config, backend_instance)
+    drive_profile_block = (
+        active_runtime_config.get("drive_profile", {})
+        if isinstance(active_runtime_config, dict)
+        else {}
+    )
+    configured_drive_profile = str(
+        drive_profile_block.get(
+            "configured_profile",
+            drive_profile_block.get("effective_profile", ""),
+        )
+    ).strip() or None
+    live_drive_profile = str(
+        drive_profile_block.get("live_profile", "")
+    ).strip() or None
+    effective_drive_profile = str(
+        drive_profile_block.get("effective_profile", "")
+    ).strip() or None
+    drive_faults = _build_drive_fault_snapshot(
+        servo_backend,
+        drive_profile=effective_drive_profile,
+        configured_drive_profile=configured_drive_profile,
+        live_drive_profile=live_drive_profile,
+        backend_instance=backend_instance,
+    )
+    if drive_faults:
+        msg["drive_faults"] = drive_faults
 
 
 def _rtcore_metrics_ready(metrics: dict[str, object] | None, *, expected_axes: int) -> tuple[bool, str]:
@@ -313,6 +405,15 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--drive-profile",
+        type=str,
+        default=None,
+        help=(
+            "Development override: drive profile id (for example a6ec_ds402 or cia402). "
+            "Requires --allow-unsafe-overrides."
+        ),
+    )
+    parser.add_argument(
         "--allow-unsafe-overrides",
         action="store_true",
         help=(
@@ -415,11 +516,25 @@ Examples:
                 "Using robot policy backend."
             )
 
+        requested_drive_profile = None
+        if allow_unsafe_overrides:
+            requested_drive_profile = (
+                args.drive_profile
+                or desired_overrides.get("drive_profile")
+                or None
+            )
+        elif args.drive_profile:
+            print(
+                "[Controller] WARNING: Drive profile override requested but unsafe overrides are disabled. "
+                "Using backend default drive profile."
+            )
+
         active_runtime_config = runtime_config.resolve_effective_runtime(
             robot_name=requested_robot_name,
             sim_mode=bool(args.sim),
             requested_ik_solver_backend=requested_ik_backend,
             requested_servo_backend=requested_servo_backend,
+            requested_drive_profile=requested_drive_profile,
             requested_active_tool_id=str(desired_active_tool_id) if desired_active_tool_id is not None else None,
             allow_unsafe_overrides=allow_unsafe_overrides,
         )
@@ -485,10 +600,16 @@ Examples:
     servo_backend = str(
         active_runtime_config.get("servo_backend", {}).get("effective_backend", selected_robot.default_servo_backend)
     )
+    drive_profile = active_runtime_config.get("drive_profile", {}).get("effective_profile")
     print(
         f"[Controller] Servo backend: {servo_backend} "
         f"(source={active_runtime_config['servo_backend']['source']})"
     )
+    if drive_profile:
+        print(
+            f"[Controller] Drive profile: {drive_profile} "
+            f"(source={active_runtime_config.get('drive_profile', {}).get('source', 'unknown')})"
+        )
 
     if servo_backend == "ethercat_rtcore" and not bool(active_runtime_config and active_runtime_config.get("mode", {}).get("sim")):
         _ensure_ethercat_rtcore_available()
@@ -529,6 +650,7 @@ Examples:
         backend_ready = bool(active_backend.initialize())
         if not backend_ready:
             print("[Controller] WARNING: Backend initialization returned False")
+        _sync_live_rtcore_drive_profile(active_runtime_config, active_backend)
         
     except Exception as e:
         print(f"[Controller] Error creating backend: {e}")
@@ -684,9 +806,13 @@ Examples:
                     now = time.time()
                     if now - last_extra_ts >= 0.5:
                         last_extra_ts = now
+                        backend = None
+                        try:
+                            backend = backend_registry.get_active_backend()
+                        except Exception:
+                            backend = None
                         try:
                             # Get present servo IDs from backend or use configured IDs
-                            backend = backend_registry.get_active_backend()
                             if backend and hasattr(backend, 'present_servo_ids'):
                                 present_ids = list(backend.present_servo_ids)
                             else:
@@ -724,6 +850,15 @@ Examples:
                                     msg["servos"] = servos
                         except Exception:
                             # Do not let telemetry extras break the main joints stream
+                            pass
+                        try:
+                            _attach_drive_faults_to_telemetry_message(
+                                msg,
+                                active_runtime_config=active_runtime_config,
+                                servo_backend=servo_backend,
+                                backend_instance=backend,
+                            )
+                        except Exception:
                             pass
                     
                     # Drain any alerts collected by lower layers and attach them
@@ -1003,6 +1138,7 @@ Examples:
                     try:
                         if active_runtime_config is None:
                             raise RuntimeError("Runtime config is unavailable.")
+                        _sync_live_rtcore_drive_profile(active_runtime_config, active_backend)
                         payload = dict(active_runtime_config)
                         payload["controller"] = {
                             "pid": os.getpid(),
@@ -1231,6 +1367,38 @@ Examples:
                         sock.sendto(f"ACK,SAFE_POWER_DOWN,{detail}".encode("utf-8"), addr)
                     except Exception:
                         pass
+
+                elif command == "SAFE_POWER_UP":
+                    detail = command_api.handle_safe_power_up()
+                    try:
+                        sock.sendto(f"ACK,SAFE_POWER_UP,{detail}".encode("utf-8"), addr)
+                    except Exception:
+                        pass
+
+                elif command == "RESET_FAULTS":
+                    try:
+                        logical_joint_index = None
+                        detail = "ALL"
+                        if len(parts) > 1 and parts[1].strip():
+                            joint_num = int(parts[1])
+                            logical_joint_index = joint_num - 1
+                            if logical_joint_index < 0 or logical_joint_index >= selected_robot.num_logical_joints:
+                                sock.sendto(
+                                    f"ERROR,RESET_FAULTS,Joint number must be 1-{selected_robot.num_logical_joints}".encode("utf-8"),
+                                    addr,
+                                )
+                                continue
+                            detail = f"JOINT,{joint_num}"
+
+                        backend = backend_registry.get_active_backend()
+                        if not backend.reset_faults(logical_joint_index=logical_joint_index):
+                            sock.sendto("ERROR,RESET_FAULTS,UNSUPPORTED_OR_FAILED".encode("utf-8"), addr)
+                            continue
+                        sock.sendto(f"ACK,RESET_FAULTS,{detail}".encode("utf-8"), addr)
+                    except (ValueError, IndexError):
+                        sock.sendto("ERROR,RESET_FAULTS,BAD_ARGS".encode("utf-8"), addr)
+                    except Exception as e:
+                        sock.sendto(f"ERROR,RESET_FAULTS,{e}".encode("utf-8", errors="replace"), addr)
 
                 # ------------------------------------------------------------------
                 # NEW: Gripper Commands
@@ -1601,6 +1769,35 @@ Examples:
                         print("[Controller] Recorder stopped")
                     except Exception as e:
                         print(f"[Controller] Error stopping recorder: {e}")
+
+                elif command == "APPLY_JOINT_SETPOINT":
+                    try:
+                        payload_b64 = parts[1].strip() if len(parts) > 1 else ""
+                        if not payload_b64:
+                            raise ValueError("Missing base64 payload")
+                        payload_json = base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+                        payload = json.loads(payload_json)
+                        if not isinstance(payload, dict):
+                            raise ValueError("Payload must be an object")
+                        arm_angles = payload.get("arm_angles_rad")
+                        if not isinstance(arm_angles, list):
+                            raise ValueError("arm_angles_rad must be a list")
+                        gripper_rad_raw = payload.get("gripper_rad")
+                        gripper_rad = float(gripper_rad_raw) if gripper_rad_raw is not None else None
+                        speed_raw = payload.get("speed")
+                        accel_raw = payload.get("acceleration")
+                        command_api.handle_apply_joint_setpoint(
+                            [float(value) for value in arm_angles],
+                            gripper_rad=gripper_rad,
+                            speed=int(speed_raw) if speed_raw is not None else None,
+                            acceleration=float(accel_raw) if accel_raw is not None else None,
+                        )
+                        sock.sendto("ACK,APPLY_JOINT_SETPOINT".encode("utf-8"), addr)
+                    except Exception as e:
+                        print(f"[Controller] APPLY_JOINT_SETPOINT rejected: {e}")
+                        traceback.print_exc()
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,APPLY_JOINT_SETPOINT,{msg}".encode("utf-8"), addr)
 
                 # Default case for raw joint angles
                 else:

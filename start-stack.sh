@@ -22,6 +22,11 @@ if [[ -z "${SYSTEM_PYTHON}" ]]; then
   exit 1
 fi
 PROJECT_PYTHON="${REPO_ROOT}/.venv/bin/python"
+PROBE_PYTHON="${PROJECT_PYTHON}"
+if [[ ! -x "${PROBE_PYTHON}" ]]; then
+  PROBE_PYTHON="${SYSTEM_PYTHON}"
+fi
+RTCORE_SYNC_SCRIPT="${REPO_ROOT}/systemd/rt-motion/sync-runtime.sh"
 TTY_DEVICE="$(tty 2>/dev/null || true)"
 
 ACTION="start"
@@ -47,6 +52,7 @@ API_TIMEOUT_S="${GRADIENT_STACK_API_TIMEOUT_S:-20}"
 WEB_TIMEOUT_S="${GRADIENT_STACK_WEB_TIMEOUT_S:-20}"
 PROBE_INTERVAL_S="${GRADIENT_STACK_PROBE_INTERVAL_S:-0.25}"
 BUS_READY_TIMEOUT_S="${GRADIENT_STACK_BUS_READY_TIMEOUT_S:-20}"
+STARTUP_FAULT_RESET_TIMEOUT_S="${GRADIENT_STACK_STARTUP_FAULT_RESET_TIMEOUT_S:-3}"
 INTERACTIVE_CONSOLE_MODE="${GRADIENT_STACK_INTERACTIVE_CONSOLE:-auto}"
 
 START_RESULT="not_started"
@@ -54,6 +60,7 @@ START_FAILURE=""
 SHUTDOWN_REASON=""
 MANAGE_CHILDREN=0
 STOP_REQUESTED=0
+SHUTDOWN_POWER_DOWN_ATTEMPTED=0
 
 CONTROLLER_PID=""
 API_PID=""
@@ -96,6 +103,7 @@ Environment:
   GRADIENT_STACK_API_TIMEOUT_S         API readiness timeout (default: 20)
   GRADIENT_STACK_WEB_TIMEOUT_S         Web readiness timeout (default: 20)
   GRADIENT_STACK_PROBE_INTERVAL_S      Probe interval seconds (default: 0.25)
+  GRADIENT_STACK_STARTUP_FAULT_RESET_TIMEOUT_S  Wait time after startup auto-reset before aborting (default: 3)
 EOF
 }
 
@@ -460,6 +468,10 @@ request_controller_power_down_via_udp() {
 }
 
 request_controller_safe_power_down() {
+  if [[ "${SHUTDOWN_POWER_DOWN_ATTEMPTED}" -eq 1 ]]; then
+    return 0
+  fi
+  SHUTDOWN_POWER_DOWN_ATTEMPTED=1
   request_controller_power_down_via_api && return 0
   request_controller_power_down_via_udp && return 0
   request_controller_stop_via_api || true
@@ -468,18 +480,6 @@ request_controller_safe_power_down() {
 
 stop_controller_process() {
   local pid="$1"
-  local payload=""
-  payload="$(capture_probe_json || true)"
-  if [[ -n "${payload}" ]]; then
-    local current_state=""
-    current_state="$(probe_json_field "${payload}" "physical_state")"
-    if [[ "${current_state}" == "ACTIVE" || "${current_state}" == "FAULTED" ]]; then
-      request_controller_safe_power_down || true
-    fi
-  else
-    request_controller_safe_power_down || true
-  fi
-
   stop_pid_hierarchy \
     "controller" \
     "${pid}" \
@@ -569,13 +569,15 @@ probe_web() {
 }
 
 probe_hardware_state_json() {
-  "${SYSTEM_PYTHON}" - "${RTCORE_METRICS_PATH}" "${CONTROLLER_HOST}" "${CONTROLLER_PORT}" "${API_PORT}" "${REPO_ROOT}" <<'PY'
+  "${PROBE_PYTHON}" - "${RTCORE_METRICS_PATH}" "${CONTROLLER_HOST}" "${CONTROLLER_PORT}" "${API_PORT}" "${REPO_ROOT}" <<'PY'
 import json
+import io
 import socket
 import sys
 import urllib.error
 import urllib.request
 from contextlib import closing
+from contextlib import redirect_stdout
 from pathlib import Path
 
 metrics_path = Path(sys.argv[1])
@@ -584,7 +586,65 @@ controller_port = int(sys.argv[3])
 api_port = int(sys.argv[4])
 repo_root = Path(sys.argv[5])
 socket_path = metrics_path.with_name("ipc.sock")
-a6ec_codebook_path = repo_root / "docs" / "resources" / "a6ec_manual_codes.json"
+sys.path.insert(0, str(repo_root / "src"))
+try:
+    with redirect_stdout(io.StringIO()):
+        from gradient_os import runtime_config
+        from gradient_os.arm_controller.backends import registry as backend_registry
+        from gradient_os.arm_controller.robots import get_robot_config
+        from gradient_os.telemetry.drive_faults import build_drive_fault_snapshot
+except Exception:
+    runtime_config = None
+    backend_registry = None
+    get_robot_config = None
+    build_drive_fault_snapshot = None
+
+
+def desired_runtime_fallback():
+    if runtime_config is None:
+        return {}, [], None
+    try:
+        desired_config = runtime_config.load_runtime_config()
+        desired = desired_config.get("desired", {}) if isinstance(desired_config, dict) else {}
+        desired_overrides = desired.get("overrides", {}) if isinstance(desired.get("overrides"), dict) else {}
+        allow_unsafe = runtime_config.resolve_allow_unsafe_overrides(
+            cli_flag=False,
+            desired_flag=bool(desired.get("allow_unsafe_overrides", False)),
+        )
+        resolved = runtime_config.resolve_effective_runtime(
+            robot_name=str(desired.get("robot", "gradient05")),
+            sim_mode=False,
+            requested_ik_solver_backend=desired_overrides.get("ik_solver_backend"),
+            requested_servo_backend=desired_overrides.get("servo_backend"),
+            requested_drive_profile=desired_overrides.get("drive_profile"),
+            requested_active_tool_id=desired.get("active_tool_id"),
+            allow_unsafe_overrides=allow_unsafe,
+        )
+        axis_to_joint: list[int] = []
+        robot_name = str(resolved.get("robot", {}).get("name", "")).strip()
+        if robot_name and callable(get_robot_config):
+            robot_cfg = get_robot_config(robot_name).get_config_dict()
+            mapping = robot_cfg.get("logical_to_physical_map", {})
+            if isinstance(mapping, dict):
+                num_axes = int(robot_cfg.get("num_physical_actuators", 0))
+                axis_to_joint = [-1] * max(0, num_axes)
+                for logical_joint, physical_axes in mapping.items():
+                    try:
+                        logical_joint_idx = int(logical_joint)
+                    except Exception:
+                        continue
+                    if not isinstance(physical_axes, list):
+                        continue
+                    for axis_idx_raw in physical_axes:
+                        try:
+                            axis_idx = int(axis_idx_raw)
+                        except Exception:
+                            continue
+                        if 0 <= axis_idx < len(axis_to_joint):
+                            axis_to_joint[axis_idx] = logical_joint_idx
+        return resolved, axis_to_joint, None
+    except Exception as exc:
+        return {}, [], str(exc)
 
 
 def api_json(path: str):
@@ -620,55 +680,45 @@ def load_metrics():
         return {}, f"{exc.__class__.__name__}: {exc}"
 
 
-def inum(value, default=0):
-    try:
-        return int(value)
-    except Exception:
-        return int(default)
-
-
-def decode_al_state(value: int) -> str:
-    return {
-        0x01: "INIT",
-        0x02: "PREOP",
-        0x04: "SAFEOP",
-        0x08: "OP",
-    }.get(int(value), "UNKNOWN")
-
-
-def decode_ds402(sw: int) -> str:
-    sw = int(sw) & 0xFFFF
-    if (sw & 0x004F) == 0x0000:
-        return "NotReady"
-    if (sw & 0x004F) == 0x0040:
-        return "SwitchOnDisabled"
-    if (sw & 0x006F) == 0x0021:
-        return "ReadyToSwitchOn"
-    if (sw & 0x006F) == 0x0023:
-        return "SwitchedOn"
-    if (sw & 0x006F) == 0x0027:
-        return "OperationEnabled"
-    if (sw & 0x006F) == 0x0007:
-        return "QuickStopActive"
-    if (sw & 0x004F) == 0x000F:
-        return "FaultReactionActive"
-    if (sw & 0x004F) == 0x0008:
-        return "Fault"
-    return "Unknown"
-
-
-def drive_fault_reference_for_backend(servo_backend: str) -> str | None:
-    # The current EtherCAT RTCore motion path is wired for A6-EC CiA402 drives.
-    # Other servo backends must remain raw until they provide their own decoder.
-    if servo_backend == "ethercat_rtcore" and a6ec_codebook_path.exists():
-        return "a6ec_603f_reference_available"
-    return None
-
-
 controller_ok, controller_detail = controller_status()
 api_health, api_health_err = api_json("/health")
 runtime_cfg, runtime_cfg_err = api_json("/info/runtime-config")
 metrics, metrics_err = load_metrics()
+runtime_active = runtime_cfg.get("active") if isinstance(runtime_cfg, dict) else None
+ik = runtime_active.get("ik_solver") if isinstance(runtime_active, dict) else {}
+servo = runtime_active.get("servo_backend") if isinstance(runtime_active, dict) else {}
+drive = runtime_active.get("drive_profile") if isinstance(runtime_active, dict) else {}
+if not isinstance(ik, dict):
+    ik = {}
+if not isinstance(servo, dict):
+    servo = {}
+if not isinstance(drive, dict):
+    drive = {}
+runtime_servo_backend = str(servo.get("effective_backend", "")).strip() or None
+runtime_drive_profile = str(drive.get("effective_profile", "")).strip() or None
+runtime_drive_profile_configured = str(
+    drive.get("configured_profile", drive.get("effective_profile", ""))
+).strip() or None
+runtime_drive_profile_live = str(drive.get("live_profile", "")).strip() or None
+runtime_drive_profile_source = str(drive.get("source", "")).strip() or None
+fallback_runtime, fallback_axis_to_joint, fallback_error = desired_runtime_fallback()
+fallback_servo = (
+    fallback_runtime.get("servo_backend", {}).get("effective_backend")
+    if isinstance(fallback_runtime.get("servo_backend"), dict)
+    else None
+)
+fallback_drive = (
+    fallback_runtime.get("drive_profile", {}).get("configured_profile")
+    if isinstance(fallback_runtime.get("drive_profile"), dict)
+    else None
+)
+probe_servo_backend = runtime_servo_backend or (str(fallback_servo).strip() or None)
+probe_drive_profile = runtime_drive_profile or runtime_drive_profile_configured or (str(fallback_drive).strip() or None)
+probe_context_source = (
+    "api_active_runtime"
+    if runtime_servo_backend
+    else ("desired_runtime_fallback" if probe_servo_backend else "unavailable")
+)
 
 if not metrics:
     payload = {
@@ -678,7 +728,17 @@ if not metrics:
         "api_error": api_health_err,
         "runtime_config_available": bool(runtime_cfg),
         "runtime_config_error": runtime_cfg_err,
-        "runtime_servo": None,
+        "runtime_ik": ik.get("effective_backend"),
+        "runtime_ik_source": ik.get("source"),
+        "runtime_servo": runtime_servo_backend,
+        "runtime_drive_profile": runtime_drive_profile,
+        "runtime_drive_profile_configured": runtime_drive_profile_configured,
+        "runtime_drive_profile_live": runtime_drive_profile_live,
+        "runtime_drive_profile_source": runtime_drive_profile_source,
+        "probe_servo_backend": probe_servo_backend,
+        "probe_drive_profile": probe_drive_profile,
+        "probe_context_source": probe_context_source,
+        "probe_context_error": fallback_error,
         "drive_fault_reference": None,
         "metrics_available": False,
         "metrics_error": metrics_err,
@@ -704,78 +764,20 @@ if not metrics:
     }
     print(json.dumps(payload))
     raise SystemExit(0)
-
-num_axes = inum(metrics.get("num_axes"), 0)
-armed = inum(metrics.get("armed"), 0)
-enable_mask = inum(metrics.get("axis_enable_mask"), 0)
-link_up = inum(metrics.get("link_up"), 0)
-responding = inum(metrics.get("responding_slaves"), 0)
-online = inum(metrics.get("online_slaves"), 0)
-operational = inum(metrics.get("operational_slaves"), 0)
-startup_ready = inum(metrics.get("startup_ready"), 0)
-wkc_actual = inum(metrics.get("wkc_actual"), 0)
-wkc_expected = inum(metrics.get("wkc_expected"), 0)
-master_al = inum(metrics.get("master_al_states"), 0)
-axes = metrics.get("axes") if isinstance(metrics.get("axes"), list) else []
-
-runtime_active = runtime_cfg.get("active") if isinstance(runtime_cfg, dict) else None
-ik = runtime_active.get("ik_solver") if isinstance(runtime_active, dict) else {}
-servo = runtime_active.get("servo_backend") if isinstance(runtime_active, dict) else {}
-if not isinstance(ik, dict):
-    ik = {}
-if not isinstance(servo, dict):
-    servo = {}
-runtime_servo_backend = str(servo.get("effective_backend", "")).strip()
-drive_fault_reference = drive_fault_reference_for_backend(runtime_servo_backend)
-
-axis_payload = []
-op_enabled = 0
-faulted = 0
-for idx, axis in enumerate(axes[:num_axes]):
-    if not isinstance(axis, dict):
-        continue
-    sw = inum(axis.get("statusword"), 0)
-    err = inum(axis.get("error_code"), 0)
-    ds = decode_ds402(sw)
-    if ds == "OperationEnabled":
-        op_enabled += 1
-    if err != 0 or ds in {"Fault", "FaultReactionActive"}:
-        faulted += 1
-    axis_payload.append(
-        {
-            "index": idx,
-            "ds402_state": ds,
-            "statusword": sw,
-            "error_code": err,
-            "slave_online": inum(axis.get("slave_online"), 0),
-            "slave_operational": inum(axis.get("slave_operational"), 0),
-            "slave_al_state": inum(axis.get("slave_al_state"), 0),
-            "slave_al_state_name": decode_al_state(inum(axis.get("slave_al_state"), 0)),
-            "pos_counts": inum(axis.get("pos_counts"), 0),
-        }
-    )
-
-if faulted > 0:
-    physical_state = "FAULTED"
-elif armed or enable_mask != 0 or op_enabled > 0:
-    physical_state = "ACTIVE"
-elif link_up and responding > 0:
-    physical_state = "BUS_UP_DISARMED"
-else:
-    physical_state = "INACTIVE"
-
-rtcore_state = "UP" if socket_path.exists() else "UNKNOWN"
-if armed or enable_mask != 0:
-    driver_state = "ACTIVE"
-elif link_up and responding > 0:
-    driver_state = "DISARMED"
-else:
-    driver_state = "INACTIVE"
-
-if link_up and responding > 0:
-    ethercat_master_state = "OP" if operational >= num_axes and num_axes > 0 else "BUS_UP"
-else:
-    ethercat_master_state = "DOWN"
+snapshot = {}
+if callable(build_drive_fault_snapshot):
+    try:
+        snapshot = build_drive_fault_snapshot(
+            metrics=metrics,
+            servo_backend=probe_servo_backend,
+            drive_profile=probe_drive_profile,
+            configured_drive_profile=runtime_drive_profile_configured or (str(fallback_drive).strip() or None),
+            live_drive_profile=runtime_drive_profile_live,
+            axis_to_joint=fallback_axis_to_joint,
+            socket_present=socket_path.exists(),
+        )
+    except Exception:
+        snapshot = {}
 
 payload = {
     "controller_udp_up": controller_ok,
@@ -787,30 +789,22 @@ payload = {
     "runtime_ik": ik.get("effective_backend"),
     "runtime_ik_source": ik.get("source"),
     "runtime_servo": runtime_servo_backend or None,
+    "runtime_drive_profile": runtime_drive_profile,
+    "runtime_drive_profile_configured": runtime_drive_profile_configured,
+    "runtime_drive_profile_live": runtime_drive_profile_live,
+    "runtime_drive_profile_source": runtime_drive_profile_source,
+    "probe_servo_backend": probe_servo_backend,
+    "probe_drive_profile": probe_drive_profile,
+    "probe_context_source": probe_context_source,
+    "probe_context_error": fallback_error,
     "runtime_restart_required": runtime_cfg.get("restart_required") if isinstance(runtime_cfg, dict) else None,
-    "drive_fault_reference": drive_fault_reference,
+    "drive_fault_reference": snapshot.get("reference") if isinstance(snapshot, dict) else None,
     "metrics_available": True,
     "metrics_error": None,
     "rtcore_socket_present": socket_path.exists(),
-    "rtcore_state": rtcore_state,
-    "ethercat_master_state": ethercat_master_state,
-    "driver_state": driver_state,
-    "physical_state": physical_state,
-    "armed": armed,
-    "axis_enable_mask": enable_mask,
-    "op_enabled_axes": op_enabled,
-    "num_axes": num_axes,
-    "link_up": link_up,
-    "responding": responding,
-    "online": online,
-    "operational": operational,
-    "startup_ready": startup_ready,
-    "wkc_actual": wkc_actual,
-    "wkc_expected": wkc_expected,
-    "master_al": master_al,
-    "axes": axis_payload,
     "metrics_path": str(metrics_path),
 }
+payload.update(snapshot if isinstance(snapshot, dict) else {})
 print(json.dumps(payload))
 PY
 }
@@ -841,21 +835,35 @@ if data.get("runtime_config_available"):
         f" ik={data.get('runtime_ik', 'unknown')}"
         f" source={data.get('runtime_ik_source', 'unknown')}"
         f" servo={data.get('runtime_servo', 'unknown')}"
+        f" drive_profile={data.get('runtime_drive_profile', 'unknown')}"
+        f" drive_source={data.get('runtime_drive_profile_source', 'unknown')}"
+        f" configured={data.get('runtime_drive_profile_configured', 'unknown')}"
+        f" live={data.get('runtime_drive_profile_live') or 'unavailable'}"
         f" restart_required={data.get('runtime_restart_required')}"
     )
 elif data.get("runtime_config_error"):
     print(f"  runtime_config: unavailable ({data['runtime_config_error']})")
+if data.get("probe_context_source") and data.get("probe_context_source") != "api_active_runtime":
+    print(
+        "  probe_decode:"
+        f" backend={data.get('probe_servo_backend') or 'unknown'}"
+        f" drive_profile={data.get('probe_drive_profile') or 'unknown'}"
+        f" source={data.get('probe_context_source')}"
+    )
+    if data.get("probe_context_error"):
+        print(f"    probe_context_error={data['probe_context_error']}")
 
-if data.get("drive_fault_reference"):
+drive_fault_reference = data.get("drive_fault_reference") or data.get("reference")
+if isinstance(drive_fault_reference, dict) and drive_fault_reference.get("available"):
     print(
         "  drive_fault_reference:"
-        f" {data.get('drive_fault_reference')}"
+        f" {drive_fault_reference.get('label') or drive_fault_reference.get('profile_id') or 'configured'}"
         " (only valid for the current servo backend)"
     )
-elif data.get("runtime_servo"):
+elif data.get("probe_servo_backend") or data.get("runtime_servo"):
     print(
         "  drive_fault_reference:"
-        f" raw_only (no vendor-specific decode applied for backend={data.get('runtime_servo')})"
+        f" raw_only (no vendor-specific decode applied for backend={data.get('probe_servo_backend') or data.get('runtime_servo')})"
     )
 else:
     print("  drive_fault_reference: raw_only (active servo backend unavailable)")
@@ -883,11 +891,25 @@ print(
 print(f"  physical_state: {data.get('physical_state')}")
 print(f"  metrics_path: {data.get('metrics_path')}")
 for axis in data.get("axes", []):
+    fault = axis.get("fault") if isinstance(axis, dict) else None
+    fault_suffix = ""
+    if isinstance(fault, dict):
+        details = []
+        code = str(fault.get("code", "")).strip()
+        name = str(fault.get("name", "")).strip()
+        if code:
+            details.append(code)
+        if name:
+            details.append(name)
+        if fault.get("resettable") is True:
+            details.append("resettable")
+        if details:
+            fault_suffix = f" [{' | '.join(details)}]"
     print(
         "  "
-        f"axis{axis.get('index')}: ds402={axis.get('ds402_state')} "
+        f"{('J' + str(axis.get('logical_joint')) + '/axis' + str(axis.get('axis', axis.get('index')))) if axis.get('logical_joint') is not None else ('axis' + str(axis.get('axis', axis.get('index'))))}: ds402={axis.get('ds402_state')} "
         f"sw=0x{int(axis.get('statusword', 0)):04x} "
-        f"err=0x{int(axis.get('error_code', 0)):04x} "
+        f"err=0x{int(axis.get('error_code', 0)):04x}{fault_suffix} "
         f"slave_online={axis.get('slave_online')} "
         f"slave_operational={axis.get('slave_operational')} "
         f"slave_al={axis.get('slave_al_state_name')} "
@@ -978,6 +1000,64 @@ print(
 PY
 }
 
+probe_is_soft_stop_safe() {
+  local payload="$1"
+  "${SYSTEM_PYTHON}" - "${payload}" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+physical_state = str(data.get("physical_state", "")).strip().upper()
+armed = int(data.get("armed", 0) or 0)
+enable_mask = int(data.get("axis_enable_mask", 0) or 0)
+op_enabled_axes = int(data.get("op_enabled_axes", 0) or 0)
+
+safe = (
+    physical_state in {"BUS_UP_DISARMED", "INACTIVE"}
+    or (
+        physical_state == "FAULTED"
+        and armed == 0
+        and enable_mask == 0
+        and op_enabled_axes == 0
+    )
+)
+raise SystemExit(0 if safe else 1)
+PY
+}
+
+describe_probe_soft_stop_state() {
+  local payload="$1"
+  "${SYSTEM_PYTHON}" - "${payload}" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+physical_state = str(data.get("physical_state", "")).strip().upper() or "UNKNOWN"
+armed = int(data.get("armed", 0) or 0)
+enable_mask = int(data.get("axis_enable_mask", 0) or 0)
+op_enabled_axes = int(data.get("op_enabled_axes", 0) or 0)
+driver_state = str(data.get("driver_state", "")).strip().upper() or "UNKNOWN"
+
+if physical_state == "INACTIVE":
+    print("inactive")
+elif physical_state == "BUS_UP_DISARMED":
+    print("bus up and disarmed")
+elif (
+    physical_state == "FAULTED"
+    and armed == 0
+    and enable_mask == 0
+    and op_enabled_axes == 0
+):
+    print("faults latched, but robot is already electrically disarmed")
+else:
+    print(
+        f"robot still active or unresolved "
+        f"(physical_state={physical_state} driver_state={driver_state} "
+        f"armed={armed} enable_mask=0x{enable_mask:x} op_enabled_axes={op_enabled_axes})"
+    )
+PY
+}
+
 wait_for_probe_state() {
   local desired_state="$1"
   local timeout_s="$2"
@@ -994,6 +1074,28 @@ wait_for_probe_state() {
         log "hardware reached ${desired_state}"
         return 0
       fi
+    fi
+
+    local now
+    now="$(date +%s)"
+    if (( now - started_at >= timeout_s )); then
+      return 1
+    fi
+    sleep "${PROBE_INTERVAL_S}"
+  done
+}
+
+wait_for_probe_soft_stop_safe() {
+  local timeout_s="$1"
+  local started_at
+  started_at="$(date +%s)"
+
+  while true; do
+    local payload=""
+    payload="$(capture_probe_json || true)"
+    if [[ -n "${payload}" ]] && probe_is_soft_stop_safe "${payload}"; then
+      log "hardware reached safe soft-stop state: $(describe_probe_soft_stop_state "${payload}")"
+      return 0
     fi
 
     local now
@@ -1054,6 +1156,116 @@ wait_for_bus_operational() {
     fi
     sleep "${PROBE_INTERVAL_S}"
   done
+}
+
+probe_startup_fault_reset_plan() {
+  local payload="$1"
+  PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}" "${PROBE_PYTHON}" - "${payload}" <<'PY'
+import io
+import json
+import sys
+from contextlib import redirect_stdout
+
+with redirect_stdout(io.StringIO()):
+    from gradient_os.telemetry.drive_faults import build_startup_fault_reset_plan
+
+payload = json.loads(sys.argv[1])
+print(json.dumps(build_startup_fault_reset_plan(payload)))
+PY
+}
+
+direct_rtcore_fault_reset_mask() {
+  local axis_mask="$1"
+  if [[ ! -x "${PROJECT_PYTHON}" ]]; then
+    warn "direct RTCore fault reset unavailable: missing ${PROJECT_PYTHON}"
+    return 1
+  fi
+
+  local detail=""
+  if detail="$(
+    PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}" \
+    "${PROJECT_PYTHON}" "${REPO_ROOT}/scripts/rtcore_jog.py" fault_reset --mask "${axis_mask}" 2>&1
+  )"; then
+    log "Issued direct RTCore fault reset: axis_mask=${axis_mask}"
+    if [[ -n "${detail}" ]]; then
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        log "${line}"
+      done <<< "${detail}"
+    fi
+    return 0
+  fi
+
+  warn "Direct RTCore fault reset failed for axis_mask=${axis_mask}: ${detail}"
+  return 1
+}
+
+startup_fault_reset_preflight() {
+  if ! wait_for_bus_operational; then
+    return 1
+  fi
+
+  local payload=""
+  payload="$(capture_probe_json || true)"
+  if [[ -z "${payload}" ]]; then
+    error "startup preflight could not capture RTCore probe data"
+    return 1
+  fi
+
+  local plan=""
+  if ! plan="$(probe_startup_fault_reset_plan "${payload}" 2>/dev/null)"; then
+    log_probe_snapshot "${payload}"
+    error "startup preflight could not build a fault-reset plan from the probe payload"
+    return 1
+  fi
+
+  local should_auto_reset=""
+  local blocks_startup=""
+  local axis_mask_hex=""
+  local fault_summary=""
+  local reason=""
+  should_auto_reset="$(probe_json_field "${plan}" "should_auto_reset")"
+  blocks_startup="$(probe_json_field "${plan}" "blocks_startup")"
+  axis_mask_hex="$(probe_json_field "${plan}" "faulted_axis_mask_hex")"
+  fault_summary="$(probe_json_field "${plan}" "faulted_summary")"
+  reason="$(probe_json_field "${plan}" "reason")"
+
+  if [[ "${should_auto_reset}" == "1" ]]; then
+    log "startup preflight found disarmed drive faults before any drive power-up: ${fault_summary:-axis_mask=${axis_mask_hex}}"
+    if ! direct_rtcore_fault_reset_mask "${axis_mask_hex}"; then
+      error "startup fault-reset preflight failed to send the RTCore reset pulse"
+      return 1
+    fi
+    if ! wait_for_probe_state "BUS_UP_DISARMED" "${STARTUP_FAULT_RESET_TIMEOUT_S}"; then
+      local post_reset_probe=""
+      post_reset_probe="$(capture_probe_json || true)"
+      if [[ -n "${post_reset_probe}" ]]; then
+        log_probe_snapshot "${post_reset_probe}"
+        local post_reset_plan=""
+        post_reset_plan="$(probe_startup_fault_reset_plan "${post_reset_probe}" 2>/dev/null || true)"
+        if [[ -n "${post_reset_plan}" ]]; then
+          local remaining_faults=""
+          remaining_faults="$(probe_json_field "${post_reset_plan}" "faulted_summary")"
+          if [[ -n "${remaining_faults}" ]]; then
+            warn "startup preflight faults still present after reset: ${remaining_faults}"
+          fi
+        fi
+      fi
+      error "startup fault-reset preflight did not clear the disarmed drive faults; refusing to start controller"
+      return 1
+    fi
+    log "startup fault-reset preflight cleared the disarmed drive faults"
+    return 0
+  fi
+
+  if [[ "${blocks_startup}" == "1" ]]; then
+    log_probe_snapshot "${payload}"
+    error "startup preflight found faulted hardware that is not safe to auto-reset (${reason}); refusing to start controller"
+    return 1
+  fi
+
+  log "startup preflight: no disarmed drive faults detected"
+  return 0
 }
 
 direct_rtcore_safe_power_down() {
@@ -1163,16 +1375,31 @@ perform_shutdown_sequence() {
   stop_child_process "web" "${WEB_PID}"
 
   local current_state=""
+  local hardware_safe_for_soft_stop=1
   if [[ -n "${initial_probe}" ]]; then
     current_state="$(probe_json_field "${initial_probe}" "physical_state")"
+    if ! probe_is_soft_stop_safe "${initial_probe}"; then
+      hardware_safe_for_soft_stop=0
+    else
+      log "soft-stop probe already safe: $(describe_probe_soft_stop_state "${initial_probe}")"
+    fi
+  else
+    hardware_safe_for_soft_stop=0
   fi
 
-  if [[ "${current_state}" == "ACTIVE" || "${current_state}" == "FAULTED" || -z "${current_state}" ]]; then
+  if [[ "${hardware_safe_for_soft_stop}" -eq 0 ]]; then
     request_controller_safe_power_down || true
-    if ! wait_for_probe_state "BUS_UP_DISARMED" 3; then
-      if ! wait_for_probe_state "INACTIVE" 1; then
-        stop_controller_process "${CONTROLLER_PID}"
-        direct_rtcore_safe_power_down || true
+    if ! wait_for_probe_soft_stop_safe 3; then
+      stop_controller_process "${CONTROLLER_PID}"
+      direct_rtcore_safe_power_down || true
+      if ! wait_for_probe_soft_stop_safe 2; then
+        local unresolved_probe=""
+        unresolved_probe="$(capture_probe_json || true)"
+        if [[ -n "${unresolved_probe}" ]]; then
+          warn "soft-stop probe still unresolved: $(describe_probe_soft_stop_state "${unresolved_probe}")"
+        else
+          warn "soft-stop probe still unresolved and no probe data is available"
+        fi
       fi
     fi
   fi
@@ -1204,6 +1431,9 @@ perform_shutdown_sequence() {
   final_probe="$(capture_probe_json || true)"
   if [[ -n "${final_probe}" ]]; then
     log_probe_snapshot "${final_probe}"
+    if probe_is_soft_stop_safe "${final_probe}"; then
+      log "soft-stop result: $(describe_probe_soft_stop_state "${final_probe}")"
+    fi
   else
     log "final probe unavailable (RTCore metrics likely gone)"
   fi
@@ -1343,6 +1573,14 @@ ensure_required_files() {
       return 1
     fi
   done
+  if [[ ! -f "${RTCORE_SYNC_SCRIPT}" ]]; then
+    error "required file missing: ${RTCORE_SYNC_SCRIPT}"
+    return 1
+  fi
+  if [[ ! -x "${RTCORE_SYNC_SCRIPT}" ]]; then
+    error "required helper is not executable: ${RTCORE_SYNC_SCRIPT}"
+    return 1
+  fi
   if [[ "${HEADLESS}" -eq 0 ]]; then
     if [[ ! -f "${WEB_SCRIPT}" ]]; then
       error "required file missing: ${WEB_SCRIPT}"
@@ -1373,6 +1611,24 @@ bootstrap_environment() {
   export PYTHONUNBUFFERED=1
   export GRADIENT_RTCORE_READY_TIMEOUT_S="${GRADIENT_RTCORE_READY_TIMEOUT_S:-30}"
   return 0
+}
+
+ensure_rtcore_runtime_sync() {
+  log "Ensuring RTCore unit/env match the selected robot scaling"
+  local detail=""
+  if detail="$("${RTCORE_SYNC_SCRIPT}" --ensure-active 2>&1)"; then
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      log "${line}"
+    done <<< "${detail}"
+    return 0
+  fi
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    warn "${line}"
+  done <<< "${detail}"
+  error "RTCore runtime sync failed; refusing to start with potentially stale scaling."
+  return 1
 }
 
 detect_external_services() {
@@ -1935,13 +2191,15 @@ start_stack() {
   ensure_required_files
   detect_external_services
   bootstrap_environment
+  ensure_rtcore_runtime_sync
+  startup_fault_reset_preflight
 
   MANAGE_CHILDREN=1
   START_RESULT="starting"
   write_state
   write_manifest
 
-  start_process "controller" "${CONTROLLER_LOG}" "${CONTROLLER_SCRIPT}"
+  start_process "controller" "${CONTROLLER_LOG}" env GRADIENT_RTCORE_AUTO_ARM=0 "${CONTROLLER_SCRIPT}"
   CONTROLLER_PID="${STARTED_PID}"
   write_state
   write_manifest

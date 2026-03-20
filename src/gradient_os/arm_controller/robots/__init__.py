@@ -91,6 +91,8 @@ def list_robot_metadata() -> list[dict[str, str]]:
     """
     Return robot metadata suitable for API/UI selection lists.
     """
+    from ..backends import registry as backend_registry
+
     out: list[dict[str, str]] = []
     for name in list_available_robots():
         cfg = get_robot_config(name)
@@ -102,6 +104,9 @@ def list_robot_metadata() -> list[dict[str, str]]:
                 "version": cfg.version,
                 "default_servo_backend": cfg.default_servo_backend,
                 "default_ik_solver_backend": cfg.default_ik_solver_backend,
+                "default_drive_profile": backend_registry.get_default_drive_profile_for_backend(
+                    cfg.default_servo_backend
+                ),
             }
         )
     return out

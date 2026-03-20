@@ -486,27 +486,19 @@ def set_single_servo_position_rads(servo_id: int, position_rad: float, speed: in
     """
     backend = _get_backend()
     if backend and _use_backend():
-        # Use backend - it expects raw values, so we need to convert
-        try:
-            config_index = utils.SERVO_IDS.index(servo_id)
-        except ValueError:
-            print(f"[Pi] ERROR: Servo ID {servo_id} not found in configuration.")
-            return
-        
-        raw_pos_value = angle_to_raw(position_rad, config_index)
-        clamped_speed = int(max(0, min(utils.ENCODER_RESOLUTION, speed)))
-        
-        # Convert acceleration to register value
-        accel_reg_val = 0
-        if accel > 0:
-            accel_reg_val = int(round(accel / utils.ACCELERATION_SCALE_FACTOR))
-            accel_reg_val = max(1, min(254, accel_reg_val))
-        
-        # sync_write expects a list of tuples: [(servo_id, pos, speed, accel), ...]
-        backend.sync_write([(servo_id, raw_pos_value, clamped_speed, accel_reg_val)])
-        
-        print(f"[Pi] Commanded single servo {servo_id} to {position_rad:.2f} rad ({raw_pos_value}) "
-              f"with Speed={clamped_speed}, AccelReg={accel_reg_val} (via backend)")
+        actuator_id = int(servo_id)
+        command_speed = max(0, int(speed))
+        command_accel = max(0, int(accel))
+        backend.set_single_actuator_position(
+            actuator_id=actuator_id,
+            position_rad=float(position_rad),
+            speed=command_speed,
+            accel=command_accel,
+        )
+        print(
+            f"[Pi] Commanded single actuator {actuator_id} to {position_rad:.2f} rad "
+            f"with Speed={command_speed}, Accel={command_accel} (via backend)"
+        )
         return
     
     # --- Fallback to legacy servo_protocol ---
