@@ -2,15 +2,16 @@
   "version": 1,
   "desired": {
     "robot": "gradient05",
-    "active_tool_id": "tig-torch-65deg",
+    "active_tool_id": "identity",
     "allow_unsafe_overrides": false,
     "overrides": {
       "ik_solver_backend": null,
-      "servo_backend": null
+      "servo_backend": null,
+      "drive_profile": null
     }
   },
   "meta": {
-    "updated_at": "2026-02-23T18:45:26+00:00",
+    "updated_at": "2026-03-20T07:25:28+00:00",
     "updated_by": "web-ui"
   }
 }

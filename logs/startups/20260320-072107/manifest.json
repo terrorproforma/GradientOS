@@ -1,0 +1,31 @@
+{
+  "api": {
+    "command": "./run-api.sh",
+    "pid": 372981,
+    "port": 4000
+  },
+  "controller": {
+    "command": "./run.sh",
+    "host": "127.0.0.1",
+    "pid": 372924,
+    "port": 3000
+  },
+  "failure": "",
+  "git": {
+    "branch": "multi-robot-architecture",
+    "commit": "81f5c27ca8b6474cd78e9c97bd0c4f99d0293574"
+  },
+  "headless": false,
+  "launcher_pid": 372768,
+  "log_dir": "/home/pi/GradientOS/logs/startups/20260320-072107",
+  "mode": "full",
+  "repo_root": "/home/pi/GradientOS",
+  "result": "stopped",
+  "run_id": "20260320-072107",
+  "shutdown_reason": "console_stop",
+  "web": {
+    "command": "./run-web.sh",
+    "pid": 373077,
+    "port": 8000
+  }
+}

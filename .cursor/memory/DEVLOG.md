@@ -2846,3 +2846,24 @@
     - no diagnostics
 - Follow-up notes / risks:
   - This raises `/info/joints` polling frequency substantially, so if the API/controller becomes noisy or CPU-heavy under live use, the next step should be shifting more of the pose path onto the SSE stream instead of polling harder.
+
+## 2026-03-20 07:12 +0000
+
+- Task summary:
+  - Added a custom commissioning step input alongside the preset joint jog step buttons in the control panel.
+- What was observed:
+  - The commissioning UI only exposed fixed `0.25 / 1 / 5` degree presets, but live alignment/zero work needs arbitrary small steps without losing the preset quick-picks.
+- Changes:
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added `MIN_CUSTOM_JOINT_STEP_DEG = 0.001`
+    - added `formatStepDegrees(...)` for trimmed dynamic step labels
+    - added `customJointStepInput` state plus `applyCustomJointStep()`
+    - inserted a signed/unsigned `Custom` degree input and `Use` button next to the preset chips
+    - existing jog buttons now display/use the active formatted step value, including custom magnitudes
+- Validation:
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - Custom values are normalized to absolute magnitude and direction still comes from the `-` / `+` jog buttons, which keeps the row-level behavior consistent.

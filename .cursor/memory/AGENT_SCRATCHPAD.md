@@ -633,3 +633,11 @@ Use this file as persistent, repo-local execution memory.
   - `App.tsx` live fallback delay now uses `1 / 50` seconds
   - `ArmVisualizer.tsx` live bounds refresh interval now uses `20 ms`
 - [self] Guardrail: when tuning live pose latency, adjust the whole pipeline consistently; a fast render loop cannot fix a slower upstream poll/fallback gate.
+
+### 2026-03-20 - Commissioning step UI should support custom magnitude without losing quick presets
+- [user] Asked for a custom joint-step value alongside the existing `0.25 / 1 / 5` commissioning presets and also asked what the 17-bit encoder resolution implies.
+- [tool] Updated `web-ui/src/ControlPanel.tsx`:
+  - added a `Custom` numeric input and `Use` button next to the preset step chips
+  - custom entries accept signed or unsigned degrees, normalize to absolute magnitude, and reuse the existing `- / +` jog buttons for direction
+  - step labels/status text now use trimmed dynamic formatting instead of assuming preset values
+- [self] Guardrail: for operator step controls, preserve the fast preset path but allow precise custom magnitudes without replacing the existing muscle-memory UI.

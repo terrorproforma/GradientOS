@@ -66,6 +66,7 @@ type DriveFaultSnapshot = {
 };
 
 const JOINT_STEP_OPTIONS_DEG = [0.25, 1, 5] as const;
+const MIN_CUSTOM_JOINT_STEP_DEG = 0.001;
 
 function formatDriveFaultAxisLabel(axis: DriveFaultAxis): string {
 	if (typeof axis.logical_joint === "number" && Number.isFinite(axis.logical_joint)) {
@@ -101,6 +102,13 @@ function expSliderToMultiplier(v: number): number {
 	if (mult < 0.1) mult = 0.1;
 	if (mult > 10) mult = 10;
 	return mult;
+}
+
+function formatStepDegrees(value: number): string {
+	if (!Number.isFinite(value)) {
+		return "--";
+	}
+	return Number(value.toFixed(3)).toString();
 }
 
 async function readErrorMessage(res: Response): Promise<string> {
@@ -151,6 +159,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const [jointAnglesDeg, setJointAnglesDeg] = useState<number[]>([]);
 	const [jointFeedbackError, setJointFeedbackError] = useState<string | null>(null);
 	const [jointStepDeg, setJointStepDeg] = useState<number>(1);
+	const [customJointStepInput, setCustomJointStepInput] = useState<string>("");
 	const [pendingJointAction, setPendingJointAction] = useState<string | null>(null);
 	const [commissioningStatus, setCommissioningStatus] = useState<CommissioningStatus | null>(null);
 	const activeDriveFaultAxes = useMemo(
@@ -178,6 +187,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const keepaliveMs = 200;
 	const linCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
 	const angCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
+	const jointStepLabel = formatStepDegrees(jointStepDeg);
 
 	const reportRequestError = useCallback((err: unknown, fallback: string, silent: boolean) => {
 		const msg = (err as Error)?.message || fallback;
@@ -384,6 +394,28 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const onDebugToggle = useCallback(async (enabled: boolean) => {
 		await post("/control/jog/debug", { enabled });
 	}, [post]);
+	const applyCustomJointStep = useCallback(() => {
+		const trimmed = customJointStepInput.trim();
+		if (!trimmed) {
+			return false;
+		}
+		const parsed = Number(trimmed);
+		if (!Number.isFinite(parsed) || Math.abs(parsed) < MIN_CUSTOM_JOINT_STEP_DEG) {
+			setCommissioningStatus({
+				tone: "error",
+				message: `Enter a custom joint step of at least ${MIN_CUSTOM_JOINT_STEP_DEG} deg.`,
+			});
+			return false;
+		}
+		const normalized = Number(Math.abs(parsed).toFixed(3));
+		setJointStepDeg(normalized);
+		setCustomJointStepInput(formatStepDegrees(normalized));
+		setCommissioningStatus({
+			tone: "info",
+			message: `Custom joint step set to +/-${formatStepDegrees(normalized)} deg.`,
+		});
+		return true;
+	}, [customJointStepInput]);
 
 	const handleJointStep = useCallback(async (jointIndex: number, direction: 1 | -1) => {
 		if (pendingJointAction) {
@@ -391,10 +423,11 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		}
 		const jointNumber = jointIndex + 1;
 		const signedStepDeg = Number((jointStepDeg * direction).toFixed(3));
+		const signedStepLabel = formatStepDegrees(Math.abs(signedStepDeg));
 		setPendingJointAction(`jog-${jointIndex}`);
 		setCommissioningStatus({
 			tone: "info",
-			message: `Jogging J${jointNumber} by ${signedStepDeg > 0 ? "+" : ""}${signedStepDeg.toFixed(3)} deg...`,
+			message: `Jogging J${jointNumber} by ${signedStepDeg > 0 ? "+" : "-"}${signedStepLabel} deg...`,
 		});
 		try {
 			if (jogEnabled) {
@@ -1237,33 +1270,75 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 						Drives are currently disarmed. Use the <span className="font-semibold">Drive Power</span> section above before jogging.
 					</div>
 				) : null}
-				<div className="mb-2 flex items-center justify-between gap-2">
-					<span className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Joint Step</span>
-					<div className="flex items-center gap-2">
-						<button
-							type="button"
-							className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[11px] font-medium text-slate-200 transition hover:border-slate-500/80 hover:text-white"
-							onClick={() => {
-								void handleRefreshJointFeedback();
-							}}
-						>
-							Refresh
-						</button>
-						<div className="flex items-center gap-1">
-						{JOINT_STEP_OPTIONS_DEG.map((value) => (
+				<div className="mb-2">
+					<div className="mb-1 flex items-center justify-between gap-2">
+						<span className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Joint Step</span>
+						<div className="flex items-center gap-2">
 							<button
-								key={value}
 								type="button"
-								className={`rounded border px-2 py-1 text-[11px] font-medium tabular-nums transition ${
-									jointStepDeg === value
-										? "border-cyan-400/70 bg-cyan-400/15 text-cyan-100"
-										: "border-slate-700/70 bg-slate-900/60 text-slate-300 hover:border-slate-500/80 hover:text-slate-100"
-								}`}
-								onClick={() => setJointStepDeg(value)}
+								className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[11px] font-medium text-slate-200 transition hover:border-slate-500/80 hover:text-white"
+								onClick={() => {
+									void handleRefreshJointFeedback();
+								}}
 							>
-								{value}°
+								Refresh
 							</button>
-						))}
+							<div className="flex items-center gap-1">
+								{JOINT_STEP_OPTIONS_DEG.map((value) => (
+									<button
+										key={value}
+										type="button"
+										className={`rounded border px-2 py-1 text-[11px] font-medium tabular-nums transition ${
+											jointStepDeg === value
+												? "border-cyan-400/70 bg-cyan-400/15 text-cyan-100"
+												: "border-slate-700/70 bg-slate-900/60 text-slate-300 hover:border-slate-500/80 hover:text-slate-100"
+										}`}
+										onClick={() => setJointStepDeg(value)}
+									>
+										{value}°
+									</button>
+								))}
+							</div>
+						</div>
+					</div>
+					<div className="flex justify-end">
+						<div className="flex w-full max-w-[15rem] items-center gap-1 rounded border border-slate-700/70 bg-slate-900/60 px-1.5 py-1">
+							<span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+								Custom
+							</span>
+							<input
+								type="number"
+								inputMode="decimal"
+								step="0.001"
+								placeholder="+/- deg"
+								value={customJointStepInput}
+								onChange={(event) => {
+									setCustomJointStepInput(event.target.value);
+								}}
+								onBlur={() => {
+									if (customJointStepInput.trim()) {
+										applyCustomJointStep();
+									}
+								}}
+								onKeyDown={(event) => {
+									if (event.key === "Enter") {
+										event.preventDefault();
+										applyCustomJointStep();
+									}
+								}}
+								className="min-w-0 flex-1 rounded border border-slate-700/70 bg-slate-950/60 px-2 py-1 text-[11px] font-medium tabular-nums text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/70 focus:ring-1 focus:ring-cyan-400/40"
+								title="Enter a signed or unsigned custom joint step in degrees. The +/- jog buttons apply direction."
+							/>
+							<button
+								type="button"
+								className="rounded border border-cyan-500/40 bg-cyan-400/10 px-2 py-1 text-[11px] font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-300/15"
+								onClick={() => {
+									applyCustomJointStep();
+								}}
+								title="Use the custom joint step"
+							>
+								Use
+							</button>
 						</div>
 					</div>
 				</div>
@@ -1318,11 +1393,11 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 											!drivePowerReady && requiresExplicitDrivePower
 												? `Power up the drives before jogging J${jointNumber}`
 												: hasLiveFeedback
-													? `Jog J${jointNumber} by -${jointStepDeg} degrees`
+													? `Jog J${jointNumber} by -${jointStepLabel} degrees`
 													: `Live joint feedback is required before jogging J${jointNumber}`
 										}
 									>
-										-{jointStepDeg}°
+										-{jointStepLabel}°
 									</button>
 									<button
 										type="button"
@@ -1335,11 +1410,11 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 											!drivePowerReady && requiresExplicitDrivePower
 												? `Power up the drives before jogging J${jointNumber}`
 												: hasLiveFeedback
-													? `Jog J${jointNumber} by +${jointStepDeg} degrees`
+													? `Jog J${jointNumber} by +${jointStepLabel} degrees`
 													: `Live joint feedback is required before jogging J${jointNumber}`
 										}
 									>
-										+{jointStepDeg}°
+										+{jointStepLabel}°
 									</button>
 									<button
 										type="button"
