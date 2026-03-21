@@ -641,3 +641,176 @@ Use this file as persistent, repo-local execution memory.
   - custom entries accept signed or unsigned degrees, normalize to absolute magnitude, and reuse the existing `- / +` jog buttons for direction
   - step labels/status text now use trimmed dynamic formatting instead of assuming preset values
 - [self] Guardrail: for operator step controls, preserve the fast preset path but allow precise custom magnitudes without replacing the existing muscle-memory UI.
+
+### 2026-03-21 - Lag experiments need upstream telemetry and caller defaults changed together
+- [user] Explicitly asked for implementation, not just explanation, after identifying `/monitor` telemetry cadence and closed-loop defaults as the highest-value remaining lag suspects.
+- [tool] Updated `src/gradient_os/api/main.py` so `TelemetryHub` now reads `GRADIENT_MONITOR_TELEMETRY_HZ` and defaults `/monitor` startup to `50 Hz` instead of a hard-coded `10 Hz`.
+- [tool] Flipped default Cartesian move-line execution to open-loop in `src/gradient_os/api/main.py`, `src/gradient_os/arm_controller/command_api.py`, `web-ui/src/ControlPanel.tsx`, `src/gradient_os/ui/pages/real_control_page.py`, and `src/gradient_os/ui/commands.py`.
+- [self] Guardrail: when A/B testing motion responsiveness, update explicit UI/API payload defaults as well as backend fallbacks; otherwise old `closed: true` callers can hide the effect of a backend-only default change.
+- [self] Guardrail: prefer env-configurable telemetry cadence over swapping one magic number for another, so live tuning can continue without another code edit.
+- [self] Follow-up risk: the RT path is still latest-wins from Python into RTCore, so faster monitor telemetry and open-loop defaults do not yet provide queued RT-side trajectory scheduling.
+
+### 2026-03-21 - Orientation controls can desync when step and jog paths use different rotation semantics
+- [user] Reported that roll/pitch/yaw controls still felt unsynchronized even after Cartesian motion improved, and narrowed it to step rotate plus realtime angular jog rather than Cartesian moves.
+- [self] Root cause: `src/gradient_os/api/main.py` had `/control/rotate` doing `GET_POSITION` plus absolute Euler read-modify-write into `SET_ORIENTATION`, which is a different path from the controller's existing relative `ROTATE` command and is vulnerable to Euler coupling/stale pose reconstruction.
+- [tool] Updated `src/gradient_os/api/main.py` so `/control/rotate` now forwards `ROTATE,<axis>,<angle>` directly to the controller.
+- [self] Root cause: `src/gradient_os/arm_controller/command_api.py` jog loop was integrating `v_roll/v_pitch/v_yaw` as a raw rotation vector, which does not match the UI's labeled roll/pitch/yaw step semantics when combining angular axes.
+- [tool] Updated realtime jog orientation integration to use `R.from_euler('xyz', angular_deg_s * dt, degrees=True)` and keep the same pre-multiply base-frame application as `handle_rotate_command()`.
+- [self] Guardrail: if operator controls are labeled `roll/pitch/yaw`, step rotate and realtime jog must share the same rotation convention; avoid mixing Euler read-modify-write in one path with rotvec integration in another.
+
+### 2026-03-21 - Orientation step moves should use live-state profiled execution, not cached one-shot IK
+- [self] Deeper root cause after the first orientation fix: `handle_rotate_command()` still used cached `utils.current_logical_joint_angles_rad` plus a single direct `servo_driver.set_servo_positions(...)`, while the Cartesian path that felt good started from `get_current_arm_state_rad()` and ran through a profiled executor.
+- [tool] Refactored `src/gradient_os/arm_controller/command_api.py`:
+  - added `_get_live_pose_snapshot()` so orientation moves start from physical joint feedback rather than cached commanded state
+  - added `_execute_orientation_path()` so orientation-only moves reuse SLERP + batched IK + executor-thread machinery
+  - changed `handle_rotate_command()` to execute a short smooth open-loop orientation path instead of a one-shot direct servo command
+  - changed `handle_set_orientation_command()` to use the same live-state helper path
+  - changed realtime jog to refresh `q_current` from `get_current_arm_state_rad(verbose=False)` every loop before FK/IK
+- [self] Guardrail: if Cartesian motion is stable because it is planned from live hardware state, orientation controls should not keep a separate legacy cached-state path.
+
+### 2026-03-21 - RTCore max-rpm is currently a global runtime clamp, not a commissioning-only hint
+- [user] Reported motion feeling worse and asked whether all moves are limited by the `100 RPM` cap and how the EtherCAT master is actually fed.
+- [tool] Verified live unit/runtime state:
+  - `/etc/systemd/system/gradient-rt-motion.service` does not pass `--max-rpm`
+  - `/etc/default/gradient-rt-motion` contains scaling/profile env only, no max-rpm override
+  - active process args also omit `--max-rpm`
+- [self] Therefore the running RTCore instance is using the binary default `max_rpm = 100.0` from `src/gradient_rt_motion/main.cpp`, which means all RTCore-driven setpoints are currently clamp-limited unless the service is launched differently.
+- [self] Important architecture reminder: Python motion code calls `servo_driver.set_servo_positions(...)` -> EtherCAT RTCore backend `set_joint_positions(...)` -> shared-memory setpoint slot + eventfd wake -> RTCore helper converts radians to target counts -> 1 kHz cyclic EtherCAT loop rate-limits per-axis motion via `max_step_counts_per_cycle` and writes `0x607A` target position plus `0x607F` max profile velocity.
+- [self] Guardrail: tuning Python-side planners/executors will not bypass a live RTCore `--max-rpm` cap; if normal production motion should exceed commissioning limits, the runtime/service layer must expose a separate max-rpm setting.
+
+### 2026-03-21 - Safe home/rest should use bounded joint trajectories, not raw joint setpoints
+- [user] Wanted `home` and `rest` specifically clamped to a gentle `100 RPM` equivalent while normal motion remains governed by the higher-level runtime RTCore limit.
+- [self] Important distinction: `home` / `rest` in `src/gradient_os/api/main.py` were raw joint-target shortcuts, so the Cartesian speed multiplier and profile velocity/acceleration path did not affect them at all.
+- [tool] Implemented bounded home/rest motion by extending `APPLY_JOINT_SETPOINT` with optional `max_motor_rpm` and making `handle_apply_joint_setpoint()` build a smooth joint-space path from live feedback when that override is present.
+- [tool] The bounded path computes per-joint max rad/s from the active robot gear ratios and requested motor RPM, then executes a smoothstep-interpolated open-loop joint path at `100 Hz`.
+- [tool] Updated `/control/home` and `/control/rest` to use `APPLY_JOINT_SETPOINT` with `max_motor_rpm=100.0`, so those buttons stay conservative without forcing the global RTCore runtime clamp back down.
+- [self] Guardrail: when a UI control must be safe but RTCore lacks a live per-command clamp knob, prefer a bounded planned path over a raw direct setpoint.
+
+### 2026-03-21 - 6000 RPM exposed coarse Python-side motion paths and overlapping joint polling
+- [user] Reported that with live RTCore `--max-rpm 6000`, realtime moves became super jerky, Cartesian step moves stayed smooth but slow, and RPY moves became insanely fast.
+- [tool] Terminal `1.txt` showed RTCore truly running with `--max-rpm 6000` and also showed heavy `/info/joints` traffic; the terminal contained `489` `GET_JOINT_ANGLES` entries and repeated API requests from multiple client ports.
+- [self] Root cause 1: `web-ui/src/ControlPanel.tsx` polled `/info/joints` every `20 ms` with no in-flight guard, so requests could overlap and hammer the controller, stealing Python-side motion timing.
+- [self] Root cause 2: realtime jog in `src/gradient_os/arm_controller/command_api.py` was still only `25 Hz`, so once the old RTCore 100 RPM smoothing ceiling was removed, the coarse jog setpoint cadence became visible as jerk.
+- [self] Root cause 3: incremental RPY step moves ignored the speed multiplier and used a short fixed duration heuristic in `handle_rotate_command()`, so they became much faster than Cartesian step moves once the global clamp was high.
+- [tool] Fixes:
+  - added an in-flight guard and visibility check to the `/info/joints` poll loop in `web-ui/src/ControlPanel.tsx`
+  - increased `JOG_CONTROL_FREQUENCY_HZ` from `25` to `50`
+  - extended `/control/rotate` / `ROTATE` to accept `duration_s`
+  - made web RPY step buttons send `duration_s = abs(angle_deg) / effectiveAngularDegS` so step rotation speed follows the UI's angular rate control
+- [self] Guardrail: once RTCore clamp is raised, any coarse Python cadence or overlapping polling that was previously masked by the clamp will become immediately visible in motion quality.
+
+### 2026-03-21 - RTCore contract-first motion redesign
+- [user] For RTCore motion redesign, do not stop at architecture commentary; implement the contract in code and explain the result.
+- [self] Safe first slice for a boundary shift this large: land the docs + shared IPC ABI + RTCore-published execution-state snapshot before attempting buffered replay or planner migration.
+- [tool] Focused validation should avoid unrelated baseline failures in broad hardware/backend suites; in this pass `tests/test_gradient05_limits_and_backends.py` still has pre-existing J5 ratio/sign expectation failures, so I validated the new contract with targeted tests plus a native `cmake --build build` of `src/gradient_rt_motion`.
+- [self] Guardrail: when introducing new RTCore status semantics, mirror the numeric enums in shared Python helpers immediately so controller/API/UI code can consume names instead of duplicating magic numbers.
+
+### 2026-03-21 - Queue-only RTCore motion path
+- [user] New hard requirement: do not leave any RTCore motion fallback to the old latest-wins slot path.
+- [self] Practical migration rule: if legacy high-level APIs still exist (`set_joint_positions`, `sync_write`, stop/brake helpers), re-implement them as thin wrappers over queued trajectory messages instead of keeping the slot alive.
+- [tool] Important hidden dependency: `scripts/rtcore_jog.py` also assumed the setpoint slot. When disabling `setpoint_offset` in RTCore, update operator tooling in the same pass or it silently becomes the last remaining old-path dependency.
+- [self] Guardrail: when removing an old IPC path, search the whole repo for struct fields like `setpoint_offset` and helper names like `_write_setpoint` so debug tools and tests do not quietly reintroduce the deprecated contract.
+
+### 2026-03-21 - RTCore completion semantics need a query path, not just richer one-shot ACKs
+- [user] Asked to continue the RTCore redesign by wiring execution/completion state through `run_controller`, `api/main.py`, and the UI, with RTCore as the source of truth.
+- [self] Implemented a concrete contract: controller motion commands can now return structured base64 JSON payloads over UDP, and `GET_MOTION_STATUS` provides a dedicated query path for queued/executing/completed state.
+- [tool] Proven pattern: keep the controller reply transport comma-safe by base64-encoding compact JSON payloads (`ACK,<COMMAND>,<payload_b64>` / `MOTION_STATUS,<payload_b64>`) instead of inventing another ad-hoc CSV schema.
+- [self] Guardrail: for RTCore-backed motion, do not reuse old names like `direct_setpoint_ack` or `trajectory_thread_ack`; return explicit `state`, `completion_scope`, and `trajectory_id` so API/UI code cannot confuse controller acceptance with physical completion.
+- [self] Guardrail: when the UI needs motion lifecycle state, poll or subscribe to the explicit motion-status endpoint and disable controls from that state; do not infer completion from `/info/joints` refresh success.
+
+### 2026-03-21 - Keep the plan file's "current state" sections fresh or it becomes actively misleading
+- [user] Asked for the plan to be updated with the real current state and all remaining no-legacy cleanup work before handing off to a fresh chat.
+- [self] Important maintenance rule: after large redesign slices, update the plan's top-level `overview`, todo statuses, and "Validated Current State" block together; leaving an old pre-redesign context section in place causes the next agent to optimize for already-removed constraints.
+- [tool] Added an explicit cross-cutting legacy-retirement track to the plan so remaining stale assumptions are visible as first-class work instead of getting lost between Phase 4 / 6 / 8.
+- [self] Guardrail: when the user says "no old RTCore pathways left," audit not just executable code but also docs, tests, and fire-and-forget call sites that still normalize old semantics.
+
+### 2026-03-21 - Structured motion ACKs require handler-level results, not just API transport changes
+- [user] Continued the RTCore redesign by prioritizing structured execution metadata for `ROTATE` / `SET_ORIENTATION` plus `App.tsx` trajectory/program UI status wiring.
+- [self] Root cause: orientation endpoints could not safely switch to `expect_response=True` while `src/gradient_os/arm_controller/command_api.py` still returned `None` and hid executor failures behind a helper thread join.
+- [tool] Updated `src/gradient_os/arm_controller/command_api.py`, `src/gradient_os/run_controller.py`, and `src/gradient_os/api/main.py` so blocking orientation commands now return structured payloads, propagate planner/executor errors, and no longer rely on fire-and-forget API semantics.
+- [tool] Updated `web-ui/src/App.tsx` to poll `/control/motion-status`, persist latest motion metadata, and show execution state in trajectory/weld drawers beyond local request booleans.
+- [tool] Updated `tests/test_api_endpoints.py` and `docs/README.md` to lock the new rotate/set-orientation/preview behavior and retire a stale web-rotate description.
+- [self] Guardrail: when a blocking motion path is migrated onto the RTCore completion contract, make the command handler itself return metadata or raise; changing only the UDP/API `expect_response` flag produces fake ACKs and hides execution failures.
+- [self] Guardrail: for program/preview UI, separate "submit in progress" from "motion still active"; the former is a local fetch state, the latter must come from `/control/motion-status` or a structured command payload.
+
+### 2026-03-21 - RTCore queued timing should snap to RT-cycle multiples, not approximate them
+- [user] Called out that queued motion planning frequency should fit neatly inside the RTCore schedule, effectively behaving like a factor/divisor relationship with the RTCore loop instead of using arbitrary off-cycle timing.
+- [self] Root cause: `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` previously derived `t_from_start_ns` via `round(1e9 / frequency)`, which can produce sample periods that are not integer multiples of the RTCore cycle and therefore do not land cleanly on RT boundaries.
+- [tool] Updated the EtherCAT RTCore backend so queued trajectory timing is quantized onto integer multiples of `cycle_ns`; effective queued frequency can never exceed the requested planner frequency or the RTCore loop rate.
+- [tool] Exposed the last queued-trajectory timing metadata back through `src/gradient_os/arm_controller/command_api.py` motion-status payloads for observability.
+- [tool] Updated `docs/rtcore_owned_motion_contract.md` and the RTCore redesign plan to spell out `ACK` as `acknowledgement` and describe the RTCore-aligned timing rule explicitly.
+- [self] Guardrail: when Python specifies nominal timing for RTCore-owned motion, convert it into an RTCore-cycle-aligned step size first; never stamp buffered points with fractional/off-cycle timing just because the requested frequency is awkward.
+
+### 2026-03-21 - For EtherCAT scheduled motion, compatibility closed-loop flags should not pull timing back into Python
+- [user] Re-emphasized that the whole point of the redesign is to move as much motion execution responsibility into RTCore as makes sense, with industrial-robot robustness as the target.
+- [self] Decision taken: for scheduled EtherCAT RTCore motion, older `closed_loop=true` request flags should not reactivate the Python-timed closed-loop executor just because that compatibility knob still exists in higher layers.
+- [tool] Updated `src/gradient_os/arm_controller/command_api.py` so scheduled `MOVE_LINE`, `MOVE_LINE_RELATIVE`, and `SET_ORIENTATION` requests are coerced onto the RTCore queued path when RTCore execution is available, while still reporting both requested and effective execution policy in metadata.
+- [tool] Updated `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`, `docs/rtcore_owned_motion_contract.md`, `docs/command_api.md`, and `docs/README.md` so the code/docs agree on that policy.
+- [self] Guardrail: if a compatibility flag would move scheduled EtherCAT motion timing back out of RTCore and into Python, prefer coercing or rejecting it explicitly; do not quietly preserve the old Python timing path in the name of backward compatibility.
+
+### 2026-03-21 - Preserve non-RT backends while clarifying RTCore-backed program semantics
+- [user] Asked where the RTCore redesign stands, requested a todo refresh, and explicitly warned not to close off controls for non-EtherCAT backends like simulation or Feetech.
+- [self] Important scope rule: RTCore-preference policies must be conditional on actual RTCore capability; simulation and Feetech should keep their controller-owned execution semantics unless and until they gain an equivalent RT execution path.
+- [tool] Updated `src/gradient_os/arm_controller/command_api.py` and `src/gradient_os/arm_controller/trajectory_execution.py` so `RUN_TRAJECTORY` reports controller-program-thread acceptance plus per-program metadata about RTCore-backed motion segments, active step, and loop iteration.
+- [tool] Updated `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md` to add explicit completed todos for RTCore timing quantization and scheduled-motion ownership, plus a new in-progress todo for program-status semantics.
+- [tool] Added tests in `tests/test_command_api_direct_setpoint.py` proving non-RT backends still preserve `closed_loop` execution for `MOVE_LINE` and `SET_ORIENTATION`, and extended `tests/test_api_endpoints.py` to lock the richer `RUN_TRAJECTORY` acknowledgement payload.
+- [self] Guardrail: when a motion path is "mixed" (controller-managed program sequencing plus RTCore-owned scheduled segments), expose both layers in metadata instead of collapsing everything into a single fake acknowledgement or pretending all backends behave like EtherCAT RTCore.
+
+### 2026-03-21 - `WAIT_FOR_IDLE` should poll composite execution truth, not one implementation detail
+- [user] Asked to do the next RTCore redesign item immediately after the program-status slice, which was the `WAIT_FOR_IDLE` semantics cleanup.
+- [self] Corrective rule: `WAIT_FOR_IDLE` must not be modeled as "join one thread" because scheduled motion can be controller-managed, RTCore-owned, or mixed; use `get_motion_execution_status()` as the single wait predicate instead.
+- [tool] Updated `src/gradient_os/arm_controller/command_api.py` so `handle_wait_for_idle()` now polls unified motion status, returns explicit wait metadata (`waited_for_motion`, `wait_timeout_s`, `wait_timed_out`), and reports a normalized terminal state such as `completed` or `timeout`.
+- [tool] Updated `src/gradient_os/run_controller.py` and `src/gradient_os/api/main.py` so `WAIT_FOR_IDLE` accepts an optional timeout override while remaining backward compatible with existing callers.
+- [tool] Updated `tests/test_command_api_direct_setpoint.py`, `tests/test_api_endpoints.py`, `docs/command_api.md`, `docs/README.md`, and the RTCore redesign plan to reflect the new status-aware wait behavior.
+- [self] Guardrail: if a helper is supposed to wait for "motion completion," make it wait on the same status contract the UI/API expose; otherwise mixed controller+RTCore paths will drift into contradictory completion semantics.
+
+### 2026-03-21 - First RTCore jog slice should move timing/timeout into RT even if Cartesian shaping stays in Python
+- [user] Asked to prioritize getting RT jog working before the next semantics cleanup, while still keeping non-EtherCAT backends open.
+- [self] Implementation rule: for EtherCAT RTCore, keep the current Cartesian jog planner/IK bridge only as a policy layer for now, but move the final timed jog command, per-cycle integration, and stale-command timeout into RTCore.
+- [tool] Updated `src/gradient_rt_motion/ipc_v1.hpp` and `src/gradient_rt_motion/main.cpp` so RTCore now accepts `MSG_CMD_JOG`, integrates joint-velocity jog intent in the RT loop, exposes `MOTION_MODE_JOG`, and terminates stale jog commands deterministically.
+- [tool] Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` so the controller has a real RTCore jog command path (`send_realtime_jog_command`, `stop_realtime_jog`) instead of only trajectory upload APIs.
+- [tool] Updated `src/gradient_os/arm_controller/command_api.py` so EtherCAT RTCore jog now routes through RTCore joint-velocity commands, while simulation and Feetech still keep the existing controller-owned jog loop.
+- [self] Mistake/fix: the first RT jog unit test hung because I forgot to seed `LOGICAL_JOINT_LIMITS_RAD`; the jog loop never reached the RTCore send path and kept warning in a loop. Fix was to initialize realistic joint limits in the test harness.
+- [self] Guardrail: when migrating mixed-control paths like jog, validate both layers separately: (1) backend command packing / RTCore build, and (2) controller behavior switching away from direct servo writes when RTCore support is present.
+
+### 2026-03-21 - Program terminal semantics must persist separately from active RTCore segment state
+- [user] Asked for the highest-value next slice: explicit multi-step program terminal truth with fields like overall state, terminal reason, failing step, completed steps, and completed loops, while keeping non-RT backends compatible.
+- [self] Corrective rule: active-only `active_program_*` fields are not enough; persist a separate `program_status` object in `utils.trajectory_state` so `GET_MOTION_STATUS` can still report the last controller-program outcome after the worker thread exits.
+- [tool] Updated `src/gradient_os/arm_controller/command_api.py` and `src/gradient_os/arm_controller/utils.py` so `RUN_TRAJECTORY` ACKs and motion-status snapshots now share one program contract (`program` plus mirrored `program_*` fields) instead of exposing only thread-acceptance hints.
+- [tool] Updated `src/gradient_os/arm_controller/trajectory_execution.py` so the executor records terminal reasons (`completed`, `operator_abort`, `planner_failure`, `rtcore_fault`, `timeout`, `compatibility_interruption`) and keeps completed-step / completed-loop counters in sync with controller program flow.
+- [tool] Updated `web-ui/src/App.tsx` so the trajectory and weld status cards show controller-program lifecycle details, not just the RTCore segment state badge.
+- [self] Guardrail: for mixed controller-program + RTCore-segment flows, keep RTCore segment truth in `execution.*` and controller program truth in `program.*`; do not collapse them into one top-level state machine or the UI will confuse "between segments" with "done."
+
+### 2026-03-21 - After a major motion-contract slice, answer "can we test now?" with a concrete rollout ladder
+- [user] Asked what is next, when testing can start, and what remains after the program-terminal-semantics implementation.
+- [self] Guardrail: when a redesign slice is code-complete and targeted tests pass, say so directly and propose a staged test ladder (targeted software tests -> simulation/non-RT regression -> EtherCAT RTCore dry run -> physical loaded runs) instead of giving a vague "more work first" answer.
+
+### 2026-03-21 - Do not mistake a clean disarmed startup for a motion-path failure
+- [user] Reported that "it’s not working" after restarting RTCore/EtherCAT and provided `./start-stack.sh` terminal output as the evidence.
+- [self] Key debugging rule: read the controller/start-stack logs carefully before blaming motion code. In this case the stack actually started cleanly, but `GRADIENT_RTCORE_AUTO_ARM=0` left the robot intentionally disarmed, no jog/move commands were ever received, and the user then issued `stop`, which shut controller/API down again.
+- [tool] Live `./start-stack.sh probe` after that session confirmed `launcher_state: absent`, `controller_udp: down`, `api_http: down`, and `physical_state: BUS_UP_DISARMED`.
+- [self] Guardrail: for live EtherCAT RTCore motion testing, require this sequence before judging the motion code: stack up -> explicit power-up -> verify `physical_state: ACTIVE` -> then issue move/jog commands and inspect resulting controller log lines.
+
+### 2026-03-21 - `start-stack.sh` web readiness is a real localhost fetch, not just a log scrape
+- [user] Clarified that they stopped the stack because the UI was not loading, so they could not trigger power-up or any motion command.
+- [tool] Confirmed from `start-stack.sh` that `wait_for_web_readiness()` calls `probe_web()`, which does `curl http://127.0.0.1:${WEB_PORT}/` before reporting startup complete.
+- [self] Guardrail: if `start-stack.sh` says startup completed, the Vite server did serve `/` locally on the Pi; if the operator still cannot see the UI, the next suspects are the browser URL, network path to port `8000`, or a client-side rendering error after the initial HTML load.
+
+### 2026-03-21 - A localhost `:8000` loading screen is a real frontend/runtime blocker, not a startup myth
+- [user] Explicitly corrected the investigation direction: the UI was already open at `http://localhost:8000/` and stuck in a perpetual loading state, with screenshot evidence of the dark loading page.
+- [tool] Current live run `20260321-080255` showed controller, API, and Vite all up; `start-stack.sh` had already passed its real localhost web probe and a manual `curl -I http://127.0.0.1:8000/` also returned `200 OK`.
+- [self] Corrective rule: when HTML is served locally but the operator sees a blank/loading React shell, do not fall back to "wrong URL", "UI not opened", or "startup failed" unless new evidence appears.
+- [self] Highest-value next step is browser-side debugging: inspect console/runtime errors, failed network requests, DOM state, and initial `App.tsx` / `ControlPanel.tsx` / `useEndpoint.ts` / `main.tsx` load gates before resuming live jog or move validation.
+- [self] Validation order after the UI is fixed: explicit power-up, confirm `physical_state: ACTIVE`, tiny joint jog, tiny realtime jog, tiny scheduled move, then larger trajectory/program flows.
+
+### 2026-03-21 - Vite dev can serve static JSON indexes from `/public/...` even when sibling robot assets load from `/assets/...`
+- [tool] While probing the live stack run `20260321-081917`, `http://127.0.0.1:8000/assets/robots/index.json` and `/assets/tools/index.json` returned the SPA HTML shell (`text/html`), but `/public/assets/robots/index.json` and `/public/assets/tools/index.json` returned the expected JSON payloads.
+- [tool] `web-ui/src/ArmVisualizer.tsx` was assuming `/assets/robots/index.json` always served JSON, so the robot visualizer startup path could fail immediately even though the synced asset files existed on disk.
+- [tool] Implemented a concrete fix: `resolveRobotUrdfConfig()` now retries the robot asset index via both `/assets/robots/index.json` and `/public/assets/robots/index.json`, and rejects non-JSON responses instead of blindly parsing the HTML shell.
+- [self] Guardrail: in this web UI, treat static JSON indexes as potentially different from sibling binary/text assets under Vite dev; verify the served `content-type` before assuming `/assets/...` behaves uniformly.
+- [self] Follow-up risk: this fix addresses the robot asset index mismatch, which was a real startup/runtime bug, but if the UI is still visually broken after refresh then the next step is to surface any remaining visualizer/bootstrap failure directly in-app instead of leaving it console-only.
+
+### 2026-03-21 - Distinguish soft-stop from full EtherCAT/RTCore teardown explicitly
+- [user] Asked how to completely shut down the EtherCAT master and RTCore after seeing `./start-stack.sh stop` leave the hardware stack in `BUS_UP_DISARMED`.
+- [self] Guardrail: when answering stack shutdown questions, check `start-stack.sh` usage/teardown flow instead of inferring from terminal output alone; `stop` is intentionally a soft stop, while `stop --hard` additionally stops `gradient-rt-motion.service` and `ethercat.service`.
+- [tool] Manual fallback path confirmed in repo docs/scripts: `sudo systemctl stop gradient-rt-motion.service` then `sudo systemctl stop ethercat.service`; use `./start-stack.sh probe` to confirm RTCore/master report `DOWN`.

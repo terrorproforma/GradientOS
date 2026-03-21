@@ -894,6 +894,32 @@ def _plan_high_fidelity_trajectory(cartesian_points: list,
     return final_joint_trajectory
 
 
+def _derive_program_terminal_outcome(exc: BaseException | None = None) -> tuple[str, str]:
+    if bool(utils.trajectory_state_get("should_stop", False)):
+        reason = str(utils.trajectory_state_get("stop_request_reason", None) or "operator_abort").strip().lower()
+        return "aborted", reason or "operator_abort"
+
+    backend = _get_backend()
+    getter = getattr(backend, "get_execution_status", None) if backend is not None else None
+    if callable(getter):
+        try:
+            execution_status = getter()
+            state_name = str(getattr(execution_status, "state_name", "")).strip().lower()
+        except Exception:
+            state_name = ""
+        if state_name in {"faulted", "underrun"}:
+            return "faulted", "rtcore_fault"
+        if state_name == "aborted":
+            return "aborted", str(
+                utils.trajectory_state_get("stop_request_reason", None) or "compatibility_interruption"
+            ).strip().lower() or "compatibility_interruption"
+
+    message = str(exc).strip().lower() if exc is not None else ""
+    if "timeout" in message or "timed out" in message:
+        return "faulted", "timeout"
+    return "faulted", "compatibility_interruption"
+
+
 def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
     """
     The target function for the trajectory execution thread. This function
@@ -905,46 +931,133 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
                        (e.g., {'type': 'move', 'path': [...]}).
         should_loop (bool): Whether to repeat the entire sequence upon completion.
     """
+    terminal_state = "completed"
+    terminal_reason = "completed"
+    failing_step_index: int | None = None
+    loop_iteration = 0
+    completed_step_count = int(utils.program_status_snapshot().get("completed_step_count", 0) or 0)
+    completed_loop_count = int(utils.program_status_snapshot().get("completed_loop_count", 0) or 0)
+
     try:
         utils.trajectory_state_set("weld_active", False)
+        utils.program_status_update(
+            active=True,
+            state="executing",
+            terminal_reason=None,
+            failing_step_index=None,
+            current_step_index=None,
+            current_step_type=None,
+            loop_iteration=0,
+        )
         execution_loop_active = True
         while execution_loop_active and not bool(utils.trajectory_state_get("should_stop", False)):
+            utils.trajectory_state_update(active_program_loop_iteration=loop_iteration)
+            utils.program_status_update(
+                active=True,
+                state="executing",
+                current_step_index=None,
+                current_step_type=None,
+                loop_iteration=loop_iteration,
+            )
             for i, step in enumerate(planned_steps):
-                # Before each step, check if a stop has been requested.
                 if bool(utils.trajectory_state_get("should_stop", False)):
                     print("[Pi Trajectory] Stop detected, halting execution.")
+                    terminal_state, terminal_reason = _derive_program_terminal_outcome()
+                    failing_step_index = i
                     execution_loop_active = False
                     break
 
-                print(f"[Pi Execute] Executing Step {i+1}/{len(planned_steps)} ({step['type']})...")
+                step_type = str(step.get("type", ""))
+                print(f"[Pi Execute] Executing Step {i+1}/{len(planned_steps)} ({step_type})...")
+                utils.trajectory_state_update(
+                    active_program_step_index=i,
+                    active_program_step_type=step_type,
+                )
+                utils.program_status_update(
+                    active=True,
+                    state="executing",
+                    terminal_reason=None,
+                    failing_step_index=None,
+                    current_step_index=i,
+                    current_step_type=step_type,
+                    loop_iteration=loop_iteration,
+                )
                 utils.trajectory_state_set("weld_active", bool(step.get("weld_active", False)))
-                if step['type'] == 'move':
-                    _execute_joint_path(step['path'], step['freq'])
-                elif step['type'] == 'joint_move':
+                if step_type == "move":
+                    _execute_joint_path(step["path"], step["freq"])
+                elif step_type == "joint_move":
                     print(f"[Pi Execute] Moving joints to target configuration and waiting {step['duration']}s.")
-                    servo_driver.set_servo_positions(step['target_q'], step['speed'], 0)
-                    # Update global state immediately
-                    utils.current_logical_joint_angles_rad = step['target_q']
-                    # Make joint_move interruptible with correct timing
-                    end_time = time.monotonic() + step['duration']
+                    servo_driver.set_servo_positions(step["target_q"], step["speed"], 0)
+                    utils.current_logical_joint_angles_rad = step["target_q"]
+                    end_time = time.monotonic() + step["duration"]
                     while not bool(utils.trajectory_state_get("should_stop", False)) and time.monotonic() < end_time:
-                        time.sleep(0.01)  # Check for stop every 10 ms
-                elif step['type'] == 'pause':
+                        time.sleep(0.01)
+                elif step_type == "pause":
                     utils.trajectory_state_set("weld_active", False)
                     print(f"[Pi Execute] Pausing for {step['duration']} seconds.")
-                    # Make pause interruptible with correct timing
-                    end_time = time.monotonic() + step['duration']
+                    end_time = time.monotonic() + step["duration"]
                     while not bool(utils.trajectory_state_get("should_stop", False)) and time.monotonic() < end_time:
-                        time.sleep(0.01)  # Check for stop every 10 ms
-            
+                        time.sleep(0.01)
+
+                if bool(utils.trajectory_state_get("should_stop", False)):
+                    print("[Pi Trajectory] Stop detected during step execution.")
+                    terminal_state, terminal_reason = _derive_program_terminal_outcome()
+                    failing_step_index = i
+                    execution_loop_active = False
+                    break
+
+                completed_step_count += 1
+                utils.program_status_update(completed_step_count=completed_step_count)
+
+            if not execution_loop_active:
+                break
+
             if not should_loop:
                 execution_loop_active = False
             elif not bool(utils.trajectory_state_get("should_stop", False)):
+                completed_loop_count += 1
+                utils.program_status_update(
+                    completed_loop_count=completed_loop_count,
+                    current_step_index=None,
+                    current_step_type=None,
+                    loop_iteration=loop_iteration + 1,
+                )
                 print("\n[Pi Trajectory] Loop enabled. Restarting sequence...")
+                loop_iteration += 1
                 time.sleep(1)
+
+        if bool(utils.trajectory_state_get("should_stop", False)) and terminal_reason == "completed":
+            terminal_state, terminal_reason = _derive_program_terminal_outcome()
+            current_step_index = utils.program_status_snapshot().get("current_step_index")
+            if current_step_index is not None:
+                try:
+                    failing_step_index = int(current_step_index)
+                except Exception:
+                    failing_step_index = failing_step_index
+
+    except Exception as exc:
+        terminal_state, terminal_reason = _derive_program_terminal_outcome(exc)
+        current_step_index = utils.program_status_snapshot().get("current_step_index")
+        if current_step_index is not None:
+            try:
+                failing_step_index = int(current_step_index)
+            except Exception:
+                pass
+        print(f"[Pi Trajectory] ERROR: Executor thread failed: {exc}")
 
     finally:
         print("[Pi Trajectory] Executor thread finished.")
+        utils.program_status_update(
+            active=False,
+            state=terminal_state,
+            terminal_reason=terminal_reason,
+            failing_step_index=failing_step_index,
+            completed_step_count=completed_step_count,
+            completed_loop_count=completed_loop_count,
+            current_step_index=None,
+            current_step_type=None,
+            loop_iteration=loop_iteration,
+        )
         # Clean up global state, but DO NOT reset the should_stop flag.
         # The stop flag should persist until a new motion command clears it.
         utils.trajectory_state_update(
@@ -952,7 +1065,20 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
             current_weld_type=None,
             is_running=False,
             thread=None,
+            active_program_name=None,
+            active_program_loop_enabled=False,
+            active_program_use_cache=False,
+            active_program_step_count=0,
+            active_program_move_steps=0,
+            active_program_pause_steps=0,
+            active_program_joint_move_steps=0,
+            active_program_rtcore_segments=False,
+            active_program_segment_execution_policy="",
+            active_program_step_index=None,
+            active_program_step_type=None,
+            active_program_loop_iteration=0,
         )
+        utils.trajectory_state_set("stop_request_reason", None)
         try:
             utils.set_motion_state("IDLE")
         except Exception:
@@ -968,10 +1094,10 @@ def _open_loop_executor_thread(
 ):
     """High-speed *open-loop* executor.
 
-    • Pre-computes the raw Sync-Write payload for every step so the realtime
-      loop only needs to send the bytes.
-    • Collects basic timing statistics analogous to the closed-loop executor
-      (loop + write duration). Optionally saves a timing chart.
+    For generic backends, this pre-computes batch writes and emits them from
+    Python at the requested cadence. For the EtherCAT RTCore backend, this now
+    offloads the full joint path to RTCore as a queued trajectory so Python is
+    no longer the sample clock for scheduled motion.
     """
 
     # Honor global diagnostics toggle as well as explicit argument
@@ -993,6 +1119,40 @@ def _open_loop_executor_thread(
         executor_speed = max(0, int(utils.ENCODER_RESOLUTION))
     except Exception:
         executor_speed = 4095
+
+    if use_backend and hasattr(backend, "execute_joint_trajectory"):
+        telemetry_result = None
+        offload_t0 = time.perf_counter()
+        try:
+            status = backend.execute_joint_trajectory(joint_path, frequency)  # type: ignore[attr-defined]
+            state_name = str(getattr(status, "state_name", "unknown"))
+            if state_name not in ("completed", "idle"):
+                raise RuntimeError(f"RTCore trajectory execution ended in state '{state_name}'")
+            utils.current_logical_joint_angles_rad = joint_path[-1]
+            elapsed_s = time.perf_counter() - offload_t0
+            print(
+                "[Pi OL] RTCore trajectory execution finished:"
+                f" state={state_name}"
+                f" traj_id={getattr(status, 'active_traj_id', 0)}"
+                f" elapsed={elapsed_s:.3f}s"
+            )
+            if return_telemetry:
+                telemetry_result = {
+                    "frequency": frequency,
+                    "backend_mode": "rtcore_trajectory",
+                    "execution_state": getattr(status, "state_name", "unknown"),
+                    "trajectory_id": int(getattr(status, "active_traj_id", 0)),
+                    "elapsed_s": float(elapsed_s),
+                }
+        finally:
+            if owns_trajectory_state and utils.trajectory_state.get("thread") is threading.current_thread():
+                utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
+                utils.trajectory_state.pop('diagnostics_session_id', None)
+                utils.trajectory_state.pop('diagnostics_folder_type', None)
+            print("[Pi OL] Open-Loop Executor finished.")
+        if return_telemetry:
+            return telemetry_result
+        return
 
     if use_backend:
         precomputed_cmds: list[list[tuple]] = [

@@ -5,6 +5,9 @@
     },
     "tig-torch-65deg": {
       "meshAssetPath": "/assets/tools/tig-torch-65deg/tool_mesh.stl"
+    },
+    "tool-1774055759338": {
+      "meshAssetPath": null
     }
   }
 }

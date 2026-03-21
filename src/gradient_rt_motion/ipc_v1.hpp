@@ -128,7 +128,11 @@ struct MsgHeader {
 };
 static_assert(sizeof(MsgHeader) == 24, "MsgHeader size must match spec");
 
-// “Latest-wins” setpoint; NOT a ring. Writer updates fields then increments seq.
+// Legacy latest-wins setpoint compatibility path.
+//
+// Scheduled motion should migrate to the trajectory messages below so RTCore owns
+// replay timing. Keep this slot during migration for direct setpoints, bring-up,
+// and rollback.
 struct SetpointSlotV1 {
   uint64_t seq;            // atomic in spec (writer increments after writing payload)
   uint64_t target_time_ns; // when this setpoint should be achieved (CLOCK_MONOTONIC)
@@ -208,6 +212,25 @@ struct StatusAxisConfigV1 {
 };
 static_assert(sizeof(StatusAxisConfigV1) == 424, "StatusAxisConfigV1 size must match spec");
 
+// Motion/execution state published by RTCore so higher layers do not have to infer
+// completion from polling or Python thread joins.
+struct StatusMotionStateV1 {
+  uint32_t active_mode;        // enum MotionModeV1
+  uint32_t state;              // enum ExecutionStateV1
+  uint64_t active_traj_id;     // 0 when no buffered trajectory is active
+  uint32_t current_point_index; // UINT32_MAX when not executing a queued point stream
+  uint32_t queue_depth;        // queued future points/chunks available to RTCore
+  uint32_t queue_capacity;     // 0 until buffered execution is implemented/enabled
+  uint32_t last_event_code;    // enum EventCodeV1
+  uint32_t underrun_count;     // buffered trajectory underruns observed by RTCore
+  uint32_t stale_command_flag; // 1 when active command input is stale
+  uint32_t motion_done;        // 1 when RTCore considers the active motion complete
+  uint32_t capability_flags;   // enum MotionCapabilityFlagsV1 bitmask
+  uint64_t active_command_seq; // legacy setpoint seq or active trajectory commit seq
+  uint64_t last_update_ns;     // CLOCK_MONOTONIC when this state snapshot was generated
+};
+static_assert(sizeof(StatusMotionStateV1) == 64, "StatusMotionStateV1 size must match spec");
+
 // ----- Command payloads -----
 
 struct CmdArmV1 {
@@ -258,6 +281,59 @@ struct CmdIoWriteV1 {
 };
 static_assert(sizeof(CmdIoWriteV1) == 32, "CmdIoWriteV1 size must match spec");
 
+// Buffered trajectory upload contract.
+//
+// RTCore v1 migration plan:
+// - Python plans q / optional qd samples ahead of time
+// - Python uploads begin -> points -> commit
+// - RTCore replays/interpolates deterministically at the RT cycle
+// - Jog remains a separate control mode, not a degenerate trajectory upload
+struct CmdTrajectoryBeginV1 {
+  uint64_t traj_id;
+  uint32_t axis_mask;
+  uint32_t flags; // reserved for upload mode / replace policy
+  uint32_t expected_points;
+  uint32_t reserved0;
+};
+static_assert(sizeof(CmdTrajectoryBeginV1) == 24, "CmdTrajectoryBeginV1 size must match spec");
+
+enum : uint32_t {
+  TRAJ_POINTF_HAS_VELOCITY = 1u << 0,
+  TRAJ_POINTF_LAST_POINT = 1u << 1,
+};
+
+struct TrajectoryPointV1 {
+  uint64_t traj_id;
+  uint32_t point_index;
+  uint32_t flags;          // enum TrajectoryPointFlagsV1
+  uint64_t t_from_start_ns; // relative schedule within traj_id
+  double q[GRADIENT_MAX_AXES];
+  double qd[GRADIENT_MAX_AXES]; // optional; valid when TRAJ_POINTF_HAS_VELOCITY
+  uint32_t axis_mask;
+  uint32_t limits_handle; // reserved for per-trajectory/per-segment limits lookup
+};
+static_assert(sizeof(TrajectoryPointV1) == 288, "TrajectoryPointV1 size must match spec");
+
+struct CmdTrajectoryControlV1 {
+  uint64_t traj_id;
+  uint32_t flags;
+  uint32_t reserved0;
+};
+static_assert(sizeof(CmdTrajectoryControlV1) == 16, "CmdTrajectoryControlV1 size must match spec");
+
+struct CmdJogV1 {
+  uint32_t axis_mask;
+  uint32_t flags;
+  uint64_t timeout_ns; // explicit stale-command timeout for RTCore-owned jog
+  double qd[GRADIENT_MAX_AXES];
+};
+static_assert(sizeof(CmdJogV1) == 144, "CmdJogV1 size must match spec");
+
+enum : uint32_t {
+  JOG_FLAG_ACTIVE = 1u << 0,
+  JOG_FLAG_STOP = 1u << 1,
+};
+
 // ----- I/O snapshot payload -----
 
 struct IoDevStatusV1 {
@@ -289,12 +365,42 @@ enum : uint16_t {
   MSG_CMD_SET_MODE = 0x0106,
   MSG_CMD_REQUEST_BUNDLE = 0x0107,
   MSG_CMD_IO_WRITE = 0x0110,
+  MSG_CMD_TRAJECTORY_BEGIN = 0x0120,
+  MSG_CMD_TRAJECTORY_POINT = 0x0121,
+  MSG_CMD_TRAJECTORY_COMMIT = 0x0122,
+  MSG_CMD_TRAJECTORY_ABORT = 0x0123,
+  MSG_CMD_JOG = 0x0130,
 
   MSG_STATUS_HELLO = 0x0201,
   MSG_STATUS_AXIS_CONFIG = 0x0203,
   MSG_STATUS_SNAPSHOT = 0x0202,
+  MSG_STATUS_MOTION_STATE = 0x0204,
   MSG_STATUS_IO_SNAPSHOT = 0x0210,
   MSG_EVENT = 0x02FF,
+};
+
+enum : uint32_t {
+  MOTION_MODE_IDLE = 0,
+  MOTION_MODE_LEGACY_SETPOINT = 1,
+  MOTION_MODE_TRAJECTORY = 2,
+  MOTION_MODE_JOG = 3,
+};
+
+enum : uint32_t {
+  EXEC_STATE_IDLE = 0,
+  EXEC_STATE_ACCEPTED = 1,
+  EXEC_STATE_QUEUED = 2,
+  EXEC_STATE_EXECUTING = 3,
+  EXEC_STATE_COMPLETED = 4,
+  EXEC_STATE_ABORTED = 5,
+  EXEC_STATE_FAULTED = 6,
+  EXEC_STATE_UNDERRUN = 7,
+};
+
+enum : uint32_t {
+  MOTION_CAP_LEGACY_SETPOINT = 1u << 0,
+  MOTION_CAP_TRAJECTORY_UPLOAD = 1u << 1,
+  MOTION_CAP_JOG_COMMAND = 1u << 2,
 };
 
 // StatusSnapshotV1.master_state values (v1).
@@ -357,6 +463,14 @@ enum : uint32_t {
   EVT_CMD_RING_OVERFLOW = 0x0105,
   EVT_DISARMED = 0x0106,
   EVT_ARMED = 0x0107,
+  EVT_TRAJECTORY_ACCEPTED = 0x0120,
+  EVT_TRAJECTORY_QUEUED = 0x0121,
+  EVT_TRAJECTORY_EXECUTING = 0x0122,
+  EVT_TRAJECTORY_COMPLETED = 0x0123,
+  EVT_TRAJECTORY_ABORTED = 0x0124,
+  EVT_TRAJECTORY_FAULTED = 0x0125,
+  EVT_TRAJECTORY_UNDERRUN = 0x0126,
+  EVT_JOG_TIMEOUT = 0x0130,
   EVT_IO_FAULT = 0x0110,
 };
 

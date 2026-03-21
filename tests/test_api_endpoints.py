@@ -13,17 +13,136 @@ from gradient_os.api import main as api_main
 from gradient_os.api.main import create_app
 
 
+def _payload_token(payload: dict[str, object]) -> str:
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return base64.urlsafe_b64encode(body).decode("ascii")
+
+
 @contextmanager
 def patch_send(monkeypatch):
+    accepted_motion_payload = {
+        "accepted": True,
+        "state": "accepted",
+        "completion_scope": "rtcore_execution",
+        "trajectory_id": 7,
+        "source_of_truth": "rtcore",
+        "execution": {
+            "controller_motion_state": "executing",
+            "controller_thread_running": False,
+            "rtcore_status_present": True,
+            "active_mode_name": "trajectory_execute",
+            "state_name": "queued",
+            "active_traj_id": 7,
+            "queue_depth": 1,
+            "queue_capacity": 4096,
+            "motion_done": False,
+            "stale_command": False,
+            "underrun_count": 0,
+        },
+    }
+    completed_motion_payload = {
+        "accepted": True,
+        "state": "completed",
+        "completion_scope": "rtcore_execution",
+        "trajectory_id": 7,
+        "source_of_truth": "rtcore",
+        "execution": {
+            "controller_motion_state": "idle",
+            "controller_thread_running": False,
+            "rtcore_status_present": True,
+            "active_mode_name": "trajectory_execute",
+            "state_name": "completed",
+            "active_traj_id": 7,
+            "queue_depth": 0,
+            "queue_capacity": 4096,
+            "motion_done": True,
+            "stale_command": False,
+            "underrun_count": 0,
+        },
+    }
+    active_program = {
+        "name": "alpha",
+        "active": True,
+        "state": "executing",
+        "terminal_reason": None,
+        "failing_step_index": None,
+        "completed_step_count": 1,
+        "completed_loop_count": 0,
+        "loop_enabled": False,
+        "use_cache": False,
+        "step_count": 3,
+        "move_steps": 2,
+        "pause_steps": 1,
+        "joint_move_steps": 0,
+        "rtcore_segments": True,
+        "segment_execution_policy": "rtcore_queued",
+        "current_step_index": 1,
+        "current_step_type": "pause",
+        "loop_iteration": 0,
+    }
+    accepted_program_motion_payload = {
+        **accepted_motion_payload,
+        "program": active_program,
+        "program_name": "alpha",
+        "program_active": True,
+        "program_state": "executing",
+        "program_terminal_reason": None,
+        "program_failing_step_index": None,
+        "program_completed_step_count": 1,
+        "program_completed_loop_count": 0,
+        "program_loop_enabled": False,
+        "program_use_cache": False,
+        "program_step_count": 3,
+        "program_move_steps": 2,
+        "program_pause_steps": 1,
+        "program_joint_move_steps": 0,
+        "program_rtcore_segments": True,
+        "program_segment_execution_policy": "rtcore_queued",
+        "program_current_step_index": 1,
+        "program_current_step_type": "pause",
+        "program_loop_iteration": 0,
+    }
+    accepted_run_program_payload = {
+        **accepted_motion_payload,
+        "completion_scope": "controller_program_thread",
+        "source_of_truth": "controller",
+        "program": {
+            **active_program,
+            "state": "accepted",
+            "current_step_index": None,
+            "current_step_type": None,
+            "completed_step_count": 0,
+        },
+        "program_name": "alpha",
+        "program_active": True,
+        "program_state": "accepted",
+        "program_terminal_reason": None,
+        "program_failing_step_index": None,
+        "program_completed_step_count": 0,
+        "program_completed_loop_count": 0,
+        "program_loop_enabled": False,
+        "program_use_cache": False,
+        "program_step_count": 3,
+        "program_move_steps": 2,
+        "program_pause_steps": 1,
+        "program_joint_move_steps": 0,
+        "program_rtcore_segments": True,
+        "program_segment_execution_policy": "rtcore_queued",
+        "program_current_step_index": None,
+        "program_current_step_type": None,
+        "program_loop_iteration": 0,
+    }
     responses = {
-        "STOP": (True, "ACK,STOP"),
+        "STOP": (True, f"ACK,STOP,{_payload_token({**completed_motion_payload, 'state': 'aborted'})}"),
         "SAFE_POWER_UP": (True, "ACK,SAFE_POWER_UP,POWER_UP_SENT"),
         "SAFE_POWER_DOWN": (True, "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"),
         "SAFE_POWER_DOWN,wait": (True, "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"),
-        "WAIT_FOR_IDLE": (True, "ACK,WAIT_FOR_IDLE"),
+        "WAIT_FOR_IDLE": (True, f"ACK,WAIT_FOR_IDLE,{_payload_token(completed_motion_payload)}"),
+        "WAIT_FOR_IDLE,12.5": (True, f"ACK,WAIT_FOR_IDLE,{_payload_token({**completed_motion_payload, 'wait_timeout_s': 12.5, 'waited_for_motion': True, 'wait_timed_out': False})}"),
         "RESET_FAULTS": (True, "ACK,RESET_FAULTS,ALL"),
         "RESET_FAULTS,1": (True, "ACK,RESET_FAULTS,JOINT,1"),
         "ZERO_JOINT,3": (True, "ACK,ZERO_JOINT,3"),
+        "GET_MOTION_STATUS": (True, f"MOTION_STATUS,{_payload_token(accepted_program_motion_payload)}"),
         "GET_STATUS": (True, "STATUS,gripper_present,True"),
         "GET_POSITION": (
             True,
@@ -40,12 +159,15 @@ def patch_send(monkeypatch):
             "CURRENT_ORIENTATION,1,0,0,0,1,0,0,0,1",
         ),
         "GET_TRAJECTORIES": (True, "TRAJECTORIES,alpha,beta"),
+        "RUN_TRAJECTORY,alpha,false": (
+            True,
+            f"ACK,RUN_TRAJECTORY,{_payload_token(accepted_run_program_payload)}",
+        ),
     }
     no_reply_commands = {
         "PLAN_TRAJECTORY",
         "REC_POS",
         "END_TRAJECTORY,test",
-        "RUN_TRAJECTORY,alpha,false",
         "0,0,0,0,0,0",
     }
     planner_payload = {
@@ -115,6 +237,15 @@ def patch_send(monkeypatch):
             "backend_default_profile": "a6ec_ds402",
             "override_profile": None,
         },
+        "rtcore": {
+            "configured_max_rpm": 6000.0,
+            "configured_source": "runtime_config",
+            "effective_max_rpm": 6000.0,
+            "source": "runtime_config",
+            "default_max_rpm": 6000.0,
+            "override_max_rpm": 6000.0,
+            "clamp_disabled": False,
+        },
         "tool": {
             "active_tool_id": "identity",
             "display_name": "Identity (No Tool Offset)",
@@ -142,6 +273,18 @@ def patch_send(monkeypatch):
         call_log.append((command, timeout, expect_response))
         if command == "GET_RUNTIME_CONFIG":
             return True, f"RUNTIME_CONFIG,{json.dumps(runtime_state, separators=(',', ':'))}"
+        if command.startswith("ROTATE,"):
+            return True, f"ACK,ROTATE,{_payload_token({**completed_motion_payload, 'axis': 'x'})}"
+        if command.startswith("SET_ORIENTATION,"):
+            payload = {
+                **completed_motion_payload,
+                "roll_deg": 10.0,
+                "pitch_deg": 20.0,
+                "yaw_deg": 30.0,
+            }
+            return True, f"ACK,SET_ORIENTATION,{_payload_token(payload)}"
+        if command.startswith("MOVE_LINE,"):
+            return True, f"ACK,MOVE_LINE,{_payload_token(accepted_motion_payload)}"
         if command.startswith("SET_ACTIVE_TOOL,"):
             requested = command.split(",", 1)[1].strip() if "," in command else ""
             resolved = requested or "identity"
@@ -173,7 +316,7 @@ def patch_send(monkeypatch):
                 }
             return True, f"ACK,SET_ACTIVE_TOOL,{runtime_state['tool']['active_tool_id']}"
         if command.startswith("APPLY_JOINT_SETPOINT,"):
-            return True, "ACK,APPLY_JOINT_SETPOINT"
+            return True, f"ACK,APPLY_JOINT_SETPOINT,{_payload_token(accepted_motion_payload)}"
         if command.startswith("REQUEST_RESTART,"):
             reason = command.split(",", 1)[1] if "," in command else "api-request"
             return True, f"ACK,REQUEST_RESTART,{reason}"
@@ -332,7 +475,10 @@ def client(monkeypatch):
 def test_control_stop(client):
     resp = client.post("/control/stop")
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "ACK,STOP"
+    body = resp.json()
+    assert body["detail"].startswith("ACK,STOP,")
+    assert body["state"] == "aborted"
+    assert body["completion_scope"] == "rtcore_execution"
 
 
 def test_control_power_down(client):
@@ -354,7 +500,57 @@ def test_control_power_down_waits_when_requested(client):
 def test_control_wait_for_idle(client):
     resp = client.post("/control/wait-for-idle")
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "ACK,WAIT_FOR_IDLE"
+    body = resp.json()
+    assert body["detail"].startswith("ACK,WAIT_FOR_IDLE,")
+    assert body["state"] == "completed"
+    assert body["completion_scope"] == "rtcore_execution"
+
+
+def test_control_wait_for_idle_accepts_timeout_override(client):
+    resp = client.post("/control/wait-for-idle", json={"timeout_s": 12.5})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["wait_timeout_s"] == 12.5
+    assert client.command_calls[-1] == ("WAIT_FOR_IDLE,12.5", 17.5, True)
+
+
+def test_control_motion_status(client):
+    resp = client.get("/control/motion-status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["detail"].startswith("MOTION_STATUS,")
+    assert body["state"] == "accepted"
+    assert body["trajectory_id"] == 7
+    assert body["execution"]["state_name"] == "queued"
+    assert body["program"]["name"] == "alpha"
+    assert body["program"]["state"] == "executing"
+    assert body["program_current_step_type"] == "pause"
+
+
+def test_control_rotate_returns_motion_metadata(client):
+    resp = client.post(
+        "/control/rotate",
+        json={"axis": "roll", "angle_deg": 15.0, "duration_s": 0.5},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["detail"].startswith("ACK,ROTATE,")
+    assert body["state"] == "completed"
+    assert body["completion_scope"] == "rtcore_execution"
+    assert client.command_calls[-1] == ("ROTATE,x,15.0,0.5", 2.0, True)
+
+
+def test_control_set_orientation_returns_motion_metadata(client):
+    resp = client.post(
+        "/control/set-orientation",
+        json={"roll": 10.0, "pitch": 20.0, "yaw": 30.0},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["detail"].startswith("ACK,SET_ORIENTATION,")
+    assert body["state"] == "completed"
+    assert body["completion_scope"] == "rtcore_execution"
+    assert client.command_calls[-1] == ("SET_ORIENTATION,10.0,20.0,30.0", 2.0, True)
 
 
 def test_control_reset_faults_all(client):
@@ -383,7 +579,31 @@ def test_control_reset_faults_joint(client):
 def test_control_home(client):
     resp = client.post("/control/home")
     assert resp.status_code == 200
-    assert client.command_calls[-1] == ("0,0,0,0,0,0", 2.0, False)
+    body = resp.json()
+    assert body["completion_scope"] == "rtcore_execution"
+    assert body["trajectory_id"] == 7
+    command, timeout, expect_response = client.command_calls[-1]
+    assert timeout == 2.0
+    assert expect_response is True
+    assert command.startswith("APPLY_JOINT_SETPOINT,")
+    payload = json.loads(base64.urlsafe_b64decode(command.split(",", 1)[1]).decode("utf-8"))
+    assert payload["arm_angles_rad"] == [0.0] * 6
+    assert payload["max_motor_rpm"] == pytest.approx(100.0)
+
+
+def test_control_rest(client):
+    resp = client.post("/control/rest")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["completion_scope"] == "rtcore_execution"
+    assert body["trajectory_id"] == 7
+    command, timeout, expect_response = client.command_calls[-1]
+    assert timeout == 2.0
+    assert expect_response is True
+    assert command.startswith("APPLY_JOINT_SETPOINT,")
+    payload = json.loads(base64.urlsafe_b64decode(command.split(",", 1)[1]).decode("utf-8"))
+    assert payload["arm_angles_rad"] == pytest.approx([0.0, -1.4, 1.5, 0.0, 0.0, 0.0])
+    assert payload["max_motor_rpm"] == pytest.approx(100.0)
 
 
 def test_control_zero_joint(client):
@@ -410,7 +630,9 @@ def test_control_joint_jog(client):
         0.10471975511965978,
     ])
     assert body["command_acknowledged"] is True
-    assert body["completion_scope"] == "direct_setpoint_ack"
+    assert body["completion_scope"] == "rtcore_execution"
+    assert body["state"] == "accepted"
+    assert body["trajectory_id"] == 7
     assert body["waited_for_idle"] is False
     assert client.command_calls[-2] == ("GET_JOINT_ANGLES", 1.0, True)
     last_command, timeout_s, expect_response = client.command_calls[-1]
@@ -522,7 +744,14 @@ def test_trajectory_list(client):
 def test_trajectory_run(client):
     resp = client.post("/trajectory/run", json={"name": "alpha"})
     assert resp.status_code == 200
-    assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false", 2.0, False)
+    body = resp.json()
+    assert body["completion_scope"] == "controller_program_thread"
+    assert body["state"] == "accepted"
+    assert body["program"]["name"] == "alpha"
+    assert body["program"]["state"] == "accepted"
+    assert body["program_segment_execution_policy"] == "rtcore_queued"
+    assert body["program_rtcore_segments"] is True
+    assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false", 2.0, True)
 
 
 def test_trajectory_plan_points_success(client):
@@ -669,8 +898,13 @@ def test_preview_execute_clear(client, monkeypatch):
 
     resp = client.post("/trajectory/execute-preview")
     assert resp.status_code == 200
+    body = resp.json()
+    assert body["dispatch_detail"].startswith("ACK,MOVE_LINE,")
+    assert body["detail"].startswith("ACK,WAIT_FOR_IDLE,")
+    assert body["dispatch"]["state"] == "accepted"
+    assert body["state"] == "completed"
     # Last two commands: MOVE_LINE..., WAIT_FOR_IDLE
-    assert client.command_calls[-2][0].startswith("MOVE_LINE,0.2,0.1,0.3,0.2,0.1")
+    assert client.command_calls[-2] == ("MOVE_LINE,0.2,0.1,0.3,0.2,0.1,false", 5.0, True)
     assert client.command_calls[-1] == ("WAIT_FOR_IDLE", 60.0, True)
 
     # Preview cleared, executing again should fail

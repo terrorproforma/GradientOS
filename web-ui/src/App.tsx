@@ -151,7 +151,56 @@ type TelemetryEvent = {
   weld_type?: string;
 };
 
+type MotionExecutionPayload = {
+  controller_motion_state?: string;
+  controller_thread_running?: boolean;
+  state_name?: string;
+  active_mode_name?: string;
+  active_traj_id?: number;
+  queue_depth?: number;
+  queue_capacity?: number;
+  motion_done?: boolean;
+  stale_command?: boolean;
+  underrun_count?: number;
+  last_submitted_traj_id?: number;
+};
+
+type ProgramStatusPayload = {
+  name?: string | null;
+  active?: boolean;
+  state?: string;
+  terminal_reason?: string | null;
+  failing_step_index?: number | null;
+  completed_step_count?: number;
+  completed_loop_count?: number;
+  loop_enabled?: boolean;
+  use_cache?: boolean;
+  step_count?: number;
+  move_steps?: number;
+  pause_steps?: number;
+  joint_move_steps?: number;
+  rtcore_segments?: boolean;
+  segment_execution_policy?: string;
+  current_step_index?: number | null;
+  current_step_type?: string | null;
+  loop_iteration?: number;
+};
+
+type MotionStatusResponse = {
+  status?: string;
+  detail?: string;
+  accepted?: boolean;
+  command_acknowledged?: boolean;
+  state?: string;
+  completion_scope?: string;
+  trajectory_id?: number;
+  source_of_truth?: string;
+  execution?: MotionExecutionPayload;
+  program?: ProgramStatusPayload;
+};
+
 const LIVE_JOINT_FALLBACK_MAX_AGE_S = 1 / 50;
+const TERMINAL_MOTION_STATES = new Set(["idle", "completed", "aborted", "faulted", "underrun", "timeout"]);
 
 function areJointArraysClose(a: number[] | undefined, b: number[]): boolean {
   if (!Array.isArray(a) || a.length !== b.length) {
@@ -252,6 +301,15 @@ type ActiveRuntimeConfig = {
     backend_default_profile?: string | null;
     override_profile?: string | null;
   };
+  rtcore?: {
+    configured_max_rpm?: number | null;
+    configured_source?: string | null;
+    effective_max_rpm?: number | null;
+    source?: string | null;
+    default_max_rpm?: number | null;
+    override_max_rpm?: number | null;
+    clamp_disabled?: boolean;
+  };
   tool?: {
     active_tool_id: string;
     display_name: string;
@@ -274,6 +332,7 @@ type RuntimeConfigSnapshot = {
       ik_solver_backend?: string | null;
       servo_backend?: string | null;
       drive_profile?: string | null;
+      rt_max_rpm?: number | null;
     };
   };
   meta?: {
@@ -406,6 +465,206 @@ function pointFromAngle(cx: number, cy: number, radius: number, degFromUp: numbe
     x: cx + Math.sin(rad) * radius,
     y: cy - Math.cos(rad) * radius,
   };
+}
+
+function normalizeMotionState(status: MotionStatusResponse | null | undefined): string {
+  return (
+    status?.state?.trim().toLowerCase() ||
+    status?.execution?.state_name?.trim().toLowerCase() ||
+    "idle"
+  );
+}
+
+function resolveMotionTrajectoryId(status: MotionStatusResponse | null | undefined): number | null {
+  const directId = status?.trajectory_id;
+  if (typeof directId === "number" && Number.isFinite(directId) && directId > 0) {
+    return directId;
+  }
+  const activeId = status?.execution?.active_traj_id;
+  if (typeof activeId === "number" && Number.isFinite(activeId) && activeId > 0) {
+    return activeId;
+  }
+  const submittedId = status?.execution?.last_submitted_traj_id;
+  if (typeof submittedId === "number" && Number.isFinite(submittedId) && submittedId > 0) {
+    return submittedId;
+  }
+  return null;
+}
+
+function shouldShowMotionStatus(status: MotionStatusResponse | null | undefined): boolean {
+  if (!status) {
+    return false;
+  }
+  const programState = status.program?.state?.trim().toLowerCase();
+  if (programState && programState !== "idle") {
+    return true;
+  }
+  const state = normalizeMotionState(status);
+  if (!TERMINAL_MOTION_STATES.has(state)) {
+    return true;
+  }
+  return Boolean(
+    status.accepted ||
+    status.command_acknowledged ||
+    resolveMotionTrajectoryId(status) !== null ||
+    (typeof status.execution?.queue_depth === "number" && status.execution.queue_depth > 0),
+  );
+}
+
+function isMotionActive(status: MotionStatusResponse | null | undefined): boolean {
+  if (!status) {
+    return false;
+  }
+  const programState = status.program?.state?.trim().toLowerCase();
+  if (status.program?.active || (programState && !TERMINAL_MOTION_STATES.has(programState))) {
+    return true;
+  }
+  const state = normalizeMotionState(status);
+  if (TERMINAL_MOTION_STATES.has(state)) {
+    return false;
+  }
+  return Boolean(
+    status.accepted ||
+    status.command_acknowledged ||
+    resolveMotionTrajectoryId(status) !== null ||
+    (typeof status.execution?.queue_depth === "number" && status.execution.queue_depth > 0),
+  );
+}
+
+type MotionStatusCardProps = {
+  title: string;
+  motionStatus: MotionStatusResponse | null;
+  isSubmitting?: boolean;
+  submittingLabel?: string;
+};
+
+function MotionStatusCard({
+  title,
+  motionStatus,
+  isSubmitting = false,
+  submittingLabel = "Submitting motion request…",
+}: MotionStatusCardProps) {
+  if (!isSubmitting && !shouldShowMotionStatus(motionStatus)) {
+    return null;
+  }
+
+  if (isSubmitting) {
+    return (
+      <div className="rounded border border-cyan-400/30 bg-cyan-500/10 px-2 py-2">
+        <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-200/90">
+          {title}
+        </div>
+        <div className="text-[12px] leading-5 text-cyan-100/90">{submittingLabel}</div>
+      </div>
+    );
+  }
+
+  if (!motionStatus) {
+    return null;
+  }
+
+  const state = normalizeMotionState(motionStatus);
+  const trajectoryId = resolveMotionTrajectoryId(motionStatus);
+  const queueDepth = motionStatus.execution?.queue_depth;
+  const queueCapacity = motionStatus.execution?.queue_capacity;
+  const source = motionStatus.source_of_truth ?? "controller";
+  const scope = motionStatus.completion_scope ?? "unknown";
+  const program = motionStatus.program;
+  const toneClasses = isMotionActive(motionStatus)
+    ? {
+        wrapper: "border-cyan-400/30 bg-cyan-500/10",
+        title: "text-cyan-200/90",
+        text: "text-cyan-100/90",
+        badge: "border-cyan-300/40 bg-cyan-400/15 text-cyan-100",
+      }
+    : state === "completed"
+      ? {
+          wrapper: "border-emerald-400/30 bg-emerald-500/10",
+          title: "text-emerald-200/90",
+          text: "text-emerald-100/90",
+          badge: "border-emerald-300/40 bg-emerald-400/15 text-emerald-100",
+        }
+      : {
+          wrapper: "border-amber-400/30 bg-amber-500/10",
+          title: "text-amber-200/90",
+          text: "text-amber-100/90",
+          badge: "border-amber-300/40 bg-amber-400/15 text-amber-100",
+        };
+  const detailParts = [`source ${source}`, `scope ${scope}`];
+  if (typeof queueDepth === "number" && Number.isFinite(queueDepth)) {
+    detailParts.push(
+      typeof queueCapacity === "number" && Number.isFinite(queueCapacity) && queueCapacity > 0
+        ? `queue ${queueDepth}/${queueCapacity}`
+        : `queue ${queueDepth}`,
+    );
+  }
+  if (motionStatus.execution?.controller_motion_state) {
+    detailParts.push(`controller ${motionStatus.execution.controller_motion_state}`);
+  }
+  if (program?.name) {
+    detailParts.push(`program ${program.name}`);
+  }
+  if (program?.segment_execution_policy) {
+    detailParts.push(`program path ${program.segment_execution_policy}`);
+  }
+
+  const programState = program?.state?.trim().toLowerCase();
+  const programSummaryParts: string[] = [];
+  if (program && programState && programState !== "idle") {
+    const currentProgram = program;
+    programSummaryParts.push(`program ${programState}`);
+    if (
+      typeof currentProgram.current_step_index === "number" &&
+      typeof currentProgram.step_count === "number" &&
+      currentProgram.step_count > 0
+    ) {
+      programSummaryParts.push(
+        `step ${currentProgram.current_step_index + 1}/${currentProgram.step_count}`,
+      );
+    } else if (
+      typeof currentProgram.completed_step_count === "number" &&
+      typeof currentProgram.step_count === "number" &&
+      currentProgram.step_count > 0
+    ) {
+      programSummaryParts.push(
+        `completed ${currentProgram.completed_step_count}/${currentProgram.step_count}`,
+      );
+    }
+    if (
+      typeof currentProgram.completed_loop_count === "number" &&
+      currentProgram.completed_loop_count > 0
+    ) {
+      programSummaryParts.push(`loops ${currentProgram.completed_loop_count}`);
+    }
+    if (currentProgram.terminal_reason) {
+      programSummaryParts.push(`reason ${currentProgram.terminal_reason}`);
+    }
+    if (typeof currentProgram.failing_step_index === "number") {
+      programSummaryParts.push(`failed step ${currentProgram.failing_step_index + 1}`);
+    }
+  }
+
+  return (
+    <div className={`rounded border px-2 py-2 ${toneClasses.wrapper}`}>
+      <div className={`mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${toneClasses.title}`}>
+        {title}
+      </div>
+      <div className="mb-1 flex items-center gap-2">
+        <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] ${toneClasses.badge}`}>
+          {state}
+        </span>
+        {trajectoryId !== null ? (
+          <span className={`text-[11px] font-semibold ${toneClasses.text}`}>traj {trajectoryId}</span>
+        ) : null}
+      </div>
+      <div className={`text-[12px] leading-5 ${toneClasses.text}`}>{detailParts.join(" | ")}</div>
+      {programSummaryParts.length > 0 ? (
+        <div className={`mt-1 text-[12px] leading-5 ${toneClasses.text}`}>
+          {programSummaryParts.join(" | ")}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 function angleFromPointer(
@@ -1290,7 +1549,9 @@ function StepImportPanel({
 type TrajectoryPanelProps = {
   isPlanning: boolean;
   isPlanLoading: boolean;
-  isRunning: boolean;
+  isSubmittingRun: boolean;
+  isMotionActive: boolean;
+  motionStatus: MotionStatusResponse | null;
   preview: PreviewPlan | null;
   plannerPoints: Point3[];
   savedTrajectories: string[];
@@ -1309,7 +1570,9 @@ type TrajectoryPanelProps = {
 function TrajectoryPanel({
   isPlanning,
   isPlanLoading,
-  isRunning,
+  isSubmittingRun,
+  isMotionActive,
+  motionStatus,
   preview,
   plannerPoints,
   savedTrajectories,
@@ -1337,12 +1600,12 @@ function TrajectoryPanel({
           <button
             type="button"
             onClick={onPlanToggle}
-            disabled={isPlanLoading || isRunning}
+            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
             className={`rounded-full border border-slate-600/50 p-2 transition ${
               isPlanning
                 ? "bg-cyan-500/80 text-slate-950 shadow-inner shadow-cyan-400/40"
                 : "bg-slate-900/60 text-slate-200 hover:border-slate-400 hover:text-slate-100"
-            } ${isPlanLoading || isRunning ? "opacity-60" : ""}`}
+            } ${isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""}`}
             aria-label="Select trajectory target"
           >
             <Route size={18} strokeWidth={2} />
@@ -1350,9 +1613,9 @@ function TrajectoryPanel({
           <button
             type="button"
             onClick={onUndoPoint}
-            disabled={plannerPoints.length === 0 || isPlanLoading || isRunning}
+            disabled={plannerPoints.length === 0 || isPlanLoading || isSubmittingRun || isMotionActive}
             className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
-              plannerPoints.length === 0 || isPlanLoading || isRunning
+              plannerPoints.length === 0 || isPlanLoading || isSubmittingRun || isMotionActive
                 ? "opacity-60"
                 : ""
             }`}
@@ -1363,9 +1626,9 @@ function TrajectoryPanel({
           <button
             type="button"
             onClick={onRun}
-            disabled={!preview || isPlanLoading || isRunning}
+            disabled={!preview || isPlanLoading || isSubmittingRun || isMotionActive}
             className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
-              (!preview || isPlanLoading || isRunning) ? "opacity-60" : ""
+              (!preview || isPlanLoading || isSubmittingRun || isMotionActive) ? "opacity-60" : ""
             }`}
             aria-label="Execute planned trajectory"
           >
@@ -1384,11 +1647,17 @@ function TrajectoryPanel({
           </button>
         </div>
       </div>
+      <MotionStatusCard
+        title="Execution Status"
+        motionStatus={motionStatus}
+        isSubmitting={isSubmittingRun}
+        submittingLabel="Submitting trajectory run..."
+      />
       <div className="text-[13px] leading-[1.35] text-slate-100/90">
         {isPlanLoading ? (
           <p>Planning preview trajectory…</p>
-        ) : isRunning ? (
-          <p>Executing trajectory…</p>
+        ) : isSubmittingRun ? (
+          <p>Submitting trajectory run…</p>
         ) : isPlanning ? (
           <p>
             Shift-click in the workspace to add waypoints. Use undo to remove
@@ -1494,7 +1763,9 @@ type WeldPanelProps = {
   weldSelectionMode: boolean;
   draft: WeldDraft | null;
   isPlanningWeld: boolean;
-  isRunning: boolean;
+  isSubmittingRun: boolean;
+  isMotionActive: boolean;
+  motionStatus: MotionStatusResponse | null;
   canRunPreview: boolean;
   weldActive: boolean;
   planningWarnings: string[];
@@ -1792,7 +2063,9 @@ function WeldPanel({
   weldSelectionMode,
   draft,
   isPlanningWeld,
-  isRunning,
+  isSubmittingRun,
+  isMotionActive,
+  motionStatus,
   canRunPreview,
   weldActive,
   planningWarnings,
@@ -1833,12 +2106,19 @@ function WeldPanel({
       draft &&
       draft.segments.length > 0 &&
       !isPlanningWeld &&
-      !isRunning,
+      !isSubmittingRun &&
+      !isMotionActive,
   );
 
   return (
     <div className="pointer-events-auto w-full">
       <div className="space-y-2 text-[13px] leading-[1.35] text-slate-200/90">
+        <MotionStatusCard
+          title="Execution Status"
+          motionStatus={motionStatus}
+          isSubmitting={isSubmittingRun}
+          submittingLabel="Submitting weld preview run..."
+        />
         {planningWarnings.length > 0 ? (
           <div className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-2">
             <div className="mb-1 text-[12px] font-semibold uppercase tracking-[0.14em] text-amber-200">
@@ -2152,9 +2432,9 @@ function WeldPanel({
       <button
         type="button"
         onClick={onRun}
-        disabled={!canRunPreview || isRunning || isPlanningWeld}
+        disabled={!canRunPreview || isSubmittingRun || isPlanningWeld || isMotionActive}
         className={`mt-3 inline-flex w-full items-center justify-center gap-2 rounded border border-orange-400/40 bg-orange-500/20 px-3 py-2 text-sm font-semibold text-orange-100 transition hover:bg-orange-500/30 ${
-          (!canRunPreview || isRunning || isPlanningWeld) ? "opacity-60" : ""
+          (!canRunPreview || isSubmittingRun || isPlanningWeld || isMotionActive) ? "opacity-60" : ""
         }`}
       >
         <Play size={14} /> Run Weld Preview
@@ -2395,6 +2675,7 @@ type SettingsDialogProps = {
   showBoundingBox: boolean;
   robots: RobotPolicyOption[];
   selectedRobotName: string;
+  selectedRtMaxRpmInput: string;
   tools: ToolDefinition[];
   selectedToolId: string;
   toolFilterRobotId: string;
@@ -2417,6 +2698,7 @@ type SettingsDialogProps = {
   onVisionHostChange: (value: string) => void;
   onShowBoundingBoxChange: (value: boolean) => void;
   onSelectedRobotNameChange: (value: string) => void;
+  onSelectedRtMaxRpmInputChange: (value: string) => void;
   onSelectedToolIdChange: (value: string) => void;
   onToolFilterRobotIdChange: (value: string) => void;
   onToolFilterTypeChange: (value: string) => void;
@@ -2450,6 +2732,7 @@ function SettingsDialog({
   showBoundingBox,
   robots,
   selectedRobotName,
+  selectedRtMaxRpmInput,
   tools,
   selectedToolId,
   toolFilterRobotId,
@@ -2472,6 +2755,7 @@ function SettingsDialog({
   onVisionHostChange,
   onShowBoundingBoxChange,
   onSelectedRobotNameChange,
+  onSelectedRtMaxRpmInputChange,
   onSelectedToolIdChange,
   onToolFilterRobotIdChange,
   onToolFilterTypeChange,
@@ -2750,6 +3034,29 @@ function SettingsDialog({
                   {activeRuntimeConfig.drive_profile.source ?? "unknown"}.
                   {" "}Configured: {activeRuntimeConfig.drive_profile.configured_profile ?? "none"}.
                   {" "}Live: {activeRuntimeConfig.drive_profile.live_profile ?? "unavailable"}.
+                </div>
+              ) : null}
+              <label className="mt-3 block text-xs text-slate-300/90">
+                RTCore max RPM
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  className="mt-1 w-full rounded border border-slate-600/70 bg-slate-900/70 px-2 py-1 text-sm text-slate-100"
+                  value={selectedRtMaxRpmInput}
+                  onChange={(event) => onSelectedRtMaxRpmInputChange(event.target.value)}
+                  disabled={isRuntimeConfigBusy || isRestartingController}
+                />
+                <span className="mt-1 block text-[11px] text-slate-400">
+                  `0` disables the RTCore clamp. `6000` matches the drive absolute max and effectively removes the old `100 RPM` cap for normal motion.
+                </span>
+              </label>
+              {activeRuntimeConfig?.rtcore ? (
+                <div className="mt-2 text-[11px] text-slate-400">
+                  Active RT clamp: {activeRuntimeConfig.rtcore.effective_max_rpm ?? "unknown"} RPM from{" "}
+                  {activeRuntimeConfig.rtcore.source ?? "unknown"}.
+                  {" "}Default: {activeRuntimeConfig.rtcore.default_max_rpm ?? "unknown"}.
+                  {activeRuntimeConfig.rtcore.clamp_disabled ? " Clamp is disabled." : ""}
                 </div>
               ) : null}
               {activeRuntimeConfig?.ik_solver?.source === "dev_override" ||
@@ -3250,6 +3557,25 @@ function AlertsPanel({
   );
 }
 
+function normalizeHealthProbeMessage(raw: string, fallback: string): string {
+  const text = raw.trim();
+  if (!text) {
+    return fallback;
+  }
+  try {
+    const payload = JSON.parse(text) as { detail?: unknown; message?: unknown };
+    if (typeof payload.detail === "string" && payload.detail.trim()) {
+      return payload.detail.trim();
+    }
+    if (typeof payload.message === "string" && payload.message.trim()) {
+      return payload.message.trim();
+    }
+  } catch {
+    // Ignore JSON parsing failures and use the raw body.
+  }
+  return text;
+}
+
 export default function App() {
   const [apiHost, setApiHost] = useState(() => resolveDefaultApiHost());
   const [visionHost, setVisionHost] = useState(() => resolveDefaultVisionHost());
@@ -3257,12 +3583,14 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [latest, setLatest] = useState<TelemetryEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [apiHealthError, setApiHealthError] = useState<string | null>(null);
   const [visionError, setVisionError] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsDialogTab>("general");
   const [robotOptions, setRobotOptions] = useState<RobotPolicyOption[]>([]);
   const [runtimeConfigSnapshot, setRuntimeConfigSnapshot] = useState<RuntimeConfigSnapshot | null>(null);
   const [selectedRobotName, setSelectedRobotName] = useState("");
+  const [selectedRtMaxRpmInput, setSelectedRtMaxRpmInput] = useState("6000");
   const [toolLibrary, setToolLibrary] = useState<ToolDefinition[]>([]);
   const [selectedToolId, setSelectedToolId] = useState("identity");
   const [toolFilterRobotId, setToolFilterRobotId] = useState("all");
@@ -3291,6 +3619,7 @@ export default function App() {
   const [isPlanning, setIsPlanning] = useState(false);
   const [isPlanLoading, setIsPlanLoading] = useState(false);
   const [isRunningPreview, setIsRunningPreview] = useState(false);
+  const [motionStatus, setMotionStatus] = useState<MotionStatusResponse | null>(null);
   const [savedTrajectories, setSavedTrajectories] = useState<string[]>([]);
   const [isTrajectoryListLoading, setIsTrajectoryListLoading] = useState(false);
   const [selectedTrajectory, setSelectedTrajectory] = useState("");
@@ -3335,6 +3664,7 @@ export default function App() {
   const selectedProgramNodeId = settings.selectedProgramNodeId;
   const visualizerRef = useRef<ArmVisualizerHandle | null>(null);
   const normalizedApiHost = useMemo(() => normaliseApiHost(apiHost), [apiHost]);
+  const motionStatusActive = useMemo(() => isMotionActive(motionStatus), [motionStatus]);
   const normalisedVisionHost = useMemo(
     () => normaliseVisionHost(visionHost),
     [visionHost],
@@ -3511,6 +3841,8 @@ export default function App() {
     setRuntimeConfigSnapshot(runtimePayload);
     const desiredRobot = runtimePayload?.desired?.robot;
     const desiredTool = runtimePayload?.desired?.active_tool_id;
+    const desiredRtMaxRpm = runtimePayload?.desired?.overrides?.rt_max_rpm;
+    const activeRtMaxRpm = runtimePayload?.active?.rtcore?.effective_max_rpm;
     setSelectedRobotName((previous) => {
       if (typeof desiredRobot === "string" && desiredRobot.trim().length > 0) {
         return desiredRobot;
@@ -3525,6 +3857,15 @@ export default function App() {
         return desiredTool;
       }
       return previous || "identity";
+    });
+    setSelectedRtMaxRpmInput(() => {
+      if (typeof desiredRtMaxRpm === "number" && Number.isFinite(desiredRtMaxRpm)) {
+        return String(desiredRtMaxRpm);
+      }
+      if (typeof activeRtMaxRpm === "number" && Number.isFinite(activeRtMaxRpm)) {
+        return String(activeRtMaxRpm);
+      }
+      return "6000";
     });
     setRuntimeConfigError(null);
     return runtimePayload;
@@ -3771,6 +4112,12 @@ export default function App() {
     if (!selectedRobotName) {
       return;
     }
+    const trimmedRtMaxRpm = selectedRtMaxRpmInput.trim();
+    const parsedRtMaxRpm = trimmedRtMaxRpm.length === 0 ? 6000 : Number(trimmedRtMaxRpm);
+    if (!Number.isFinite(parsedRtMaxRpm) || parsedRtMaxRpm < 0) {
+      setRuntimeConfigError("RTCore max RPM must be a number greater than or equal to 0.");
+      return;
+    }
     setIsRuntimeConfigBusy(true);
     try {
       const response = await fetch(`${normalizedApiHost}/info/runtime-config`, {
@@ -3779,6 +4126,9 @@ export default function App() {
         body: JSON.stringify({
           robot: selectedRobotName,
           active_tool_id: selectedToolId || null,
+          overrides: {
+            rt_max_rpm: parsedRtMaxRpm,
+          },
           actor: "web-ui",
         }),
       });
@@ -3798,7 +4148,7 @@ export default function App() {
     } finally {
       setIsRuntimeConfigBusy(false);
     }
-  }, [fetchRuntimeConfigSnapshot, normalizedApiHost, selectedRobotName, selectedToolId]);
+  }, [fetchRuntimeConfigSnapshot, normalizedApiHost, selectedRobotName, selectedRtMaxRpmInput, selectedToolId]);
 
   const handleRestartController = useCallback(async () => {
     if (!runtimeConfigSnapshot?.restart_required) {
@@ -4023,7 +4373,7 @@ export default function App() {
       point,
     };
   }, [selectedProgramControlPointIndex, treeEditableWaypoints]);
-  const canTreeWaypointValueEdit = !isPlanningWeld && !isRunningPreview;
+  const canTreeWaypointValueEdit = !isPlanningWeld && !isRunningPreview && !motionStatusActive;
   const minRemainingWaypoints = weldDraft ? 2 : 1;
   const canTreeWaypointAdd = canTreeWaypointValueEdit;
   const canTreeWaypointRemove = Boolean(
@@ -4316,6 +4666,43 @@ export default function App() {
     connect();
   }, [connect, disconnect, isConnected]);
 
+  useEffect(() => {
+    let disposed = false;
+    let inFlight = false;
+    const tick = async () => {
+      if (disposed || inFlight) {
+        return;
+      }
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
+      inFlight = true;
+      try {
+        const response = await fetch(`${normalizedApiHost}/control/motion-status`);
+        if (!response.ok) {
+          return;
+        }
+        const payload = (await response.json()) as MotionStatusResponse;
+        if (!disposed) {
+          setMotionStatus(payload);
+        }
+      } catch {
+        // Keep the last known status when the poll misses; other UI health
+        // paths already surface broader connectivity problems.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => {
+      void tick();
+    }, 200);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [normalizedApiHost]);
+
   const toggleVision = useCallback(() => {
     if (isVisionActive) {
       setIsVisionActive(false);
@@ -4537,7 +4924,7 @@ export default function App() {
   );
 
   const handlePlanToggle = useCallback(() => {
-    if (isPlanLoading || isRunningPreview) {
+    if (isPlanLoading || isRunningPreview || motionStatusActive) {
       return;
     }
     setError(null);
@@ -4552,7 +4939,7 @@ export default function App() {
       }
       return next;
     });
-  }, [isPlanLoading, isRunningPreview, previewPlan]);
+  }, [isPlanLoading, isRunningPreview, motionStatusActive, previewPlan]);
 
   const handlePointSelected = useCallback(
     async (point: Point3) => {
@@ -4729,7 +5116,7 @@ export default function App() {
   }, [weldDraft]);
 
   const handleRunPreview = useCallback(async () => {
-    if (!previewPlan || isPlanLoading || isRunningPreview) {
+    if (!previewPlan || isPlanLoading || isRunningPreview || motionStatusActive) {
       return;
     }
     setIsRunningPreview(true);
@@ -4768,6 +5155,8 @@ export default function App() {
         const message = await response.text();
         throw new Error(message || `Run request failed (${response.status})`);
       }
+      const payload = (await response.json()) as MotionStatusResponse;
+      setMotionStatus(payload);
     } catch (err) {
       setError(`Failed to execute trajectory: ${(err as Error).message}`);
     } finally {
@@ -4777,6 +5166,7 @@ export default function App() {
     previewPlan,
     isPlanLoading,
     isRunningPreview,
+    motionStatusActive,
     normalizedApiHost,
     weldDraft,
     requestWeldPreview,
@@ -5213,6 +5603,8 @@ export default function App() {
         }
         throw new Error(detail);
       }
+      const payload = (await response.json()) as MotionStatusResponse;
+      setMotionStatus(payload);
     } catch (err) {
       setError(
         `Failed to send STOP command: ${(err as Error).message ?? "Unknown error"}`,
@@ -5236,6 +5628,8 @@ export default function App() {
         const message = await response.text();
         throw new Error(message || `Home request failed (${response.status})`);
       }
+      const payload = (await response.json()) as MotionStatusResponse;
+      setMotionStatus(payload);
     } catch (err) {
       setError(`Failed to home: ${(err as Error).message ?? "Unknown error"}`);
     } finally {
@@ -5257,6 +5651,8 @@ export default function App() {
         const message = await response.text();
         throw new Error(message || `Rest request failed (${response.status})`);
       }
+      const payload = (await response.json()) as MotionStatusResponse;
+      setMotionStatus(payload);
     } catch (err) {
       setError(`Failed to move to rest: ${(err as Error).message ?? "Unknown error"}`);
     } finally {
@@ -5366,14 +5762,22 @@ export default function App() {
       try {
         const r = await fetch(`${normalizedApiHost}/health`, { method: "GET" });
         if (!r.ok) {
-          const txt = await r.text();
+          const detail = normalizeHealthProbeMessage(await r.text(), r.statusText);
           if (!cancelled) {
-            setError(`API /health ${r.status}: ${txt || r.statusText}`);
+            setApiHealthError(
+              r.status === 503
+                ? `Controller unavailable: ${detail}`
+                : `API health check failed: ${detail}`,
+            );
           }
+          return;
+        }
+        if (!cancelled) {
+          setApiHealthError(null);
         }
       } catch (e) {
         if (!cancelled) {
-          setError("API unreachable. Check that gradient-api is running.");
+          setApiHealthError("API unreachable. Check that gradient-api is running.");
         }
       }
     };
@@ -5384,6 +5788,14 @@ export default function App() {
       window.clearInterval(id);
     };
   }, [normalizedApiHost]);
+  useEffect(() => {
+    if (
+      error === "API unreachable. Check that gradient-api is running." ||
+      error?.startsWith("API /health ")
+    ) {
+      setError(null);
+    }
+  }, [error]);
   useEffect(() => {
     persistSettings(settings);
   }, [settings]);
@@ -5547,6 +5959,11 @@ export default function App() {
   const headerAlert = [error, visionError].filter(Boolean).join(" • ");
   const hasHeaderAlert = headerAlert.length > 0;
   const alertTone = error ? "rose" : "amber";
+  const controllerStatusTone = apiHealthError?.startsWith("API unreachable")
+    ? "rose"
+    : apiHealthError
+      ? "amber"
+      : null;
   const activeDrawerWidthClass = activePanel === "telemetry"
     ? "w-[30rem] max-w-[calc(100vw-7rem)]"
     : activePanel === "tools"
@@ -5609,7 +6026,9 @@ export default function App() {
           <TrajectoryPanel
             isPlanning={isPlanning}
             isPlanLoading={isPlanLoading}
-            isRunning={isRunningPreview}
+          isSubmittingRun={isRunningPreview}
+          isMotionActive={motionStatusActive}
+          motionStatus={motionStatus}
             preview={previewPlan}
             plannerPoints={plannerPoints}
             savedTrajectories={savedTrajectories}
@@ -5679,7 +6098,9 @@ export default function App() {
               weldSelectionMode={weldSelectionMode}
               draft={weldDraft}
               isPlanningWeld={isPlanningWeld}
-              isRunning={isRunningPreview}
+          isSubmittingRun={isRunningPreview}
+          isMotionActive={motionStatusActive}
+          motionStatus={motionStatus}
               canRunPreview={Boolean(previewPlan?.name)}
               weldActive={weldActive}
               planningWarnings={previewPlan?.planningWarnings ?? []}
@@ -5884,6 +6305,23 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {apiHealthError ? (
+              <span
+                className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
+                  controllerStatusTone === "rose"
+                    ? "bg-rose-500/10 text-rose-200 ring-1 ring-inset ring-rose-400/20"
+                    : "bg-amber-500/10 text-amber-200 ring-1 ring-inset ring-amber-400/25"
+                }`}
+                title={apiHealthError}
+              >
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${
+                    controllerStatusTone === "rose" ? "bg-rose-400" : "bg-amber-400"
+                  }`}
+                />
+                {controllerStatusTone === "rose" ? "API Offline" : "Controller Offline"}
+              </span>
+            ) : null}
             <span
               className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
                 isConnected
@@ -6126,6 +6564,7 @@ export default function App() {
         showBoundingBox={showBoundingBox}
         robots={robotOptions}
         selectedRobotName={selectedRobotName}
+        selectedRtMaxRpmInput={selectedRtMaxRpmInput}
         tools={toolLibrary}
         selectedToolId={selectedToolId}
         toolFilterRobotId={toolFilterRobotId}
@@ -6148,6 +6587,7 @@ export default function App() {
         onVisionHostChange={setVisionHost}
         onShowBoundingBoxChange={(value) => updateSettings({ showBoundingBox: value })}
         onSelectedRobotNameChange={setSelectedRobotName}
+        onSelectedRtMaxRpmInputChange={setSelectedRtMaxRpmInput}
         onSelectedToolIdChange={setSelectedToolId}
         onToolFilterRobotIdChange={setToolFilterRobotId}
         onToolFilterTypeChange={setToolFilterType}

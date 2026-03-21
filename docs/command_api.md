@@ -17,20 +17,20 @@ This module contains a `handle_...` function for every high-level action the rob
 
 #### `MOVE_LINE`
 -   **Syntax:** `MOVE_LINE,x,y,z,[velocity],[acceleration],[closed_loop]`
--   **Description:** Plans and executes a high-precision, closed-loop, straight-line move to an absolute Cartesian position. The tool's orientation is locked to match its orientation at the start of the move. This command is **non-blocking**.
+-   **Description:** Plans and executes a straight-line move to an absolute Cartesian position while locking the tool orientation to its starting orientation. This command is **non-blocking**.
 -   **Parameters:**
     -   `x, y, z`: (float, required) The absolute target coordinates in meters.
     -   `velocity`: (float, optional) The maximum velocity for the move in meters/sec. Defaults to `DEFAULT_PROFILE_VELOCITY`.
     -   `acceleration`: (float, optional) The acceleration and deceleration for the move in meters/sec^2. Defaults to `DEFAULT_PROFILE_ACCELERATION`.
-    -   `closed_loop`: (bool, optional) Set to `false`, `open`, or `off` to execute in high-speed open-loop mode. Defaults to `true` (closed-loop).
+    -   `closed_loop`: (bool, optional) Compatibility flag. On non-RT backends it still selects the Python closed-loop executor. On EtherCAT RTCore scheduled motion, requests are coerced onto the RTCore queued path instead of reactivating Python-timed closed-loop execution.
 
 #### `MOVE_LINE_RELATIVE`
 -   **Syntax:** `MOVE_LINE_RELATIVE,dx,dy,dz,[speed_multiplier],[closed_loop]`
--   **Description:** Plans and executes a high-precision, closed-loop, straight-line move relative to the robot's current position. The tool's orientation is locked. This command is **non-blocking**.
+-   **Description:** Plans and executes a straight-line move relative to the robot's current position while locking the tool orientation. This command is **non-blocking**.
 -   **Parameters:**
     -   `dx, dy, dz`: (float, required) The relative distance to move in meters.
     -   `speed_multiplier`: (float, optional) A multiplier for the default velocity and acceleration. Defaults to `1.0`.
-    -   `closed_loop`: (bool, optional) Set to `false`, `open`, or `off` to execute in high-speed open-loop mode. Defaults to `true` (closed-loop).
+    -   `closed_loop`: (bool, optional) Compatibility flag. On non-RT backends it still selects the Python closed-loop executor. On EtherCAT RTCore scheduled motion, requests are coerced onto the RTCore queued path instead of reactivating Python-timed closed-loop execution.
 
 #### `RUN_TRAJECTORY`
 -   **Syntax:** `RUN_TRAJECTORY,name,[use_cache]`
@@ -38,6 +38,7 @@ This module contains a `handle_...` function for every high-level action the rob
 -   **Parameters:**
     -   `name`: (string, required) The name of the trajectory to run (must be a key in `trajectories.json`).
     -   `use_cache`: (boolean, optional) If `true`, loads a pre-planned path from the `trajectory_cache` directory. If `false` or omitted, plans the trajectory from scratch.
+-   **Reply behavior:** Returns a structured acknowledgement (ACK) payload immediately after controller acceptance. For multi-step programs, the payload now includes shared program-lifecycle metadata such as `program_state`, `program_terminal_reason`, `program_failing_step_index`, `program_completed_step_count`, `program_completed_loop_count`, and a nested `program` object. This controller-program state is distinct from RTCore segment state.
 
 #### `PLAN_TRAJECTORY_POINTS`
 -   **Syntax:** `PLAN_TRAJECTORY_POINTS,x1,y1,z1[,x2,y2,z2,...]`
@@ -64,21 +65,12 @@ This module contains a `handle_...` function for every high-level action the rob
 -   **Parameters:**
     -   `roll, pitch, yaw` (float, required): Target orientation in degrees, XYZ Euler order.
     -   `duration_s` (float, optional): Desired motion duration in seconds (≥ 0.1 s). Defaults to `1.0` for a gentle re-orientation.
-    -   `closed_loop` (bool, optional): If `true`, executes in 50 Hz closed-loop mode for maximum accuracy; otherwise runs open-loop at 100 Hz (default).
+    -   `closed_loop` (bool, optional): Compatibility flag. On non-RT backends it can still request the Python closed-loop executor. On EtherCAT RTCore scheduled motion, requests are coerced onto the RTCore queued path instead of reactivating Python-timed closed-loop execution.
 -   **Blocking:** Yes — the command returns only after the orientation move has finished.
 
 ##### Effect of `duration_s`
 
-| duration_s | Execution Mode | Frequency | Interpolation Steps | Feel of Motion | Typical Use-Case |
-|------------|----------------|-----------|---------------------|----------------|------------------|
-| **0.25**   | Open-loop      | 1300 Hz   | 325                 | Very brisk     | Small touch-ups, dynamic demos |
-| **0.50**   | Open-loop      | 1300 Hz   | 650                 | Fast           | Quick pick-and-place |
-| **1.00**   | Open-loop      | 1300 Hz   | 1300                | Smooth         | Default, safe around people |
-| **2.00**   | Open-loop      | 1300 Hz   | 2600                | Slow & gentle  | Precision assembly, filming |
-| **0.25**   | Closed-loop    | 400 Hz    | 100                 | Quick, precise | Rapid calibration |
-| **0.50**   | Closed-loop    | 400 Hz    | 200                 | Moderate       | High-accuracy pick-and-place |
-| **1.00**   | Closed-loop    | 400 Hz    | 400                 | Very smooth    | Fine alignment tasks |
-| **2.00**   | Closed-loop    | 400 Hz    | 800                 | Ultra smooth   | Slow-mo camera shots, teaching |
+`duration_s` changes how densely the orientation path is planned and how long the move should take. On EtherCAT RTCore scheduled motion, the resulting queued sample timing is snapped onto RTCore-cycle-aligned intervals instead of using arbitrary off-cycle timestamps.
 
 ##### Command Examples
 
@@ -92,13 +84,14 @@ SET_ORIENTATION,0,30,0,2
 # Very fast (0.25 s, open-loop)
 SET_ORIENTATION,0,30,0,0.25
 
-# Smooth and high-accuracy (1.5 s, closed-loop)
+# Compatibility request for closed-loop semantics. On EtherCAT RTCore scheduled motion
+# this is coerced back onto the RTCore queued path instead of reactivating Python timing.
 SET_ORIENTATION,0,30,0,1.5,true
 ```
 
 #### `JOG_START`
 -   **Syntax:** `JOG_START`
--   **Description:** Enables real-time Cartesian jogging mode. While active, the controller runs a high-frequency loop (100 Hz) that integrates target Cartesian and angular velocities and solves IK each step. This mode can run in parallel with trajectory recording and telemetry.
+-   **Description:** Enables real-time Cartesian jogging mode. On EtherCAT RTCore, the controller now uses its current Cartesian/IK bridge only to derive joint-velocity intent, then sends dedicated RTCore jog commands so the final timed execution and stale-command timeout live in RTCore. On non-RT backends, the existing controller-owned jog loop remains in place. This mode can run in parallel with trajectory recording and telemetry.
     -   Backend safety: Linear and angular jog rates are capped server-side; IK solutions are clamped to `LOGICAL_JOINT_LIMITS_RAD` before commanding.
 
 #### `SET_JOG_VELOCITY`
@@ -107,11 +100,11 @@ SET_ORIENTATION,0,30,0,1.5,true
 -   **Parameters:**
     -   `vx, vy, vz` (float, required): Linear velocities in meters/second (base frame).
     -   `v_roll, v_pitch, v_yaw` (float, required): Angular rates in degrees/second (XYZ intrinsic order).
--   Notes: If no `SET_JOG_VELOCITY` is received for 0.2 s, velocities are auto-zeroed for safety.
+-   Notes: If no `SET_JOG_VELOCITY` is received for the jog timeout window, the controller forces zero intent locally and EtherCAT RTCore jog also times out in RT for a controlled stop instead of lingering on the last non-zero command.
 
 #### `JOG_STOP`
 -   **Syntax:** `JOG_STOP`
--   **Description:** Disables jogging mode and sends a brake command (speed=0) to safely stop motion.
+-   **Description:** Disables jogging mode. On EtherCAT RTCore this sends an explicit RTCore jog-stop command; on non-RT backends it falls back to the previous direct stop behavior.
 
 #### `SET_GRIPPER_JOG_VELOCITY`
 -   **Syntax:** `SET_GRIPPER_JOG_VELOCITY,rate_deg_s`
@@ -132,8 +125,18 @@ SET_ORIENTATION,0,30,0,1.5,true
 -   **Description:** Immediately and safely halts any running motion (`MOVE_LINE`, `RUN_TRAJECTORY`, etc.). This is the highest priority command.
 
 #### `WAIT_FOR_IDLE`
--   **Syntax:** `WAIT_FOR_IDLE`
--   **Description:** This is a **blocking** command that does nothing until the currently running move or trajectory has finished. It is used for sequencing moves in client-side scripts.
+-   **Syntax:** `WAIT_FOR_IDLE[,timeout_s]`
+-   **Description:** This is a **blocking** compatibility helper used for sequencing moves in client-side scripts. Instead of only joining one controller thread, it polls the composite motion execution state until controller-managed motion and RTCore-backed queued execution are both quiescent.
+-   **Parameters:**
+    -   `timeout_s`: (float, optional) Maximum time to wait before returning a `timeout` result. Defaults to `30.0`.
+-   **Reply behavior:** Returns a structured acknowledgement (ACK) payload with an explicit terminal `state` such as `completed`, `idle`, `aborted`, `faulted`, `underrun`, or `timeout`, plus wait metadata like `waited_for_motion` and `wait_timeout_s`. If the waited motion was a multi-step program, the same shared `program` / `program_*` metadata remains available so callers can see whether the terminal outcome came from operator abort, planner failure, RTCore fault, or normal completion.
+
+#### `GET_MOTION_STATUS`
+-   **Syntax:** `GET_MOTION_STATUS`
+-   **Description:** Returns the controller's composite motion-execution snapshot. This includes RTCore queued/active segment state when present and, for multi-step recorded programs, a shared controller-program contract that persists terminal truth after the worker thread exits.
+-   **Reply behavior:** The payload includes top-level motion fields such as `state`, `completion_scope`, `trajectory_id`, and `source_of_truth`, plus:
+    -   `execution`: low-level RTCore/controller execution detail (`state_name`, `active_traj_id`, `queue_depth`, etc.)
+    -   `program` and mirrored `program_*` fields: controller-program lifecycle detail (`program_state`, `program_terminal_reason`, `program_failing_step_index`, `program_completed_step_count`, `program_completed_loop_count`, active step/type, and loop iteration)
 
 #### `GET_POSITION`
 -   **Syntax:** `GET_POSITION`

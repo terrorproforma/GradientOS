@@ -60,11 +60,15 @@ _MSG_CMD_AXIS_ENABLE = 0x0102
 _MSG_CMD_AXIS_DISABLE = 0x0103
 _MSG_CMD_FAULT_RESET = 0x0104
 _MSG_CMD_SET_MODE = 0x0106
+_MSG_CMD_TRAJECTORY_BEGIN = 0x0120
+_MSG_CMD_TRAJECTORY_POINT = 0x0121
+_MSG_CMD_TRAJECTORY_COMMIT = 0x0122
 
 _MSG_STATUS_SNAPSHOT = 0x0202
 _MSG_STATUS_AXIS_CONFIG = 0x0203
 
 _MODE_CSP = 8
+_TRAJ_POINTF_LAST_POINT = 1 << 1
 
 # ABI structs
 _HELLO_STRUCT = struct.Struct("<IHHIIQ4Q")  # 56 bytes
@@ -78,6 +82,9 @@ _CMD_ARM_STRUCT = struct.Struct("<II")
 _CMD_AXIS_MASK_STRUCT = struct.Struct("<II")
 _CMD_FAULT_RESET_STRUCT = struct.Struct("<II")
 _CMD_SET_MODE_STRUCT = struct.Struct("<II")
+_CMD_TRAJECTORY_BEGIN_STRUCT = struct.Struct("<QIIII")
+_TRAJECTORY_POINT_STRUCT = struct.Struct("<QIIQ16d16dII")
+_CMD_TRAJECTORY_CONTROL_STRUCT = struct.Struct("<QII")
 
 # StatusSnapshotV1: 40-byte header + 16*AxisStatusV1 (28 bytes each) = 488 bytes.
 _AXIS_STATUS_STRUCT = struct.Struct("<i h H H B B H 2x I I I")  # 28 bytes
@@ -172,7 +179,7 @@ class RTCoreClient:
         self._status_eventfd: Optional[int] = None
 
         self._cmd_seq = 1
-        self._setpoint_seq = 0
+        self._next_traj_id = 1
 
         self.welcome: Optional[_Welcome] = None
         self.axis_config: Optional[AxisConfig] = None
@@ -400,32 +407,35 @@ class RTCoreClient:
         self._cmd_ring_write(_MSG_CMD_FAULT_RESET, _CMD_FAULT_RESET_STRUCT.pack(int(axis_mask), 0))
 
     def write_setpoint(self, q: list[float], axis_mask: int) -> None:
-        assert self._cmd_shm is not None
-        assert self._cmd_hdr is not None
-        if self._cmd_hdr.setpoint_offset == 0:
-            raise RuntimeError("RTCore did not provide a setpoint slot")
-
-        slot_off = self._cmd_hdr.setpoint_offset
-        target_time_ns = _now_ns() + int(self._cmd_hdr.cycle_ns)
-
-        # Write payload (excluding seq) first.
-        self._cmd_shm[slot_off + 8 : slot_off + 16] = struct.pack("<Q", target_time_ns)
+        traj_id = int(self._next_traj_id)
+        self._next_traj_id += 1
 
         qq = [0.0] * _MAX_AXES
         for i, v in enumerate(q[:_MAX_AXES]):
             qq[i] = float(v)
-        self._cmd_shm[slot_off + 16 : slot_off + 16 + 16 * 8] = struct.pack("<16d", *qq)
+        qd = [0.0] * _MAX_AXES
 
-        self._cmd_shm[slot_off + 16 + 16 * 8 : slot_off + 16 + 16 * 8 + 4] = struct.pack("<I", int(axis_mask))
-        self._cmd_shm[slot_off + 16 + 16 * 8 + 4 : slot_off + 16 + 16 * 8 + 8] = struct.pack("<I", 0)
-
-        # Publish seq last.
-        self._setpoint_seq += 1
-        self._cmd_shm[slot_off : slot_off + 8] = struct.pack("<Q", self._setpoint_seq)
-
-        # Wake helper thread.
-        if self._cmd_eventfd is not None:
-            os.write(self._cmd_eventfd, struct.pack("<Q", 1))
+        self._cmd_ring_write(
+            _MSG_CMD_TRAJECTORY_BEGIN,
+            _CMD_TRAJECTORY_BEGIN_STRUCT.pack(int(traj_id), int(axis_mask), 0, 1, 0),
+        )
+        self._cmd_ring_write(
+            _MSG_CMD_TRAJECTORY_POINT,
+            _TRAJECTORY_POINT_STRUCT.pack(
+                int(traj_id),
+                0,
+                _TRAJ_POINTF_LAST_POINT,
+                0,
+                *qq,
+                *qd,
+                int(axis_mask),
+                0,
+            ),
+        )
+        self._cmd_ring_write(
+            _MSG_CMD_TRAJECTORY_COMMIT,
+            _CMD_TRAJECTORY_CONTROL_STRUCT.pack(int(traj_id), 0, 0),
+        )
 
     def read_status_snapshot(self, timeout_s: float = 0.5) -> Optional[StatusSnapshot]:
         if self._status_eventfd is None or self._status_shm is None or self._status_hdr is None:

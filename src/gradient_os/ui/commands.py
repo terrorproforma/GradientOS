@@ -1,4 +1,4 @@
-def move_line(x, y, z, v=None, a=None, closed=True):
+def move_line(x, y, z, v=None, a=None, closed=False):
     parts = [str(x), str(y), str(z)]
     if v is not None:
         parts.append(str(v))
@@ -9,7 +9,7 @@ def move_line(x, y, z, v=None, a=None, closed=True):
     return "MOVE_LINE," + ",".join(parts)
 
 
-def move_line_relative(dx, dy, dz, speed=None, closed=True):
+def move_line_relative(dx, dy, dz, speed=None, closed=False):
     parts = [str(dx), str(dy), str(dz)]
     if speed is not None:
         parts.append(str(speed))

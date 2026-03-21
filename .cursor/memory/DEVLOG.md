@@ -2867,3 +2867,654 @@
     - no diagnostics
 - Follow-up notes / risks:
   - Custom values are normalized to absolute magnitude and direction still comes from the `-` / `+` jog buttons, which keeps the row-level behavior consistent.
+
+## 2026-03-21 00:39 +0000
+
+- Task summary:
+  - Raised the default `/monitor` controller telemetry cadence and flipped the default Cartesian move-line path to open-loop for the next lag/performance comparison pass.
+- What was observed:
+  - `TelemetryHub` in `src/gradient_os/api/main.py` still started controller telemetry with a hard-coded `START_TELEMETRY,...,10`.
+  - `web-ui/src/ControlPanel.tsx` still explicitly posted `closed: true` for incremental Cartesian jogs, which would have masked a backend-only default change.
+- Changes:
+  - Updated `src/gradient_os/api/main.py`:
+    - added `_DEFAULT_MONITOR_TELEMETRY_HZ = 50` and `_DEFAULT_MOVE_LINE_CLOSED_LOOP = False`
+    - added `_read_int_env(...)` and now read `GRADIENT_MONITOR_TELEMETRY_HZ` for `/monitor`
+    - changed move-line / preview closed-loop defaults to open-loop unless callers explicitly opt in
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - `handle_move_profiled(...)`, `handle_move_line(...)`, and `handle_move_line_relative(...)` now default to open-loop
+    - adjusted move-profiled docstrings to match the executor behavior
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - incremental Cartesian jog requests now send `closed: false`
+  - Updated `src/gradient_os/ui/pages/real_control_page.py`:
+    - the `Closed-loop control` checkbox now starts unchecked
+  - Updated `src/gradient_os/ui/commands.py` and `docs/README.md` to match the new default behavior
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/api/main.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py" "/home/pi/GradientOS/src/gradient_os/ui/pages/real_control_page.py" "/home/pi/GradientOS/src/gradient_os/ui/commands.py"`
+    - passed
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did not run a live robot motion comparison in this pass, so the runtime improvement still needs on-hardware verification.
+  - If `50 Hz` monitor telemetry is still too laggy or too heavy, adjust `GRADIENT_MONITOR_TELEMETRY_HZ` instead of editing another hard-coded value.
+
+## 2026-03-21 01:36 +0000
+
+- Task summary:
+  - Aligned the roll/pitch/yaw step and realtime jog rotation semantics to address the new orientation-only synchronization issue.
+- What was observed:
+  - `/control/rotate` in `src/gradient_os/api/main.py` was not using the controller's relative `ROTATE` path; it did `GET_POSITION`, edited absolute Euler angles, then sent `SET_ORIENTATION`.
+  - Realtime jog in `src/gradient_os/arm_controller/command_api.py` integrated `v_roll/v_pitch/v_yaw` as a raw rotation vector, which differs from the labeled roll/pitch/yaw step semantics when angular axes combine.
+- Changes:
+  - Updated `src/gradient_os/api/main.py`:
+    - `/control/rotate` now forwards `ROTATE,<axis>,<angle_deg>` directly to the controller
+    - removed the API-side `GET_POSITION` + absolute Euler reconstruction for relative rotate requests
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - realtime jog orientation integration now uses `R.from_euler('xyz', angular_deg_s * dt, degrees=True)`
+    - kept the same pre-multiply application so realtime jog matches `handle_rotate_command()` base-frame rotation semantics
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/api/main.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py"`
+    - passed
+  - `ReadLints` on the edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I still have not run on-hardware orientation tests in this pass, so the fix is code-validated but not motion-validated yet.
+  - If orientation step buttons still feel stacky after this, the next thing to inspect is request pacing / completion gating for repeated rotate taps, not Euler math.
+
+## 2026-03-21 01:58 +0000
+
+- Task summary:
+  - Reworked controller-side orientation execution so rotate/set-orientation/jog all start from live hardware state instead of a stale cached joint snapshot.
+- What was observed:
+  - The Cartesian path that felt correct already started from `servo_driver.get_current_arm_state_rad(...)` and used a profiled executor.
+  - `handle_rotate_command()` still used cached `utils.current_logical_joint_angles_rad` plus a one-shot `servo_driver.set_servo_positions(...)`, which is a materially different execution model from the Cartesian path.
+  - Realtime jog only resynced `q_current` from hardware after a pause; otherwise it kept integrating from the last commanded posture.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added `_get_live_pose_snapshot()` to read physical joint state and FK pose for orientation moves
+    - added `_execute_orientation_path()` to centralize SLERP + batched IK + executor-thread execution for orientation-only motions
+    - changed `handle_rotate_command()` to use live feedback and a short smooth open-loop orientation path instead of one-shot direct servo commands
+    - changed `handle_set_orientation_command()` to use the same live-state helper path
+    - changed realtime jog to refresh `q_current` from `get_current_arm_state_rad(verbose=False)` every loop before FK/IK
+    - fixed the orientation verification calculation to use the full rotation-vector norm
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py"`
+    - passed
+  - `ReadLints` on `src/gradient_os/arm_controller/command_api.py`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I still have not run live motion tests in this pass, so this is controller-code validation rather than robot validation.
+  - If repeated rotate taps still queue in a way that feels wrong, the next pass should add explicit UI-side in-flight gating or command-level completion acknowledgement for rotation steps.
+
+## 2026-03-21 02:11 +0000
+
+- Task summary:
+  - Investigated whether RTCore runtime clamping could explain the now-worse motion feel and traced the exact Python -> RTCore -> EtherCAT data path.
+- What was observed:
+  - The installed unit `/etc/systemd/system/gradient-rt-motion.service` does not pass `--max-rpm`.
+  - `/etc/default/gradient-rt-motion` currently contains axis scaling and drive-profile env only; there is no max-rpm override.
+  - The active process command line is:
+    - `/usr/local/bin/gradient-rt-motion --num-axes 6 --counts-per-rev ... --gear-ratio ... --sign ... --drive-profile a6ec_ds402`
+  - Because `src/gradient_rt_motion/main.cpp` defaults `Options::max_rpm = 100.0`, the live service is currently running with the binary default 100 RPM cap.
+  - RTCore applies that cap globally by:
+    - deriving `max_step_counts_per_cycle` and `max_profile_vel_counts_per_s` from `max_rpm`
+    - rate-limiting `hold_target_counts` toward each desired target in the 1 kHz cyclic loop
+    - writing `0x607F` max profile velocity alongside `0x607A` target position
+- Validation:
+  - `systemctl show gradient-rt-motion.service -p ExecStart -p EnvironmentFiles -p FragmentPath`
+  - `ps -p 1739 -o pid=,args=`
+  - inspected `/etc/default/gradient-rt-motion`
+  - inspected `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`, `src/gradient_os/arm_controller/servo_driver.py`, and `src/gradient_rt_motion/main.cpp`
+- Follow-up notes / risks:
+  - Any motion routed through the EtherCAT RTCore backend is currently subject to the same 100 RPM runtime clamp unless the service startup path is changed.
+  - If commissioning and normal-operation limits should differ, the next clean change is to add an explicit RTCore max-rpm runtime setting and plumb it through the systemd env/service path rather than relying on the binary default.
+
+## 2026-03-21 02:49 +0000
+
+- Task summary:
+  - Added a bounded joint-space path for `home` / `rest` so those buttons stay gentle even when the global RTCore max-RPM ceiling is raised for normal motion.
+- What was observed:
+  - `home` and `rest` did not use Cartesian planning or the speed multiplier path; they sent raw joint targets directly from `src/gradient_os/api/main.py`.
+  - For the EtherCAT RTCore backend, the legacy direct-setpoint `speed` / `acceleration` fields do not provide a live per-command RT speed cap.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - extended `handle_apply_joint_setpoint(...)` with optional `max_motor_rpm`
+    - when provided, it now reads live joint feedback, computes a per-joint safe duration from active robot gear ratios, builds a smooth joint-space path, and starts the open-loop executor thread instead of issuing a raw direct setpoint
+  - Updated `src/gradient_os/run_controller.py`:
+    - `APPLY_JOINT_SETPOINT` now parses optional `max_motor_rpm` from the payload
+  - Updated `src/gradient_os/api/main.py`:
+    - `/control/home` and `/control/rest` now use `APPLY_JOINT_SETPOINT` with `max_motor_rpm=100.0`
+    - these endpoints now report `completion_scope: trajectory_thread_ack`
+  - Updated tests:
+    - `tests/test_api_endpoints.py`
+    - `tests/test_command_api_direct_setpoint.py`
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/api/main.py" "/home/pi/GradientOS/src/gradient_os/run_controller.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py"`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_rtcore_runtime.py tests/test_speed_multiplier_scaling.py`
+    - passed (`46 passed`)
+- Follow-up notes / risks:
+  - This implements a safe `100 RPM`-equivalent home/rest path at the planner layer; it does not add a true live per-command RTCore clamp register.
+  - The Cartesian speed multiplier behavior is unchanged: it still scales planned velocity linearly and acceleration quadratically before execution.
+
+## 2026-03-21 03:06 +0000
+
+- Task summary:
+  - Investigated the new “jerky realtime / slow Cartesian / overly fast RPY” behavior under live `--max-rpm 6000` and tightened the Python-side motion paths that had been masked by the old RTCore clamp.
+- What was observed:
+  - Terminal `1.txt` confirmed RTCore was live with `--max-rpm 6000`.
+  - The same terminal showed very heavy `/info/joints` traffic (`489` `GET_JOINT_ANGLES` lines), indicating that the fast UI poll loop could overlap requests and contend with motion timing.
+  - The asymmetry matched code structure:
+    - realtime jog still ran at `25 Hz`
+    - RPY step moves ignored the speed multiplier and used a short duration heuristic
+    - Cartesian step moves still used planner velocity/acceleration scaling, so they remained comparatively smooth and conservative
+- Changes:
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added an in-flight guard so `/info/joints` polling no longer overlaps requests
+    - skip poll ticks when the document is hidden
+    - RPY step buttons now send `duration_s` derived from `abs(angle_deg) / effectiveAngularDegS`
+  - Updated `src/gradient_os/api/main.py`:
+    - `/control/rotate` now accepts optional `duration_s`
+  - Updated `src/gradient_os/run_controller.py`:
+    - `ROTATE` now accepts optional `duration_s`
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - `handle_rotate_command()` now accepts optional `duration_s`
+    - increased `JOG_CONTROL_FREQUENCY_HZ` from `25` to `50`
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/api/main.py" "/home/pi/GradientOS/src/gradient_os/run_controller.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py"`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_rtcore_runtime.py tests/test_speed_multiplier_scaling.py`
+    - passed (`46 passed`)
+  - `npm run build` in `web-ui/`
+    - passed
+- Follow-up notes / risks:
+  - This does not yet add a true per-command RTCore clamp field; it improves the Python-side motion cadence and UI pacing exposed by the higher runtime cap.
+  - Any retest still needs the controller/API restart to pick up the new jog/rotate behavior, and RTCore restart if you want a different global `rt_max_rpm` live value.
+
+## 2026-03-21 04:40 +0000
+
+- Task summary:
+  - Started the RTCore-owned motion redesign by landing the shared contract/docs layer plus a real RTCore execution-state status message, while keeping the legacy latest-wins setpoint path intact.
+- What changed:
+  - Added `docs/rtcore_owned_motion_contract.md` and linked the boundary summary from `src/gradient_os/arm_controller/ARCHITECTURE.md`.
+  - Extended `src/gradient_rt_motion/ipc_v1.hpp` with:
+    - motion mode / execution state / capability enums
+    - `StatusMotionStateV1`
+    - future trajectory/jog command payload structs (`CmdTrajectoryBeginV1`, `TrajectoryPointV1`, `CmdTrajectoryControlV1`, `CmdJogV1`)
+    - new message ids/events for trajectory/jog lifecycle
+  - Updated `src/gradient_rt_motion/main.cpp` so the helper thread now emits `MSG_STATUS_MOTION_STATE` snapshots that describe:
+    - active mode (`idle` vs `legacy_setpoint`)
+    - execution state (`idle`, `executing`, `completed`, `faulted`)
+    - stale-command flag
+    - motion-done flag
+    - active command sequence
+  - Updated Python RTCore helpers:
+    - `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py` now exposes motion mode / execution state name mappings
+    - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` now parses `MSG_STATUS_MOTION_STATE` into `RTCoreExecutionStatus` and exposes `get_execution_status()`
+  - Added focused tests in:
+    - `tests/test_rtcore_runtime.py`
+    - `tests/test_gradient05_limits_and_backends.py`
+- Validation:
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py -k "rtcore_motion_state_name_maps_round_trip or rtcore_drive_profile_ids_round_trip or build_rtcore_axis_scaling_uses_robot_config_values or render_rtcore_systemd_env_contains_scaling_and_profile or execution_status_defaults_idle or parses_motion_state_status"`
+    - passed (`6 passed, 18 deselected`)
+  - `cmake -S . -B build && cmake --build build` in `src/gradient_rt_motion`
+    - passed
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - Buffered trajectory upload/commit/replay is still contract-only in this pass; RTCore execution is still physically driven by the legacy setpoint slot.
+  - A broader `pytest` run against `tests/test_gradient05_limits_and_backends.py` still has unrelated baseline failures around current J5 gear-ratio/sign expectations; I did not change those assertions in this pass.
+
+## 2026-03-21 04:57 +0000
+
+- Task summary:
+  - Continued the RTCore motion redesign into a queue-only execution slice and updated the plan file to reflect the new "no legacy fallback" direction.
+- What changed:
+  - Updated `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`:
+    - marked contract / IPC / RTCore queue / Python backend phases as completed
+    - marked planned-move migration as in progress
+    - recorded the new rule that RTCore motion must not fall back to the latest-wins slot
+  - Updated `src/gradient_rt_motion/main.cpp`:
+    - removed command shared-memory allocation/use of the latest-wins setpoint slot (`setpoint_offset=0`)
+    - added queued trajectory upload handling in the helper thread for `TRAJECTORY_BEGIN`, `TRAJECTORY_POINT`, `TRAJECTORY_COMMIT`, and `TRAJECTORY_ABORT`
+    - added RT-loop trajectory sampling/interpolation and trajectory-derived motion-state publication
+    - `MSG_STATUS_MOTION_STATE` now reports queue-only trajectory execution state instead of legacy-slot state
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - added `begin_trajectory(...)`, `enqueue_trajectory_points(...)`, `commit_trajectory(...)`, `abort_trajectory(...)`, `execute_joint_trajectory(...)`, and `wait_for_trajectory_complete(...)`
+    - changed `set_joint_positions(...)` and `set_single_actuator_position(...)` to emit one-point queued trajectories
+    - disabled `_write_setpoint(...)` with a fail-closed runtime error
+    - `prepare_sync_write_commands(...)` / `sync_write(...)` now wrap trajectory-point execution rather than the old slot
+  - Updated `src/gradient_os/arm_controller/trajectory_execution.py`:
+    - the open-loop EtherCAT RTCore path now offloads the full joint path to RTCore instead of sleeping and streaming samples from Python
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - `STOP` now requests RTCore trajectory abort when available
+    - `WAIT_FOR_IDLE` now also waits on RTCore execution state, not just Python threads
+  - Updated `scripts/rtcore_jog.py`:
+    - the CLI's old `write_setpoint(...)` helper now emits a one-point queued trajectory so tooling matches the queue-only runtime contract
+  - Updated tests:
+    - `tests/test_gradient05_limits_and_backends.py`
+    - `tests/test_trajectory_execution_backends.py`
+- Validation:
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py tests/test_trajectory_execution_backends.py -k "applies_master_offsets_to_setpoints or execution_status_defaults_idle or parses_motion_state_status or rtcore_motion_state_name_maps_round_trip or open_loop_executor_offloads_rtcore_trajectory_backend or open_loop_executor_uses_backend_precomputed_commands or closed_loop_executor_uses_backend_joint_space"`
+    - passed (`7 passed, 20 deselected`)
+  - `cmake -S . -B build && cmake --build build` in `src/gradient_rt_motion`
+    - passed
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - RTCore motion is now queue-only, but the current queue implementation is still a whole-trajectory upload/commit model; streaming refill / underrun recovery and dedicated jog mode remain future work.
+  - Broad hardware/backend pytest still includes unrelated baseline failures around the current `gradient05` J5 ratio/sign expectations; those failures were not introduced by this pass.
+
+## 2026-03-21 05:21 +0000
+
+- Task summary:
+  - Wired the first RTCore-backed completion-status slice through the controller, FastAPI, and the ControlPanel so acceptance and execution state are no longer exposed only as legacy ack strings.
+- What changed:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - track the last submitted RTCore trajectory id so higher layers can report accepted commands before RTCore status snapshots catch up
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added structured motion-status helpers that summarize controller thread state plus RTCore execution status
+    - `handle_move_profiled()`, `handle_move_line()`, `handle_move_line_relative()`, `handle_run_trajectory()`, `handle_apply_joint_setpoint()`, and `handle_wait_for_idle()` now return execution metadata instead of only implicit side effects
+  - Updated `src/gradient_os/run_controller.py`:
+    - added structured command ACK payloads (`ACK,<COMMAND>,<payload_b64>`)
+    - added `GET_MOTION_STATUS` UDP command
+    - move/apply/wait/stop/trajectory-run replies now include motion metadata
+  - Updated `src/gradient_os/api/main.py`:
+    - added controller ACK/base64 payload decoding helpers
+    - added `/control/motion-status`
+    - `/control/stop`, `/control/wait-for-idle`, `/control/home`, `/control/rest`, `/control/joint-jog`, `/control/move-line-relative`, and `/trajectory/run` now surface `state`, `completion_scope`, `trajectory_id`, and nested execution metadata when available
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added motion-status polling
+    - added a visible motion-state summary panel
+    - disable commissioning jog and home/rest actions while motion is active
+    - updated joint commissioning messages to mention RTCore trajectory/state information
+  - Updated tests:
+    - `tests/test_api_endpoints.py`
+    - `tests/test_command_api_direct_setpoint.py`
+  - Updated planning/docs/memory:
+    - `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`
+    - `.cursor/memory/AGENT_SCRATCHPAD.md`
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py" "/home/pi/GradientOS/src/gradient_os/run_controller.py" "/home/pi/GradientOS/src/gradient_os/api/main.py" "/home/pi/GradientOS/tests/test_api_endpoints.py" "/home/pi/GradientOS/tests/test_command_api_direct_setpoint.py"`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py`
+    - passed (`40 passed`)
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - `ControlPanel` now consumes RTCore-backed motion status, but other UI surfaces such as the trajectory drawer in `web-ui/src/App.tsx` still do not present the same execution metadata directly.
+  - Orientation commands still use older controller-side execution behavior; their API endpoints were not converted to structured completion metadata in this pass.
+
+## 2026-03-21 05:41 +0000
+
+- Task summary:
+  - Refreshed the RTCore redesign plan so it reflects the actual post-queue / post-motion-status state and explicitly tracks the remaining "no legacy RTCore pathways" cleanup work for a fresh handoff.
+- What changed:
+  - Updated `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`:
+    - refreshed the top-level overview to match the current redesign stage
+    - marked `retire-legacy-rtcore-paths` as an explicit in-progress workstream
+    - replaced the stale pre-redesign "Validated Current Context" with a current-state summary
+    - expanded Phase 4 / 6 with the remaining orientation / preview / UI completion-status work
+    - added a cross-cutting legacy-retirement section covering stale docs, tests, tooling, and fire-and-forget call sites
+    - extended milestone order with explicit retirement of stale latest-wins assumptions
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the guardrail that the plan's current-state sections must be kept in sync after each major redesign slice.
+- Validation:
+  - repo search only (`rg`) to confirm the remaining work items called out in the refreshed plan:
+    - orientation endpoints still use fire-and-forget calls in `src/gradient_os/api/main.py`
+    - trajectory/program UI still does not surface execution metadata directly in `web-ui/src/App.tsx`
+    - stale latest-wins / setpoint-slot references still exist in docs/planning artifacts and should be retired or clarified as deprecated
+- Follow-up notes / risks:
+  - This pass intentionally updated planning and handoff state, not implementation.
+  - The remaining code work is now clearer in the plan, but those old assumptions are still present until the next implementation pass lands.
+
+## 2026-03-21 05:50 +0000
+
+- Task summary:
+  - Implemented structured orientation motion ACKs and wired the `App.tsx` trajectory/weld UI to RTCore-backed motion status instead of relying only on local run booleans.
+- What changed:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - `_get_live_pose_snapshot()` and `_execute_orientation_path()` now raise on failure instead of silently returning
+    - blocking orientation execution now returns structured motion metadata and surfaces executor-thread failures after join
+    - `handle_rotate_command()` / `handle_set_orientation_command()` now return metadata payloads suitable for controller/API ACKs
+  - Updated `src/gradient_os/run_controller.py`:
+    - `ROTATE` now returns `ACK,ROTATE,<payload_b64>` and sends explicit controller errors on failure
+    - `SET_ORIENTATION` now returns structured ACK payloads too and defaults controller command execution to the open-loop path unless `closed_loop` is explicitly requested
+  - Updated `src/gradient_os/api/main.py`:
+    - `/control/rotate` and `/control/set-orientation` now call the controller with `expect_response=True` and expose structured motion metadata in the HTTP response
+    - `/control/set-orientation` now accepts optional `duration_s` and `closed_loop`
+    - `/trajectory/execute-preview` now returns both the initial `MOVE_LINE` dispatch metadata and the final `WAIT_FOR_IDLE` completion payload instead of fire-and-forget plus a bare `{"status":"ok"}`
+  - Updated `web-ui/src/App.tsx`:
+    - added an app-level motion-status model plus polling of `/control/motion-status`
+    - trajectory and weld/program drawers now show execution state, source/scope, and trajectory id via a shared status card
+    - preview/program run controls stay disabled from motion-status truth, not only while the submit request is in flight
+    - STOP/home/rest handlers now persist returned motion metadata into app state
+  - Updated docs/tests:
+    - `tests/test_api_endpoints.py` now covers rotate/set-orientation structured ACKs and the richer preview-execution response
+    - `docs/README.md` no longer describes web rotate as a `GET_POSITION` + `SET_ORIENTATION` reconstruction path
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py" "/home/pi/GradientOS/src/gradient_os/run_controller.py" "/home/pi/GradientOS/src/gradient_os/api/main.py" "/home/pi/GradientOS/tests/test_api_endpoints.py"`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py`
+    - passed (`42 passed`)
+  - `npm run build` in `web-ui/`
+    - passed
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - `SET_ORIENTATION` is now on the structured ACK path and defaults to open-loop at the controller layer, but dedicated RTCore jog mode and deeper closed-loop semantics are still future work.
+  - The broader stale-reference retirement pass is still incomplete beyond the updated web rotate docs; remaining docs/plans/tooling references should still be audited as called out in the RTCore redesign plan.
+
+## 2026-03-21 06:20 +0000
+
+- Task summary:
+  - Updated the RTCore redesign plan/contract notes to reflect the newly completed orientation/UI status work, then implemented RTCore-cycle-aligned quantization for queued trajectory upload timing.
+- What changed:
+  - Updated `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`:
+    - marked the orientation/UI status slice as completed progress
+    - replaced stale remaining-work bullets with the current closed-loop / `WAIT_FOR_IDLE` / legacy-retirement follow-ups
+    - spelled out `ACK` as `acknowledgement` and documented the new RTCore-aligned frequency rule
+  - Updated `docs/rtcore_owned_motion_contract.md`:
+    - clarified that `legacy_setpoint` is a deprecated compatibility artifact, not a scheduled-motion fallback
+    - added explicit guidance that queued timestamps must be quantized onto integer multiples of the RTCore cycle
+    - explained the role of structured controller acknowledgement (ACK) payloads versus RTCore motion-status truth
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - added helpers to read RTCore cycle time, resolve a requested queued trajectory frequency onto an RTCore-compatible effective rate, and expose the last trajectory timing metadata
+    - changed `execute_joint_trajectory()` to stamp `t_from_start_ns` from the quantized RTCore-aligned step size and size its timeout from the effective queued rate
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - motion-status payloads now include the backend's last queued-trajectory timing metadata when RTCore execution status is available
+  - Updated tests:
+    - `tests/test_gradient05_limits_and_backends.py` now covers frequency quantization and quantized trajectory timestamp generation
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py"`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_gradient05_limits_and_backends.py -k "quantizes_trajectory_frequency_to_rtcore_cycle or execute_joint_trajectory_uses_quantized_timing"`
+    - passed (`2 passed`)
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py`
+    - passed (`42 passed`)
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - Quantized timing is now clean for RTCore queued uploads, but higher-level closed-loop EtherCAT paths still need an explicit policy on whether they remain Python-owned or should be prevented from presenting RTCore-owned completion semantics.
+  - The broader legacy-retirement pass is still pending for older planning/docs artifacts such as `RTOS-ETHERCAT-PLAN/RTOS-ETHERCAT-plan.md`.
+
+## 2026-03-21 06:27 +0000
+
+- Task summary:
+  - Continued the RTCore redesign with the explicit policy that scheduled EtherCAT motion should stay RTCore-owned, even if compatibility callers still ask for Python closed-loop execution.
+- What changed:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added a scheduled-motion execution-policy resolver that prefers RTCore queued execution whenever RTCore motion support is available
+    - `MOVE_LINE`, `MOVE_LINE_RELATIVE`, and `SET_ORIENTATION` now report both requested and effective closed-loop policy in their motion metadata
+    - scheduled EtherCAT requests that still pass `closed_loop=true` are now coerced back onto the RTCore queued path instead of reactivating the Python-timed closed-loop executor
+  - Updated docs/planning:
+    - `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`
+    - `docs/rtcore_owned_motion_contract.md`
+    - `docs/command_api.md`
+    - `docs/README.md`
+    - the above now describe the closed-loop compatibility flag as non-authoritative for scheduled EtherCAT RTCore motion and spell out the RTCore-owned policy more clearly
+  - Updated tests:
+    - `tests/test_command_api_direct_setpoint.py` now covers coercion of scheduled `MOVE_LINE` and `SET_ORIENTATION` requests onto the RTCore queued path
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py" "/home/pi/GradientOS/tests/test_command_api_direct_setpoint.py"`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_command_api_direct_setpoint.py`
+    - passed (`4 passed`)
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_api_endpoints.py`
+    - passed (`40 passed`)
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - Scheduled EtherCAT motion now stays on the RTCore queued path, but `RUN_TRAJECTORY` / multi-step program execution still needs richer semantics so controller-program-thread acceptance and RTCore segment execution are not conflated.
+  - RTCore jog mode is still pending; realtime jog remains the largest remaining motion path that is still intentionally Python-driven.
+
+## 2026-03-21 06:56 +0000
+
+- Task summary:
+  - Refreshed the RTCore redesign plan/todos and implemented the next program-status slice so `RUN_TRAJECTORY` better distinguishes controller-managed program execution from RTCore-owned scheduled move segments, while explicitly preserving non-EtherCAT backend behavior.
+- What changed:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - `get_motion_execution_status()` now distinguishes controller-program-thread scope from RTCore segment scope when a multi-step program is active
+    - motion metadata now includes active program fields such as program name, loop mode, step counts, current step, and whether move segments are expected to run through RTCore queued execution
+    - `handle_run_trajectory()` now annotates acknowledgements with program-segment execution policy rather than only reporting a generic controller thread launch
+  - Updated `src/gradient_os/arm_controller/trajectory_execution.py`:
+    - the trajectory executor thread now publishes current program step index/type and loop iteration while a program is running
+    - active program metadata is cleared on executor shutdown
+  - Updated planning:
+    - `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`
+    - added explicit completed todos for RTCore timing quantization and scheduled-motion ownership
+    - added a new in-progress todo for program-status semantics and refreshed the current-state notes
+  - Updated tests:
+    - `tests/test_command_api_direct_setpoint.py` now proves non-RT backends still preserve `closed_loop` execution for `MOVE_LINE` and `SET_ORIENTATION`
+    - `tests/test_api_endpoints.py` now locks the richer `RUN_TRAJECTORY` acknowledgement payload fields
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/trajectory_execution.py" "/home/pi/GradientOS/tests/test_command_api_direct_setpoint.py" "/home/pi/GradientOS/tests/test_api_endpoints.py"`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py`
+    - passed (`46 passed`)
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - `RUN_TRAJECTORY` metadata is clearer now, but `WAIT_FOR_IDLE` still needs a final decision so program pauses, RTCore segment completion, and compatibility polling semantics line up cleanly.
+  - RTCore jog mode is still pending; realtime jog remains the largest remaining motion path that is still intentionally Python-driven.
+
+## 2026-03-21 07:18 +0000
+
+- Task summary:
+  - Completed the `WAIT_FOR_IDLE` semantics cleanup so the compatibility wait path now follows the same composite execution-state contract used by controller/API/UI motion status.
+- What changed:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - `handle_wait_for_idle()` now polls `get_motion_execution_status()` instead of blindly joining a thread or checking RTCore in isolation
+    - wait replies now normalize terminal outcomes (`completed`, `idle`, `timeout`, etc.) and include explicit wait metadata such as `waited_for_motion`, `wait_timeout_s`, and `wait_timed_out`
+  - Updated `src/gradient_os/run_controller.py`:
+    - `WAIT_FOR_IDLE` now accepts an optional timeout argument and returns clearer `BAD_ARGS` / wait-failure responses
+  - Updated `src/gradient_os/api/main.py`:
+    - `/control/wait-for-idle` now accepts an optional JSON `timeout_s` override and maps it to the controller command with a matching transport timeout
+  - Updated tests:
+    - `tests/test_command_api_direct_setpoint.py` now covers both successful composite wait completion and timeout behavior
+    - `tests/test_api_endpoints.py` now covers the timeout override for `/control/wait-for-idle`
+  - Updated docs/planning:
+    - `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`
+    - `docs/command_api.md`
+    - `docs/README.md`
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py" "/home/pi/GradientOS/src/gradient_os/run_controller.py" "/home/pi/GradientOS/src/gradient_os/api/main.py" "/home/pi/GradientOS/tests/test_command_api_direct_setpoint.py" "/home/pi/GradientOS/tests/test_api_endpoints.py"`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py`
+    - passed (`49 passed`)
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - `WAIT_FOR_IDLE` is now status-aware, but richer program-level terminal semantics are still incomplete for multi-step trajectories that mix pauses, looping, and multiple RTCore segments.
+  - RTCore jog mode is still pending; realtime jog remains the largest remaining motion path that is still intentionally Python-driven.
+
+## 2026-03-21 08:02 +0000
+
+- Task summary:
+  - Implemented the first RTCore realtime-jog slice so EtherCAT jog no longer streams direct servo position writes from Python; RTCore now owns the final timed jog command execution and stale-command timeout behavior.
+- What changed:
+  - Updated `src/gradient_rt_motion/ipc_v1.hpp`:
+    - added explicit jog flag constants for `MSG_CMD_JOG`
+  - Updated `src/gradient_rt_motion/main.cpp`:
+    - added RTCore-side storage for latest jog command state
+    - helper thread now accepts `MSG_CMD_JOG`
+    - RT loop now integrates jog velocity intent into RT-owned target counts, publishes `MOTION_MODE_JOG`, and marks stale jog timeout via RTCore motion status
+    - RTCore capability flags now advertise jog command support
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - added RTCore jog command packing helpers and backend methods for start/send/stop realtime jog
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - realtime jog now uses the RTCore backend when available, sending joint-velocity jog commands instead of direct `set_servo_positions(...)`
+    - non-RT backends still use the existing controller-owned jog loop
+    - RTCore jog stop now avoids injecting a one-point queued position command as a fake brake path
+  - Updated docs/planning:
+    - `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`
+    - `docs/rtcore_owned_motion_contract.md`
+    - `docs/command_api.md`
+    - `docs/README.md`
+    - plan Phase 5 is now `in_progress` rather than `pending`
+  - Updated tests:
+    - `tests/test_gradient05_limits_and_backends.py` now covers RTCore jog command packing / stop semantics
+    - `tests/test_command_api_direct_setpoint.py` now covers controller-side RT jog routing
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py" "/home/pi/GradientOS/tests/test_command_api_direct_setpoint.py" "/home/pi/GradientOS/tests/test_gradient05_limits_and_backends.py" "/home/pi/GradientOS/tests/test_realtime_jog_backend_compatibility.py"`
+    - passed
+  - `cmake -S "/home/pi/GradientOS/src/gradient_rt_motion" -B "/tmp/gradient_rt_motion_build" && cmake --build "/tmp/gradient_rt_motion_build" -j2`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_command_api_direct_setpoint.py tests/test_realtime_jog_backend_compatibility.py tests/test_gradient05_limits_and_backends.py -k "realtime_jog or stop_realtime_jog or sends_realtime_jog_command or handle_move_line_forces_rtcore_path_when_closed_loop_requested or handle_set_orientation_forces_rtcore_path_when_closed_loop_requested or handle_move_line_preserves_closed_loop_on_non_rtcore_backend or handle_set_orientation_preserves_closed_loop_on_non_rtcore_backend or wait_for_idle"`
+    - passed (`11 passed`)
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - EtherCAT jog timing/timeout is now RT-owned, but Cartesian-to-joint conversion still lives in Python; a future Jacobian/differential-IK slice could reduce that controller bridge further if needed.
+  - The direct bring-up `scripts/rtcore_jog.py` path still needs its own cleanup if we want every RTCore jog/testing tool to use `MSG_CMD_JOG` consistently.
+  - Broader `tests/test_gradient05_limits_and_backends.py` still contains unrelated baseline failures around existing Gradient05 expectations; those were not changed here.
+
+## 2026-03-21 07:29 +0000
+
+- Task summary:
+  - Implemented the richer RTCore program terminal-semantics slice so multi-step recorded programs now report explicit controller-program lifecycle/terminal truth separately from RTCore segment state.
+- What changed:
+  - Updated `src/gradient_os/arm_controller/utils.py`:
+    - added persistent `program_status` storage and helpers for reset/update/snapshot
+    - added `stop_request_reason` so controller stop intent can be classified cleanly during program shutdown
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - `RUN_TRAJECTORY` now seeds and finalizes a shared program contract with fields like `program_state`, `program_terminal_reason`, `program_failing_step_index`, `program_completed_step_count`, and `program_completed_loop_count`
+    - `GET_MOTION_STATUS` now returns the same program contract alongside existing RTCore execution metadata, and preserves terminal program truth after the worker thread exits
+    - non-program motion paths now clear stale program metadata before returning their own execution payloads
+    - planning/compatibility/startup failures before thread launch now stamp explicit terminal outcomes instead of silently dropping program context
+  - Updated `src/gradient_os/arm_controller/trajectory_execution.py`:
+    - `_trajectory_executor_thread()` now tracks completed steps/loops and records explicit terminal reasons for normal completion, operator aborts, timeouts, compatibility interruptions, and RTCore-backed faults
+  - Updated `web-ui/src/App.tsx`:
+    - trajectory and weld execution cards now show controller-program lifecycle details, including terminal reason and step/loop progress, in addition to RTCore segment state
+  - Updated tests:
+    - `tests/test_command_api_direct_setpoint.py`
+    - `tests/test_api_endpoints.py`
+    - `tests/test_trajectory_execution_backends.py`
+  - Updated docs/planning:
+    - `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`
+    - `docs/command_api.md`
+    - `docs/rtcore_owned_motion_contract.md`
+- Validation:
+  - `python3 -m py_compile "/home/pi/GradientOS/src/gradient_os/arm_controller/utils.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/command_api.py" "/home/pi/GradientOS/src/gradient_os/arm_controller/trajectory_execution.py" "/home/pi/GradientOS/tests/test_command_api_direct_setpoint.py" "/home/pi/GradientOS/tests/test_api_endpoints.py" "/home/pi/GradientOS/tests/test_trajectory_execution_backends.py"`
+    - passed
+  - `"/home/pi/GradientOS/.venv/bin/pytest" -q tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py tests/test_trajectory_execution_backends.py`
+    - passed (`56 passed`)
+  - `ReadLints` on edited files
+    - no diagnostics
+- Follow-up notes / risks:
+  - `web-ui/src/ControlPanel.tsx` was not part of this slice; trajectory/weld program panels in `App.tsx` now consume the richer contract, but any other future program-facing surface should use the same `program` / `program_*` fields rather than inferring state again.
+  - `handle_stop_command()` still layers controller brake behavior on top of RTCore abort semantics; a stricter dedicated RTCore stop/hold contract may still be worth a follow-up slice.
+  - Legacy-retirement cleanup is still pending in docs/tooling paths like `scripts/rtcore_jog.py` and any stale latest-wins references outside the edited contract/test surfaces.
+
+## 2026-03-21 07:35 +0000
+
+- Task summary:
+  - Reviewed the current RTCore redesign state and wrote down the immediate testing/rollout guidance after the program-terminal-semantics slice.
+- What changed:
+  - No code changes.
+  - Re-read the redesign plan plus latest scratchpad/devlog context to confirm which todos are still in progress vs completed.
+- Validation:
+  - No new commands beyond status/context review.
+- Follow-up notes / risks:
+  - Current recommended next work is staged rollout and cleanup, not another core semantics rewrite before any testing begins.
+  - Hardware testing can start now in a staged way because the latest targeted compile/tests/lints already passed, but full rollout still needs legacy-retirement cleanup and broader validation coverage.
+
+## 2026-03-21 07:45 +0000
+
+- Task summary:
+  - Investigated how to fully shut down the EtherCAT master and RTCore after a `./start-stack.sh stop` soft-stop left the bus up and disarmed.
+- What changed:
+  - No code changes.
+  - Re-read `start-stack.sh`, `systemd/README.md`, `systemd/rt-motion/stop.sh`, and `docs/ethercat/bringup.md` to confirm the supported full-teardown path.
+- Validation:
+  - `date '+%Y-%m-%d %H:%M %z'`
+    - captured timestamp for this investigation entry
+  - Repo source review:
+    - confirmed `./start-stack.sh stop` is a soft stop
+    - confirmed `./start-stack.sh stop --hard` also stops `gradient-rt-motion.service` and `ethercat.service`
+- Follow-up notes / risks:
+  - If the stack was not launched under `start-stack.sh`, the manual fallback remains `sudo systemctl stop gradient-rt-motion.service` followed by `sudo systemctl stop ethercat.service`.
+  - `./start-stack.sh probe` is the quickest repo-native verification path after shutdown.
+
+## 2026-03-21 07:52 +0000
+
+- Task summary:
+  - Investigated a reported "not working" live restart using the latest `./start-stack.sh` terminal output and current probe state.
+- What changed:
+  - No code changes.
+  - Read the latest terminal transcript plus `logs/startups/20260321-074826/{controller,api,web}.log`.
+  - Ran `./start-stack.sh probe` and a local API health check.
+- Validation:
+  - `./start-stack.sh probe`
+    - showed `launcher_state: absent`, `controller_udp: down`, `api_http: down`, and `physical_state: BUS_UP_DISARMED`
+  - `curl -sS -m 2 http://127.0.0.1:4000/health`
+    - failed with connection refused, confirming the API had already been stopped
+- Follow-up notes / risks:
+  - The provided startup logs do not show a move/jog failure. They show a clean startup into the intentionally disarmed state (`GRADIENT_RTCORE_AUTO_ARM=0`), followed by an explicit `stop` that shut controller/API down again.
+  - Before judging the new motion/jog code on hardware, the next live test must keep the stack running, explicitly power up the drives, verify `physical_state: ACTIVE`, and only then issue jog/move commands.
+
+## 2026-03-21 08:00 +0000
+
+- Task summary:
+  - Clarified the "UI wasn't loading" angle by checking how `start-stack.sh` verifies the web server.
+- What changed:
+  - No code changes.
+  - Read `start-stack.sh` web readiness functions.
+- Validation:
+  - Source review:
+    - `wait_for_web_readiness()` calls `probe_web()`
+    - `probe_web()` performs `curl -fsS --max-time 1 "http://127.0.0.1:${WEB_PORT}/"`
+- Follow-up notes / risks:
+  - If `./start-stack.sh` reports startup complete, the web server did serve `/` locally on the Pi.
+  - A remaining "UI not loading" complaint after that points more toward wrong URL / network path to port 8000 / browser-side render failure than a launcher failure.
+
+## 2026-03-21 08:12 +0000
+
+- Task summary:
+  - Prepared a fresh-chat handoff for the current live blocker and corrected the investigation direction around the stuck web UI.
+- What changed:
+  - No code changes.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with a corrective note that the operator-confirmed `http://localhost:8000/` loading screen is a real frontend/runtime issue, not evidence that Vite failed to start or that the wrong URL was used.
+  - Captured the current live stack context and next-step debugging focus for handoff:
+    - run id `20260321-080255`
+    - web/API/controller all reported up
+    - next task is browser-side debugging of the perpetual loading state before any further move/jog validation
+- Validation:
+  - `date '+%Y-%m-%d %H:%M:%S %z'`
+    - captured handoff timestamp (`2026-03-21 08:12:09 +0000`)
+  - Source/context review:
+    - re-read `/home/pi/.cursor/plans/rtcore_motion_redesign_a2ff8300.plan.md`
+    - re-read the latest `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md` entries
+    - used the provided live terminal/log context for run `20260321-080255`
+- Follow-up notes / risks:
+  - Do not re-diagnose the current blocker as "wrong URL", "UI unopened", or "startup incomplete" without new contradictory evidence.
+  - Highest-value next investigation is a real browser session capturing console errors, failed network requests, and DOM/render state around `web-ui/src/App.tsx` and related startup logic.
+
+## 2026-03-21 08:29 +0000
+
+- Task summary:
+  - Investigated the live web UI blocker through code and HTTP probing, found a real robot-asset index serving mismatch under the Vite dev server, and patched the visualizer bootstrap to tolerate it.
+- What changed:
+  - Updated `web-ui/src/ArmVisualizer.tsx`:
+    - `resolveRobotUrdfConfig()` no longer assumes `/assets/robots/index.json` always serves JSON
+    - it now retries the robot asset index through both `/assets/robots/index.json` and `/public/assets/robots/index.json`
+    - it explicitly rejects non-JSON responses (the SPA HTML shell) before parsing, so the visualizer can recover to the working dev-server path
+  - Re-started the live supervised stack with `./start-stack.sh`
+    - current live run id: `20260321-081917`
+- Validation:
+  - `./start-stack.sh`
+    - stack reached controller/API/web ready state on run `20260321-081917`
+  - Static asset probing:
+    - `http://127.0.0.1:8000/assets/robots/index.json` returned `200 text/html` (incorrect for the index)
+    - `http://127.0.0.1:8000/public/assets/robots/index.json` returned the expected JSON index
+    - `http://127.0.0.1:8000/assets/tools/index.json` likewise returned SPA HTML while `/public/assets/tools/index.json` returned JSON
+    - `http://127.0.0.1:8000/assets/robots/gradient-05/robot.urdf` still returned the expected URDF content
+  - `npm run build` in `web-ui`
+    - passed after the `ArmVisualizer.tsx` fix
+  - `ReadLints` on `web-ui/src/ArmVisualizer.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - This was a real frontend/runtime bug in the startup asset path, not a launcher failure.
+  - The fix should unblock robot visualizer bootstrap on dev, but if the UI still appears visually broken after refresh then the next best change is to surface visualizer/bootstrap failures directly in-app instead of leaving them console-only.

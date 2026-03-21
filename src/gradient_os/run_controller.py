@@ -163,6 +163,23 @@ def _coerce_int(value: object, default: int = 0) -> int:
         return int(default)
 
 
+def _encode_controller_payload_b64(payload: dict[str, object]) -> str:
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return base64.urlsafe_b64encode(body).decode("ascii")
+
+
+def _send_controller_ack(sock: socket.socket, addr, command: str, payload: dict[str, object] | None = None) -> None:
+    message = f"ACK,{command}"
+    if payload is not None:
+        message += f",{_encode_controller_payload_b64(payload)}"
+    sock.sendto(message.encode("utf-8"), addr)
+
+
+def _send_motion_status(sock: socket.socket, addr, payload: dict[str, object]) -> None:
+    message = f"MOTION_STATUS,{_encode_controller_payload_b64(payload)}"
+    sock.sendto(message.encode("utf-8"), addr)
+
+
 def _load_rtcore_metrics_snapshot(path: str) -> dict[str, object] | None:
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -529,12 +546,17 @@ Examples:
                 "Using backend default drive profile."
             )
 
+        requested_rt_max_rpm = None
+        if isinstance(desired_overrides, dict):
+            requested_rt_max_rpm = desired_overrides.get("rt_max_rpm")
+
         active_runtime_config = runtime_config.resolve_effective_runtime(
             robot_name=requested_robot_name,
             sim_mode=bool(args.sim),
             requested_ik_solver_backend=requested_ik_backend,
             requested_servo_backend=requested_servo_backend,
             requested_drive_profile=requested_drive_profile,
+            requested_rt_max_rpm=requested_rt_max_rpm,
             requested_active_tool_id=str(desired_active_tool_id) if desired_active_tool_id is not None else None,
             allow_unsafe_overrides=allow_unsafe_overrides,
         )
@@ -942,7 +964,12 @@ Examples:
                     except Exception:
                         pass
                     try:
-                        sock.sendto("ACK,STOP".encode("utf-8"), addr)
+                        _send_controller_ack(
+                            sock,
+                            addr,
+                            "STOP",
+                            command_api.get_motion_execution_status(),
+                        )
                     except Exception:
                         pass
                     continue
@@ -1133,6 +1160,13 @@ Examples:
                 elif command == "GET_STATUS":
                     reply = f"STATUS,gripper_present,{utils.gripper_present}"
                     sock.sendto(reply.encode("utf-8"), addr)
+
+                elif command == "GET_MOTION_STATUS":
+                    try:
+                        _send_motion_status(sock, addr, command_api.get_motion_execution_status())
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,GET_MOTION_STATUS,{msg}".encode("utf-8"), addr)
 
                 elif command == "GET_RUNTIME_CONFIG":
                     try:
@@ -1352,11 +1386,19 @@ Examples:
                     servo_driver.set_servo_angle_limits_from_urdf()
 
                 elif command == "WAIT_FOR_IDLE":
-                    command_api.handle_wait_for_idle()
                     try:
-                        sock.sendto("ACK,WAIT_FOR_IDLE".encode("utf-8"), addr)
-                    except Exception:
-                        pass
+                        timeout_s = float(parts[1]) if len(parts) > 1 else 30.0
+                        payload = command_api.handle_wait_for_idle(timeout_s=timeout_s)
+                        _send_controller_ack(sock, addr, "WAIT_FOR_IDLE", payload)
+                    except (TypeError, ValueError):
+                        sock.sendto("ERROR,WAIT_FOR_IDLE,BAD_ARGS".encode("utf-8"), addr)
+                    except Exception as exc:
+                        msg = "WAIT_FAILED"
+                        try:
+                            msg = str(exc).replace(" ", "_").replace(",", "_")
+                        except Exception:
+                            pass
+                        sock.sendto(f"ERROR,WAIT_FOR_IDLE,{msg}".encode("utf-8"), addr)
 
                 elif command == "SAFE_POWER_DOWN":
                     wait_for_idle = False
@@ -1513,16 +1555,37 @@ Examples:
                     try:
                         axis = parts[1].lower()
                         angle_deg = float(parts[2])
-                        command_api.handle_rotate_command(axis, angle_deg)
+                        duration_s = float(parts[3]) if len(parts) > 3 and parts[3].strip() != "" else None
+                        payload = command_api.handle_rotate_command(axis, angle_deg, duration_s=duration_s)
+                        _send_controller_ack(sock, addr, "ROTATE", payload)
                     except (ValueError, IndexError, KeyError):
-                        print("[Controller] Error: Invalid ROTATE command. Use 'ROTATE,axis,degrees'.")
+                        print("[Controller] Error: Invalid ROTATE command. Use 'ROTATE,axis,degrees[,duration_s]'.")
+                        sock.sendto("ERROR,ROTATE,BAD_ARGS".encode("utf-8"), addr)
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,ROTATE,{msg}".encode("utf-8"), addr)
 
                 elif command == "SET_ORIENTATION":
                     try:
                         roll, pitch, yaw = map(float, parts[1:4])
-                        command_api.handle_set_orientation_command(roll, pitch, yaw)
+                        duration_s = float(parts[4]) if len(parts) > 4 and parts[4].strip() != "" else 2.0
+                        closed_loop = False
+                        if len(parts) > 5 and parts[5].strip() != "":
+                            closed_loop = parts[5].strip().lower() in {"true", "1", "yes", "closed", "on"}
+                        payload = command_api.handle_set_orientation_command(
+                            roll,
+                            pitch,
+                            yaw,
+                            closed_loop=closed_loop,
+                            duration_s=duration_s,
+                        )
+                        _send_controller_ack(sock, addr, "SET_ORIENTATION", payload)
                     except (ValueError, IndexError):
-                        print("[Controller] Error: Invalid SET_ORIENTATION command. Use 'SET_ORIENTATION,roll,pitch,yaw'.")
+                        print("[Controller] Error: Invalid SET_ORIENTATION command. Use 'SET_ORIENTATION,roll,pitch,yaw[,duration_s][,closed_loop]'.")
+                        sock.sendto("ERROR,SET_ORIENTATION,BAD_ARGS".encode("utf-8"), addr)
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,SET_ORIENTATION,{msg}".encode("utf-8"), addr)
 
                 elif command == "MOVE_LINE":
                     try:
@@ -1533,13 +1596,19 @@ Examples:
                         closed_loop = False
                         if len(parts) > 6 and parts[6].strip() != "":
                             closed_loop = parts[6].strip().lower() in {"true", "1", "yes", "closed", "on"}
-                        command_api.handle_move_line(x, y, z, v, a, closed_loop)
+                        payload = command_api.handle_move_line(x, y, z, v, a, closed_loop)
+                        _send_controller_ack(sock, addr, "MOVE_LINE", payload)
                     except (ValueError, IndexError):
                         print("[Controller] Error: Invalid MOVE_LINE command. Use 'MOVE_LINE,x,y,z,[v],[a],[closed_loop]'.")
+                        sock.sendto("ERROR,MOVE_LINE,BAD_ARGS".encode("utf-8"), addr)
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,MOVE_LINE,{msg}".encode("utf-8"), addr)
 
                 elif command == "MOVE_LINE_RELATIVE":
                     if len(parts) < 4:
                         print("[Controller] Error: Invalid MOVE_LINE_RELATIVE command. Use '...,dx,dy,dz,[speed_multiplier]'.")
+                        sock.sendto("ERROR,MOVE_LINE_RELATIVE,BAD_ARGS".encode("utf-8"), addr)
                         continue
 
                     # Parse numeric arguments safely
@@ -1565,7 +1634,12 @@ Examples:
                     closed_loop = False
                     if len(parts) > 5 and parts[5].strip() != "":
                         closed_loop = parts[5].strip().lower() in {"true", "1", "yes", "closed", "on"}
-                    command_api.handle_move_line_relative(dx, dy, dz, speed_multiplier, closed_loop)
+                    try:
+                        payload = command_api.handle_move_line_relative(dx, dy, dz, speed_multiplier, closed_loop)
+                        _send_controller_ack(sock, addr, "MOVE_LINE_RELATIVE", payload)
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,MOVE_LINE_RELATIVE,{msg}".encode("utf-8"), addr)
 
                 elif command == "MOVE_PROFILED":
                     print("[Controller] WARNING: The 'MOVE_PROFILED' command is deprecated. Please use 'MOVE_LINE' for clearer intent.")
@@ -1591,9 +1665,14 @@ Examples:
                         name = parts[1].lower().strip()
                         cache = parts[2].lower().strip() in ['true', '1', 'yes'] if len(parts) > 2 else False
                         loop_override = parts[3].lower().strip() in ['true', '1', 'yes'] if len(parts) > 3 else None
-                        command_api.handle_run_trajectory(name, use_cache=cache, loop_override=loop_override)
+                        payload = command_api.handle_run_trajectory(name, use_cache=cache, loop_override=loop_override)
+                        _send_controller_ack(sock, addr, "RUN_TRAJECTORY", payload)
                     except IndexError:
                         print("[Controller] Error: Invalid RUN_TRAJECTORY command. Use 'RUN_TRAJECTORY,name,[use_cache],[loop_override]'.")
+                        sock.sendto("ERROR,RUN_TRAJECTORY,BAD_ARGS".encode("utf-8"), addr)
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,RUN_TRAJECTORY,{msg}".encode("utf-8"), addr)
 
                 # ------------------------------------------------------------------
                 # Telemetry control and episode recorder
@@ -1786,13 +1865,15 @@ Examples:
                         gripper_rad = float(gripper_rad_raw) if gripper_rad_raw is not None else None
                         speed_raw = payload.get("speed")
                         accel_raw = payload.get("acceleration")
-                        command_api.handle_apply_joint_setpoint(
+                        max_motor_rpm_raw = payload.get("max_motor_rpm")
+                        payload = command_api.handle_apply_joint_setpoint(
                             [float(value) for value in arm_angles],
                             gripper_rad=gripper_rad,
                             speed=int(speed_raw) if speed_raw is not None else None,
                             acceleration=float(accel_raw) if accel_raw is not None else None,
+                            max_motor_rpm=float(max_motor_rpm_raw) if max_motor_rpm_raw is not None else None,
                         )
-                        sock.sendto("ACK,APPLY_JOINT_SETPOINT".encode("utf-8"), addr)
+                        _send_controller_ack(sock, addr, "APPLY_JOINT_SETPOINT", payload)
                     except Exception as e:
                         print(f"[Controller] APPLY_JOINT_SETPOINT rejected: {e}")
                         traceback.print_exc()

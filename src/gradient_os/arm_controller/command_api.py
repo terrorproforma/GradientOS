@@ -19,6 +19,7 @@ except ImportError:
     trajectory_planner = None
 
 from . import utils
+from . import robot_config
 from . import servo_driver
 from . import trajectory_execution
 from . import pid_tuner
@@ -27,6 +28,528 @@ from ..kinematics import runtime as kinematics_runtime
 
 _DIRECT_SETPOINT_FALLBACK_SPEED = 500
 _DIRECT_SETPOINT_FALLBACK_ACCELERATION_DEG_S2 = 500.0
+_SAFE_JOINT_MOVE_FREQUENCY_HZ = 100
+_SAFE_JOINT_MOVE_MIN_DURATION_S = 0.25
+_WAIT_FOR_IDLE_DEFAULT_TIMEOUT_S = 30.0
+_WAIT_FOR_IDLE_POLL_INTERVAL_S = 0.01
+_RTCORE_TERMINAL_EXECUTION_STATES = {"idle", "completed", "aborted", "faulted", "underrun"}
+_PROGRAM_TERMINAL_STATES = {"completed", "aborted", "faulted", "timeout", "interrupted"}
+_PROGRAM_ACTIVE_STATES = {"planning", "accepted", "executing"}
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value if value is not None else default)
+    except Exception:
+        return default
+
+
+def _safe_optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _reset_program_status(**overrides: object) -> None:
+    utils.program_status_reset(**overrides)
+
+
+def _update_program_status(**kwargs: object) -> None:
+    utils.program_status_update(**kwargs)
+
+
+def _begin_non_program_motion() -> None:
+    _reset_program_status()
+    utils.trajectory_state_set("stop_request_reason", None)
+
+
+def _program_status_from_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
+    raw = snapshot.get("program_status")
+    merged: dict[str, object] = {
+        "name": None,
+        "active": False,
+        "state": "idle",
+        "terminal_reason": None,
+        "failing_step_index": None,
+        "completed_step_count": 0,
+        "completed_loop_count": 0,
+        "loop_enabled": False,
+        "use_cache": False,
+        "step_count": 0,
+        "move_steps": 0,
+        "pause_steps": 0,
+        "joint_move_steps": 0,
+        "rtcore_segments": False,
+        "segment_execution_policy": "",
+        "current_step_index": None,
+        "current_step_type": None,
+        "loop_iteration": 0,
+    }
+    if isinstance(raw, dict):
+        merged.update(raw)
+
+    active_program_name = snapshot.get("active_program_name")
+    if isinstance(active_program_name, str) and active_program_name.strip():
+        merged["name"] = active_program_name.strip()
+        merged["active"] = True
+        merged["loop_enabled"] = bool(snapshot.get("active_program_loop_enabled", merged["loop_enabled"]))
+        merged["use_cache"] = bool(snapshot.get("active_program_use_cache", merged["use_cache"]))
+        merged["step_count"] = _safe_int(snapshot.get("active_program_step_count"), _safe_int(merged.get("step_count")))
+        merged["move_steps"] = _safe_int(snapshot.get("active_program_move_steps"), _safe_int(merged.get("move_steps")))
+        merged["pause_steps"] = _safe_int(snapshot.get("active_program_pause_steps"), _safe_int(merged.get("pause_steps")))
+        merged["joint_move_steps"] = _safe_int(
+            snapshot.get("active_program_joint_move_steps"),
+            _safe_int(merged.get("joint_move_steps")),
+        )
+        merged["rtcore_segments"] = bool(snapshot.get("active_program_rtcore_segments", merged["rtcore_segments"]))
+        merged["segment_execution_policy"] = str(
+            snapshot.get("active_program_segment_execution_policy", merged["segment_execution_policy"]) or ""
+        )
+        merged["current_step_index"] = snapshot.get("active_program_step_index")
+        merged["current_step_type"] = snapshot.get("active_program_step_type")
+        merged["loop_iteration"] = _safe_int(
+            snapshot.get("active_program_loop_iteration"),
+            _safe_int(merged.get("loop_iteration")),
+        )
+
+    name = str(merged.get("name") or "").strip()
+    active = bool(merged.get("active", False))
+    state = str(merged.get("state") or ("executing" if active else "idle")).strip().lower() or "idle"
+    if active and state not in _PROGRAM_ACTIVE_STATES:
+        state = "executing"
+
+    if not name and not active and state == "idle":
+        return {}
+
+    terminal_reason_raw = merged.get("terminal_reason")
+    terminal_reason = None
+    if terminal_reason_raw is not None and str(terminal_reason_raw).strip():
+        terminal_reason = str(terminal_reason_raw).strip().lower()
+
+    return {
+        "name": name or None,
+        "active": active,
+        "state": state,
+        "terminal_reason": terminal_reason,
+        "failing_step_index": _safe_optional_int(merged.get("failing_step_index")),
+        "completed_step_count": _safe_int(merged.get("completed_step_count")),
+        "completed_loop_count": _safe_int(merged.get("completed_loop_count")),
+        "loop_enabled": bool(merged.get("loop_enabled", False)),
+        "use_cache": bool(merged.get("use_cache", False)),
+        "step_count": _safe_int(merged.get("step_count")),
+        "move_steps": _safe_int(merged.get("move_steps")),
+        "pause_steps": _safe_int(merged.get("pause_steps")),
+        "joint_move_steps": _safe_int(merged.get("joint_move_steps")),
+        "rtcore_segments": bool(merged.get("rtcore_segments", False)),
+        "segment_execution_policy": str(merged.get("segment_execution_policy") or ""),
+        "current_step_index": _safe_optional_int(merged.get("current_step_index")),
+        "current_step_type": (
+            str(merged.get("current_step_type")).strip()
+            if merged.get("current_step_type") not in (None, "")
+            else None
+        ),
+        "loop_iteration": _safe_int(merged.get("loop_iteration")),
+    }
+
+
+def _flatten_program_status(program: dict[str, object]) -> dict[str, object]:
+    if not program:
+        return {}
+    return {
+        "program_name": program.get("name"),
+        "program_active": bool(program.get("active", False)),
+        "program_state": str(program.get("state") or "idle"),
+        "program_terminal_reason": program.get("terminal_reason"),
+        "program_failing_step_index": program.get("failing_step_index"),
+        "program_completed_step_count": _safe_int(program.get("completed_step_count")),
+        "program_completed_loop_count": _safe_int(program.get("completed_loop_count")),
+        "program_loop_enabled": bool(program.get("loop_enabled", False)),
+        "program_use_cache": bool(program.get("use_cache", False)),
+        "program_step_count": _safe_int(program.get("step_count")),
+        "program_move_steps": _safe_int(program.get("move_steps")),
+        "program_pause_steps": _safe_int(program.get("pause_steps")),
+        "program_joint_move_steps": _safe_int(program.get("joint_move_steps")),
+        "program_rtcore_segments": bool(program.get("rtcore_segments", False)),
+        "program_segment_execution_policy": str(program.get("segment_execution_policy") or ""),
+        "program_current_step_index": program.get("current_step_index"),
+        "program_current_step_type": program.get("current_step_type"),
+        "program_loop_iteration": _safe_int(program.get("loop_iteration")),
+    }
+
+
+def _attach_program_status(payload: dict[str, object], snapshot: dict[str, object]) -> None:
+    program = _program_status_from_snapshot(snapshot)
+    if not program:
+        return
+
+    payload["program"] = program
+    payload.update(_flatten_program_status(program))
+    payload["accepted"] = bool(payload.get("accepted", False) or program.get("state") != "idle")
+
+    program_active = bool(program.get("active", False))
+    program_state = str(program.get("state") or "idle").strip().lower() or "idle"
+    execution = payload.get("execution")
+    execution_payload = dict(execution) if isinstance(execution, dict) else {}
+    rtcore_segment_active = bool(
+        int(execution_payload.get("active_traj_id", 0) or 0) > 0
+        or int(execution_payload.get("queue_depth", 0) or 0) > 0
+    )
+    payload["execution"] = execution_payload
+
+    if program_active and not rtcore_segment_active:
+        payload["completion_scope"] = "controller_program_thread"
+        payload["source_of_truth"] = "controller_program_thread"
+        if str(payload.get("state", "")).strip().lower() in {"", "idle", "accepted"}:
+            payload["state"] = program_state
+        return
+
+    if (not program_active) and program_state in _PROGRAM_TERMINAL_STATES and not _motion_payload_is_active(payload):
+        payload["completion_scope"] = "controller_program_thread"
+        payload["source_of_truth"] = "controller_program_thread"
+        payload["state"] = program_state
+
+
+def _get_active_backend():
+    try:
+        return backend_registry.get_active_backend()
+    except Exception:
+        return None
+
+
+def _get_rtcore_execution_backend_and_status():
+    backend = _get_active_backend()
+    if backend is None:
+        return None, None
+    getter = getattr(backend, "get_execution_status", None)
+    if not callable(getter):
+        return backend, None
+    try:
+        return backend, getter()
+    except Exception:
+        return backend, None
+
+
+def _backend_supports_rtcore_execution() -> bool:
+    backend, status = _get_rtcore_execution_backend_and_status()
+    return backend is not None and status is not None
+
+
+def _get_rtcore_jog_backend():
+    backend = _get_active_backend()
+    if backend is None:
+        return None
+    supports = getattr(backend, "supports_realtime_jog", None)
+    if not callable(supports):
+        return None
+    try:
+        return backend if bool(supports()) else None
+    except Exception:
+        return None
+
+
+def _default_completion_scope(*, closed_loop: bool = False, prefer_rtcore: bool = False) -> str:
+    if prefer_rtcore and _backend_supports_rtcore_execution():
+        return "rtcore_execution"
+    if closed_loop:
+        return "controller_closed_loop"
+    return "controller_trajectory_thread"
+
+
+def _resolve_scheduled_motion_execution_policy(
+    *,
+    closed_loop_requested: bool,
+    command_name: str,
+) -> tuple[bool, dict[str, object]]:
+    requested = bool(closed_loop_requested)
+    rtcore_backed = _backend_supports_rtcore_execution()
+    effective_closed_loop = requested
+    execution_policy = "controller_closed_loop" if requested else "controller_open_loop"
+
+    if rtcore_backed:
+        if requested:
+            print(
+                f"[RTCore Policy] {command_name}: forcing scheduled motion onto the RTCore queued path "
+                "instead of the Python-timed closed-loop executor."
+            )
+        effective_closed_loop = False
+        execution_policy = "rtcore_queued"
+
+    return effective_closed_loop, {
+        "closed_loop_requested": requested,
+        "closed_loop_effective": effective_closed_loop,
+        "execution_policy": execution_policy,
+        "rtcore_execution_preferred": rtcore_backed,
+    }
+
+
+def _motion_payload_is_active(payload: dict[str, object]) -> bool:
+    program = payload.get("program")
+    if isinstance(program, dict):
+        if bool(program.get("active", False)):
+            return True
+        program_state = str(program.get("state", "")).strip().lower()
+        if program_state in _PROGRAM_ACTIVE_STATES:
+            return True
+
+    execution = payload.get("execution")
+    if not isinstance(execution, dict):
+        return False
+    if bool(execution.get("controller_thread_running", False)):
+        return True
+    if not bool(execution.get("rtcore_status_present", False)):
+        return False
+
+    state_name = str(execution.get("state_name", payload.get("state", "idle"))).strip().lower() or "idle"
+    active_mode_name = str(execution.get("active_mode_name", "idle")).strip().lower() or "idle"
+    active_traj_id = int(execution.get("active_traj_id", 0) or 0)
+    queue_depth = int(execution.get("queue_depth", 0) or 0)
+    motion_done = bool(execution.get("motion_done", False))
+
+    if active_traj_id > 0 or queue_depth > 0:
+        return True
+    if state_name in {"accepted", "queued", "executing"}:
+        return True
+    if active_mode_name != "idle" and not motion_done and state_name not in _RTCORE_TERMINAL_EXECUTION_STATES:
+        return True
+    return False
+
+
+def _wait_for_idle_terminal_state(
+    current_payload: dict[str, object],
+    last_active_payload: dict[str, object] | None,
+) -> str:
+    for payload in (current_payload, last_active_payload):
+        if not isinstance(payload, dict):
+            continue
+        program = payload.get("program")
+        if isinstance(program, dict):
+            program_state = str(program.get("state", "")).strip().lower()
+            if program_state in _PROGRAM_TERMINAL_STATES:
+                return program_state
+        execution = payload.get("execution")
+        if isinstance(execution, dict):
+            state_name = str(execution.get("state_name", "")).strip().lower()
+            if state_name in _RTCORE_TERMINAL_EXECUTION_STATES - {"idle"}:
+                return state_name
+        state = str(payload.get("state", "")).strip().lower()
+        if state in _RTCORE_TERMINAL_EXECUTION_STATES - {"idle"}:
+            return state
+    if last_active_payload is not None:
+        return "completed"
+    return "idle"
+
+
+def _finalize_wait_for_idle_payload(
+    current_payload: dict[str, object],
+    *,
+    timeout_s: float,
+    waited_for_motion: bool,
+    last_active_payload: dict[str, object] | None,
+    timed_out: bool,
+) -> dict[str, object]:
+    payload = dict(current_payload)
+    execution = payload.get("execution")
+    execution_payload = dict(execution) if isinstance(execution, dict) else {}
+
+    if waited_for_motion and isinstance(last_active_payload, dict):
+        payload["completion_scope"] = str(
+            last_active_payload.get("completion_scope", payload.get("completion_scope", "controller_idle"))
+        )
+        payload["source_of_truth"] = str(
+            last_active_payload.get("source_of_truth", payload.get("source_of_truth", "controller"))
+        )
+
+    terminal_state = "timeout" if timed_out else _wait_for_idle_terminal_state(
+        payload,
+        last_active_payload,
+    )
+    payload["accepted"] = bool(waited_for_motion or payload.get("accepted", False) or terminal_state != "idle")
+    payload["state"] = terminal_state
+    payload["waited_for_motion"] = bool(waited_for_motion)
+    payload["wait_timeout_s"] = float(timeout_s)
+    payload["wait_timed_out"] = bool(timed_out)
+    execution_payload["wait_terminal_state"] = terminal_state
+    if isinstance(last_active_payload, dict):
+        execution_payload["wait_last_active_state"] = str(
+            last_active_payload.get("state", "")
+        ).strip().lower()
+        last_active_execution = last_active_payload.get("execution")
+        if isinstance(last_active_execution, dict):
+            execution_payload["wait_last_active_state_name"] = str(
+                last_active_execution.get("state_name", "")
+            ).strip().lower()
+    payload["execution"] = execution_payload
+    return payload
+
+
+def _build_motion_execution_metadata(
+    *,
+    accepted: bool,
+    completion_scope: str,
+    state: str | None = None,
+    use_rtcore_status: bool = False,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    snapshot = utils.trajectory_state_snapshot()
+    controller_motion_state = str(snapshot.get("motion_state", "IDLE")).strip().lower() or "idle"
+    controller_thread_running = bool(snapshot.get("is_running", False))
+    backend = None
+    execution_status = None
+    if use_rtcore_status:
+        backend, execution_status = _get_rtcore_execution_backend_and_status()
+
+    trajectory_id = 0
+    derived_state = str(state).strip().lower() if state is not None else ""
+    source_of_truth = "controller"
+    execution: dict[str, object] = {
+        "controller_motion_state": controller_motion_state,
+        "controller_thread_running": controller_thread_running,
+        "last_correlation_id": snapshot.get("last_correlation_id"),
+        "rtcore_status_present": execution_status is not None,
+    }
+
+    if execution_status is not None:
+        source_of_truth = "rtcore"
+        active_traj_id = int(getattr(execution_status, "active_traj_id", 0) or 0)
+        submitted_traj_id = 0
+        trajectory_timing: dict[str, object] = {}
+        if backend is not None:
+            getter = getattr(backend, "get_last_submitted_trajectory_id", None)
+            if callable(getter):
+                try:
+                    submitted_traj_id = int(getter() or 0)
+                except Exception:
+                    submitted_traj_id = 0
+            timing_getter = getattr(backend, "get_last_trajectory_timing", None)
+            if callable(timing_getter):
+                try:
+                    raw_timing = timing_getter()
+                    if isinstance(raw_timing, dict):
+                        trajectory_timing = {
+                            "trajectory_requested_frequency_hz": int(raw_timing.get("requested_frequency_hz", 0) or 0),
+                            "trajectory_effective_frequency_hz": int(raw_timing.get("effective_frequency_hz", 0) or 0),
+                            "trajectory_cycle_ns": int(raw_timing.get("cycle_ns", 0) or 0),
+                            "trajectory_step_ns": int(raw_timing.get("step_ns", 0) or 0),
+                            "trajectory_cycles_per_point": int(raw_timing.get("cycles_per_point", 0) or 0),
+                        }
+                except Exception:
+                    trajectory_timing = {}
+        trajectory_id = active_traj_id or submitted_traj_id
+        observed_state = (
+            str(getattr(execution_status, "state_name", "idle")).strip().lower() or "idle"
+        )
+        program_thread_active = controller_thread_running and bool(
+            snapshot.get("active_program_name")
+        )
+        rtcore_segment_active = (
+            active_traj_id > 0 or int(getattr(execution_status, "queue_depth", 0) or 0) > 0
+        )
+        if not derived_state:
+            if program_thread_active and not rtcore_segment_active:
+                source_of_truth = "controller_program_thread"
+                derived_state = "executing"
+            elif (
+                observed_state in _RTCORE_TERMINAL_EXECUTION_STATES
+                and bool(getattr(execution_status, "motion_done", False))
+            ):
+                derived_state = observed_state
+            elif rtcore_segment_active:
+                derived_state = observed_state
+            elif trajectory_id > 0 and accepted:
+                derived_state = "accepted"
+            else:
+                derived_state = observed_state
+        execution.update(
+            {
+                "active_mode": int(getattr(execution_status, "active_mode", 0) or 0),
+                "active_mode_name": str(getattr(execution_status, "active_mode_name", "idle")),
+                "state_id": int(getattr(execution_status, "state", 0) or 0),
+                "state_name": observed_state,
+                "active_traj_id": active_traj_id,
+                "current_point_index": getattr(execution_status, "current_point_index", None),
+                "queue_depth": int(getattr(execution_status, "queue_depth", 0) or 0),
+                "queue_capacity": int(getattr(execution_status, "queue_capacity", 0) or 0),
+                "last_event_code": int(getattr(execution_status, "last_event_code", 0) or 0),
+                "underrun_count": int(getattr(execution_status, "underrun_count", 0) or 0),
+                "stale_command": bool(getattr(execution_status, "stale_command", False)),
+                "motion_done": bool(getattr(execution_status, "motion_done", False)),
+                "capability_flags": int(getattr(execution_status, "capability_flags", 0) or 0),
+                "active_command_seq": int(getattr(execution_status, "active_command_seq", 0) or 0),
+                "last_update_ns": int(getattr(execution_status, "last_update_ns", 0) or 0),
+                "last_submitted_traj_id": submitted_traj_id,
+                **trajectory_timing,
+            }
+        )
+
+    if not derived_state:
+        if controller_thread_running:
+            derived_state = "executing" if controller_motion_state == "executing" else "accepted"
+        else:
+            derived_state = "accepted" if accepted else "idle"
+
+    payload: dict[str, object] = {
+        "accepted": bool(accepted),
+        "state": derived_state,
+        "completion_scope": str(completion_scope),
+        "trajectory_id": int(trajectory_id),
+        "source_of_truth": source_of_truth,
+        "execution": execution,
+    }
+    if extra:
+        payload.update(extra)
+    _attach_program_status(payload, snapshot)
+    return payload
+
+
+def get_motion_execution_status() -> dict[str, object]:
+    backend, execution_status = _get_rtcore_execution_backend_and_status()
+    snapshot = utils.trajectory_state_snapshot()
+    controller_thread_running = bool(snapshot.get("is_running", False))
+    active_program = bool(snapshot.get("active_program_name"))
+    if execution_status is not None:
+        submitted_traj_id = 0
+        if backend is not None:
+            getter = getattr(backend, "get_last_submitted_trajectory_id", None)
+            if callable(getter):
+                try:
+                    submitted_traj_id = int(getter() or 0)
+                except Exception:
+                    submitted_traj_id = 0
+        accepted = bool(
+            int(getattr(execution_status, "active_traj_id", 0) or 0) > 0
+            or submitted_traj_id > 0
+            or int(getattr(execution_status, "last_update_ns", 0) or 0) > 0
+        )
+        queue_depth = int(getattr(execution_status, "queue_depth", 0) or 0)
+        active_traj_id = int(getattr(execution_status, "active_traj_id", 0) or 0)
+        completion_scope = (
+            "controller_program_thread"
+            if controller_thread_running and active_program and active_traj_id == 0 and queue_depth == 0
+            else "rtcore_execution"
+        )
+        return _build_motion_execution_metadata(
+            accepted=accepted,
+            completion_scope=completion_scope,
+            use_rtcore_status=True,
+        )
+
+    controller_motion_state = str(snapshot.get("motion_state", "IDLE")).strip().lower() or "idle"
+    completion_scope = (
+        "controller_program_thread"
+        if controller_thread_running and active_program
+        else "controller_trajectory_thread" if controller_thread_running else "controller_idle"
+    )
+    state = controller_motion_state if controller_thread_running else "idle"
+    accepted = controller_thread_running or controller_motion_state not in {"idle", ""}
+    return _build_motion_execution_metadata(
+        accepted=accepted,
+        completion_scope=completion_scope,
+        state=state,
+        use_rtcore_status=False,
+    )
 
 
 def _coerce_direct_setpoint_speed(value: int | float | str | None) -> int:
@@ -127,67 +650,207 @@ def handle_translate_command(dx: float, dy: float, dz: float):
         print(f"[Pi IK] Verification -> Target: {np.round(target_pos_xyz, 4)}, Final FK: {np.round(final_pos_xyz, 4)}")
         print(f"[Pi IK] Distance from target: {np.linalg.norm(final_pos_xyz - target_pos_xyz):.6f} m")
 
-def handle_rotate_command(axis: str, angle_deg: float):
+def _get_live_pose_snapshot() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Snapshot of the robot's current joint/pose state from live feedback."""
+    initial_angles = servo_driver.get_current_arm_state_rad(verbose=False)
+    if initial_angles is None:
+        raise RuntimeError("Failed to read current arm state from hardware.")
+    initial_angles_np = np.asarray(initial_angles, dtype=float)
+    current_pose_matrix = ik_solver.get_fk_matrix(initial_angles_np)
+    if current_pose_matrix is None:
+        raise RuntimeError("Failed to calculate current pose using FK.")
+    current_position = np.asarray(current_pose_matrix[:3, 3], dtype=float)
+    current_orientation = np.asarray(current_pose_matrix[:3, :3], dtype=float)
+    return initial_angles_np, current_position, current_orientation
+
+
+def _execute_orientation_path(
+    target_orientation: np.ndarray,
+    *,
+    command_name: str = "SET_ORIENTATION",
+    closed_loop: bool = True,
+    duration_s: float = 2.0,
+    diagnostics: bool = False,
+    initial_angles: np.ndarray | None = None,
+    current_position: np.ndarray | None = None,
+    current_orientation: np.ndarray | None = None,
+) -> dict[str, object]:
+    """Plan and execute a smooth orientation-only move from live robot state."""
+    if initial_angles is None or current_position is None or current_orientation is None:
+        initial_angles, current_position, current_orientation = _get_live_pose_snapshot()
+
+    effective_closed_loop, execution_policy = _resolve_scheduled_motion_execution_policy(
+        closed_loop_requested=closed_loop,
+        command_name=command_name,
+    )
+
+    assert initial_angles is not None
+    assert current_position is not None
+    assert current_orientation is not None
+
+    # --- Set up diagnostics session if enabled ---
+    session_id = None
+    diagnostics_enabled = (
+        os.environ.get("MINI_ARM_IK_LOG", "0") == "1"
+        or diagnostics
+        or utils.trajectory_state.get("diagnostics_enabled", False)
+    )
+    if diagnostics_enabled:
+        session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        utils.trajectory_state['diagnostics_session_id'] = session_id
+        utils.trajectory_state['diagnostics_folder_type'] = (
+            "closed_loop" if effective_closed_loop else "open_loop"
+        )
+
+    frequency_hz = 50 if effective_closed_loop else 100
+    duration_s = max(0.1, duration_s)
+    num_steps = max(2, int(duration_s * frequency_hz))
+
+    try:
+        from scipy.spatial.transform import Slerp
+
+        rot_start = R.from_matrix(current_orientation)
+        rot_end = R.from_matrix(target_orientation)
+        key_rots = R.concatenate([rot_start, rot_end])
+        key_times = [0, 1]
+        slerp = Slerp(key_times, key_rots)
+        times = np.linspace(0, 1, num_steps)
+        interpolated_rots = slerp(times)
+        orientation_matrices = [r.as_matrix() for r in interpolated_rots]
+    except Exception as e:
+        if session_id:
+            del utils.trajectory_state['diagnostics_session_id']
+            del utils.trajectory_state['diagnostics_folder_type']
+        raise RuntimeError(f"Failed to build SLERP interpolation: {e}") from e
+
+    path_positions = [current_position] * num_steps
+    joint_path = ik_solver.solve_ik_path_batch(
+        path_points=path_positions,
+        initial_joint_angles=initial_angles,
+        target_orientations=orientation_matrices,
+    )
+    if joint_path is None:
+        if session_id:
+            del utils.trajectory_state['diagnostics_session_id']
+            del utils.trajectory_state['diagnostics_folder_type']
+        raise RuntimeError("IK solver failed to find a solution for the orientation path.")
+
+    target_func = (
+        trajectory_execution._closed_loop_executor_thread
+        if effective_closed_loop
+        else trajectory_execution._open_loop_executor_thread
+    )
+    executor_error: list[BaseException] = []
+
+    def _run_executor() -> None:
+        try:
+            target_func(
+                joint_path=joint_path,
+                frequency=frequency_hz,
+                diagnostics=diagnostics_enabled,
+            )
+        except BaseException as exc:  # pragma: no cover - re-raised after join
+            executor_error.append(exc)
+
+    executor_thread = threading.Thread(
+        target=_run_executor,
+        daemon=True,
+    )
+
+    utils.trajectory_state_update(thread=executor_thread, is_running=True, should_stop=False)
+    try:
+        utils.set_motion_state("EXECUTING")
+    except Exception:
+        pass
+
+    try:
+        executor_thread.start()
+        executor_thread.join()
+        if executor_error:
+            raise RuntimeError(str(executor_error[0])) from executor_error[0]
+    finally:
+        utils.trajectory_state_update(thread=None, is_running=False)
+        try:
+            utils.set_motion_state("IDLE")
+        except Exception:
+            pass
+
+    final_pose_matrix = ik_solver.get_fk_matrix(joint_path[-1])
+    if final_pose_matrix is not None:
+        final_position = final_pose_matrix[:3, 3]
+        final_orientation = final_pose_matrix[:3, :3]
+        orient_error_matrix = np.transpose(target_orientation) @ final_orientation
+        orient_error_rotvec = R.from_matrix(orient_error_matrix).as_rotvec()
+        print(f"[Pi IK] Verification -> Final Pos: {np.round(final_position, 4)}")
+        print(f"[Pi IK] Positional error: {np.linalg.norm(final_position - current_position):.6f} m")
+        print(f"[Pi IK] Orientational error: {np.rad2deg(np.linalg.norm(orient_error_rotvec)):.3f} degrees")
+
+    if session_id:
+        del utils.trajectory_state['diagnostics_session_id']
+        del utils.trajectory_state['diagnostics_folder_type']
+
+    return _build_motion_execution_metadata(
+        accepted=True,
+        completion_scope=_default_completion_scope(
+            closed_loop=effective_closed_loop,
+            prefer_rtcore=not effective_closed_loop,
+        ),
+        state="completed",
+        use_rtcore_status=(not effective_closed_loop),
+        extra={
+            "duration_s": float(duration_s),
+            "frequency_hz": int(frequency_hz),
+            "closed_loop": bool(effective_closed_loop),
+            **execution_policy,
+        },
+    )
+
+
+def handle_rotate_command(axis: str, angle_deg: float, *, duration_s: float | None = None) -> dict[str, object]:
     """
     Handles the 'ROTATE' command.
-    Performs a simple, blocking, single-point IK move to rotate the end effector
-    around a specified axis of the base frame.
+    Performs a smooth relative rotation around a specified base-frame axis.
     """
     utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
+    _begin_non_program_motion()
     print(f"[Pi IK] Received ROTATE command: axis={axis}, angle={angle_deg} degrees")
 
-    # 1. Get current state
-    initial_angles = utils.current_logical_joint_angles_rad
+    if utils.trajectory_state.get("is_running"):
+        raise RuntimeError("Cannot start ROTATE, another task is running.")
+
+    initial_angles, current_position, current_orientation = _get_live_pose_snapshot()
     print(f"[Pi IK] Initial logical joint angles (rad): {np.round(initial_angles, 3)}")
-
-    # 2. Get the full current pose (position and orientation) using FK
-    current_pose_matrix = ik_solver.get_fk_matrix(initial_angles)
-    if current_pose_matrix is None:
-        print("[Pi IK] ERROR: Failed to calculate current pose using FK.")
-        return
-
-    current_position = current_pose_matrix[:3, 3]
-    current_orientation = current_pose_matrix[:3, :3]
     print(f"[Pi IK] Current EE position (m): {np.round(current_position, 4)}")
 
-    # 3. Create the rotation matrix for the new rotation
     try:
-        # The rotation is created around the specified axis (x, y, or z)
-        # This new rotation is then pre-multiplied with the current orientation matrix.
-        # This results in a rotation being applied in the context of the base frame.
         rotation = R.from_euler(axis, angle_deg, degrees=True).as_matrix()
         target_orientation = rotation @ current_orientation
     except Exception as e:
-        print(f"[Pi IK] ERROR: Failed to create rotation matrix: {e}")
-        return
+        raise RuntimeError(f"Failed to create rotation matrix: {e}") from e
 
-    # 4. The target position is the current position (we only want to rotate)
-    target_position = current_position
     print(f"[Pi IK] Target EE orientation matrix:\n{np.round(target_orientation, 2)}")
-
-    # 5. Use IK to find the new joint angles
-    new_logical_joint_angles = ik_solver.solve_ik(
-        target_position=target_position,
-        target_orientation_matrix=target_orientation,
-        initial_joint_angles=initial_angles
+    rotate_duration_s = (
+        max(0.1, float(duration_s))
+        if duration_s is not None
+        else max(0.12, min(0.75, abs(float(angle_deg)) / 90.0))
     )
-
-    if new_logical_joint_angles is None:
-        print("[Pi IK] ERROR: IK solver failed to find a solution for rotation.")
-        return
-
-    print(f"[Pi IK] IK Solution Found (deg): {np.round(np.rad2deg(new_logical_joint_angles), 2)}")
-
-    # 6. Command servos
-    servo_driver.set_servo_positions(new_logical_joint_angles, utils.DEFAULT_SERVO_SPEED, utils.DEFAULT_SERVO_ACCELERATION_DEG_S2)
-    print("[Pi IK] Sent new positions to servos for rotation.")
-
-    # 7. Get and print the final pose for verification
-    final_pose_matrix = ik_solver.get_fk_matrix(new_logical_joint_angles)
-    if final_pose_matrix is not None:
-        final_position = final_pose_matrix[:3, 3]
-        print(f"[Pi IK] Verification -> Target Pos: {np.round(target_position, 4)}, Final FK Pos: {np.round(final_position, 4)}")
-        print(f"[Pi IK] Positional distance from target: {np.linalg.norm(final_position - target_position):.6f} m")
+    payload = _execute_orientation_path(
+        target_orientation,
+        command_name="ROTATE",
+        closed_loop=False,
+        duration_s=rotate_duration_s,
+        diagnostics=False,
+        initial_angles=initial_angles,
+        current_position=current_position,
+        current_orientation=current_orientation,
+    )
+    payload.update(
+        {
+            "axis": str(axis),
+            "angle_deg": float(angle_deg),
+        }
+    )
+    return payload
 
 
 def handle_set_orientation_command(
@@ -198,7 +861,7 @@ def handle_set_orientation_command(
     closed_loop: bool = True,
     duration_s: float = 2.0,
     diagnostics: bool = False,
-):
+) -> dict[str, object]:
     """
     Handles the `SET_ORIENTATION` command.
 
@@ -228,163 +891,65 @@ def handle_set_orientation_command(
         scaling the number of interpolation steps.  Default `1.0`.
     """
     utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
+    _begin_non_program_motion()
     print(f"[Pi IK] Received SET_ORIENTATION command: Roll={roll}, Pitch={pitch}, Yaw={yaw} degrees")
 
     if utils.trajectory_state.get("is_running"):
-        print("[Pi IK] ERROR: Cannot start SET_ORIENTATION, another task is running.")
-        return
+        raise RuntimeError("Cannot start SET_ORIENTATION, another task is running.")
 
-    # 1. Get current state (joint angles and full pose).
-    initial_angles = utils.current_logical_joint_angles_rad
-    current_pose_matrix = ik_solver.get_fk_matrix(initial_angles)
-    if current_pose_matrix is None:
-        print("[Pi IK] ERROR: Failed to calculate current pose using FK.")
-        return
-
-    current_position = current_pose_matrix[:3, 3]
-    current_orientation = current_pose_matrix[:3, :3]
+    initial_angles, current_position, current_orientation = _get_live_pose_snapshot()
 
     # 2. Build the target orientation matrix from Euler angles (XYZ intrinsic).
     try:
         target_orientation = R.from_euler('xyz', [roll, pitch, yaw], degrees=True).as_matrix()
     except Exception as e:
-        print(f"[Pi IK] ERROR: Failed to create orientation matrix from Euler angles: {e}")
-        return
+        raise RuntimeError(f"Failed to create orientation matrix from Euler angles: {e}") from e
 
     print(f"[Pi IK] Target EE Orientation Matrix:\n{np.round(target_orientation, 2)}")
     print(f"[Pi IK] Maintaining EE Position at: {np.round(current_position, 4)}")
 
-    # --- 3. Set up diagnostics session if enabled ---
-    session_id = None
-    diagnostics_enabled = (
-        os.environ.get("MINI_ARM_IK_LOG", "0") == "1"
-        or diagnostics
-        or utils.trajectory_state.get("diagnostics_enabled", False)
+    payload = _execute_orientation_path(
+        target_orientation,
+        command_name="SET_ORIENTATION",
+        closed_loop=closed_loop,
+        duration_s=duration_s,
+        diagnostics=diagnostics,
+        initial_angles=initial_angles,
+        current_position=current_position,
+        current_orientation=current_orientation,
     )
-    if diagnostics_enabled:
-        # Use a consistent timestamp for all diagnostics in this session
-        session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        utils.trajectory_state['diagnostics_session_id'] = session_id
-        # The IK logger will use this to place the plan in the correct subfolder
-        utils.trajectory_state['diagnostics_folder_type'] = "closed_loop" if closed_loop else "open_loop"
-
-    # ------------------------------------------------------------------
-    # 3. Generate an orientation-only path that keeps the tool-tip fixed.
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------
-    #   3. Determine execution parameters
-    # ------------------------------------------------------------
-    frequency_hz = 50 if closed_loop else 100
-
-    # Use caller-provided duration (default 1 s) to scale interpolation density.
-    duration_s = max(0.1, duration_s)  # clamp to sane minimum
-    NUM_STEPS = max(2, int(duration_s * frequency_hz))
-
-    try:
-        # Use spherical linear interpolation (SLERP) between current and target orientation
-        from scipy.spatial.transform import Slerp  # local import to avoid polluting global namespace
-
-        rot_start = R.from_matrix(current_orientation)
-        rot_end = R.from_matrix(target_orientation)
-
-        key_rots = R.concatenate([rot_start, rot_end])
-        key_times = [0, 1]
-        slerp = Slerp(key_times, key_rots)
-        times = np.linspace(0, 1, NUM_STEPS)
-        interpolated_rots = slerp(times)
-        orientation_matrices = [r.as_matrix() for r in interpolated_rots]
-    except Exception as e:
-        print(f"[Pi IK] ERROR: Failed to build SLERP interpolation: {e}")
-        return
-
-    # Build constant-position list matching orientation list
-    path_positions = [current_position] * NUM_STEPS
-
-    # ------------------------------------------------------------------
-    # 4. Solve IK for the entire path in one batched call.
-    # ------------------------------------------------------------------
-    joint_path = ik_solver.solve_ik_path_batch(
-        path_points=path_positions,
-        initial_joint_angles=initial_angles,
-        target_orientations=orientation_matrices,
+    payload.update(
+        {
+            "roll_deg": float(roll),
+            "pitch_deg": float(pitch),
+            "yaw_deg": float(yaw),
+        }
     )
-
-    if joint_path is None:
-        print("[Pi IK] ERROR: IK solver failed to find a solution for the orientation path.")
-        return
-
-    # ------------------------------------------------------------------
-    # 5. Execute the joint path (blocking) using the selected executor.
-    # ------------------------------------------------------------------
-    if closed_loop:
-        target_func = trajectory_execution._closed_loop_executor_thread
-    else:
-        target_func = trajectory_execution._open_loop_executor_thread
-    
-    executor_thread = threading.Thread(
-        target=target_func,
-        kwargs={'joint_path': joint_path, 'frequency': frequency_hz, 'diagnostics': diagnostics_enabled}
-    )
-
-    # Mark motion active so jog pauses during execution.
-    utils.trajectory_state_set("is_running", True)
-    try:
-        utils.set_motion_state("EXECUTING")
-    except Exception:
-        pass
-    try:
-        executor_thread.start()
-        executor_thread.join() # Block until the move is finished
-    finally:
-        utils.trajectory_state_set("is_running", False)
-        try:
-            utils.set_motion_state("IDLE")
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # 6. Final verification (optional, quick FK check).
-    # ------------------------------------------------------------------
-    final_pose_matrix = ik_solver.get_fk_matrix(joint_path[-1])
-    if final_pose_matrix is not None:
-        final_position = final_pose_matrix[:3, 3]
-        final_orientation = final_pose_matrix[:3, :3]
-
-        # Compare orientation error
-        orient_error_matrix = np.transpose(target_orientation) @ final_orientation
-        angle_rad, _, _ = R.from_matrix(orient_error_matrix).as_rotvec()
-
-        print(f"[Pi IK] Verification -> Final Pos: {np.round(final_position, 4)}")
-        print(f"[Pi IK] Positional error: {np.linalg.norm(final_position - current_position):.6f} m")
-        print(f"[Pi IK] Orientational error: {np.rad2deg(np.linalg.norm(angle_rad)):.3f} degrees")
-
-    # --- Clean up diagnostics session ---
-    if session_id:
-        del utils.trajectory_state['diagnostics_session_id']
-        del utils.trajectory_state['diagnostics_folder_type']
+    return payload
 
 
-def handle_move_profiled(target_x: float, 
-                         target_y: float, 
-                         target_z: float, 
-                         velocity: float, 
-                         acceleration: float, 
-                         frequency: int = 100, 
-                         use_smoothing: bool = True, 
-                         closed_loop: bool = True,
-                         diagnostics: bool = False
-                         ):
+def handle_move_profiled(target_x: float,
+                         target_y: float,
+                         target_z: float,
+                         velocity: float,
+                         acceleration: float,
+                         frequency: int = 100,
+                         use_smoothing: bool = True,
+                         closed_loop: bool = False,
+                         diagnostics: bool = False,
+                         command_name: str = "MOVE_LINE",
+                         ) -> dict[str, object]:
     """
     Handles the 'MOVE_PROFILED' command. This is the core handler for all
     high-precision, profiled, non-blocking linear moves. It plans the full path,
-    then starts the closed-loop executor in a background thread.
+    then starts the requested executor in a background thread.
     """
     utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
+    _begin_non_program_motion()
     print(f"[Pi Smooth] Received MOVE_PROFILED command to [{target_x}, {target_y}, {target_z}]")
     
     if bool(utils.trajectory_state_get("is_running", False)):
-        print("[Pi Smooth] ERROR: Cannot start move, another task is running.")
-        return
+        raise RuntimeError("Cannot start move, another task is running.")
 
     # 1. Get current state from the physical robot to start the plan
     initial_q = servo_driver.get_current_arm_state_rad(verbose=False)
@@ -395,14 +960,20 @@ def handle_move_profiled(target_x: float,
         or diagnostics
         or utils.trajectory_state.get("diagnostics_enabled", False)
     )
+    effective_closed_loop, execution_policy = _resolve_scheduled_motion_execution_policy(
+        closed_loop_requested=closed_loop,
+        command_name=command_name,
+    )
 
     # --- Set up diagnostics session if enabled ---
     if diagnostics_enabled:
         session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         utils.trajectory_state['diagnostics_session_id'] = session_id
-        utils.trajectory_state['diagnostics_folder_type'] = "closed_loop" if closed_loop else "open_loop"
+        utils.trajectory_state['diagnostics_folder_type'] = (
+            "closed_loop" if effective_closed_loop else "open_loop"
+        )
 
-    if closed_loop:
+    if effective_closed_loop:
         frequency = 50
     else:
         # Standardize default open-loop planning/execution to 100 Hz as well
@@ -421,7 +992,7 @@ def handle_move_profiled(target_x: float,
     # 3. If planning was successful, choose executor
     if joint_path:
         executor_fn = (trajectory_execution._closed_loop_executor_thread
-                       if closed_loop
+                       if effective_closed_loop
                        else trajectory_execution._open_loop_executor_thread)
 
         executor_thread = threading.Thread(
@@ -437,9 +1008,25 @@ def handle_move_profiled(target_x: float,
             pass
         executor_thread.start()
         print("[Pi Smooth] Trajectory started "
-              f"({'closed' if closed_loop else 'open'} loop, background).")
-    else:
-        print("[Pi Smooth] ERROR: Move failed because path planning was unsuccessful.")
+              f"({'closed' if effective_closed_loop else 'open'} loop, background).")
+        return _build_motion_execution_metadata(
+            accepted=True,
+            completion_scope=_default_completion_scope(
+                closed_loop=effective_closed_loop,
+                prefer_rtcore=not effective_closed_loop,
+            ),
+            state="accepted",
+            use_rtcore_status=(not effective_closed_loop),
+            extra={
+                "velocity": float(velocity),
+                "acceleration": float(acceleration),
+                "frequency_hz": int(frequency),
+                "closed_loop": bool(effective_closed_loop),
+                **execution_policy,
+            },
+        )
+
+    raise RuntimeError("Move failed because path planning was unsuccessful.")
 
 
 def handle_move_profiled_relative(dx: float, dy: float, dz: float, speed: float = 1.0, use_smoothing: bool = True):
@@ -470,7 +1057,7 @@ def handle_move_profiled_relative(dx: float, dy: float, dz: float, speed: float 
     )
     handle_move_profiled(target_pos[0], target_pos[1], target_pos[2], target_velocity, target_acceleration, use_smoothing=use_smoothing)
 
-def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_override: bool | None = None):
+def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_override: bool | None = None) -> dict[str, object]:
     """
     Handles the 'RUN_TRAJECTORY' command. It loads a trajectory definition
     from a JSON file, plans all the constituent moves, and then starts the
@@ -478,11 +1065,23 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
     The `loop_override` parameter from the UI takes precedence over the setting in the file.
     """
     utils.trajectory_state["should_stop"] = False # Reset stop flag for a new trajectory run
+    utils.trajectory_state_set("stop_request_reason", None)
     print(f"[Pi Trajectory] Received RUN_TRAJECTORY for '{trajectory_name}' (Use Cache: {use_cache}, Loop Override: {loop_override})")
 
     if utils.trajectory_state.get("is_running"):
-        print("[Pi Trajectory] ERROR: Cannot start trajectory, another task is running.")
-        return
+        raise RuntimeError("Cannot start trajectory, another task is running.")
+
+    _reset_program_status(
+        name=str(trajectory_name),
+        active=True,
+        state="planning",
+        terminal_reason=None,
+        failing_step_index=None,
+        completed_step_count=0,
+        completed_loop_count=0,
+        loop_enabled=False,
+        use_cache=bool(use_cache),
+    )
 
     # Jog can stay active in the UI and keep streaming velocity packets.
     # Force-stop it before trajectory execution so no jog loop can contend
@@ -494,17 +1093,35 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         except Exception as e:
             print(f"[Pi Trajectory] WARNING: Failed to stop jog mode cleanly: {e}")
         if utils.trajectory_state.get("is_jogging"):
-            print("[Pi Trajectory] ERROR: Jog mode is still active; aborting trajectory run.")
-            return
+            _update_program_status(
+                active=False,
+                state="interrupted",
+                terminal_reason="compatibility_interruption",
+            )
+            raise RuntimeError("Jog mode is still active; aborting trajectory run.")
 
     # --- 1. Load Trajectory Definition ---
     trajectory = _load_trajectory_by_name(trajectory_name)
 
     if trajectory is None:
-        print(f"[Pi Trajectory] ERROR: Trajectory '{trajectory_name}' not found.")
-        return
+        _update_program_status(
+            active=False,
+            state="faulted",
+            terminal_reason="planner_failure",
+        )
+        raise RuntimeError(f"Trajectory '{trajectory_name}' not found.")
 
     moves = trajectory.get("moves", [])
+    command_tokens = [
+        str(move_cmd.get("command", "")).strip().lower()
+        for move_cmd in moves
+        if isinstance(move_cmd, dict)
+    ]
+    declared_move_step_count = sum(
+        1 for command in command_tokens if command in {"move_relative", "move_absolute", "move_arc"}
+    )
+    declared_pause_step_count = sum(1 for command in command_tokens if command == "pause")
+    declared_joint_move_step_count = sum(1 for command in command_tokens if command == "home")
     weld_meta = trajectory.get("weld") if isinstance(trajectory.get("weld"), dict) else None
     if weld_meta:
         utils.trajectory_state["current_weld_type"] = weld_meta.get("type")
@@ -517,6 +1134,14 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         should_loop = loop_override
     else:
         should_loop = trajectory.get("loop", False)
+
+    _update_program_status(
+        loop_enabled=bool(should_loop),
+        step_count=len(moves),
+        move_steps=declared_move_step_count,
+        pause_steps=declared_pause_step_count,
+        joint_move_steps=declared_joint_move_step_count,
+    )
 
     # NEW: Parse orientation lock from trajectory file (unchanged from original)
     orientation_lock_euler = trajectory.get("orientation_euler_angles_deg")
@@ -557,10 +1182,16 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         print(f"[Pi Trajectory] Planning will start from current state (rad): {np.round(current_q, 3)}")
         
         planning_succeeded = True
+        planning_failure_step_index: int | None = None
+        planning_failure_reason = "planner_failure"
         for i, move_cmd in enumerate(moves):
             if utils.trajectory_state["should_stop"]:
                 print("[Pi Plan] Stop detected – aborting trajectory planning.")
                 planning_succeeded = False
+                planning_failure_step_index = i
+                planning_failure_reason = str(
+                    utils.trajectory_state_get("stop_request_reason", None) or "operator_abort"
+                )
                 break
             command = move_cmd.get("command")
             print(f"[Pi Plan] Planning Command {i+1}/{len(moves)}: {command}...")
@@ -594,6 +1225,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 if start_pos is None:
                     print(f"[Pi Trajectory] ERROR: Could not get start position for relative move. Aborting plan.")
                     planning_succeeded = False
+                    planning_failure_step_index = i
                     break
                 
                 target_pos = start_pos + vector
@@ -618,6 +1250,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                     current_q = np.array(joint_path[-1])
                 else:
                     planning_succeeded = False
+                    planning_failure_step_index = i
                     break
 
             elif command == "move_absolute":
@@ -656,6 +1289,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                     current_q = np.array(joint_path[-1])
                 else:
                     planning_succeeded = False
+                    planning_failure_step_index = i
                     break
                     
             elif command == "move_arc":
@@ -670,6 +1304,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 if start_pos is None:
                     print(f"[Pi Trajectory] ERROR: Could not get start position for arc move. Aborting plan.")
                     planning_succeeded = False
+                    planning_failure_step_index = i
                     break
                 
                 # 1. Generate the Cartesian path for the arc
@@ -679,6 +1314,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 if not cartesian_path:
                     print(f"[Pi Trajectory] ERROR: Could not generate arc trajectory. Aborting plan.")
                     planning_succeeded = False
+                    planning_failure_step_index = i
                     break
 
                 # 2. Plan the joint space path from the Cartesian points
@@ -703,6 +1339,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                     current_q = np.array(joint_path[-1])
                 else:
                     planning_succeeded = False
+                    planning_failure_step_index = i
                     break
 
             elif command == "pause":
@@ -716,7 +1353,20 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
             print("[Pi Trajectory] FATAL: Planning failed for one of the moves. Aborting execution.")
             utils.trajectory_state["weld_active"] = False
             utils.trajectory_state["current_weld_type"] = None
-            return
+            terminal_state = "aborted" if planning_failure_reason == "operator_abort" else "faulted"
+            _update_program_status(
+                active=False,
+                state=terminal_state,
+                terminal_reason=planning_failure_reason,
+                failing_step_index=planning_failure_step_index,
+                current_step_index=None,
+                current_step_type=None,
+            )
+            if planning_failure_step_index is None:
+                raise RuntimeError("Trajectory planning failed before execution started.")
+            raise RuntimeError(
+                f"Trajectory planning failed at step {planning_failure_step_index + 1}."
+            )
 
         # After successful planning, save the result to cache
         try:
@@ -801,7 +1451,50 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
     # --- 2. Execution Phase ---
     print("\n--- Trajectory Ready. Starting Execution in a background thread ---")
     
-    utils.trajectory_state_update(is_running=True, should_stop=False)
+    move_step_count = sum(1 for step in planned_steps if step.get("type") == "move")
+    pause_step_count = sum(1 for step in planned_steps if step.get("type") == "pause")
+    joint_move_step_count = sum(1 for step in planned_steps if step.get("type") == "joint_move")
+    rtcore_segment_execution = _backend_supports_rtcore_execution() and move_step_count > 0
+    program_segment_execution_policy = (
+        "rtcore_queued" if rtcore_segment_execution else "controller_open_loop"
+    )
+
+    utils.trajectory_state_update(
+        is_running=True,
+        should_stop=False,
+        active_program_name=str(trajectory_name),
+        active_program_loop_enabled=bool(should_loop),
+        active_program_use_cache=bool(use_cache),
+        active_program_step_count=len(planned_steps),
+        active_program_move_steps=move_step_count,
+        active_program_pause_steps=pause_step_count,
+        active_program_joint_move_steps=joint_move_step_count,
+        active_program_rtcore_segments=rtcore_segment_execution,
+        active_program_segment_execution_policy=program_segment_execution_policy,
+        active_program_step_index=None,
+        active_program_step_type=None,
+        active_program_loop_iteration=0,
+    )
+    _update_program_status(
+        name=str(trajectory_name),
+        active=True,
+        state="accepted",
+        terminal_reason=None,
+        failing_step_index=None,
+        completed_step_count=0,
+        completed_loop_count=0,
+        loop_enabled=bool(should_loop),
+        use_cache=bool(use_cache),
+        step_count=len(planned_steps),
+        move_steps=move_step_count,
+        pause_steps=pause_step_count,
+        joint_move_steps=joint_move_step_count,
+        rtcore_segments=bool(rtcore_segment_execution),
+        segment_execution_policy=program_segment_execution_policy,
+        current_step_index=None,
+        current_step_type=None,
+        loop_iteration=0,
+    )
     try:
         utils.set_motion_state("EXECUTING")
     except Exception:
@@ -817,6 +1510,12 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         current_pose = ik_solver.get_fk_matrix(current_q)
         if current_pose is None or first_pose is None:
             print("[Pi Trajectory] Failed to get current or first pose, aborting trajectory.")
+            _update_program_status(
+                active=False,
+                state="faulted",
+                terminal_reason="planner_failure",
+                failing_step_index=0 if len(planned_steps) > 0 else None,
+            )
             utils.trajectory_state_update(
                 is_running=False,
                 weld_active=False,
@@ -826,7 +1525,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 utils.set_motion_state("IDLE")
             except Exception:
                 pass
-            return
+            raise RuntimeError("Failed to get current or first pose for looping trajectory start.")
         first_pos = first_pose[:3, 3]
         first_orient = first_pose[:3, :3]
         current_pos = current_pose[:3, 3]
@@ -850,6 +1549,12 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         )
         if joint_path_initial is None:
             print("[Pi Trajectory] Failed to plan initial move to first waypoint, aborting trajectory.")
+            _update_program_status(
+                active=False,
+                state="faulted",
+                terminal_reason="planner_failure",
+                failing_step_index=0 if len(planned_steps) > 0 else None,
+            )
             utils.trajectory_state_update(
                 is_running=False,
                 weld_active=False,
@@ -859,7 +1564,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                 utils.set_motion_state("IDLE")
             except Exception:
                 pass
-            return
+            raise RuntimeError("Failed to plan initial move to first waypoint.")
         initial_freq = frequency_hz
         initial_thread = threading.Thread(
             target=trajectory_execution._open_loop_executor_thread,
@@ -871,8 +1576,41 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         while initial_thread.is_alive():
             if utils.trajectory_state["should_stop"]:
                 print("[Pi Trajectory] Stop detected during initial move – aborting.")
+                _update_program_status(
+                    active=False,
+                    state="aborted",
+                    terminal_reason=str(
+                        utils.trajectory_state_get("stop_request_reason", None) or "operator_abort"
+                    ),
+                    failing_step_index=0 if len(planned_steps) > 0 else None,
+                )
                 break
             initial_thread.join(timeout=0.1)  # Check every 100ms
+
+        if utils.trajectory_state["should_stop"]:
+            utils.trajectory_state_update(
+                is_running=False,
+                thread=None,
+                weld_active=False,
+                current_weld_type=None,
+                active_program_name=None,
+                active_program_loop_enabled=False,
+                active_program_use_cache=False,
+                active_program_step_count=0,
+                active_program_move_steps=0,
+                active_program_pause_steps=0,
+                active_program_joint_move_steps=0,
+                active_program_rtcore_segments=False,
+                active_program_segment_execution_policy="",
+                active_program_step_index=None,
+                active_program_step_type=None,
+                active_program_loop_iteration=0,
+            )
+            try:
+                utils.set_motion_state("IDLE")
+            except Exception:
+                pass
+            raise RuntimeError("Trajectory run aborted before the looping body started.")
 
         # NEW: For looping, create a modified steps list that starts from the second step
         loop_steps = planned_steps[1:]
@@ -893,6 +1631,23 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
     executor_thread.start()
     
     print("[Pi Trajectory] Trajectory thread started. Main loop is responsive.")
+    return _build_motion_execution_metadata(
+        accepted=True,
+        completion_scope="controller_program_thread",
+        state="accepted",
+        use_rtcore_status=False,
+        extra={
+            "trajectory_name": str(trajectory_name),
+            "use_cache": bool(use_cache),
+            "loop_enabled": bool(should_loop),
+            "program_segment_execution_policy": program_segment_execution_policy,
+            "program_rtcore_segments": bool(rtcore_segment_execution),
+            "program_step_count": int(len(planned_steps)),
+            "program_move_steps": int(move_step_count),
+            "program_pause_steps": int(pause_step_count),
+            "program_joint_move_steps": int(joint_move_step_count),
+        },
+    )
 
 def handle_stop_command():
     """
@@ -902,10 +1657,31 @@ def handle_stop_command():
     print("[Controller] Received STOP command. Halting all motion.")
     # Set the flag to stop any high-level trajectory loops
     utils.trajectory_state_update(should_stop=True, weld_active=False)
+    utils.trajectory_state_set("stop_request_reason", "operator_abort")
+    program_status = _program_status_from_snapshot(utils.trajectory_state_snapshot())
+    program_state = str(program_status.get("state") or "idle").strip().lower() if program_status else "idle"
+    if program_status and (
+        bool(program_status.get("active", False)) or program_state in _PROGRAM_ACTIVE_STATES
+    ):
+        _update_program_status(
+            active=bool(program_status.get("active", False)),
+            terminal_reason="operator_abort",
+            state=str(program_status.get("state") or "executing"),
+        )
     try:
         utils.set_motion_state("IDLE")
     except Exception:
         pass
+
+    try:
+        backend = backend_registry.get_active_backend()
+    except Exception:
+        backend = None
+    if backend is not None and hasattr(backend, "abort_trajectory"):
+        try:
+            backend.abort_trajectory()  # type: ignore[attr-defined]
+        except Exception as e:
+            print(f"[Controller] WARNING: RTCore trajectory abort failed: {e}")
 
     # Also send an immediate brake command to the physical servos
     # by commanding them to their current position with zero speed.
@@ -1045,59 +1821,82 @@ def handle_get_orientation(sock: 'socket.socket', addr: tuple):
         except Exception as e:
             print(f"[Pi] Error sending FK_FAILED error to {addr}: {e}")
 
-def handle_move_line(target_x: float, target_y: float, target_z: float, velocity: float, acceleration: float, closed_loop: bool = True):
-    """Convenience wrapper that calls the main profiled move handler, defaulting to closed-loop."""
+def handle_move_line(target_x: float, target_y: float, target_z: float, velocity: float, acceleration: float, closed_loop: bool = False) -> dict[str, object]:
+    """Convenience wrapper that calls the main profiled move handler, defaulting to open-loop."""
     utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
-    handle_move_profiled(
+    return handle_move_profiled(
         target_x, target_y, target_z, velocity, acceleration,
         closed_loop=closed_loop,
         use_smoothing=True,
-        diagnostics=False
+        diagnostics=False,
+        command_name="MOVE_LINE",
     )
 
-def handle_move_line_relative(dx: float, dy: float, dz: float, speed: float = 1.0, closed_loop: bool = True):
-    """Convenience wrapper that calls the main profiled move handler, defaulting to closed-loop."""
+def handle_move_line_relative(dx: float, dy: float, dz: float, speed: float = 1.0, closed_loop: bool = False) -> dict[str, object]:
+    """Convenience wrapper that calls the main profiled move handler, defaulting to open-loop."""
     utils.trajectory_state["should_stop"] = False # Reset stop flag on new move
     current_q = servo_driver.get_current_arm_state_rad(verbose=False)
     if current_q is None:
-        print("[Pi Smooth] ERROR: Cannot start relative move, failed to get current position.")
-        return
+        raise RuntimeError("Cannot start relative move, failed to get current position.")
         
     start_pos = ik_solver.get_fk(current_q)
     if start_pos is None:
-        print("[Pi Smooth] ERROR: Cannot start relative move, failed to get start position.")
-        return
+        raise RuntimeError("Cannot start relative move, failed to get start position.")
         
     _, target_velocity, target_acceleration = _resolve_profile_params_for_speed_multiplier(speed)
     target_pos = start_pos + np.array([dx, dy, dz])
     
-    handle_move_profiled(
+    return handle_move_profiled(
         target_pos[0], target_pos[1], target_pos[2],
         velocity=target_velocity,
         acceleration=target_acceleration,
         closed_loop=closed_loop,
         use_smoothing=True,
-        diagnostics=False
+        diagnostics=False,
+        command_name="MOVE_LINE_RELATIVE",
     )
 
 
-def handle_wait_for_idle():
+def handle_wait_for_idle(timeout_s: float = _WAIT_FOR_IDLE_DEFAULT_TIMEOUT_S) -> dict[str, object]:
     """
-    Block until the currently running planner/trajectory thread finishes.
+    Block until controller-thread and RTCore-backed motion activity has quiesced.
+    """
+    resolved_timeout_s = float(timeout_s)
+    if not np.isfinite(resolved_timeout_s) or resolved_timeout_s <= 0.0:
+        raise ValueError("WAIT_FOR_IDLE timeout must be a positive finite number of seconds.")
 
-    Direct commissioning setpoints sent via `servo_driver.set_servo_positions(...)`
-    do not run through this thread, so this call intentionally does not imply that a
-    one-shot joint setpoint has been applied or completed on hardware.
-    """
-    # Check if a trajectory thread exists and is running
-    if utils.trajectory_state.get("is_running") and utils.trajectory_state.get("thread"):
-        print("[Controller] Waiting for current move to complete...")
-        thread = utils.trajectory_state.get("thread")
-        if thread:
-            thread.join() # Wait for the thread to finish
-        print("[Controller] Move complete. Resuming.")
-    else:
-        print("[Controller] No move is currently running.")
+    deadline = time.monotonic() + resolved_timeout_s
+    waited_for_motion = False
+    last_active_payload: dict[str, object] | None = None
+
+    while True:
+        payload = get_motion_execution_status()
+        if _motion_payload_is_active(payload):
+            if not waited_for_motion:
+                print("[Controller] Waiting for motion execution to become idle...")
+            waited_for_motion = True
+            last_active_payload = payload
+            if time.monotonic() > deadline:
+                print("[Controller] WARNING: Timed out waiting for motion execution to become idle.")
+                return _finalize_wait_for_idle_payload(
+                    payload,
+                    timeout_s=resolved_timeout_s,
+                    waited_for_motion=waited_for_motion,
+                    last_active_payload=last_active_payload,
+                    timed_out=True,
+                )
+            time.sleep(_WAIT_FOR_IDLE_POLL_INTERVAL_S)
+            continue
+
+        result = _finalize_wait_for_idle_payload(
+            payload,
+            timeout_s=resolved_timeout_s,
+            waited_for_motion=waited_for_motion,
+            last_active_payload=last_active_payload,
+            timed_out=False,
+        )
+        print(f"[Controller] WAIT_FOR_IDLE finished with state: {result['state']}")
+        return result
 
 
 def handle_apply_joint_setpoint(
@@ -1106,6 +1905,7 @@ def handle_apply_joint_setpoint(
     gripper_rad: float | None = None,
     speed: int | None = None,
     acceleration: float | None = None,
+    max_motor_rpm: float | None = None,
 ) -> dict[str, object]:
     """
     Send a direct joint/gripper setpoint and return once the backend accepts it.
@@ -1120,15 +1920,93 @@ def handle_apply_joint_setpoint(
         if acceleration is not None
         else utils.DEFAULT_SERVO_ACCELERATION_DEG_S2
     )
+    _begin_non_program_motion()
+    if max_motor_rpm is not None and float(max_motor_rpm) > 0.0:
+        if bool(utils.trajectory_state_get("is_running", False)):
+            raise RuntimeError("Cannot start bounded joint setpoint, another task is running.")
+        current_q = servo_driver.get_current_arm_state_rad(verbose=False)
+        if current_q is None:
+            raise RuntimeError("Failed to read current joint state for bounded joint setpoint.")
+
+        try:
+            active_robot = robot_config.get_active_robot()
+            gear_ratios = list(active_robot.actuator_gear_ratios)
+        except Exception:
+            gear_ratios = []
+
+        target_q = np.asarray(arm_angles_rad, dtype=float)
+        current_q_arr = np.asarray(current_q[: len(target_q)], dtype=float)
+        delta_q = target_q - current_q_arr
+        max_joint_rates_rad_s: list[float] = []
+        for joint_idx in range(len(target_q)):
+            ratio = float(gear_ratios[joint_idx]) if joint_idx < len(gear_ratios) else 1.0
+            if not np.isfinite(ratio) or ratio <= 0.0:
+                ratio = 1.0
+            max_joint_rates_rad_s.append((float(max_motor_rpm) / ratio) * (2.0 * np.pi / 60.0))
+
+        duration_s = _SAFE_JOINT_MOVE_MIN_DURATION_S
+        for joint_idx, max_rate in enumerate(max_joint_rates_rad_s):
+            if max_rate > 0.0:
+                duration_s = max(duration_s, abs(float(delta_q[joint_idx])) / max_rate)
+
+        num_steps = max(2, int(np.ceil(duration_s * _SAFE_JOINT_MOVE_FREQUENCY_HZ)))
+        t = np.linspace(0.0, 1.0, num_steps)
+        smooth = (3.0 * np.square(t)) - (2.0 * np.power(t, 3))
+        joint_path = [
+            (current_q_arr + (smooth_i * delta_q)).tolist()
+            for smooth_i in smooth
+        ]
+
+        executor_thread = threading.Thread(
+            target=trajectory_execution._open_loop_executor_thread,
+            kwargs={
+                "joint_path": joint_path,
+                "frequency": _SAFE_JOINT_MOVE_FREQUENCY_HZ,
+                "diagnostics": False,
+            },
+            daemon=True,
+        )
+        utils.trajectory_state_update(thread=executor_thread, is_running=True, should_stop=False)
+        try:
+            utils.set_motion_state("EXECUTING")
+        except Exception:
+            pass
+        executor_thread.start()
+
+        if gripper_rad is not None:
+            handle_set_gripper_state(np.rad2deg(gripper_rad), resolved_speed, resolved_acceleration)
+        return _build_motion_execution_metadata(
+            accepted=True,
+            completion_scope=_default_completion_scope(
+                closed_loop=False,
+                prefer_rtcore=True,
+            ),
+            state="accepted",
+            use_rtcore_status=True,
+            extra={
+                "speed": resolved_speed,
+                "acceleration": resolved_acceleration,
+                "max_motor_rpm": float(max_motor_rpm),
+                "duration_s": float(duration_s),
+                "frequency_hz": _SAFE_JOINT_MOVE_FREQUENCY_HZ,
+            },
+        )
+
     servo_driver.set_servo_positions(arm_angles_rad, resolved_speed, resolved_acceleration)
     if gripper_rad is not None:
         handle_set_gripper_state(np.rad2deg(gripper_rad), resolved_speed, resolved_acceleration)
-    return {
-        "accepted": True,
-        "completion_scope": "direct_setpoint_ack",
-        "speed": resolved_speed,
-        "acceleration": resolved_acceleration,
-    }
+    return _build_motion_execution_metadata(
+        accepted=True,
+        completion_scope=(
+            "rtcore_execution" if _backend_supports_rtcore_execution() else "controller_ack"
+        ),
+        state="accepted",
+        use_rtcore_status=_backend_supports_rtcore_execution(),
+        extra={
+            "speed": resolved_speed,
+            "acceleration": resolved_acceleration,
+        },
+    )
 
 
 def handle_safe_power_down(wait_for_idle: bool = False) -> str:
@@ -1322,7 +2200,7 @@ def handle_get_gripper_state(sock: 'socket.socket', addr: tuple):
 # Real-time Cartesian Jogging
 # -----------------------------------------------------------------------------
 
-JOG_CONTROL_FREQUENCY_HZ = 25
+JOG_CONTROL_FREQUENCY_HZ = 50
 JOG_VELOCITY_TIMEOUT_S = 0.5  # If no command received in this time, stop
 MAX_JOG_LINEAR_M_S = 0.2      # Safety cap per-axis
 MAX_JOG_ANGULAR_DEG_S = 180.0 # Safety cap per-axis
@@ -1335,12 +2213,14 @@ def _jog_controller_thread():
     latest velocity commands stored in the global trajectory_state.
     """
     print("[Jog] Jog controller thread started.")
-    
+
+    rtcore_jog_backend = _get_rtcore_jog_backend()
+    rtcore_jog_owned = rtcore_jog_backend is not None
+
     # Get initial state
     q_current = servo_driver.get_current_arm_state_rad(verbose=False)
-    
+
     last_loop_time = time.monotonic()
-    
     last_status_log_time = time.monotonic()
     timeout_zero_logged = False
     was_paused_for_motion = False
@@ -1354,6 +2234,13 @@ def _jog_controller_thread():
         # When the motion ends, resync q_current from the physical robot so we do not
         # "snap back" to stale internal state.
         if utils.trajectory_state.get("is_running"):
+            if rtcore_jog_owned:
+                try:
+                    stop_realtime_jog = getattr(rtcore_jog_backend, "stop_realtime_jog", None)
+                    if callable(stop_realtime_jog):
+                        stop_realtime_jog()
+                except Exception as exc:
+                    print(f"[Jog] WARNING: Failed to pause RTCore jog cleanly: {exc}")
             was_paused_for_motion = True
             loop_duration = time.monotonic() - loop_start_time
             sleep_time = (1.0 / JOG_CONTROL_FREQUENCY_HZ) - loop_duration
@@ -1378,6 +2265,12 @@ def _jog_controller_thread():
                 timeout_zero_logged = True
         else:
             timeout_zero_logged = False
+
+        # Resync from physical feedback each loop so jog IK follows the real arm
+        # instead of integrating indefinitely from the last commanded posture.
+        fresh_q = servo_driver.get_current_arm_state_rad(verbose=False)
+        if fresh_q is not None:
+            q_current = np.asarray(fresh_q, dtype=float)
 
         # 1. Get current pose from FK
         current_pose_matrix = ik_solver.get_fk_matrix(q_current)
@@ -1405,18 +2298,15 @@ def _jog_controller_thread():
         # Apply backend safety caps component-wise
         linear_vel = np.clip(velocities[:3], -MAX_JOG_LINEAR_M_S, MAX_JOG_LINEAR_M_S)
         angular_deg_s = np.clip(velocities[3:], -MAX_JOG_ANGULAR_DEG_S, MAX_JOG_ANGULAR_DEG_S)
-        angular_vel_rad_s = np.deg2rad(angular_deg_s) # Convert RPY rates to radians
         
         # 3. Calculate target pose for this time step
         # Integrate linear velocity to get new position
         target_position = current_position + linear_vel * dt
         
-        # Integrate angular velocity to get new orientation
-        # Create a small rotation vector from angular velocity and time step
-        rotation_vector = angular_vel_rad_s * dt
-        # Convert the small rotation vector to a rotation matrix
-        delta_rotation = R.from_rotvec(rotation_vector).as_matrix()
-        # Apply the small rotation to the current orientation
+        # Integrate angular velocity as explicit XYZ Euler deltas so realtime
+        # jog matches the step-rotate path's labeled roll/pitch/yaw semantics.
+        delta_rotation = R.from_euler('xyz', angular_deg_s * dt, degrees=True).as_matrix()
+        # Apply the small rotation in the base frame, matching `handle_rotate_command()`.
         target_orientation = delta_rotation @ current_orientation
         if utils.trajectory_state.get("jog_debug", False):
             try:
@@ -1446,8 +2336,19 @@ def _jog_controller_thread():
                 if utils.trajectory_state.get("jog_debug", False):
                     dq = q_clamped - q_current
                     print(f"[Jog] q_delta(rad)={np.round(dq, 5)} | lin={np.round(linear_vel,4)} m/s, ang={np.round(angular_deg_s,1)} deg/s, dt={dt:.4f}s")
-                # 6. Command servos to the clamped angles. High speed, zero accel for responsiveness.
-                servo_driver.set_servo_positions(q_clamped, 800, 0)
+                if rtcore_jog_owned:
+                    send_realtime_jog_command = getattr(rtcore_jog_backend, "send_realtime_jog_command", None)
+                    if not callable(send_realtime_jog_command):
+                        raise RuntimeError("RTCore jog backend does not expose send_realtime_jog_command()")
+                    dt_safe = max(dt, 1.0 / float(JOG_CONTROL_FREQUENCY_HZ))
+                    joint_velocity_cmd = ((q_clamped - q_current) / dt_safe).tolist()
+                    send_realtime_jog_command(
+                        joint_velocity_cmd,
+                        timeout_s=JOG_VELOCITY_TIMEOUT_S,
+                    )
+                else:
+                    # 6. Command servos to the clamped angles. High speed, zero accel for responsiveness.
+                    servo_driver.set_servo_positions(q_clamped, 800, 0)
                 q_current = q_clamped # Update our state for the next iteration's IK
             except Exception as e:
                 print(f"[Jog] WARNING: Failed to clamp/apply joint limits: {e}")
@@ -1455,6 +2356,16 @@ def _jog_controller_thread():
             # If IK fails, we don't command anything and just try again next cycle.
             # This can happen if the target is unreachable.
             print("[Jog] WARNING: IK solution not found for step.")
+            if rtcore_jog_owned:
+                try:
+                    send_realtime_jog_command = getattr(rtcore_jog_backend, "send_realtime_jog_command", None)
+                    if callable(send_realtime_jog_command):
+                        send_realtime_jog_command(
+                            [0.0] * len(q_current),
+                            timeout_s=JOG_VELOCITY_TIMEOUT_S,
+                        )
+                except Exception as exc:
+                    print(f"[Jog] WARNING: Failed to zero RTCore jog command after IK miss: {exc}")
 
         # --- Maintain loop frequency ---
         loop_duration = time.monotonic() - loop_start_time
@@ -1497,8 +2408,16 @@ def _jog_controller_thread():
             last_status_log_time = now
 
     print("[Jog] Jog controller thread stopped.")
+    if rtcore_jog_owned:
+        try:
+            stop_realtime_jog = getattr(rtcore_jog_backend, "stop_realtime_jog", None)
+            if callable(stop_realtime_jog):
+                stop_realtime_jog()
+        except Exception as exc:
+            print(f"[Jog] WARNING: Failed to stop RTCore jog on thread exit: {exc}")
     # Ensure global state reflects the jog thread is no longer active.
     utils.trajectory_state["is_jogging"] = False
+    utils.trajectory_state["jog_execution_policy"] = ""
     if utils.trajectory_state.get("jog_thread") is threading.current_thread():
         utils.trajectory_state["jog_thread"] = None
 
@@ -1509,11 +2428,25 @@ def handle_jog_start():
         print("[Jog] ERROR: Another motion is already active. Cannot start jog mode.")
         return
 
+    rtcore_jog_backend = _get_rtcore_jog_backend()
     print("[Jog] Starting jog mode...")
     utils.trajectory_state["is_jogging"] = True
     utils.trajectory_state["last_jog_command_time"] = time.monotonic()
     utils.trajectory_state["jog_velocities"] = np.zeros(6, dtype=float)
     utils.trajectory_state["jog_gripper_velocity_deg_s"] = 0.0
+    utils.trajectory_state["jog_execution_policy"] = (
+        "rtcore_joint_velocity" if rtcore_jog_backend is not None else "controller_cartesian_loop"
+    )
+
+    if rtcore_jog_backend is not None:
+        try:
+            start_realtime_jog = getattr(rtcore_jog_backend, "start_realtime_jog", None)
+            if callable(start_realtime_jog):
+                start_realtime_jog(timeout_s=JOG_VELOCITY_TIMEOUT_S)
+        except Exception as exc:
+            utils.trajectory_state["is_jogging"] = False
+            utils.trajectory_state["jog_execution_policy"] = ""
+            raise RuntimeError(f"Failed to start RTCore jog mode: {exc}") from exc
 
     jog_thread = threading.Thread(target=_jog_controller_thread, daemon=True)
     utils.trajectory_state["jog_thread"] = jog_thread
@@ -1523,6 +2456,7 @@ def handle_jog_start():
 def handle_jog_stop():
     """Stops the real-time jogging mode."""
     print("[Jog] Stopping jog mode...")
+    rtcore_jog_backend = _get_rtcore_jog_backend()
     utils.trajectory_state["is_jogging"] = False # Signal the thread to exit
     utils.trajectory_state["jog_gripper_velocity_deg_s"] = 0.0
 
@@ -1531,11 +2465,21 @@ def handle_jog_stop():
     if thread and thread.is_alive():
         thread.join(timeout=0.5)
     utils.trajectory_state["jog_thread"] = None
+    utils.trajectory_state["jog_execution_policy"] = ""
 
-    # Hard stop the servos as a final safety measure
-    current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
-    if current_angles:
-        servo_driver.set_servo_positions(current_angles, 0, 100)
+    if rtcore_jog_backend is not None:
+        try:
+            stop_realtime_jog = getattr(rtcore_jog_backend, "stop_realtime_jog", None)
+            if callable(stop_realtime_jog):
+                stop_realtime_jog()
+        except Exception as exc:
+            print(f"[Jog] WARNING: Failed to stop RTCore jog mode: {exc}")
+
+    if rtcore_jog_backend is None:
+        # Hard stop the servos as a final safety measure for non-RT backends.
+        current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
+        if current_angles:
+            servo_driver.set_servo_positions(current_angles, 0, 100)
     
     print("[Jog] Jog mode stopped.")
 

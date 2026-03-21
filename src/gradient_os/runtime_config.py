@@ -7,6 +7,7 @@ from typing import Any
 
 from . import robot_assets
 from . import tool_library
+from .arm_controller.backends.ethercat_rtcore.runtime import DEFAULT_RT_MAX_RPM
 from .arm_controller.backends import registry as backend_registry
 from .arm_controller.robots import (
     get_robot_config,
@@ -53,6 +54,7 @@ def _empty_runtime_config() -> dict[str, Any]:
                 "ik_solver_backend": None,
                 "servo_backend": None,
                 "drive_profile": None,
+                "rt_max_rpm": DEFAULT_RT_MAX_RPM,
             },
         },
         "meta": {
@@ -106,6 +108,20 @@ def _normalize_drive_profile(raw: Any) -> str | None:
     return token
 
 
+def _normalize_rt_max_rpm(raw: Any) -> float | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.strip().lower() in {"", "none", "null"}:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported rt_max_rpm '{raw}'.") from exc
+    if value < 0.0:
+        raise ValueError("rt_max_rpm must be >= 0.")
+    return float(value)
+
+
 def _normalize_tool_id(raw: Any) -> str | None:
     if raw is None:
         return None
@@ -144,6 +160,9 @@ def _normalize_runtime_config(raw: Any) -> dict[str, Any]:
                 ),
                 "servo_backend": _normalize_servo_backend(overrides_obj.get("servo_backend")),
                 "drive_profile": _normalize_drive_profile(overrides_obj.get("drive_profile")),
+                "rt_max_rpm": _normalize_rt_max_rpm(
+                    overrides_obj.get("rt_max_rpm", defaults["desired"]["overrides"]["rt_max_rpm"])
+                ),
             },
         },
         "meta": {
@@ -215,6 +234,10 @@ def update_runtime_config_desired(
             overrides["drive_profile"] = _normalize_drive_profile(
                 patch_overrides.get("drive_profile")
             )
+        if "rt_max_rpm" in patch_overrides:
+            overrides["rt_max_rpm"] = _normalize_rt_max_rpm(
+                patch_overrides.get("rt_max_rpm")
+            )
     desired["overrides"] = overrides
     current["desired"] = desired
     return save_runtime_config(current, actor=actor)
@@ -241,6 +264,7 @@ def resolve_effective_runtime(
     requested_ik_solver_backend: str | None = None,
     requested_servo_backend: str | None = None,
     requested_drive_profile: str | None = None,
+    requested_rt_max_rpm: float | int | str | None = None,
     requested_active_tool_id: str | None = None,
     allow_unsafe_overrides: bool = False,
 ) -> dict[str, Any]:
@@ -272,6 +296,12 @@ def resolve_effective_runtime(
     if override_drive_profile and allow_unsafe_overrides and not sim_mode:
         effective_drive_profile = override_drive_profile
         drive_profile_source = "dev_override"
+
+    override_rt_max_rpm = _normalize_rt_max_rpm(requested_rt_max_rpm)
+    effective_rt_max_rpm = (
+        DEFAULT_RT_MAX_RPM if override_rt_max_rpm is None else float(override_rt_max_rpm)
+    )
+    rtcore_source = "default" if override_rt_max_rpm is None else "runtime_config"
 
     selected_tool = tool_library.resolve_active_tool(
         robot_id=robot.robot_id,
@@ -309,6 +339,15 @@ def resolve_effective_runtime(
             "source": drive_profile_source,
             "backend_default_profile": backend_default_drive_profile,
             "override_profile": override_drive_profile,
+        },
+        "rtcore": {
+            "configured_max_rpm": effective_rt_max_rpm,
+            "configured_source": rtcore_source,
+            "effective_max_rpm": effective_rt_max_rpm,
+            "source": rtcore_source,
+            "default_max_rpm": DEFAULT_RT_MAX_RPM,
+            "override_max_rpm": override_rt_max_rpm,
+            "clamp_disabled": bool(effective_rt_max_rpm == 0.0),
         },
         "tool": {
             "active_tool_id": selected_tool.get("tool_id"),
@@ -354,9 +393,9 @@ def attach_live_drive_profile(
 
 def _active_fields(
     runtime: dict[str, Any] | None,
-) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, str | None, float | None, str | None]:
     if not isinstance(runtime, dict):
-        return (None, None, None, None, None)
+        return (None, None, None, None, None, None)
     robot_name = runtime.get("robot", {}).get("name") if isinstance(runtime.get("robot"), dict) else None
     ik_backend = runtime.get("ik_solver", {}).get("effective_backend") if isinstance(runtime.get("ik_solver"), dict) else None
     servo_backend = runtime.get("servo_backend", {}).get("effective_backend") if isinstance(runtime.get("servo_backend"), dict) else None
@@ -366,18 +405,31 @@ def _active_fields(
         if isinstance(drive_block, dict)
         else None
     )
+    rtcore_block = runtime.get("rtcore", {}) if isinstance(runtime.get("rtcore"), dict) else {}
+    rt_max_rpm_raw = (
+        rtcore_block.get("configured_max_rpm", rtcore_block.get("effective_max_rpm"))
+        if isinstance(rtcore_block, dict)
+        else None
+    )
+    rt_max_rpm = None
+    if rt_max_rpm_raw is not None:
+        try:
+            rt_max_rpm = float(rt_max_rpm_raw)
+        except (TypeError, ValueError):
+            rt_max_rpm = None
     active_tool_id = runtime.get("tool", {}).get("active_tool_id") if isinstance(runtime.get("tool"), dict) else None
     return (
         str(robot_name) if isinstance(robot_name, str) else None,
         str(ik_backend) if isinstance(ik_backend, str) else None,
         str(servo_backend) if isinstance(servo_backend, str) else None,
         str(drive_profile) if isinstance(drive_profile, str) else None,
+        rt_max_rpm,
         str(active_tool_id) if isinstance(active_tool_id, str) else None,
     )
 
 
 def compute_restart_required(active_runtime: dict[str, Any] | None, desired_config: dict[str, Any]) -> bool:
-    active_robot, active_ik, active_servo, active_drive_profile, _active_tool_id = _active_fields(active_runtime)
+    active_robot, active_ik, active_servo, active_drive_profile, active_rt_max_rpm, _active_tool_id = _active_fields(active_runtime)
     active_mode = active_runtime.get("mode", {}) if isinstance(active_runtime, dict) else {}
     desired_obj = desired_config.get("desired", {}) if isinstance(desired_config, dict) else {}
     desired_robot_name = _normalize_robot_name(desired_obj.get("robot"))
@@ -392,12 +444,15 @@ def compute_restart_required(active_runtime: dict[str, Any] | None, desired_conf
         requested_ik_solver_backend=desired_overrides.get("ik_solver_backend"),
         requested_servo_backend=desired_overrides.get("servo_backend"),
         requested_drive_profile=desired_overrides.get("drive_profile"),
+        requested_rt_max_rpm=desired_overrides.get("rt_max_rpm"),
         requested_active_tool_id=desired_obj.get("active_tool_id"),
         allow_unsafe_overrides=desired_allow_unsafe,
     )
     desired_ik = desired_runtime.get("ik_solver", {}).get("effective_backend")
     desired_servo = desired_runtime.get("servo_backend", {}).get("effective_backend")
     desired_drive_profile = desired_runtime.get("drive_profile", {}).get("effective_profile")
+    desired_rt_max_rpm_raw = desired_runtime.get("rtcore", {}).get("effective_max_rpm")
+    desired_rt_max_rpm = float(desired_rt_max_rpm_raw) if desired_rt_max_rpm_raw is not None else None
     if active_robot is None:
         return False
     return (
@@ -405,5 +460,6 @@ def compute_restart_required(active_runtime: dict[str, Any] | None, desired_conf
         or active_ik != desired_ik
         or active_servo != desired_servo
         or active_drive_profile != desired_drive_profile
+        or active_rt_max_rpm != desired_rt_max_rpm
     )
 

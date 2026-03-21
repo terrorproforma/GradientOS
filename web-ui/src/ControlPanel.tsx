@@ -14,6 +14,30 @@ type JointInfoResponse = {
 	gripper_deg?: number;
 };
 
+type MotionExecutionPayload = {
+	controller_motion_state?: string;
+	controller_thread_running?: boolean;
+	state_name?: string;
+	active_mode_name?: string;
+	active_traj_id?: number;
+	queue_depth?: number;
+	queue_capacity?: number;
+	motion_done?: boolean;
+	stale_command?: boolean;
+	underrun_count?: number;
+};
+
+type MotionStatusResponse = {
+	status?: string;
+	accepted?: boolean;
+	command_acknowledged?: boolean;
+	state?: string;
+	completion_scope?: string;
+	trajectory_id?: number;
+	source_of_truth?: string;
+	execution?: MotionExecutionPayload;
+};
+
 const LIVE_JOINT_FEEDBACK_POLL_MS = 20;
 
 type CommissioningStatus = {
@@ -111,6 +135,14 @@ function formatStepDegrees(value: number): string {
 	return Number(value.toFixed(3)).toString();
 }
 
+function formatMotionStateLabel(value: string | undefined): string {
+	const raw = (value ?? "").trim();
+	if (!raw) {
+		return "UNKNOWN";
+	}
+	return raw.replace(/_/g, " ").toUpperCase();
+}
+
 async function readErrorMessage(res: Response): Promise<string> {
 	const contentType = res.headers.get("content-type") ?? "";
 	if (contentType.includes("application/json")) {
@@ -155,13 +187,14 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const speedMult = useMemo(() => expSliderToMultiplier(speedVal), [speedVal]);
 	const [grip, setGrip] = useState<number>(0);
 	const gripTimerRef = useRef<number | null>(null);
-	const [busy, setBusy] = useState<boolean>(false);
 	const [jointAnglesDeg, setJointAnglesDeg] = useState<number[]>([]);
 	const [jointFeedbackError, setJointFeedbackError] = useState<string | null>(null);
 	const [jointStepDeg, setJointStepDeg] = useState<number>(1);
 	const [customJointStepInput, setCustomJointStepInput] = useState<string>("");
 	const [pendingJointAction, setPendingJointAction] = useState<string | null>(null);
 	const [commissioningStatus, setCommissioningStatus] = useState<CommissioningStatus | null>(null);
+	const [commissioningExpanded, setCommissioningExpanded] = useState<boolean>(false);
+	const [motionStatus, setMotionStatus] = useState<MotionStatusResponse | null>(null);
 	const activeDriveFaultAxes = useMemo(
 		() =>
 			(driveFaults?.axes ?? []).filter(
@@ -173,6 +206,13 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const requiresExplicitDrivePower = driveControlBackend === "ethercat_rtcore";
 	const isDrivePowerActive = (driveFaults?.driver_state ?? "").trim().toUpperCase() === "ACTIVE";
 	const drivePowerReady = !requiresExplicitDrivePower || isDrivePowerActive;
+	const motionStateName = (motionStatus?.state ?? motionStatus?.execution?.state_name ?? "idle").trim().toLowerCase();
+	const motionTrajectoryId = typeof motionStatus?.trajectory_id === "number" && motionStatus.trajectory_id > 0
+		? motionStatus.trajectory_id
+		: (typeof motionStatus?.execution?.active_traj_id === "number" && motionStatus.execution.active_traj_id > 0
+			? motionStatus.execution.active_traj_id
+			: null);
+	const motionBusy = motionStateName === "accepted" || motionStateName === "queued" || motionStateName === "executing";
 	// Realtime jog state
 	const [jogEnabled, setJogEnabled] = useState<boolean>(false);
 	const [deadman, setDeadman] = useState<boolean>(true);
@@ -282,8 +322,17 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 
 	useEffect(() => {
 		let disposed = false;
+		let inFlight = false;
 		const tick = async () => {
+			if (disposed || inFlight) {
+				return;
+			}
+			if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+				return;
+			}
+			inFlight = true;
 			const ok = await refreshJointAngles(true);
+			inFlight = false;
 			if (disposed) {
 				return;
 			}
@@ -300,6 +349,31 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 			window.clearInterval(timer);
 		};
 	}, [refreshJointAngles]);
+
+	useEffect(() => {
+		let disposed = false;
+		let inFlight = false;
+		const tick = async () => {
+			if (disposed || inFlight) {
+				return;
+			}
+			inFlight = true;
+			const payload = await getJson<MotionStatusResponse>("/control/motion-status", true);
+			inFlight = false;
+			if (disposed || !payload) {
+				return;
+			}
+			setMotionStatus(payload);
+		};
+		void tick();
+		const timer = window.setInterval(() => {
+			void tick();
+		}, 200);
+		return () => {
+			disposed = true;
+			window.clearInterval(timer);
+		};
+	}, [getJson]);
 
 	// ------------------------
 	// Realtime jog helpers
@@ -437,11 +511,16 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 				joint: jointNumber,
 				delta_deg: signedStepDeg,
 				wait_for_idle: true,
-			});
+			}) as MotionStatusResponse | null;
 			if (result) {
+				setMotionStatus(result);
 				const refreshed = await refreshJointAngles(false);
 				const driveFaulted = driveFaults?.physical_state === "FAULTED";
 				const opEnabledAxes = driveFaults?.op_enabled_axes ?? 0;
+				const executionState = (result.state ?? result.execution?.state_name ?? "accepted").trim().toLowerCase();
+				const queuedTrajectoryId = typeof result.trajectory_id === "number" && result.trajectory_id > 0
+					? result.trajectory_id
+					: null;
 				if (result.command_acknowledged) {
 					if (driveFaulted) {
 						setCommissioningStatus({
@@ -456,12 +535,16 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 					} else if (refreshed) {
 						setCommissioningStatus({
 							tone: "success",
-							message: `J${jointNumber} setpoint accepted by backend. Live joint feedback refreshed; verify actual motion on hardware.`,
+							message: queuedTrajectoryId !== null
+								? `J${jointNumber} accepted as RTCore trajectory ${queuedTrajectoryId} (${executionState}). Live joint feedback refreshed.`
+								: `J${jointNumber} command accepted with state ${executionState}. Live joint feedback refreshed.`,
 						});
 					} else {
 						setCommissioningStatus({
 							tone: "info",
-							message: `J${jointNumber} setpoint accepted by backend, but live feedback refresh did not succeed yet.`,
+							message: queuedTrajectoryId !== null
+								? `J${jointNumber} accepted as RTCore trajectory ${queuedTrajectoryId} (${executionState}), but live feedback refresh did not succeed yet.`
+								: `J${jointNumber} command accepted with state ${executionState}, but live feedback refresh did not succeed yet.`,
 						});
 					}
 				} else {
@@ -703,7 +786,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 				dy,
 				dz,
 				speed_multiplier: speedMult,
-				closed: true,
+				closed: false,
 			});
 		},
 		[post, speedMult, linBaseMmS],
@@ -713,12 +796,14 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		async (axis: "roll" | "pitch" | "yaw", direction: 1 | -1) => {
 			// Use the user-configured angular base value from the UI as the incremental step size.
 			const angleDeg = angBaseDegS * direction;
+			const commandedAngularDegS = Math.max(1e-3, effectiveAngularDegS);
 			await post("/control/rotate", {
 				axis,
 				angle_deg: angleDeg,
+				duration_s: Math.abs(angleDeg) / commandedAngularDegS,
 			});
 		},
-		[post, angBaseDegS],
+		[post, angBaseDegS, effectiveAngularDegS],
 	);
 
 	const changeLinearCount = useCallback(async (axis: "x" | "y" | "z", delta: number) => {
@@ -887,6 +972,34 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 						)}
 					</div>
 				) : null}
+			</div>
+			<div className="mb-3 rounded-lg border border-slate-700/60 bg-slate-950/30 p-3">
+				<div className="mb-2 flex items-center justify-between gap-2 text-xs text-slate-300/80">
+					<span className="font-semibold uppercase tracking-[0.18em]">Motion State</span>
+					<span
+						className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
+							motionStateName === "faulted" || motionStateName === "aborted" || motionStateName === "underrun"
+								? "border-rose-500/40 bg-rose-400/10 text-rose-100"
+								: motionBusy
+									? "border-cyan-500/40 bg-cyan-400/10 text-cyan-100"
+									: motionStateName === "completed"
+										? "border-emerald-500/40 bg-emerald-400/10 text-emerald-100"
+										: "border-slate-600/70 bg-slate-800/70 text-slate-300"
+						}`}
+					>
+						{formatMotionStateLabel(motionStateName)}
+					</span>
+				</div>
+				<div className="text-[11px] leading-relaxed text-slate-300">
+					{motionStatus
+						? `Source ${motionStatus.source_of_truth ?? "controller"} | scope ${motionStatus.completion_scope ?? "unknown"}`
+						: "Waiting for controller motion status..."}
+				</div>
+				<div className="mt-1 text-[10px] text-slate-400">
+					{motionStatus
+						? `traj ${motionTrajectoryId ?? "none"} | mode ${motionStatus.execution?.active_mode_name ?? "n/a"} | queue ${motionStatus.execution?.queue_depth ?? 0}/${motionStatus.execution?.queue_capacity ?? 0} | done ${motionStatus.execution?.motion_done ? "yes" : "no"} | stale ${motionStatus.execution?.stale_command ? "yes" : "no"} | underruns ${motionStatus.execution?.underrun_count ?? 0}`
+						: "No RTCore execution metadata yet."}
+				</div>
 			</div>
 			{/* Removed step move blocks; unified under realtime jog below */}
 			<div className="mb-3 rounded-lg border border-slate-700/60 p-2">
@@ -1253,195 +1366,210 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 			<div className="mb-3 rounded-lg border border-slate-700/60 bg-slate-950/30 p-2">
 				<div className="mb-2 flex items-center justify-between gap-2 text-xs text-slate-300/80">
 					<span className="font-semibold">Joint Commissioning</span>
-					<span className="rounded border border-amber-500/30 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-200/90">
-						RTCore cap 100 RPM
-					</span>
-				</div>
-				<div className="mb-2 text-[11px] leading-relaxed text-slate-400">
-					Use small relative steps while aligning joints for zero capture. This panel assumes the RTCore setup-time
-					safety clamp remains at <code className="rounded bg-slate-900/80 px-1 py-0.5 text-slate-200">--max-rpm 100</code>.
-				</div>
-				<div className="mb-2 rounded border border-amber-500/20 bg-amber-400/5 px-2 py-2 text-[11px] leading-relaxed text-amber-100/90">
-					Zero capture writes a persistent logical offset for the selected joint. Refresh feedback first, jog the joint
-					into alignment, then capture zero only when the live angle shown for that joint matches what you expect.
-				</div>
-				{requiresExplicitDrivePower && !drivePowerReady ? (
-					<div className="mb-2 rounded border border-cyan-500/20 bg-cyan-400/10 px-2 py-1.5 text-[11px] text-cyan-100">
-						Drives are currently disarmed. Use the <span className="font-semibold">Drive Power</span> section above before jogging.
+					<div className="flex items-center gap-2">
+						<span className="rounded border border-amber-500/30 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-200/90">
+							RTCore cap 100 RPM
+						</span>
+						<button
+							type="button"
+							className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300 transition hover:border-slate-500/80 hover:text-white"
+							onClick={() => {
+								setCommissioningExpanded((expanded) => !expanded);
+							}}
+							aria-expanded={commissioningExpanded}
+						>
+							{commissioningExpanded ? "Hide" : "Show"}
+						</button>
 					</div>
-				) : null}
-				<div className="mb-2">
-					<div className="mb-1 flex items-center justify-between gap-2">
-						<span className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Joint Step</span>
-						<div className="flex items-center gap-2">
-							<button
-								type="button"
-								className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[11px] font-medium text-slate-200 transition hover:border-slate-500/80 hover:text-white"
-								onClick={() => {
-									void handleRefreshJointFeedback();
-								}}
-							>
-								Refresh
-							</button>
-							<div className="flex items-center gap-1">
-								{JOINT_STEP_OPTIONS_DEG.map((value) => (
-									<button
-										key={value}
-										type="button"
-										className={`rounded border px-2 py-1 text-[11px] font-medium tabular-nums transition ${
-											jointStepDeg === value
-												? "border-cyan-400/70 bg-cyan-400/15 text-cyan-100"
-												: "border-slate-700/70 bg-slate-900/60 text-slate-300 hover:border-slate-500/80 hover:text-slate-100"
-										}`}
-										onClick={() => setJointStepDeg(value)}
-									>
-										{value}°
-									</button>
-								))}
+				</div>
+				{commissioningExpanded ? (
+					<>
+						<div className="mb-2 text-[11px] leading-relaxed text-slate-400">
+							Use small relative steps while aligning joints for zero capture. This panel assumes the RTCore setup-time
+							safety clamp remains at <code className="rounded bg-slate-900/80 px-1 py-0.5 text-slate-200">--max-rpm 100</code>.
+						</div>
+						<div className="mb-2 rounded border border-amber-500/20 bg-amber-400/5 px-2 py-2 text-[11px] leading-relaxed text-amber-100/90">
+							Zero capture writes a persistent logical offset for the selected joint. Refresh feedback first, jog the joint
+							into alignment, then capture zero only when the live angle shown for that joint matches what you expect.
+						</div>
+						{requiresExplicitDrivePower && !drivePowerReady ? (
+							<div className="mb-2 rounded border border-cyan-500/20 bg-cyan-400/10 px-2 py-1.5 text-[11px] text-cyan-100">
+								Drives are currently disarmed. Use the <span className="font-semibold">Drive Power</span> section above before jogging.
 							</div>
-						</div>
-					</div>
-					<div className="flex justify-end">
-						<div className="flex w-full max-w-[15rem] items-center gap-1 rounded border border-slate-700/70 bg-slate-900/60 px-1.5 py-1">
-							<span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
-								Custom
-							</span>
-							<input
-								type="number"
-								inputMode="decimal"
-								step="0.001"
-								placeholder="+/- deg"
-								value={customJointStepInput}
-								onChange={(event) => {
-									setCustomJointStepInput(event.target.value);
-								}}
-								onBlur={() => {
-									if (customJointStepInput.trim()) {
-										applyCustomJointStep();
-									}
-								}}
-								onKeyDown={(event) => {
-									if (event.key === "Enter") {
-										event.preventDefault();
-										applyCustomJointStep();
-									}
-								}}
-								className="min-w-0 flex-1 rounded border border-slate-700/70 bg-slate-950/60 px-2 py-1 text-[11px] font-medium tabular-nums text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/70 focus:ring-1 focus:ring-cyan-400/40"
-								title="Enter a signed or unsigned custom joint step in degrees. The +/- jog buttons apply direction."
-							/>
-							<button
-								type="button"
-								className="rounded border border-cyan-500/40 bg-cyan-400/10 px-2 py-1 text-[11px] font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-300/15"
-								onClick={() => {
-									applyCustomJointStep();
-								}}
-								title="Use the custom joint step"
-							>
-								Use
-							</button>
-						</div>
-					</div>
-				</div>
-				{jointFeedbackError ? (
-					<div className="mb-2 rounded border border-slate-700/60 bg-slate-900/70 px-2 py-1.5 text-[11px] text-slate-400">
-						{jointFeedbackError}
-					</div>
-				) : null}
-				{commissioningStatus ? (
-					<div
-						className={`mb-2 rounded border px-2 py-1.5 text-[11px] ${
-							commissioningStatus.tone === "success"
-								? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100"
-								: commissioningStatus.tone === "error"
-									? "border-rose-500/30 bg-rose-400/10 text-rose-100"
-									: "border-cyan-500/20 bg-cyan-400/10 text-cyan-100"
-						}`}
-					>
-						{commissioningStatus.message}
-					</div>
-				) : null}
-				<div className="space-y-1">
-					{Array.from({ length: jointAnglesDeg.length > 0 ? jointAnglesDeg.length : 6 }, (_, jointIndex) => {
-						const jointNumber = jointIndex + 1;
-						const angleDeg = jointAnglesDeg[jointIndex];
-						const angleLabel = Number.isFinite(angleDeg) ? `${angleDeg.toFixed(2)}°` : "--";
-						const isPending = pendingJointAction === `jog-${jointIndex}` || pendingJointAction === `zero-${jointIndex}`;
-						const hasLiveFeedback = Number.isFinite(angleDeg);
-						const controlsDisabled = pendingJointAction !== null;
-						const jogDisabled = controlsDisabled || !hasLiveFeedback || !drivePowerReady;
-						const zeroDisabled = controlsDisabled || !hasLiveFeedback;
-						return (
-							<div
-								key={jointNumber}
-								className="flex items-center gap-2 rounded border border-slate-700/60 bg-slate-900/45 px-2 py-1.5"
-							>
-								<div className="min-w-[3.25rem]">
-									<div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
-										J{jointNumber}
+						) : null}
+						<div className="mb-2">
+							<div className="mb-1 flex items-center justify-between gap-2">
+								<span className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Joint Step</span>
+								<div className="flex items-center gap-2">
+									<button
+										type="button"
+										className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[11px] font-medium text-slate-200 transition hover:border-slate-500/80 hover:text-white"
+										onClick={() => {
+											void handleRefreshJointFeedback();
+										}}
+									>
+										Refresh
+									</button>
+									<div className="flex items-center gap-1">
+										{JOINT_STEP_OPTIONS_DEG.map((value) => (
+											<button
+												key={value}
+												type="button"
+												className={`rounded border px-2 py-1 text-[11px] font-medium tabular-nums transition ${
+													jointStepDeg === value
+														? "border-cyan-400/70 bg-cyan-400/15 text-cyan-100"
+														: "border-slate-700/70 bg-slate-900/60 text-slate-300 hover:border-slate-500/80 hover:text-slate-100"
+												}`}
+												onClick={() => setJointStepDeg(value)}
+											>
+												{value}°
+											</button>
+										))}
 									</div>
-									<div className="tabular-nums text-sm font-semibold text-cyan-100">{angleLabel}</div>
 								</div>
-								<div className="ml-auto grid grid-cols-3 gap-1">
+							</div>
+							<div className="flex justify-end">
+								<div className="flex w-full max-w-[15rem] items-center gap-1 rounded border border-slate-700/70 bg-slate-900/60 px-1.5 py-1">
+									<span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+										Custom
+									</span>
+									<input
+										type="number"
+										inputMode="decimal"
+										step="0.001"
+										placeholder="+/- deg"
+										value={customJointStepInput}
+										onChange={(event) => {
+											setCustomJointStepInput(event.target.value);
+										}}
+										onBlur={() => {
+											if (customJointStepInput.trim()) {
+												applyCustomJointStep();
+											}
+										}}
+										onKeyDown={(event) => {
+											if (event.key === "Enter") {
+												event.preventDefault();
+												applyCustomJointStep();
+											}
+										}}
+										className="min-w-0 flex-1 rounded border border-slate-700/70 bg-slate-950/60 px-2 py-1 text-[11px] font-medium tabular-nums text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/70 focus:ring-1 focus:ring-cyan-400/40"
+										title="Enter a signed or unsigned custom joint step in degrees. The +/- jog buttons apply direction."
+									/>
 									<button
 										type="button"
-										className="rounded border border-slate-700/70 bg-slate-950/60 px-2 py-1 text-xs font-semibold text-slate-200 transition hover:border-slate-500/80 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+										className="rounded border border-cyan-500/40 bg-cyan-400/10 px-2 py-1 text-[11px] font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-300/15"
 										onClick={() => {
-											void handleJointStep(jointIndex, -1);
+											applyCustomJointStep();
 										}}
-										disabled={jogDisabled}
-										title={
-											!drivePowerReady && requiresExplicitDrivePower
-												? `Power up the drives before jogging J${jointNumber}`
-												: hasLiveFeedback
-													? `Jog J${jointNumber} by -${jointStepLabel} degrees`
-													: `Live joint feedback is required before jogging J${jointNumber}`
-										}
+										title="Use the custom joint step"
 									>
-										-{jointStepLabel}°
-									</button>
-									<button
-										type="button"
-										className="rounded border border-slate-700/70 bg-slate-950/60 px-2 py-1 text-xs font-semibold text-slate-200 transition hover:border-slate-500/80 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
-										onClick={() => {
-											void handleJointStep(jointIndex, +1);
-										}}
-										disabled={jogDisabled}
-										title={
-											!drivePowerReady && requiresExplicitDrivePower
-												? `Power up the drives before jogging J${jointNumber}`
-												: hasLiveFeedback
-													? `Jog J${jointNumber} by +${jointStepLabel} degrees`
-													: `Live joint feedback is required before jogging J${jointNumber}`
-										}
-									>
-										+{jointStepLabel}°
-									</button>
-									<button
-										type="button"
-										className="rounded border border-amber-500/40 bg-amber-400/10 px-2 py-1 text-xs font-semibold text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
-										onClick={() => {
-											void handleJointZero(jointIndex);
-										}}
-										disabled={zeroDisabled}
-										title={
-											hasLiveFeedback
-												? `Capture current J${jointNumber} position as logical zero`
-												: `Live joint feedback is required before zero capture on J${jointNumber}`
-										}
-									>
-										{isPending && pendingJointAction === `zero-${jointIndex}` ? "..." : "Zero"}
+										Use
 									</button>
 								</div>
 							</div>
-						);
-					})}
-				</div>
+						</div>
+						{jointFeedbackError ? (
+							<div className="mb-2 rounded border border-slate-700/60 bg-slate-900/70 px-2 py-1.5 text-[11px] text-slate-400">
+								{jointFeedbackError}
+							</div>
+						) : null}
+						{commissioningStatus ? (
+							<div
+								className={`mb-2 rounded border px-2 py-1.5 text-[11px] ${
+									commissioningStatus.tone === "success"
+										? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100"
+										: commissioningStatus.tone === "error"
+											? "border-rose-500/30 bg-rose-400/10 text-rose-100"
+											: "border-cyan-500/20 bg-cyan-400/10 text-cyan-100"
+								}`}
+							>
+								{commissioningStatus.message}
+							</div>
+						) : null}
+						<div className="space-y-1">
+							{Array.from({ length: jointAnglesDeg.length > 0 ? jointAnglesDeg.length : 6 }, (_, jointIndex) => {
+								const jointNumber = jointIndex + 1;
+								const angleDeg = jointAnglesDeg[jointIndex];
+								const angleLabel = Number.isFinite(angleDeg) ? `${angleDeg.toFixed(2)}°` : "--";
+								const isPending = pendingJointAction === `jog-${jointIndex}` || pendingJointAction === `zero-${jointIndex}`;
+								const hasLiveFeedback = Number.isFinite(angleDeg);
+								const controlsDisabled = pendingJointAction !== null || motionBusy;
+								const jogDisabled = controlsDisabled || !hasLiveFeedback || !drivePowerReady;
+								const zeroDisabled = controlsDisabled || !hasLiveFeedback;
+								return (
+									<div
+										key={jointNumber}
+										className="flex items-center gap-2 rounded border border-slate-700/60 bg-slate-900/45 px-2 py-1.5"
+									>
+										<div className="min-w-[3.25rem]">
+											<div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
+												J{jointNumber}
+											</div>
+											<div className="tabular-nums text-sm font-semibold text-cyan-100">{angleLabel}</div>
+										</div>
+										<div className="ml-auto grid grid-cols-3 gap-1">
+											<button
+												type="button"
+												className="rounded border border-slate-700/70 bg-slate-950/60 px-2 py-1 text-xs font-semibold text-slate-200 transition hover:border-slate-500/80 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+												onClick={() => {
+													void handleJointStep(jointIndex, -1);
+												}}
+												disabled={jogDisabled}
+												title={
+													!drivePowerReady && requiresExplicitDrivePower
+														? `Power up the drives before jogging J${jointNumber}`
+														: hasLiveFeedback
+															? `Jog J${jointNumber} by -${jointStepLabel} degrees`
+															: `Live joint feedback is required before jogging J${jointNumber}`
+												}
+											>
+												-{jointStepLabel}°
+											</button>
+											<button
+												type="button"
+												className="rounded border border-slate-700/70 bg-slate-950/60 px-2 py-1 text-xs font-semibold text-slate-200 transition hover:border-slate-500/80 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+												onClick={() => {
+													void handleJointStep(jointIndex, +1);
+												}}
+												disabled={jogDisabled}
+												title={
+													!drivePowerReady && requiresExplicitDrivePower
+														? `Power up the drives before jogging J${jointNumber}`
+														: hasLiveFeedback
+															? `Jog J${jointNumber} by +${jointStepLabel} degrees`
+															: `Live joint feedback is required before jogging J${jointNumber}`
+												}
+											>
+												+{jointStepLabel}°
+											</button>
+											<button
+												type="button"
+												className="rounded border border-amber-500/40 bg-amber-400/10 px-2 py-1 text-xs font-semibold text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+												onClick={() => {
+													void handleJointZero(jointIndex);
+												}}
+												disabled={zeroDisabled}
+												title={
+													hasLiveFeedback
+														? `Capture current J${jointNumber} position as logical zero`
+														: `Live joint feedback is required before zero capture on J${jointNumber}`
+												}
+											>
+												{isPending && pendingJointAction === `zero-${jointIndex}` ? "..." : "Zero"}
+											</button>
+										</div>
+									</div>
+								);
+							})}
+						</div>
+					</>
+				) : null}
 			</div>
 			<div className="flex items-center justify-between">
 				<button
 					className="rounded bg-rose-600 px-3 py-2 text-white shadow hover:brightness-110 disabled:opacity-60"
 					onClick={() => post("/control/stop")}
-					disabled={busy}
 				>
 					STOP
 				</button>
@@ -1452,9 +1580,12 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 						if (jogEnabled) {
 							await stopJog();
 						}
-						await post("/control/home");
+						const result = await post("/control/home") as MotionStatusResponse | null;
+						if (result) {
+							setMotionStatus(result);
+						}
 					}}
-					disabled={busy}
+					disabled={motionBusy}
 				>
 					Home
 				</button>
@@ -1464,9 +1595,12 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 						if (jogEnabled) {
 							await stopJog();
 						}
-						await post("/control/rest");
+						const result = await post("/control/rest") as MotionStatusResponse | null;
+						if (result) {
+							setMotionStatus(result);
+						}
 					}}
-					disabled={busy}
+					disabled={motionBusy}
 				>
 					Rest
 				</button>

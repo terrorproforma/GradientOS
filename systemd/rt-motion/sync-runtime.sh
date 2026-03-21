@@ -56,15 +56,18 @@ resolved = runtime_config.resolve_effective_runtime(
     requested_ik_solver_backend=desired_overrides.get("ik_solver_backend"),
     requested_servo_backend=desired_overrides.get("servo_backend"),
     requested_drive_profile=desired_overrides.get("drive_profile"),
+    requested_rt_max_rpm=desired_overrides.get("rt_max_rpm"),
     requested_active_tool_id=desired.get("active_tool_id"),
     allow_unsafe_overrides=allow_unsafe,
 )
 robot = get_robot_config(str(resolved.get("robot", {}).get("name", "gradient05")))
 drive_profile = resolved.get("drive_profile", {}).get("configured_profile")
+rtcore_max_rpm = resolved.get("rtcore", {}).get("configured_max_rpm")
 print(
     render_rtcore_systemd_env(
         robot_config=robot.get_config_dict(),
         drive_profile=str(drive_profile).strip() or None,
+        max_rpm=rtcore_max_rpm,
     ),
     end="",
 )

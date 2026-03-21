@@ -814,12 +814,40 @@ async function resolveRobotUrdfConfig(selectedRobotId?: string | null): Promise<
   urdfPath: string;
   assetBasePath: string;
 }> {
-  const response = await fetch("/assets/robots/index.json", { cache: "no-store" });
-  if (!response.ok) {
-    throw new Error(`Failed to load robot asset index: HTTP ${response.status}`);
+  // In this Vite dev setup, static JSON indexes can be served from `/public/...`
+  // even when sibling URDF assets are reachable from `/assets/...`.
+  const candidateUrls = [
+    "/assets/robots/index.json",
+    "/public/assets/robots/index.json",
+  ];
+  let parsed: Partial<RobotAssetIndex> | null = null;
+  let lastError: Error | null = null;
+
+  for (const url of candidateUrls) {
+    try {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) {
+        lastError = new Error(`Failed to load robot asset index from ${url}: HTTP ${response.status}`);
+        continue;
+      }
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.includes("json")) {
+        lastError = new Error(
+          `Robot asset index at ${url} returned '${contentType || "unknown"}' instead of JSON.`,
+        );
+        continue;
+      }
+      parsed = (await response.json()) as Partial<RobotAssetIndex>;
+      break;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+    }
   }
 
-  const parsed = (await response.json()) as Partial<RobotAssetIndex>;
+  if (!parsed) {
+    throw lastError ?? new Error("Failed to load robot asset index.");
+  }
+
   if (!parsed || typeof parsed.defaultRobotId !== "string" || !parsed.robots) {
     throw new Error("Invalid robot asset index format");
   }

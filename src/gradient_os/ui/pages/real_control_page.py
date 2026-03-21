@@ -225,7 +225,7 @@ class RealControlPage(QWidget):
         self.send_btn.clicked.connect(self.send_command_from_inputs)
         right_side_layout.addWidget(self.send_btn)
         self.closed_loop_checkbox = QCheckBox("Closed-loop control")
-        self.closed_loop_checkbox.setChecked(True)
+        self.closed_loop_checkbox.setChecked(False)
         right_side_layout.addWidget(self.closed_loop_checkbox)
 
         self.speed_group = QGroupBox("Speed Multiplier & Diagnostics")

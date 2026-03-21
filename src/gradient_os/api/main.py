@@ -45,6 +45,9 @@ _ALLOWED_WELD_TYPES = {"fillet", "butt", "lap", "tack/spot", "custom"}
 _PROJECT_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _WELD_PROGRAM_DIR = os.path.join(_PROJECT_ROOT_DIR, "recorded_trajectories", "weld_programs")
 _CONTROLLER_REPLY_MAX_BYTES = 65535
+_DEFAULT_MONITOR_TELEMETRY_HZ = 50
+_DEFAULT_MOVE_LINE_CLOSED_LOOP = False
+_SAFE_HOME_REST_MAX_MOTOR_RPM = 100.0
 
 
 def _default_controller_port() -> int:
@@ -59,6 +62,17 @@ def _resolve_controller_endpoint() -> Tuple[str, int]:
     host = os.environ.get("GRADIENT_CONTROLLER_HOST", "127.0.0.1")
     port = int(os.environ.get("GRADIENT_CONTROLLER_PORT", _default_controller_port()))
     return host, port
+
+
+def _read_int_env(name: str, default: int, *, minimum: int | None = None) -> int:
+    raw = os.environ.get(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return value
 
 
 def _probe_controller(timeout: float = 0.5) -> Tuple[bool, str]:
@@ -216,6 +230,11 @@ class TelemetryHub:
         self._servo_proc: subprocess.Popen | None = None
         self._advertise_host = os.environ.get("GRADIENT_MONITOR_HOST")
         self._bind_host = os.environ.get("GRADIENT_MONITOR_BIND", "127.0.0.1")
+        self._telemetry_hz = _read_int_env(
+            "GRADIENT_MONITOR_TELEMETRY_HZ",
+            _DEFAULT_MONITOR_TELEMETRY_HZ,
+            minimum=1,
+        )
         self._listen_port: int | None = None
         # Optional fixed UDP port to ingest auxiliary telemetry (e.g., servo_telemetry_stream.py)
         # Set GRADIENT_AUX_TELEMETRY_PORT=0 to disable. Default 5556.
@@ -255,7 +274,7 @@ class TelemetryHub:
         assert sockname is not None
         listen_host = self._advertise_host or _resolve_controller_endpoint()[0]
         self._listen_port = sockname[1]
-        start_cmd = f"START_TELEMETRY,{listen_host}:{self._listen_port},10"
+        start_cmd = f"START_TELEMETRY,{listen_host}:{self._listen_port},{self._telemetry_hz}"
         ok, detail = await run_in_threadpool(_send_controller_command, start_cmd)
         if not ok:
             await self._cleanup_transport()
@@ -408,6 +427,47 @@ def create_app() -> FastAPI:
     def _encode_payload_b64(payload: dict[str, Any]) -> str:
         body = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         return base64.urlsafe_b64encode(body).decode("ascii")
+
+    def _decode_payload_b64(token: str) -> dict[str, Any]:
+        try:
+            raw = base64.urlsafe_b64decode(token.encode("ascii"))
+            payload = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Malformed controller payload: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=502, detail="Controller payload must decode to a JSON object.")
+        return payload
+
+    def _parse_controller_ack_payload(
+        detail: str,
+        command: str,
+        *,
+        allow_plain_suffix: bool = False,
+    ) -> dict[str, Any]:
+        bare_prefix = f"ACK,{command}"
+        if detail == bare_prefix:
+            return {}
+        prefix = bare_prefix + ","
+        if not detail.startswith(prefix):
+            raise HTTPException(status_code=502, detail=f"Malformed {command} reply: {detail}")
+        token = detail[len(prefix) :].strip()
+        if not token:
+            return {}
+        try:
+            return _decode_payload_b64(token)
+        except HTTPException:
+            if allow_plain_suffix:
+                return {"detail_token": token}
+            raise
+
+    def _parse_motion_status_reply(detail: str) -> dict[str, Any]:
+        prefix = "MOTION_STATUS,"
+        if not detail.startswith(prefix):
+            raise HTTPException(status_code=502, detail=f"Malformed motion-status reply: {detail}")
+        token = detail[len(prefix) :].strip()
+        if not token:
+            raise HTTPException(status_code=502, detail="Motion-status reply did not include a payload.")
+        return _decode_payload_b64(token)
 
     def _parse_kinematics_error(detail: str) -> HTTPException:
         if detail.startswith("ERROR,KINEMATICS,"):
@@ -572,7 +632,8 @@ def create_app() -> FastAPI:
         detail = await run_in_threadpool(
             _controller_call_or_503, "STOP", timeout=1.0, expect_response=True
         )
-        return {"status": "ok", "detail": detail}
+        payload = _parse_controller_ack_payload(detail, "STOP")
+        return {"status": "ok", "detail": detail, **payload}
 
     @api.post("/control/power-down", summary="Best-effort actuator power-down / de-energize")
     async def control_power_down(payload: dict[str, Any] | None = None):
@@ -616,15 +677,36 @@ def create_app() -> FastAPI:
         }
 
     @api.post("/control/wait-for-idle", summary="Block until planner/trajectory motion completes")
-    async def control_wait_for_idle():
+    async def control_wait_for_idle(payload: dict[str, Any] | None = None):
+        timeout_s = 30.0
+        if payload is not None:
+            if not isinstance(payload, dict):
+                raise HTTPException(status_code=400, detail="JSON body must be an object if provided.")
+            raw_timeout = payload.get("timeout_s")
+            if raw_timeout is not None:
+                try:
+                    timeout_s = float(raw_timeout)
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(status_code=400, detail="Field 'timeout_s' must be a positive number.") from exc
+                if timeout_s <= 0.0:
+                    raise HTTPException(status_code=400, detail="Field 'timeout_s' must be a positive number.")
+        command = "WAIT_FOR_IDLE" if timeout_s == 30.0 else f"WAIT_FOR_IDLE,{timeout_s}"
         detail = await run_in_threadpool(
-            _controller_call_or_503, "WAIT_FOR_IDLE", timeout=60.0, expect_response=True
+            _controller_call_or_503,
+            command,
+            timeout=max(5.0, timeout_s + 5.0),
+            expect_response=True,
         )
-        return {
-            "status": "ok",
-            "detail": detail,
-            "completion_scope": "trajectory_thread",
-        }
+        payload = _parse_controller_ack_payload(detail, "WAIT_FOR_IDLE")
+        return {"status": "ok", "detail": detail, **payload}
+
+    @api.get("/control/motion-status", summary="Current controller/RTCore motion execution status")
+    async def control_motion_status():
+        detail = await run_in_threadpool(
+            _controller_call_or_503, "GET_MOTION_STATUS", timeout=1.0, expect_response=True
+        )
+        payload = _parse_motion_status_reply(detail)
+        return {"status": "ok", "detail": detail, **payload}
 
     @api.post("/control/reset-faults", summary="Request DS402/drive fault reset")
     async def control_reset_faults(payload: dict[str, Any] | None = None):
@@ -646,10 +728,25 @@ def create_app() -> FastAPI:
 
     @api.post("/control/home", summary="Move all joints to zero position")
     async def control_home():
-        await run_in_threadpool(
-            _controller_call_or_503, "0,0,0,0,0,0", timeout=2.0, expect_response=False
+        detail = await run_in_threadpool(
+            _controller_call_or_503,
+            "APPLY_JOINT_SETPOINT,"
+            + _encode_payload_b64(
+                {
+                    "arm_angles_rad": [0.0] * 6,
+                    "max_motor_rpm": _SAFE_HOME_REST_MAX_MOTOR_RPM,
+                }
+            ),
+            timeout=2.0,
+            expect_response=True,
         )
-        return {"status": "ok"}
+        payload = _parse_controller_ack_payload(detail, "APPLY_JOINT_SETPOINT")
+        return {
+            "status": "ok",
+            "detail": detail,
+            "max_motor_rpm": _SAFE_HOME_REST_MAX_MOTOR_RPM,
+            **payload,
+        }
 
     @api.post("/control/zero-joint", summary="Capture the current physical pose as logical zero for one joint")
     async def control_zero_joint(payload: dict[str, Any]):
@@ -718,7 +815,8 @@ def create_app() -> FastAPI:
         except HTTPException as exc:
             detail_text = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
             raise _parse_apply_joint_setpoint_error(detail_text) from exc
-        command_acknowledged = detail.startswith("ACK,APPLY_JOINT_SETPOINT")
+        payload = _parse_controller_ack_payload(detail, "APPLY_JOINT_SETPOINT")
+        command_acknowledged = bool(payload.get("accepted", detail.startswith("ACK,APPLY_JOINT_SETPOINT")))
         return {
             "status": "ok",
             "joint": joint,
@@ -727,22 +825,32 @@ def create_app() -> FastAPI:
             "target_arm_rad": target_arm_rad,
             "detail": detail,
             "command_acknowledged": command_acknowledged,
-            "completion_scope": "direct_setpoint_ack",
             "wait_for_idle_requested": wait_for_idle,
             "waited_for_idle": False,
-            "completion_note": (
-                "WAIT_FOR_IDLE only tracks planner/trajectory motion; "
-                "direct commissioning setpoints now return after backend acceptance."
-            ),
+            **payload,
         }
 
     @api.post("/control/rest", summary="Move all joints to predefined REST pose")
     async def control_rest():
-        pose_cmd = ",".join(map(str, _resolve_rest_pose()))
-        await run_in_threadpool(
-            _controller_call_or_503, pose_cmd, timeout=2.0, expect_response=False
+        detail = await run_in_threadpool(
+            _controller_call_or_503,
+            "APPLY_JOINT_SETPOINT,"
+            + _encode_payload_b64(
+                {
+                    "arm_angles_rad": list(_resolve_rest_pose()),
+                    "max_motor_rpm": _SAFE_HOME_REST_MAX_MOTOR_RPM,
+                }
+            ),
+            timeout=2.0,
+            expect_response=True,
         )
-        return {"status": "ok"}
+        payload = _parse_controller_ack_payload(detail, "APPLY_JOINT_SETPOINT")
+        return {
+            "status": "ok",
+            "detail": detail,
+            "max_motor_rpm": _SAFE_HOME_REST_MAX_MOTOR_RPM,
+            **payload,
+        }
 
     @api.post("/control/move-line-relative", summary="Move tool by dx,dy,dz with optional speed multiplier")
     async def control_move_line_relative(payload: dict[str, Any]):
@@ -757,7 +865,7 @@ def create_app() -> FastAPI:
             sm = float(speed_multiplier) if speed_multiplier is not None else None
         except Exception:
             raise HTTPException(status_code=400, detail="speed_multiplier must be a number")
-        closed = bool(payload.get("closed", True))
+        closed = bool(payload.get("closed", _DEFAULT_MOVE_LINE_CLOSED_LOOP))
         # Command format: MOVE_LINE_RELATIVE,dx,dy,dz[,speed_multiplier][,closed]
         parts: list[str] = [
             "MOVE_LINE_RELATIVE",
@@ -769,8 +877,9 @@ def create_app() -> FastAPI:
             parts.append(str(sm))
         parts.append("true" if closed else "false")
         cmd = ",".join(parts)
-        await run_in_threadpool(_controller_call_or_503, cmd, timeout=2.0, expect_response=False)
-        return {"status": "ok"}
+        detail = await run_in_threadpool(_controller_call_or_503, cmd, timeout=2.0, expect_response=True)
+        payload = _parse_controller_ack_payload(detail, "MOVE_LINE_RELATIVE")
+        return {"status": "ok", "detail": detail, **payload}
 
     @api.post("/control/rotate", summary="Rotate tool by axis and angle in degrees (relative)")
     async def control_rotate(payload: dict[str, Any]):
@@ -788,25 +897,26 @@ def create_app() -> FastAPI:
             angle_deg = float(payload.get("angle_deg", 0.0))
         except Exception:
             raise HTTPException(status_code=400, detail="angle_deg must be a number")
-        # Emulate desktop UI: fetch current absolute RPY, then call SET_ORIENTATION with updated axis
-        detail = await run_in_threadpool(_controller_call_or_503, "GET_POSITION", timeout=1.0)
-        parts = detail.split(",")
-        if len(parts) < 1 or parts[0] != "CURRENT_POSE" or len(parts) < 1 + 3 + 3:
-            raise HTTPException(status_code=502, detail=f"Malformed pose reply: {detail}")
-        try:
-            orient = list(map(float, parts[4:7]))  # roll, pitch, yaw in degrees
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail=f"Invalid orientation data: {exc}") from exc
-        # Update selected axis
-        if axis == "x":
-            orient[0] += angle_deg
-        elif axis == "y":
-            orient[1] += angle_deg
-        else:
-            orient[2] += angle_deg
-        set_cmd = f"SET_ORIENTATION,{orient[0]},{orient[1]},{orient[2]}"
-        await run_in_threadpool(_controller_call_or_503, set_cmd, timeout=2.0, expect_response=False)
-        return {"status": "ok"}
+        duration_s_token = payload.get("duration_s", None)
+        duration_s: float | None = None
+        if duration_s_token is not None:
+            try:
+                duration_s = float(duration_s_token)
+            except Exception:
+                raise HTTPException(status_code=400, detail="duration_s must be a number")
+            if not np.isfinite(duration_s) or duration_s <= 0.0:
+                raise HTTPException(status_code=400, detail="duration_s must be > 0")
+        # Preserve relative-axis semantics by forwarding the command directly to the
+        # controller's ROTATE path instead of reconstructing an absolute Euler target
+        # from a fresh GET_POSITION sample.
+        cmd = f"ROTATE,{axis},{angle_deg}"
+        if duration_s is not None:
+            cmd += f",{duration_s}"
+        detail = await run_in_threadpool(
+            _controller_call_or_503, cmd, timeout=2.0, expect_response=True
+        )
+        command_payload = _parse_controller_ack_payload(detail, "ROTATE")
+        return {"status": "ok", "detail": detail, **command_payload}
 
     @api.post("/control/set-orientation", summary="Set absolute end-effector orientation (roll,pitch,yaw deg)")
     async def control_set_orientation(payload: dict[str, Any]):
@@ -816,9 +926,41 @@ def create_app() -> FastAPI:
             yaw = float(payload.get("yaw", 0.0))
         except Exception:
             raise HTTPException(status_code=400, detail="roll,pitch,yaw must be numbers")
-        cmd = f"SET_ORIENTATION,{roll},{pitch},{yaw}"
-        await run_in_threadpool(_controller_call_or_503, cmd, timeout=2.0, expect_response=False)
-        return {"status": "ok"}
+        duration_s_token = payload.get("duration_s", None)
+        duration_s: float | None = None
+        if duration_s_token is not None:
+            try:
+                duration_s = float(duration_s_token)
+            except Exception:
+                raise HTTPException(status_code=400, detail="duration_s must be a number")
+            if not np.isfinite(duration_s) or duration_s <= 0.0:
+                raise HTTPException(status_code=400, detail="duration_s must be > 0")
+        closed_token = payload.get("closed_loop", payload.get("closed", None))
+        closed_loop: bool | None = None
+        if closed_token is not None:
+            if isinstance(closed_token, bool):
+                closed_loop = closed_token
+            elif isinstance(closed_token, (int, float)):
+                closed_loop = bool(closed_token)
+            else:
+                token = str(closed_token).strip().lower()
+                if token in {"true", "1", "yes", "closed", "on"}:
+                    closed_loop = True
+                elif token in {"false", "0", "no", "open", "off"}:
+                    closed_loop = False
+                else:
+                    raise HTTPException(status_code=400, detail="closed_loop must be a boolean")
+        parts = ["SET_ORIENTATION", str(roll), str(pitch), str(yaw)]
+        if duration_s is not None or closed_loop is not None:
+            parts.append("" if duration_s is None else str(duration_s))
+        if closed_loop is not None:
+            parts.append("true" if closed_loop else "false")
+        cmd = ",".join(parts)
+        detail = await run_in_threadpool(
+            _controller_call_or_503, cmd, timeout=2.0, expect_response=True
+        )
+        command_payload = _parse_controller_ack_payload(detail, "SET_ORIENTATION")
+        return {"status": "ok", "detail": detail, **command_payload}
 
     @api.post("/control/set-gripper", summary="Set gripper angle in degrees")
     async def control_set_gripper(payload: dict[str, Any]):
@@ -1694,10 +1836,11 @@ def create_app() -> FastAPI:
         elif loop_override is not None:
             parts.append(str(loop_override))
         command = "RUN_TRAJECTORY," + ",".join(parts)
-        await run_in_threadpool(
-            _controller_call_or_503, command, timeout=2.0, expect_response=False
+        detail = await run_in_threadpool(
+            _controller_call_or_503, command, timeout=2.0, expect_response=True
         )
-        return {"status": "ok"}
+        payload = _parse_controller_ack_payload(detail, "RUN_TRAJECTORY")
+        return {"status": "ok", "detail": detail, **payload}
 
     @api.post("/trajectory/preview", summary="Plan a trajectory to a target point")
     async def trajectory_preview(payload: dict):
@@ -1725,20 +1868,28 @@ def create_app() -> FastAPI:
 
         velocity = float(plan.get("velocity", 0.1))
         acceleration = float(plan.get("acceleration", 0.05))
-        closed_loop = bool(plan.get("closed_loop", True))
+        closed_loop = bool(plan.get("closed_loop", _DEFAULT_MOVE_LINE_CLOSED_LOOP))
         closed_loop_token = "true" if closed_loop else "false"
 
         command = f"MOVE_LINE,{x},{y},{z},{velocity},{acceleration},{closed_loop_token}"
-        await run_in_threadpool(
-            _controller_call_or_503, command, timeout=5.0, expect_response=False
+        dispatch_detail = await run_in_threadpool(
+            _controller_call_or_503, command, timeout=5.0, expect_response=True
         )
-        await run_in_threadpool(
+        dispatch_payload = _parse_controller_ack_payload(dispatch_detail, "MOVE_LINE")
+        completion_detail = await run_in_threadpool(
             _controller_call_or_503, "WAIT_FOR_IDLE", timeout=60.0, expect_response=True
         )
+        completion_payload = _parse_controller_ack_payload(completion_detail, "WAIT_FOR_IDLE")
 
         async with _latest_plan_lock:
             _latest_plan = None
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "dispatch_detail": dispatch_detail,
+            "dispatch": dispatch_payload,
+            "detail": completion_detail,
+            **completion_payload,
+        }
 
     @api.post("/trajectory/clear-preview", summary="Discard the stored preview trajectory")
     async def trajectory_clear_preview():
@@ -1832,7 +1983,7 @@ async def _plan_point(payload: dict) -> dict[str, Any]:
 
     velocity = float(payload.get("velocity", 0.1))
     acceleration = float(payload.get("acceleration", 0.05))
-    closed_loop = bool(payload.get("closed_loop", True))
+    closed_loop = bool(payload.get("closed_loop", _DEFAULT_MOVE_LINE_CLOSED_LOOP))
 
     def _compute_plan() -> dict[str, Any]:
         start_joints = _get_live_joint_angles_from_controller(timeout=1.0)

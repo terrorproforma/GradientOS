@@ -240,10 +240,34 @@ TRAJECTORY_CACHE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "
 # =============================================================================
 
 # Global state for trajectory execution
+def _default_program_status() -> dict[str, Any]:
+    return {
+        "name": None,
+        "active": False,
+        "state": "idle",
+        "terminal_reason": None,
+        "failing_step_index": None,
+        "completed_step_count": 0,
+        "completed_loop_count": 0,
+        "loop_enabled": False,
+        "use_cache": False,
+        "step_count": 0,
+        "move_steps": 0,
+        "pause_steps": 0,
+        "joint_move_steps": 0,
+        "rtcore_segments": False,
+        "segment_execution_policy": "",
+        "current_step_index": None,
+        "current_step_type": None,
+        "loop_iteration": 0,
+    }
+
+
 trajectory_state = {
     "is_running": False,
     "should_stop": False,
     "thread": None,
+    "stop_request_reason": None,
     # Weld execution state for telemetry/UI overlays.
     "weld_active": False,
     "current_weld_type": None,
@@ -264,6 +288,8 @@ trajectory_state = {
     "motion_state": "IDLE",
     # Correlation ID for command/audit tracing
     "last_correlation_id": None,
+    # Persistent multi-step program lifecycle state.
+    "program_status": _default_program_status(),
     # Rolling audit trail (small in-memory ring)
     "audit_log": [],
 }
@@ -298,6 +324,33 @@ def trajectory_state_update(**kwargs: Any) -> None:
 def trajectory_state_snapshot() -> dict[str, Any]:
     with trajectory_state_lock:
         return dict(trajectory_state)
+
+
+def program_status_snapshot() -> dict[str, Any]:
+    with trajectory_state_lock:
+        current = trajectory_state.get("program_status")
+        if isinstance(current, dict):
+            merged = _default_program_status()
+            merged.update(current)
+            return merged
+        return _default_program_status()
+
+
+def program_status_update(**kwargs: Any) -> None:
+    with trajectory_state_lock:
+        current = trajectory_state.get("program_status")
+        merged = _default_program_status()
+        if isinstance(current, dict):
+            merged.update(current)
+        merged.update(kwargs)
+        trajectory_state["program_status"] = merged
+
+
+def program_status_reset(**overrides: Any) -> None:
+    with trajectory_state_lock:
+        next_status = _default_program_status()
+        next_status.update(overrides)
+        trajectory_state["program_status"] = next_status
 
 
 def get_motion_state() -> str:

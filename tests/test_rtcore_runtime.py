@@ -1,8 +1,13 @@
 from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import (
+    DEFAULT_RT_MAX_RPM,
+    RTCORE_EXEC_STATE_COMPLETED,
+    RTCORE_MOTION_MODE_LEGACY_SETPOINT,
     RTCORE_DRIVE_PROFILE_A6EC_DS402,
     build_rtcore_axis_scaling,
     render_rtcore_systemd_env,
     rtcore_drive_profile_id_to_name,
+    rtcore_execution_state_id_to_name,
+    rtcore_motion_mode_id_to_name,
     rtcore_drive_profile_name_to_id,
 )
 from gradient_os.arm_controller.robots import get_robot_config
@@ -15,25 +20,36 @@ def test_rtcore_drive_profile_ids_round_trip():
     assert rtcore_drive_profile_id_to_name(0) is None
 
 
+def test_rtcore_motion_state_name_maps_round_trip():
+    assert rtcore_motion_mode_id_to_name(RTCORE_MOTION_MODE_LEGACY_SETPOINT) == "legacy_setpoint"
+    assert rtcore_execution_state_id_to_name(RTCORE_EXEC_STATE_COMPLETED) == "completed"
+    assert rtcore_motion_mode_id_to_name(999) is None
+    assert rtcore_execution_state_id_to_name(999) is None
+
+
 def test_build_rtcore_axis_scaling_uses_robot_config_values():
     robot = get_robot_config("gradient05")
-    scaling = build_rtcore_axis_scaling(robot.get_config_dict())
+    robot_cfg = robot.get_config_dict()
+    scaling = build_rtcore_axis_scaling(robot_cfg)
     assert scaling["num_axes"] == 6
     assert scaling["counts_per_rev"] == [131072] * 6
-    assert scaling["gear_ratio"] == [100.0, 100.0, 100.0, 18.0, 20.0, 10.0]
+    assert scaling["gear_ratio"] == [float(value) for value in robot_cfg["actuator_gear_ratios"][:6]]
     assert len(scaling["sign"]) == 6
 
 
 def test_render_rtcore_systemd_env_contains_scaling_and_profile():
     robot = get_robot_config("gradient05")
+    robot_cfg = robot.get_config_dict()
+    expected_gear_ratio = ",".join(f"{float(value):g}" for value in robot_cfg["actuator_gear_ratios"][:6])
     rendered = render_rtcore_systemd_env(
-        robot_config=robot.get_config_dict(),
+        robot_config=robot_cfg,
         drive_profile="a6ec_ds402",
     )
     assert 'GRADIENT_RT_NUM_AXES="6"' in rendered
     assert 'GRADIENT_RT_COUNTS_PER_REV="131072,131072,131072,131072,131072,131072"' in rendered
-    assert 'GRADIENT_RT_GEAR_RATIO="100,100,100,18,20,10"' in rendered
+    assert f'GRADIENT_RT_GEAR_RATIO="{expected_gear_ratio}"' in rendered
     assert 'GRADIENT_RT_DRIVE_PROFILE="a6ec_ds402"' in rendered
+    assert f'GRADIENT_RT_MAX_RPM="{DEFAULT_RT_MAX_RPM:g}"' in rendered
 
 
 def test_drive_fault_snapshot_decodes_axis_fault_and_master_state():

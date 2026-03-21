@@ -1,12 +1,9 @@
 {
-  "tool_id": "identity",
-  "display_name": "Identity (No Tool Offset)",
-  "description": "No additional tool transform.",
-  "tool_type": "utility",
-  "keywords": [
-    "debug",
-    "identity"
-  ],
+  "tool_id": "tool-1774055759338",
+  "display_name": "mig torch",
+  "description": "",
+  "tool_type": "generic",
+  "keywords": [],
   "compatible_robot_ids": [],
   "offset": {
     "position_mm": {

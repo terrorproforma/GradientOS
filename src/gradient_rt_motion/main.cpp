@@ -1155,19 +1155,40 @@ int main(int argc, char** argv) {
   std::atomic<int64_t> rt_max_abs_jitter_ns{0};
   std::atomic<uint64_t> rt_overrun_count{0};
 
-  // Shared state (helper thread produces; RT thread consumes).
-  struct LatestSetpoint {
-    std::atomic<uint64_t> seq{0};
-    uint64_t target_time_ns = 0;
-    uint32_t axis_mask = 0;
-    std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> q{};
-  };
+  constexpr uint32_t kMaxTrajectoryPoints = 4096;
 
-  struct LatestTargets {
-    std::atomic<uint64_t> seq{0};
-    uint64_t target_time_ns = 0;
+  // Shared state (helper thread produces; RT thread consumes).
+  struct TrajectoryPointRuntime {
+    uint64_t t_from_start_ns = 0;
     uint32_t axis_mask = 0;
     std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> target_counts{};
+  };
+
+  struct PendingTrajectoryUpload {
+    bool active = false;
+    uint64_t traj_id = 0;
+    uint32_t axis_mask = 0;
+    uint32_t expected_points = 0;
+    uint32_t point_count = 0;
+    std::array<TrajectoryPointRuntime, kMaxTrajectoryPoints> points{};
+  };
+
+  struct CommittedTrajectory {
+    std::atomic<uint64_t> seq{0};
+    uint64_t traj_id = 0;
+    uint64_t cmd_seq = 0;
+    uint32_t axis_mask = 0;
+    uint32_t point_count = 0;
+    std::array<TrajectoryPointRuntime, kMaxTrajectoryPoints> points{};
+  };
+
+  struct JogCommandRuntime {
+    std::atomic<uint64_t> seq{0};
+    uint64_t cmd_seq = 0;
+    uint32_t axis_mask = 0;
+    uint32_t flags = 0;
+    uint64_t timeout_ns = 0;
+    std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> velocity_counts_per_s{};
   };
 
   struct LatestFeedback {
@@ -1204,9 +1225,24 @@ int main(int argc, char** argv) {
   std::atomic<uint32_t> axis_enable_mask{0};
   std::atomic<int32_t> mode_of_operation{0}; // e.g. 8=CSP
   std::atomic<uint32_t> fault_reset_request{0}; // bitmask; helper thread -> RT thread
-  LatestSetpoint latest_setpoint{};
-  LatestTargets latest_targets{};
+  std::atomic<uint64_t> trajectory_abort_request{0}; // 0 means none, UINT64_MAX means any active trajectory
+  CommittedTrajectory committed_trajectory{};
+  JogCommandRuntime latest_jog_command{};
   LatestFeedback latest_feedback{};
+  std::atomic<uint32_t> motion_active_mode{gradient::ipc::v1::MOTION_MODE_IDLE};
+  std::atomic<uint32_t> motion_exec_state{gradient::ipc::v1::EXEC_STATE_IDLE};
+  std::atomic<uint64_t> motion_active_traj_id{0};
+  std::atomic<uint32_t> motion_current_point_index{std::numeric_limits<uint32_t>::max()};
+  std::atomic<uint32_t> motion_queue_depth{0};
+  std::atomic<uint32_t> motion_last_event_code{0};
+  std::atomic<uint32_t> motion_underrun_count{0};
+  std::atomic<uint32_t> motion_stale_command_flag{0};
+  std::atomic<uint32_t> motion_done{1};
+  std::atomic<uint32_t> motion_capability_flags{
+      gradient::ipc::v1::MOTION_CAP_TRAJECTORY_UPLOAD |
+      gradient::ipc::v1::MOTION_CAP_JOG_COMMAND};
+  std::atomic<uint64_t> motion_active_command_seq{0};
+  std::atomic<uint64_t> motion_last_update_ns{0};
 
   std::thread rt_thread([&]() {
     pthread_setname_np(pthread_self(), "rt-cycle");
@@ -1234,8 +1270,27 @@ int main(int argc, char** argv) {
     uint64_t next_ns = now_monotonic_ns();
     bool shutdown_active = false;
     uint64_t shutdown_until_ns = 0;
+#if GRADIENT_HAVE_ECRT
     // Grace window to push DS402 disable (controlword=0) before dropping the bus.
     constexpr uint64_t kShutdownGraceNs = 250000000ULL; // 250 ms
+    bool active_trajectory = false;
+    bool active_jog = false;
+    uint64_t active_traj_id_rt = 0;
+    uint64_t active_commit_seq_seen = 0;
+    uint64_t active_jog_seq_seen = 0;
+    uint64_t active_jog_cmd_seq = 0;
+    uint64_t active_jog_deadline_ns = 0;
+    uint64_t active_traj_start_ns = 0;
+    uint64_t active_traj_cmd_seq = 0;
+    uint32_t active_traj_axis_mask = 0;
+    uint32_t active_traj_point_count = 0;
+    uint32_t active_traj_segment_index = 0;
+    uint32_t active_jog_axis_mask = 0;
+    std::array<TrajectoryPointRuntime, kMaxTrajectoryPoints> active_traj_points{};
+    std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> active_jog_velocity_counts_per_s{};
+    std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> jog_target_counts_float{};
+    std::array<bool, gradient::ipc::v1::GRADIENT_MAX_AXES> have_jog_target{};
+#endif
 
 #if GRADIENT_HAVE_ECRT
     // -----------------------------------------------------------------------
@@ -2032,17 +2087,217 @@ int main(int argc, char** argv) {
           ecrt_domain_process(domain);
         }
 
-        // Read latest targets (double-read seq).
         std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> target_counts{};
         uint32_t sp_mask = 0;
-        {
-          const uint64_t s1 = latest_targets.seq.load(std::memory_order_acquire);
-          target_counts = latest_targets.target_counts;
-          sp_mask = latest_targets.axis_mask;
-          const uint64_t s2 = latest_targets.seq.load(std::memory_order_acquire);
-          if (s1 != s2) {
-            // If torn, just hold (keep previous hold_target_counts).
-            sp_mask = 0;
+        const uint64_t abort_req =
+            trajectory_abort_request.exchange(0, std::memory_order_acq_rel);
+        if (active_trajectory &&
+            (abort_req == std::numeric_limits<uint64_t>::max() || abort_req == active_traj_id_rt)) {
+          active_trajectory = false;
+          active_traj_axis_mask = 0;
+          active_traj_point_count = 0;
+          active_traj_segment_index = 0;
+          motion_active_mode.store(gradient::ipc::v1::MOTION_MODE_TRAJECTORY, std::memory_order_relaxed);
+          motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_ABORTED, std::memory_order_relaxed);
+          motion_active_traj_id.store(active_traj_id_rt, std::memory_order_relaxed);
+          motion_current_point_index.store(std::numeric_limits<uint32_t>::max(), std::memory_order_relaxed);
+          motion_queue_depth.store(0, std::memory_order_relaxed);
+          motion_last_event_code.store(gradient::ipc::v1::EVT_TRAJECTORY_ABORTED, std::memory_order_relaxed);
+          motion_stale_command_flag.store(0, std::memory_order_relaxed);
+          motion_done.store(1, std::memory_order_relaxed);
+          motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
+        }
+
+        const uint64_t committed_seq = committed_trajectory.seq.load(std::memory_order_acquire);
+        if (committed_seq != 0 && committed_seq != active_commit_seq_seen) {
+          active_commit_seq_seen = committed_seq;
+          active_trajectory = true;
+          active_jog = false;
+          active_jog_axis_mask = 0;
+          active_jog_deadline_ns = 0;
+          have_jog_target.fill(false);
+          active_traj_id_rt = committed_trajectory.traj_id;
+          active_traj_cmd_seq = committed_trajectory.cmd_seq;
+          active_traj_axis_mask = committed_trajectory.axis_mask;
+          active_traj_point_count = committed_trajectory.point_count;
+          active_traj_segment_index = 0;
+          active_traj_start_ns = diag_now_ns;
+          for (uint32_t i = 0; i < active_traj_point_count; ++i) {
+            active_traj_points[i] = committed_trajectory.points[i];
+          }
+          motion_active_mode.store(gradient::ipc::v1::MOTION_MODE_TRAJECTORY, std::memory_order_relaxed);
+          motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_EXECUTING, std::memory_order_relaxed);
+          motion_active_traj_id.store(active_traj_id_rt, std::memory_order_relaxed);
+          motion_current_point_index.store(0, std::memory_order_relaxed);
+          motion_queue_depth.store(
+              active_traj_point_count > 0 ? (active_traj_point_count - 1) : 0,
+              std::memory_order_relaxed);
+          motion_last_event_code.store(
+              gradient::ipc::v1::EVT_TRAJECTORY_EXECUTING, std::memory_order_relaxed);
+          motion_stale_command_flag.store(0, std::memory_order_relaxed);
+          motion_done.store(0, std::memory_order_relaxed);
+          motion_active_command_seq.store(active_traj_cmd_seq, std::memory_order_relaxed);
+          motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
+        }
+
+        const uint64_t jog_seq = latest_jog_command.seq.load(std::memory_order_acquire);
+        if (jog_seq != 0 && jog_seq != active_jog_seq_seen) {
+          active_jog_seq_seen = jog_seq;
+          active_jog_cmd_seq = latest_jog_command.cmd_seq;
+          const uint32_t jog_flags = latest_jog_command.flags;
+          const bool stop_requested =
+              (jog_flags & gradient::ipc::v1::JOG_FLAG_STOP) != 0u;
+          if (stop_requested) {
+            active_jog = false;
+            active_jog_axis_mask = 0;
+            active_jog_deadline_ns = 0;
+            have_jog_target.fill(false);
+            if (!active_trajectory) {
+              motion_active_mode.store(gradient::ipc::v1::MOTION_MODE_IDLE, std::memory_order_relaxed);
+              motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_IDLE, std::memory_order_relaxed);
+              motion_active_traj_id.store(0, std::memory_order_relaxed);
+              motion_current_point_index.store(std::numeric_limits<uint32_t>::max(),
+                                               std::memory_order_relaxed);
+              motion_queue_depth.store(0, std::memory_order_relaxed);
+              motion_last_event_code.store(0, std::memory_order_relaxed);
+              motion_stale_command_flag.store(0, std::memory_order_relaxed);
+              motion_done.store(1, std::memory_order_relaxed);
+              motion_active_command_seq.store(active_jog_cmd_seq, std::memory_order_relaxed);
+              motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
+            }
+          } else {
+            active_jog = (jog_flags & gradient::ipc::v1::JOG_FLAG_ACTIVE) != 0u;
+            active_jog_axis_mask = latest_jog_command.axis_mask;
+            active_jog_deadline_ns =
+                diag_now_ns + std::max<uint64_t>(latest_jog_command.timeout_ns, period);
+            for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+              active_jog_velocity_counts_per_s[i] = latest_jog_command.velocity_counts_per_s[i];
+              if ((active_jog_axis_mask & (1u << i)) == 0u) {
+                have_jog_target[i] = false;
+              }
+            }
+          }
+        }
+
+        if (active_trajectory && active_traj_point_count > 0) {
+          sp_mask = active_traj_axis_mask;
+          if (active_traj_point_count == 1) {
+            target_counts = active_traj_points[0].target_counts;
+            motion_current_point_index.store(0, std::memory_order_relaxed);
+            motion_queue_depth.store(0, std::memory_order_relaxed);
+          } else {
+            const uint64_t elapsed_ns =
+                (diag_now_ns >= active_traj_start_ns) ? (diag_now_ns - active_traj_start_ns) : 0;
+            while ((active_traj_segment_index + 1) < active_traj_point_count &&
+                   elapsed_ns >= active_traj_points[active_traj_segment_index + 1].t_from_start_ns) {
+              active_traj_segment_index += 1;
+            }
+            uint32_t current_index = active_traj_segment_index;
+            if (current_index >= active_traj_point_count) {
+              current_index = active_traj_point_count - 1;
+            }
+            motion_current_point_index.store(current_index, std::memory_order_relaxed);
+            motion_queue_depth.store(
+                (active_traj_point_count > current_index + 1)
+                    ? (active_traj_point_count - current_index - 1)
+                    : 0,
+                std::memory_order_relaxed);
+            if ((current_index + 1) < active_traj_point_count) {
+              const auto& p0 = active_traj_points[current_index];
+              const auto& p1 = active_traj_points[current_index + 1];
+              if (p1.t_from_start_ns <= p0.t_from_start_ns) {
+                active_trajectory = false;
+                sp_mask = 0;
+                motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_FAULTED, std::memory_order_relaxed);
+                motion_last_event_code.store(
+                    gradient::ipc::v1::EVT_TRAJECTORY_FAULTED, std::memory_order_relaxed);
+                motion_done.store(1, std::memory_order_relaxed);
+                motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
+              } else if (elapsed_ns <= p0.t_from_start_ns) {
+                target_counts = p0.target_counts;
+                sp_mask = p0.axis_mask;
+              } else if (elapsed_ns >= p1.t_from_start_ns) {
+                target_counts = p1.target_counts;
+                sp_mask = p1.axis_mask;
+              } else {
+                const double alpha =
+                    static_cast<double>(elapsed_ns - p0.t_from_start_ns) /
+                    static_cast<double>(p1.t_from_start_ns - p0.t_from_start_ns);
+                sp_mask = p0.axis_mask | p1.axis_mask;
+                for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+                  if ((sp_mask & (1u << i)) == 0u) {
+                    target_counts[i] = 0;
+                    continue;
+                  }
+                  const double interp =
+                      static_cast<double>(p0.target_counts[i]) +
+                      (static_cast<double>(p1.target_counts[i] - p0.target_counts[i]) * alpha);
+                  target_counts[i] = static_cast<int32_t>(std::llround(interp));
+                }
+              }
+            } else {
+              target_counts = active_traj_points[active_traj_point_count - 1].target_counts;
+              sp_mask = active_traj_points[active_traj_point_count - 1].axis_mask;
+            }
+          }
+        } else if (active_jog) {
+          bool any_nonzero_velocity = false;
+          for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+            if ((active_jog_axis_mask & (1u << i)) == 0u) {
+              continue;
+            }
+            if (std::abs(active_jog_velocity_counts_per_s[i]) > 1e-6) {
+              any_nonzero_velocity = true;
+              break;
+            }
+          }
+
+          if (active_jog_deadline_ns != 0 && diag_now_ns > active_jog_deadline_ns) {
+            active_jog = false;
+            active_jog_axis_mask = 0;
+            active_jog_deadline_ns = 0;
+            have_jog_target.fill(false);
+            motion_active_mode.store(gradient::ipc::v1::MOTION_MODE_JOG, std::memory_order_relaxed);
+            motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_ABORTED, std::memory_order_relaxed);
+            motion_active_traj_id.store(0, std::memory_order_relaxed);
+            motion_current_point_index.store(std::numeric_limits<uint32_t>::max(),
+                                             std::memory_order_relaxed);
+            motion_queue_depth.store(0, std::memory_order_relaxed);
+            motion_last_event_code.store(gradient::ipc::v1::EVT_JOG_TIMEOUT, std::memory_order_relaxed);
+            motion_stale_command_flag.store(1, std::memory_order_relaxed);
+            motion_done.store(1, std::memory_order_relaxed);
+            motion_active_command_seq.store(active_jog_cmd_seq, std::memory_order_relaxed);
+            motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
+          } else {
+            motion_active_mode.store(gradient::ipc::v1::MOTION_MODE_JOG, std::memory_order_relaxed);
+            motion_exec_state.store(
+                any_nonzero_velocity ? gradient::ipc::v1::EXEC_STATE_EXECUTING
+                                     : gradient::ipc::v1::EXEC_STATE_ACCEPTED,
+                std::memory_order_relaxed);
+            motion_active_traj_id.store(0, std::memory_order_relaxed);
+            motion_current_point_index.store(std::numeric_limits<uint32_t>::max(),
+                                             std::memory_order_relaxed);
+            motion_queue_depth.store(0, std::memory_order_relaxed);
+            motion_last_event_code.store(0, std::memory_order_relaxed);
+            motion_stale_command_flag.store(0, std::memory_order_relaxed);
+            motion_done.store(0, std::memory_order_relaxed);
+            motion_active_command_seq.store(active_jog_cmd_seq, std::memory_order_relaxed);
+            motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
+
+            if (any_nonzero_velocity) {
+              sp_mask = active_jog_axis_mask;
+              for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+                if ((active_jog_axis_mask & (1u << i)) == 0u) {
+                  continue;
+                }
+                if (!have_jog_target[i]) {
+                  jog_target_counts_float[i] = static_cast<double>(latest_feedback.pos_counts[i]);
+                  have_jog_target[i] = true;
+                }
+                jog_target_counts_float[i] += active_jog_velocity_counts_per_s[i] * period_s;
+                target_counts[i] = static_cast<int32_t>(std::llround(jog_target_counts_float[i]));
+              }
+            }
           }
         }
 
@@ -2168,6 +2423,49 @@ int main(int argc, char** argv) {
           latest_feedback.mode_display[i] = mode_disp;
           latest_feedback.ds402_state[i] = static_cast<uint8_t>(st);
           latest_feedback.di_bits[i] = di;
+        }
+
+        if (active_trajectory && active_traj_point_count > 0) {
+          motion_active_mode.store(gradient::ipc::v1::MOTION_MODE_TRAJECTORY, std::memory_order_relaxed);
+          motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_EXECUTING, std::memory_order_relaxed);
+          motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
+          const auto& final_point = active_traj_points[active_traj_point_count - 1];
+          const uint64_t elapsed_ns =
+              (diag_now_ns >= active_traj_start_ns) ? (diag_now_ns - active_traj_start_ns) : 0;
+          const bool final_due = elapsed_ns >= final_point.t_from_start_ns;
+          bool any_faulted = false;
+          bool all_axes_at_target = final_due;
+          for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+            if ((final_point.axis_mask & (1u << i)) == 0u) {
+              continue;
+            }
+            const uint8_t ds402 = latest_feedback.ds402_state[i];
+            if (latest_feedback.error_code[i] != 0 ||
+                ds402 == gradient::ipc::v1::DS402_FAULT ||
+                ds402 == gradient::ipc::v1::DS402_FAULT_REACTION_ACTIVE) {
+              any_faulted = true;
+            }
+            if (latest_feedback.pos_counts[i] != final_point.target_counts[i]) {
+              all_axes_at_target = false;
+            }
+          }
+          if (any_faulted) {
+            active_trajectory = false;
+            motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_FAULTED, std::memory_order_relaxed);
+            motion_last_event_code.store(
+                gradient::ipc::v1::EVT_TRAJECTORY_FAULTED, std::memory_order_relaxed);
+            motion_done.store(1, std::memory_order_relaxed);
+            motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
+          } else if (all_axes_at_target) {
+            active_trajectory = false;
+            motion_current_point_index.store(active_traj_point_count - 1, std::memory_order_relaxed);
+            motion_queue_depth.store(0, std::memory_order_relaxed);
+            motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_COMPLETED, std::memory_order_relaxed);
+            motion_last_event_code.store(
+                gradient::ipc::v1::EVT_TRAJECTORY_COMPLETED, std::memory_order_relaxed);
+            motion_done.store(1, std::memory_order_relaxed);
+            motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
+          }
         }
 
         if (!startup_skip_domain_queue_active) {
@@ -2760,10 +3058,8 @@ int main(int argc, char** argv) {
         cmd_ring_hdr_aligned +
         static_cast<size_t>(gradient::ipc::v1::GRADIENT_CMD_RING_CAPACITY) *
             gradient::ipc::v1::GRADIENT_RING_MSG_BYTES;
-    const size_t cmd_setpoint_offset =
-        align_up(sizeof(gradient::ipc::v1::ShmHeaderV1) + cmd_ring_bytes, 64);
     const size_t cmd_shm_bytes =
-        align_up(cmd_setpoint_offset + sizeof(gradient::ipc::v1::SetpointSlotV1), 4096);
+        align_up(sizeof(gradient::ipc::v1::ShmHeaderV1) + cmd_ring_bytes, 4096);
 
     const size_t status_ring_hdr_aligned = align_up(sizeof(gradient::ipc::v1::RingHeaderV1), 8);
     const size_t status_ring_bytes =
@@ -2803,7 +3099,7 @@ int main(int argc, char** argv) {
       hdr->ring_offset = sizeof(*hdr);
       hdr->ring_capacity = gradient::ipc::v1::GRADIENT_CMD_RING_CAPACITY;
       hdr->ring_msg_bytes = gradient::ipc::v1::GRADIENT_RING_MSG_BYTES;
-      hdr->setpoint_offset = static_cast<uint32_t>(cmd_setpoint_offset);
+      hdr->setpoint_offset = 0;
 
       auto ring = make_ring_view(cmd_shm.base, hdr);
       ring.header->magic = gradient::ipc::v1::kMagicRing;
@@ -2813,9 +3109,6 @@ int main(int argc, char** argv) {
       ring.header->read_idx = 0;
       ring.header->dropped = 0;
 
-      auto* slot = reinterpret_cast<gradient::ipc::v1::SetpointSlotV1*>(
-          static_cast<uint8_t*>(cmd_shm.base) + hdr->setpoint_offset);
-      std::memset(slot, 0, sizeof(*slot));
     }
 
     // Initialize status_shm.
@@ -2911,8 +3204,30 @@ int main(int argc, char** argv) {
       auto* cmd_hdr =
           reinterpret_cast<const gradient::ipc::v1::ShmHeaderV1*>(cmd_shm.base);
       RingView cmd_ring = make_ring_view(cmd_shm.base, cmd_hdr);
-      auto* setpoint_slot = reinterpret_cast<gradient::ipc::v1::SetpointSlotV1*>(
-          static_cast<uint8_t*>(cmd_shm.base) + cmd_hdr->setpoint_offset);
+      PendingTrajectoryUpload pending_upload{};
+      uint64_t committed_traj_seq = 1;
+
+      auto publish_motion_status = [&](uint32_t active_mode,
+                                       uint32_t exec_state,
+                                       uint64_t traj_id,
+                                       uint32_t point_index,
+                                       uint32_t queue_depth,
+                                       uint32_t last_event_code,
+                                       uint32_t stale_flag,
+                                       uint32_t motion_done_flag,
+                                       uint64_t active_cmd_seq,
+                                       uint64_t update_ns) {
+        motion_active_mode.store(active_mode, std::memory_order_relaxed);
+        motion_exec_state.store(exec_state, std::memory_order_relaxed);
+        motion_active_traj_id.store(traj_id, std::memory_order_relaxed);
+        motion_current_point_index.store(point_index, std::memory_order_relaxed);
+        motion_queue_depth.store(queue_depth, std::memory_order_relaxed);
+        motion_last_event_code.store(last_event_code, std::memory_order_relaxed);
+        motion_stale_command_flag.store(stale_flag, std::memory_order_relaxed);
+        motion_done.store(motion_done_flag, std::memory_order_relaxed);
+        motion_active_command_seq.store(active_cmd_seq, std::memory_order_relaxed);
+        motion_last_update_ns.store(update_ns, std::memory_order_relaxed);
+      };
 
       // Emit STATUS_HELLO once on connect.
       {
@@ -2953,7 +3268,6 @@ int main(int argc, char** argv) {
       }
 
       uint64_t next_snapshot_ns = now_monotonic_ns();
-      uint64_t last_setpoint_seen = 0;
 
       while (helper_running.load(std::memory_order_relaxed) &&
              !g_stop.load(std::memory_order_relaxed)) {
@@ -3028,6 +3342,210 @@ int main(int argc, char** argv) {
                   }
                   break;
                 }
+                case gradient::ipc::v1::MSG_CMD_TRAJECTORY_BEGIN: {
+                  if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::CmdTrajectoryBeginV1)) {
+                    auto* cmd =
+                        reinterpret_cast<const gradient::ipc::v1::CmdTrajectoryBeginV1*>(payload);
+                    pending_upload = PendingTrajectoryUpload{};
+                    pending_upload.active = true;
+                    pending_upload.traj_id = cmd->traj_id;
+                    pending_upload.axis_mask = cmd->axis_mask;
+                    pending_upload.expected_points = cmd->expected_points;
+                    const uint64_t update_ns = now_monotonic_ns();
+                    publish_motion_status(
+                        gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                        gradient::ipc::v1::EXEC_STATE_ACCEPTED,
+                        cmd->traj_id,
+                        std::numeric_limits<uint32_t>::max(),
+                        0,
+                        gradient::ipc::v1::EVT_TRAJECTORY_ACCEPTED,
+                        0,
+                        0,
+                        mh->seq,
+                        update_ns);
+                  }
+                  break;
+                }
+                case gradient::ipc::v1::MSG_CMD_TRAJECTORY_POINT: {
+                  if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::TrajectoryPointV1)) {
+                    auto* cmd =
+                        reinterpret_cast<const gradient::ipc::v1::TrajectoryPointV1*>(payload);
+                    if (!pending_upload.active ||
+                        cmd->traj_id != pending_upload.traj_id ||
+                        pending_upload.point_count >= kMaxTrajectoryPoints ||
+                        cmd->point_index != pending_upload.point_count) {
+                      const uint64_t update_ns = now_monotonic_ns();
+                      publish_motion_status(
+                          gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                          gradient::ipc::v1::EXEC_STATE_FAULTED,
+                          cmd->traj_id,
+                          std::numeric_limits<uint32_t>::max(),
+                          pending_upload.point_count,
+                          gradient::ipc::v1::EVT_TRAJECTORY_FAULTED,
+                          0,
+                          1,
+                          mh->seq,
+                          update_ns);
+                      pending_upload = PendingTrajectoryUpload{};
+                      break;
+                    }
+
+                    if (pending_upload.point_count > 0) {
+                      const auto& prev = pending_upload.points[pending_upload.point_count - 1];
+                      if (cmd->t_from_start_ns < prev.t_from_start_ns) {
+                        const uint64_t update_ns = now_monotonic_ns();
+                        publish_motion_status(
+                            gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                            gradient::ipc::v1::EXEC_STATE_FAULTED,
+                            cmd->traj_id,
+                            std::numeric_limits<uint32_t>::max(),
+                            pending_upload.point_count,
+                            gradient::ipc::v1::EVT_TRAJECTORY_FAULTED,
+                            0,
+                            1,
+                            mh->seq,
+                            update_ns);
+                        pending_upload = PendingTrajectoryUpload{};
+                        break;
+                      }
+                    }
+
+                    TrajectoryPointRuntime runtime_point{};
+                    runtime_point.t_from_start_ns = cmd->t_from_start_ns;
+                    runtime_point.axis_mask = (cmd->axis_mask != 0u) ? cmd->axis_mask : pending_upload.axis_mask;
+                    for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+                      if ((runtime_point.axis_mask & (1u << i)) == 0u) {
+                        runtime_point.target_counts[i] = 0;
+                        continue;
+                      }
+                      const double cpu = opt.axis[i].counts_per_unit;
+                      const int sgn = opt.axis[i].sign;
+                      const double raw = cmd->q[i] * cpu;
+                      long long counts = static_cast<long long>(sgn) * std::llround(raw);
+                      if (counts > static_cast<long long>(std::numeric_limits<int32_t>::max())) {
+                        counts = static_cast<long long>(std::numeric_limits<int32_t>::max());
+                      } else if (counts < static_cast<long long>(std::numeric_limits<int32_t>::min())) {
+                        counts = static_cast<long long>(std::numeric_limits<int32_t>::min());
+                      }
+                      runtime_point.target_counts[i] = static_cast<int32_t>(counts);
+                    }
+                    pending_upload.points[pending_upload.point_count] = runtime_point;
+                    pending_upload.point_count += 1;
+                  }
+                  break;
+                }
+                case gradient::ipc::v1::MSG_CMD_TRAJECTORY_COMMIT: {
+                  if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::CmdTrajectoryControlV1)) {
+                    auto* cmd =
+                        reinterpret_cast<const gradient::ipc::v1::CmdTrajectoryControlV1*>(payload);
+                    if (!pending_upload.active ||
+                        cmd->traj_id != pending_upload.traj_id ||
+                        pending_upload.point_count == 0) {
+                      const uint64_t update_ns = now_monotonic_ns();
+                      publish_motion_status(
+                          gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                          gradient::ipc::v1::EXEC_STATE_FAULTED,
+                          cmd->traj_id,
+                          std::numeric_limits<uint32_t>::max(),
+                          0,
+                          gradient::ipc::v1::EVT_TRAJECTORY_FAULTED,
+                          0,
+                          1,
+                          mh->seq,
+                          update_ns);
+                      pending_upload = PendingTrajectoryUpload{};
+                      break;
+                    }
+
+                    committed_trajectory.traj_id = pending_upload.traj_id;
+                    committed_trajectory.cmd_seq = mh->seq;
+                    committed_trajectory.axis_mask = pending_upload.axis_mask;
+                    committed_trajectory.point_count = pending_upload.point_count;
+                    for (uint32_t i = 0; i < pending_upload.point_count; ++i) {
+                      committed_trajectory.points[i] = pending_upload.points[i];
+                    }
+                    committed_trajectory.seq.store(committed_traj_seq++, std::memory_order_release);
+                    const uint64_t update_ns = now_monotonic_ns();
+                    publish_motion_status(
+                        gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                        gradient::ipc::v1::EXEC_STATE_QUEUED,
+                        pending_upload.traj_id,
+                        0,
+                        pending_upload.point_count,
+                        gradient::ipc::v1::EVT_TRAJECTORY_QUEUED,
+                        0,
+                        0,
+                        mh->seq,
+                        update_ns);
+                    pending_upload = PendingTrajectoryUpload{};
+                  }
+                  break;
+                }
+                case gradient::ipc::v1::MSG_CMD_TRAJECTORY_ABORT: {
+                  if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::CmdTrajectoryControlV1)) {
+                    auto* cmd =
+                        reinterpret_cast<const gradient::ipc::v1::CmdTrajectoryControlV1*>(payload);
+                    trajectory_abort_request.store(
+                        cmd->traj_id == 0 ? std::numeric_limits<uint64_t>::max() : cmd->traj_id,
+                        std::memory_order_release);
+                    if (pending_upload.active &&
+                        (cmd->traj_id == 0 || cmd->traj_id == pending_upload.traj_id)) {
+                      pending_upload = PendingTrajectoryUpload{};
+                    }
+                    const uint64_t update_ns = now_monotonic_ns();
+                    publish_motion_status(
+                        gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                        gradient::ipc::v1::EXEC_STATE_ABORTED,
+                        cmd->traj_id,
+                        std::numeric_limits<uint32_t>::max(),
+                        0,
+                        gradient::ipc::v1::EVT_TRAJECTORY_ABORTED,
+                        0,
+                        1,
+                        mh->seq,
+                        update_ns);
+                  }
+                  break;
+                }
+                case gradient::ipc::v1::MSG_CMD_JOG: {
+                  if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::CmdJogV1)) {
+                    auto* cmd =
+                        reinterpret_cast<const gradient::ipc::v1::CmdJogV1*>(payload);
+                    latest_jog_command.axis_mask = cmd->axis_mask;
+                    latest_jog_command.flags = cmd->flags;
+                    latest_jog_command.timeout_ns = cmd->timeout_ns;
+                    latest_jog_command.cmd_seq = mh->seq;
+                    for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+                      if ((cmd->axis_mask & (1u << i)) == 0u) {
+                        latest_jog_command.velocity_counts_per_s[i] = 0.0;
+                        continue;
+                      }
+                      const double cpu = opt.axis[i].counts_per_unit;
+                      const int sgn = opt.axis[i].sign;
+                      latest_jog_command.velocity_counts_per_s[i] =
+                          cmd->qd[i] * cpu * static_cast<double>(sgn);
+                    }
+                    latest_jog_command.seq.store(mh->seq, std::memory_order_release);
+
+                    const uint64_t update_ns = now_monotonic_ns();
+                    const bool stop_requested =
+                        (cmd->flags & gradient::ipc::v1::JOG_FLAG_STOP) != 0u;
+                    publish_motion_status(
+                        stop_requested ? gradient::ipc::v1::MOTION_MODE_IDLE
+                                       : gradient::ipc::v1::MOTION_MODE_JOG,
+                        stop_requested ? gradient::ipc::v1::EXEC_STATE_IDLE
+                                       : gradient::ipc::v1::EXEC_STATE_ACCEPTED,
+                        0,
+                        std::numeric_limits<uint32_t>::max(),
+                        0,
+                        0,
+                        0,
+                        stop_requested ? 1 : 0,
+                        mh->seq,
+                        update_ns);
+                  }
+                  break;
+                }
                 default:
                   break;
               }
@@ -3035,51 +3553,6 @@ int main(int argc, char** argv) {
               r += 1;
             }
             cmd_ring.header->read_idx = r;
-          }
-        }
-
-        // Read latest setpoint slot (latest-wins) and publish into local snapshot.
-        if (cmd_hdr->setpoint_offset != 0 && setpoint_slot) {
-          // Double-read sequence pattern (writer increments seq after writing fields).
-          const uint64_t s1 = setpoint_slot->seq;
-          const uint64_t target_time = setpoint_slot->target_time_ns;
-          const uint32_t axis_mask = setpoint_slot->axis_mask;
-          std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> q{};
-          for (size_t i = 0; i < q.size(); ++i) {
-            q[i] = setpoint_slot->q[i];
-          }
-          const uint64_t s2 = setpoint_slot->seq;
-
-          if (s1 == s2 && s1 != 0) {
-            latest_setpoint.target_time_ns = target_time;
-            latest_setpoint.axis_mask = axis_mask;
-            latest_setpoint.q = q;
-            latest_setpoint.seq.store(s1, std::memory_order_release);
-
-            if (s1 != last_setpoint_seen) {
-              // Convert q (axis units) to target counts for the cyclic thread.
-              LatestTargets tmp{};
-              tmp.target_time_ns = target_time;
-              tmp.axis_mask = axis_mask;
-              for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
-                const double cpu = opt.axis[i].counts_per_unit;
-                const int sgn = opt.axis[i].sign;
-                const double raw = q[i] * cpu;
-                const long long rounded = std::llround(raw);
-                long long counts = static_cast<long long>(sgn) * rounded;
-                if (counts > static_cast<long long>(std::numeric_limits<int32_t>::max())) {
-                  counts = static_cast<long long>(std::numeric_limits<int32_t>::max());
-                } else if (counts < static_cast<long long>(std::numeric_limits<int32_t>::min())) {
-                  counts = static_cast<long long>(std::numeric_limits<int32_t>::min());
-                }
-                tmp.target_counts[i] = static_cast<int32_t>(counts);
-              }
-              latest_targets.target_time_ns = tmp.target_time_ns;
-              latest_targets.axis_mask = tmp.axis_mask;
-              latest_targets.target_counts = tmp.target_counts;
-              latest_targets.seq.store(s1, std::memory_order_release);
-              last_setpoint_seen = s1;
-            }
           }
         }
 
@@ -3124,20 +3597,36 @@ int main(int argc, char** argv) {
               snap.axes[i].di_bits = latest_feedback.di_bits[i];
             }
           } else {
-            // Until EtherCAT is wired up, expose the current target counts as "position" for visibility.
-            // This makes it easy to validate the Python->RTCore setpoint path before libecrt is present.
-            const uint64_t tc_seq = latest_targets.seq.load(std::memory_order_acquire);
-            if (tc_seq != 0) {
-              for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
-                snap.axes[i].pos_counts = latest_targets.target_counts[i];
-              }
-            }
+            // No live process data yet; leave snapshot at zero/default values.
           }
 
           ring_write(status_ring,
                      gradient::ipc::v1::MSG_STATUS_SNAPSHOT,
                      &snap,
                      sizeof(snap),
+                     &status_seq,
+                     now);
+          eventfd_write_one(status_eventfd);
+
+          gradient::ipc::v1::StatusMotionStateV1 motion{};
+          motion.active_mode = motion_active_mode.load(std::memory_order_relaxed);
+          motion.state = motion_exec_state.load(std::memory_order_relaxed);
+          motion.active_traj_id = motion_active_traj_id.load(std::memory_order_relaxed);
+          motion.current_point_index = motion_current_point_index.load(std::memory_order_relaxed);
+          motion.queue_depth = motion_queue_depth.load(std::memory_order_relaxed);
+          motion.queue_capacity = kMaxTrajectoryPoints;
+          motion.last_event_code = motion_last_event_code.load(std::memory_order_relaxed);
+          motion.underrun_count = motion_underrun_count.load(std::memory_order_relaxed);
+          motion.stale_command_flag = motion_stale_command_flag.load(std::memory_order_relaxed);
+          motion.motion_done = motion_done.load(std::memory_order_relaxed);
+          motion.capability_flags = motion_capability_flags.load(std::memory_order_relaxed);
+          motion.active_command_seq = motion_active_command_seq.load(std::memory_order_relaxed);
+          motion.last_update_ns = motion_last_update_ns.load(std::memory_order_relaxed);
+
+          ring_write(status_ring,
+                     gradient::ipc::v1::MSG_STATUS_MOTION_STATE,
+                     &motion,
+                     sizeof(motion),
                      &status_seq,
                      now);
           eventfd_write_one(status_eventfd);

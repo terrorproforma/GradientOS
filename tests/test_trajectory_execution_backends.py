@@ -36,6 +36,21 @@ class FakeBackend:
         return list(self.actual_positions)
 
 
+class FakeRTCoreTrajectoryBackend(FakeBackend):
+    def __init__(self, actual_positions):
+        super().__init__(actual_positions)
+        self.execute_calls = []
+
+    def execute_joint_trajectory(self, joint_path, frequency):
+        self.execute_calls.append((joint_path, frequency))
+
+        class _Status:
+            state_name = "completed"
+            active_traj_id = 77
+
+        return _Status()
+
+
 def _configure_backend_executor_test(monkeypatch, backend, *, num_joints=2):
     monkeypatch.setattr(trajectory_execution, "_get_backend", lambda: backend)
     monkeypatch.setattr(trajectory_execution, "_use_backend", lambda: True)
@@ -110,3 +125,118 @@ def test_open_loop_executor_uses_backend_precomputed_commands(monkeypatch):
 
     assert backend.prepare_calls == [([0.2, -0.1], 4095, 0)]
     assert backend.sync_write_calls == [[("setpoint_rad", [0.2, -0.1])]]
+
+
+def test_open_loop_executor_offloads_rtcore_trajectory_backend(monkeypatch):
+    backend = FakeRTCoreTrajectoryBackend(actual_positions=[0.0, 0.0])
+    _configure_backend_executor_test(monkeypatch, backend)
+
+    trajectory_execution._open_loop_executor_thread(
+        joint_path=[[0.1, -0.2], [0.2, -0.3], [0.3, -0.4]],
+        frequency=100,
+        diagnostics=False,
+        owns_trajectory_state=False,
+    )
+
+    assert backend.execute_calls == [
+        (
+            [[0.1, -0.2], [0.2, -0.3], [0.3, -0.4]],
+            100,
+        )
+    ]
+    assert backend.prepare_calls == []
+    assert backend.sync_write_calls == []
+
+
+def test_trajectory_executor_records_program_completion(monkeypatch):
+    monkeypatch.setattr(trajectory_execution, "_get_backend", lambda: None)
+    monkeypatch.setattr(trajectory_execution, "_execute_joint_path", lambda _path, _freq: None)
+    monkeypatch.setattr(
+        trajectory_execution.servo_driver,
+        "set_servo_positions",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(trajectory_execution.time, "sleep", lambda _seconds: None)
+
+    utils.program_status_reset(
+        name="alpha",
+        active=True,
+        state="accepted",
+        step_count=3,
+        move_steps=1,
+        pause_steps=1,
+        joint_move_steps=1,
+    )
+    utils.trajectory_state.update(
+        {
+            "should_stop": False,
+            "stop_request_reason": None,
+            "is_running": True,
+            "thread": None,
+            "active_program_name": "alpha",
+        }
+    )
+
+    trajectory_execution._trajectory_executor_thread(
+        [
+            {"type": "move", "path": [[0.0, 0.0]], "freq": 100},
+            {"type": "pause", "duration": 0.01},
+            {"type": "joint_move", "target_q": [0.1, -0.1], "speed": 100, "duration": 0.01},
+        ],
+        should_loop=False,
+    )
+
+    program = utils.program_status_snapshot()
+    assert program["state"] == "completed"
+    assert program["terminal_reason"] == "completed"
+    assert program["failing_step_index"] is None
+    assert program["completed_step_count"] == 3
+    assert program["completed_loop_count"] == 0
+
+
+def test_trajectory_executor_records_rtcore_fault_terminal_reason(monkeypatch):
+    class _FaultBackend:
+        is_initialized = True
+
+        @staticmethod
+        def get_execution_status():
+            class _Status:
+                state_name = "faulted"
+
+            return _Status()
+
+    monkeypatch.setattr(trajectory_execution, "_get_backend", lambda: _FaultBackend())
+    monkeypatch.setattr(
+        trajectory_execution,
+        "_execute_joint_path",
+        lambda _path, _freq: (_ for _ in ()).throw(RuntimeError("rtcore fault")),
+    )
+    monkeypatch.setattr(trajectory_execution.time, "sleep", lambda _seconds: None)
+
+    utils.program_status_reset(
+        name="beta",
+        active=True,
+        state="accepted",
+        step_count=1,
+        move_steps=1,
+    )
+    utils.trajectory_state.update(
+        {
+            "should_stop": False,
+            "stop_request_reason": None,
+            "is_running": True,
+            "thread": None,
+            "active_program_name": "beta",
+        }
+    )
+
+    trajectory_execution._trajectory_executor_thread(
+        [{"type": "move", "path": [[0.0, 0.0]], "freq": 100}],
+        should_loop=False,
+    )
+
+    program = utils.program_status_snapshot()
+    assert program["state"] == "faulted"
+    assert program["terminal_reason"] == "rtcore_fault"
+    assert program["failing_step_index"] == 0
+    assert program["completed_step_count"] == 0

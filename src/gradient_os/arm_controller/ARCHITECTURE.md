@@ -143,6 +143,15 @@ robots/
     └── ...                      # model-local files (meshes, docs, tools)
 ```
 
+## RTCore Motion Boundary
+
+For the EtherCAT RTCore backend, the motion-execution boundary is intentionally lower than the Python planner boundary.
+
+- Python should keep planning, IK, and policy.
+- RTCore should own replay timing, execution state, jog timeouts, and final safety clamping.
+
+The current migration contract is documented in `docs/rtcore_owned_motion_contract.md`.
+
 ## ActuatorBackend Interface
 
 The complete interface that all servo backends must implement:

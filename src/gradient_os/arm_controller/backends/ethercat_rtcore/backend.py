@@ -12,7 +12,18 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ...actuator_interface import ActuatorBackend
-from .runtime import rtcore_drive_profile_id_to_name
+from .runtime import (
+    RTCORE_EXEC_STATE_ABORTED,
+    RTCORE_EXEC_STATE_COMPLETED,
+    RTCORE_EXEC_STATE_FAULTED,
+    RTCORE_EXEC_STATE_IDLE,
+    RTCORE_MOTION_CAP_JOG_COMMAND,
+    RTCORE_EXEC_STATE_UNDERRUN,
+    RTCORE_MOTION_MODE_IDLE,
+    rtcore_drive_profile_id_to_name,
+    rtcore_execution_state_id_to_name,
+    rtcore_motion_mode_id_to_name,
+)
 from ....joint_zero_offsets import load_joint_zero_offsets, save_joint_zero_offsets
 
 
@@ -39,6 +50,7 @@ _GRADIENT_MAX_AXES = 16
 _MSG_STATUS_HELLO = 0x0201
 _MSG_STATUS_SNAPSHOT = 0x0202
 _MSG_STATUS_AXIS_CONFIG = 0x0203
+_MSG_STATUS_MOTION_STATE = 0x0204
 
 # Command ring message types (v1)
 _MSG_CMD_ARM = 0x0101
@@ -46,8 +58,16 @@ _MSG_CMD_AXIS_ENABLE = 0x0102
 _MSG_CMD_AXIS_DISABLE = 0x0103
 _MSG_CMD_FAULT_RESET = 0x0104
 _MSG_CMD_SET_MODE = 0x0106
+_MSG_CMD_TRAJECTORY_BEGIN = 0x0120
+_MSG_CMD_TRAJECTORY_POINT = 0x0121
+_MSG_CMD_TRAJECTORY_COMMIT = 0x0122
+_MSG_CMD_TRAJECTORY_ABORT = 0x0123
+_MSG_CMD_JOG = 0x0130
 
 _MODE_CSP = 8
+_TRAJ_POINTF_LAST_POINT = 1 << 1
+_JOG_FLAG_ACTIVE = 1 << 0
+_JOG_FLAG_STOP = 1 << 1
 
 _HELLO_STRUCT = struct.Struct("<IHHIIQ4Q")  # 56 bytes
 _WELCOME_STRUCT = struct.Struct("<IHHI II 4x QQ IIII Q 4Q")  # 96 bytes (includes padding after reserved0)
@@ -59,9 +79,14 @@ _MSG_HEADER_STRUCT = struct.Struct("<HHIQQ")  # 24 bytes
 _CMD_ARM_STRUCT = struct.Struct("<II")
 _CMD_AXIS_MASK_STRUCT = struct.Struct("<II")
 _CMD_SET_MODE_STRUCT = struct.Struct("<II")
+_CMD_TRAJECTORY_BEGIN_STRUCT = struct.Struct("<QIIII")
+_TRAJECTORY_POINT_STRUCT = struct.Struct("<QIIQ16d16dII")
+_CMD_TRAJECTORY_CONTROL_STRUCT = struct.Struct("<QII")
+_CMD_JOG_STRUCT = struct.Struct("<IIQ16d")
 _STATUS_HELLO_STRUCT = struct.Struct("<QQQIIII")
 _AXIS_CONFIG_STRUCT = struct.Struct("<II16I16d16i16B16x16d")  # 424 bytes
 _STATUS_SNAPSHOT_HEADER_STRUCT = struct.Struct("<IIIIqqQ")
+_STATUS_MOTION_STATE_STRUCT = struct.Struct("<IIQIIIIIIIIQQ")  # 64 bytes
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -92,6 +117,25 @@ class _AxisConfig:
     sign: list[int]
 
 
+@dataclass(frozen=True)
+class RTCoreExecutionStatus:
+    active_mode: int
+    active_mode_name: str
+    state: int
+    state_name: str
+    active_traj_id: int
+    current_point_index: Optional[int]
+    queue_depth: int
+    queue_capacity: int
+    last_event_code: int
+    underrun_count: int
+    stale_command: bool
+    motion_done: bool
+    capability_flags: int
+    active_command_seq: int
+    last_update_ns: int
+
+
 class EthercatRTCoreBackend(ActuatorBackend):
     """
     ActuatorBackend proxy to the RTCore daemon (`gradient-rt-motion`).
@@ -99,7 +143,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
     This class intentionally does *not* perform any EtherCAT I/O itself.
     It only performs:
     - IPC handshake (UDS + SCM_RIGHTS)
-    - setpoint slot writes
+    - trajectory command-ring writes
     - status ring reads (best-effort, non-RT)
     """
 
@@ -130,6 +174,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         # Command ring sequencing (producer-owned).
         self._cmd_seq = 1
+        self._next_traj_id = 1
+        self._last_submitted_traj_id = 0
+        self._last_trajectory_timing: dict[str, int] = {}
 
         # Auto-arm on successful IPC connect (mirrors how serial servos become usable after init).
         self._auto_arm = os.environ.get("GRADIENT_RTCORE_AUTO_ARM", "0").lower() not in ("0", "false", "no")
@@ -177,15 +224,29 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._last_wkc_expected = 0
         self._last_wkc_actual = 0
         self._last_master_state = 0
+        self._execution_status = RTCoreExecutionStatus(
+            active_mode=RTCORE_MOTION_MODE_IDLE,
+            active_mode_name=rtcore_motion_mode_id_to_name(RTCORE_MOTION_MODE_IDLE) or "idle",
+            state=RTCORE_EXEC_STATE_IDLE,
+            state_name=rtcore_execution_state_id_to_name(RTCORE_EXEC_STATE_IDLE) or "idle",
+            active_traj_id=0,
+            current_point_index=None,
+            queue_depth=0,
+            queue_capacity=0,
+            last_event_code=0,
+            underrun_count=0,
+            stale_command=False,
+            motion_done=True,
+            capability_flags=0,
+            active_command_seq=0,
+            last_update_ns=0,
+        )
 
         # Latest commanded joint positions (radians) as a safe fallback for getters.
         self._last_joint_setpoint_rad: list[float] = [0.0] * self._num_joints
 
         self._status_thread: Optional[threading.Thread] = None
         self._status_stop = threading.Event()
-
-        # Setpoint slot sequence (writer-owned).
-        self._setpoint_seq = 0
 
     # -------------------------------------------------------------------------
     # ActuatorBackend required API
@@ -248,6 +309,24 @@ class EthercatRTCoreBackend(ActuatorBackend):
         with self._status_lock:
             self._rt_drive_profile_code = 0
             self._rt_drive_profile_id = None
+            self._last_submitted_traj_id = 0
+            self._execution_status = RTCoreExecutionStatus(
+                active_mode=RTCORE_MOTION_MODE_IDLE,
+                active_mode_name=rtcore_motion_mode_id_to_name(RTCORE_MOTION_MODE_IDLE) or "idle",
+                state=RTCORE_EXEC_STATE_IDLE,
+                state_name=rtcore_execution_state_id_to_name(RTCORE_EXEC_STATE_IDLE) or "idle",
+                active_traj_id=0,
+                current_point_index=None,
+                queue_depth=0,
+                queue_capacity=0,
+                last_event_code=0,
+                underrun_count=0,
+                stale_command=False,
+                motion_done=True,
+                capability_flags=0,
+                active_command_seq=0,
+                last_update_ns=0,
+            )
 
     def safe_power_down(self) -> bool:
         self._best_effort_safe_power_down()
@@ -260,6 +339,190 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def get_live_drive_profile_id(self) -> Optional[str]:
         with self._status_lock:
             return self._rt_drive_profile_id
+
+    def get_execution_status(self) -> RTCoreExecutionStatus:
+        with self._status_lock:
+            return self._execution_status
+
+    def get_last_submitted_trajectory_id(self) -> int:
+        with self._status_lock:
+            return int(self._last_submitted_traj_id)
+
+    def get_last_trajectory_timing(self) -> dict[str, int]:
+        with self._status_lock:
+            return dict(self._last_trajectory_timing)
+
+    def get_rtcore_cycle_ns(self) -> int:
+        hdr = self._cmd_hdr or self._status_hdr
+        cycle_ns = int(hdr.cycle_ns) if hdr is not None else 0
+        return cycle_ns if cycle_ns > 0 else 1_000_000
+
+    def resolve_trajectory_frequency(self, requested_hz: int) -> dict[str, int]:
+        requested_hz = max(1, int(requested_hz))
+        cycle_ns = max(1, int(self.get_rtcore_cycle_ns()))
+        requested_step_ns = max(1, (1_000_000_000 + requested_hz - 1) // requested_hz)
+        cycles_per_point = max(1, (requested_step_ns + cycle_ns - 1) // cycle_ns)
+        step_ns = cycles_per_point * cycle_ns
+        effective_hz = max(1, 1_000_000_000 // step_ns)
+        return {
+            "requested_frequency_hz": requested_hz,
+            "effective_frequency_hz": int(effective_hz),
+            "cycle_ns": cycle_ns,
+            "step_ns": int(step_ns),
+            "cycles_per_point": int(cycles_per_point),
+        }
+
+    def begin_trajectory(
+        self,
+        *,
+        traj_id: Optional[int] = None,
+        axis_mask: Optional[int] = None,
+        expected_points: int = 0,
+    ) -> int:
+        if not self._connected:
+            raise RuntimeError("RTCore not connected (cannot begin trajectory)")
+        if self._rt_num_axes <= 0:
+            raise RuntimeError("RTCore did not report a valid num_axes")
+        if traj_id is None:
+            traj_id = self._allocate_traj_id()
+        resolved_axis_mask = (
+            int(axis_mask)
+            if axis_mask is not None
+            else ((1 << self._rt_num_axes) - 1)
+        )
+        self._cmd_ring_write(
+            _MSG_CMD_TRAJECTORY_BEGIN,
+            _CMD_TRAJECTORY_BEGIN_STRUCT.pack(
+                int(traj_id),
+                int(resolved_axis_mask),
+                0,
+                max(0, int(expected_points)),
+                0,
+            ),
+        )
+        return int(traj_id)
+
+    def enqueue_trajectory_points(self, traj_id: int, points: list[dict[str, object]]) -> None:
+        if not self._connected:
+            raise RuntimeError("RTCore not connected (cannot enqueue trajectory points)")
+        if self._rt_num_axes <= 0:
+            raise RuntimeError("RTCore did not report a valid num_axes")
+        total = len(points)
+        for idx, point in enumerate(points):
+            t_from_start_ns = int(point.get("t_from_start_ns", 0))
+            axis_mask = int(point.get("axis_mask", (1 << self._rt_num_axes) - 1))
+            flags = int(point.get("flags", 0))
+            if idx == total - 1:
+                flags |= _TRAJ_POINTF_LAST_POINT
+
+            axis_q_obj = point.get("axis_q")
+            if axis_q_obj is not None:
+                axis_q = [float(v) for v in list(axis_q_obj)]
+            else:
+                positions_obj = point.get("positions_rad")
+                if positions_obj is None:
+                    raise ValueError("Trajectory point requires positions_rad or axis_q")
+                axis_q = self._axis_q_from_joint_positions([float(v) for v in list(positions_obj)])
+            if len(axis_q) != self._rt_num_axes:
+                raise ValueError(
+                    f"Expected {self._rt_num_axes} RT axis values, got {len(axis_q)}"
+                )
+
+            qd = point.get("qd")
+            qd_values = [0.0] * _GRADIENT_MAX_AXES
+            if qd is not None:
+                qd_list = [float(v) for v in list(qd)]
+                for vel_i, vel in enumerate(qd_list[:_GRADIENT_MAX_AXES]):
+                    qd_values[vel_i] = vel
+
+            q_values = [0.0] * _GRADIENT_MAX_AXES
+            for axis_i, value in enumerate(axis_q[:_GRADIENT_MAX_AXES]):
+                q_values[axis_i] = float(value)
+
+            self._cmd_ring_write(
+                _MSG_CMD_TRAJECTORY_POINT,
+                _TRAJECTORY_POINT_STRUCT.pack(
+                    int(traj_id),
+                    idx,
+                    int(flags),
+                    max(0, t_from_start_ns),
+                    *q_values,
+                    *qd_values,
+                    int(axis_mask),
+                    0,
+                ),
+            )
+
+    def commit_trajectory(self, traj_id: int) -> None:
+        self._cmd_ring_write(
+            _MSG_CMD_TRAJECTORY_COMMIT,
+            _CMD_TRAJECTORY_CONTROL_STRUCT.pack(int(traj_id), 0, 0),
+        )
+        with self._status_lock:
+            self._last_submitted_traj_id = int(traj_id)
+
+    def abort_trajectory(self, traj_id: Optional[int] = None) -> None:
+        self._cmd_ring_write(
+            _MSG_CMD_TRAJECTORY_ABORT,
+            _CMD_TRAJECTORY_CONTROL_STRUCT.pack(0 if traj_id is None else int(traj_id), 0, 0),
+        )
+
+    def execute_joint_trajectory(
+        self,
+        joint_path: list[list[float]],
+        frequency: int,
+        *,
+        timeout_s: Optional[float] = None,
+    ) -> RTCoreExecutionStatus:
+        if not joint_path:
+            raise ValueError("joint_path must not be empty")
+        timing = self.resolve_trajectory_frequency(frequency)
+        requested_frequency_hz = int(timing["requested_frequency_hz"])
+        frequency_hz = int(timing["effective_frequency_hz"])
+        step_ns = int(timing["step_ns"])
+        with self._status_lock:
+            self._last_trajectory_timing = dict(timing)
+        if frequency_hz != requested_frequency_hz:
+            print(
+                "[EtherCAT RTCore] Quantized trajectory frequency:"
+                f" requested={requested_frequency_hz}Hz"
+                f" effective={frequency_hz}Hz"
+                f" cycle_ns={int(timing['cycle_ns'])}"
+                f" cycles_per_point={int(timing['cycles_per_point'])}"
+            )
+        traj_id = self.begin_trajectory(expected_points=len(joint_path))
+        points = [
+            {
+                "positions_rad": list(q),
+                "t_from_start_ns": idx * step_ns,
+            }
+            for idx, q in enumerate(joint_path)
+        ]
+        self.enqueue_trajectory_points(traj_id, points)
+        self.commit_trajectory(traj_id)
+
+        wait_timeout_s = timeout_s
+        if wait_timeout_s is None:
+            wait_timeout_s = max(2.0, (len(joint_path) / float(frequency_hz)) + 2.0)
+        return self.wait_for_trajectory_complete(traj_id, timeout_s=wait_timeout_s)
+
+    def wait_for_trajectory_complete(self, traj_id: int, *, timeout_s: float) -> RTCoreExecutionStatus:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while time.monotonic() <= deadline:
+            status = self.get_execution_status()
+            if status.active_traj_id == int(traj_id):
+                if status.state in (
+                    RTCORE_EXEC_STATE_COMPLETED,
+                    RTCORE_EXEC_STATE_ABORTED,
+                    RTCORE_EXEC_STATE_FAULTED,
+                    RTCORE_EXEC_STATE_UNDERRUN,
+                ):
+                    return status
+            elif status.motion_done and status.last_update_ns > 0:
+                # A newer trajectory or stop/abort command superseded this one.
+                return status
+            time.sleep(0.01)
+        raise TimeoutError(f"Timed out waiting for RTCore trajectory {traj_id} to complete")
 
     def reset_faults(self, logical_joint_index: Optional[int] = None) -> bool:
         if not self._connected:
@@ -360,14 +623,18 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if self._rt_num_axes <= 0:
             raise RuntimeError("RTCore did not report a valid num_axes")
 
-        # Build per-axis setpoint vector from the configured mapping.
-        axis_q: list[float] = [0.0] * self._rt_num_axes
-        for axis_i, joint_i in enumerate(self._axis_to_joint):
-            if 0 <= joint_i < len(positions_rad):
-                axis_q[axis_i] = float(positions_rad[joint_i]) + self._master_offset_for_joint(joint_i)
-
-        axis_mask = (1 << self._rt_num_axes) - 1
-        self._write_setpoint(axis_q, axis_mask=axis_mask)
+        traj_id = self.begin_trajectory(expected_points=1)
+        self.enqueue_trajectory_points(
+            traj_id,
+            [
+                {
+                    "positions_rad": list(positions_rad),
+                    "t_from_start_ns": 0,
+                    "axis_mask": (1 << self._rt_num_axes) - 1,
+                }
+            ],
+        )
+        self.commit_trajectory(traj_id)
 
     def get_joint_positions(self, verbose: bool = False) -> list[float]:
         if self._connected and self._axis_config is None:
@@ -389,9 +656,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
         speed: int = 4095,
         accel: int = 0,
     ) -> list[tuple]:
-        # This backend does not support raw SYNC_WRITE-style commands from Python.
-        # Return a backend-private command tuple consumed by sync_write().
-        return [("setpoint_rad", list(positions_rad))]
+        # This backend is trajectory-only. Return a backend-private point payload
+        # so sync_write() can wrap it as a one-point trajectory when callers still
+        # use the generic sync-write executor interface.
+        return [("trajectory_point_rad", list(positions_rad))]
 
     def sync_write(self, commands: list[tuple]) -> None:
         # Accept our private command format only.
@@ -399,10 +667,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
             return
 
         kind = commands[0][0] if isinstance(commands[0], tuple) and commands[0] else None
-        if kind != "setpoint_rad":
+        if kind != "trajectory_point_rad":
             raise NotImplementedError(
-                "ethercat_rtcore does not accept raw sync_write tuples; "
-                "use set_joint_positions() / prepare_sync_write_commands()."
+                "ethercat_rtcore requires trajectory-point command tuples; "
+                "use set_joint_positions(), execute_joint_trajectory(), or prepare_sync_write_commands()."
             )
 
         positions_rad = commands[0][1]
@@ -447,7 +715,18 @@ class EthercatRTCoreBackend(ActuatorBackend):
         axis_q = [0.0] * self._rt_num_axes
         axis_q[actuator_id] = float(position_rad)
         axis_mask = 1 << actuator_id
-        self._write_setpoint(axis_q, axis_mask=axis_mask)
+        traj_id = self.begin_trajectory(axis_mask=axis_mask, expected_points=1)
+        self.enqueue_trajectory_points(
+            traj_id,
+            [
+                {
+                    "axis_q": axis_q,
+                    "t_from_start_ns": 0,
+                    "axis_mask": axis_mask,
+                }
+            ],
+        )
+        self.commit_trajectory(traj_id)
 
     def read_single_actuator_position(self, actuator_id: int) -> Optional[int]:
         if not self._connected:
@@ -776,6 +1055,27 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def _send_cmd_set_mode(self, axis_mask: int, mode: int) -> None:
         self._cmd_ring_write(_MSG_CMD_SET_MODE, _CMD_SET_MODE_STRUCT.pack(int(axis_mask), int(mode)))
 
+    def _send_cmd_jog(
+        self,
+        *,
+        axis_mask: int,
+        flags: int,
+        timeout_ns: int,
+        axis_qd: list[float],
+    ) -> None:
+        payload_qd = [0.0] * _GRADIENT_MAX_AXES
+        for idx, value in enumerate(axis_qd[:_GRADIENT_MAX_AXES]):
+            payload_qd[idx] = float(value)
+        self._cmd_ring_write(
+            _MSG_CMD_JOG,
+            _CMD_JOG_STRUCT.pack(
+                int(axis_mask),
+                int(flags),
+                int(timeout_ns),
+                *payload_qd,
+            ),
+        )
+
     def _map_fd(self, fd: int) -> mmap.mmap:
         st = os.fstat(fd)
         if st.st_size <= 0:
@@ -851,6 +1151,42 @@ class EthercatRTCoreBackend(ActuatorBackend):
             int(wkc_expected),
         )
 
+    def _parse_motion_state(self, payload: bytes) -> RTCoreExecutionStatus:
+        (
+            active_mode,
+            state,
+            active_traj_id,
+            current_point_index,
+            queue_depth,
+            queue_capacity,
+            last_event_code,
+            underrun_count,
+            stale_command_flag,
+            motion_done,
+            capability_flags,
+            active_command_seq,
+            last_update_ns,
+        ) = _STATUS_MOTION_STATE_STRUCT.unpack_from(payload, 0)
+        return RTCoreExecutionStatus(
+            active_mode=int(active_mode),
+            active_mode_name=rtcore_motion_mode_id_to_name(active_mode) or f"unknown:{int(active_mode)}",
+            state=int(state),
+            state_name=rtcore_execution_state_id_to_name(state) or f"unknown:{int(state)}",
+            active_traj_id=int(active_traj_id),
+            current_point_index=None
+            if int(current_point_index) == 0xFFFFFFFF
+            else int(current_point_index),
+            queue_depth=int(queue_depth),
+            queue_capacity=int(queue_capacity),
+            last_event_code=int(last_event_code),
+            underrun_count=int(underrun_count),
+            stale_command=bool(stale_command_flag),
+            motion_done=bool(motion_done),
+            capability_flags=int(capability_flags),
+            active_command_seq=int(active_command_seq),
+            last_update_ns=int(last_update_ns),
+        )
+
     def _build_axis_config_from_robot_config(self, robot_config: dict) -> Optional[_AxisConfig]:
         counts_per_radian = list(robot_config.get("actuator_counts_per_radian", []))
         if not counts_per_radian:
@@ -916,10 +1252,35 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 self._axis_config_mismatch_logged = True
                 return
 
+    def _allocate_traj_id(self) -> int:
+        traj_id = int(self._next_traj_id)
+        self._next_traj_id += 1
+        return traj_id
+
     def _master_offset_for_joint(self, logical_joint_idx: int) -> float:
         if 0 <= logical_joint_idx < len(self._master_offsets_rad):
             return float(self._master_offsets_rad[logical_joint_idx])
         return 0.0
+
+    def _axis_q_from_joint_positions(self, positions_rad: list[float]) -> list[float]:
+        if len(positions_rad) != self._num_joints:
+            raise ValueError(f"Expected {self._num_joints} joint positions, got {len(positions_rad)}")
+        axis_q: list[float] = [0.0] * self._rt_num_axes
+        for axis_i, joint_i in enumerate(self._axis_to_joint):
+            if 0 <= joint_i < len(positions_rad):
+                axis_q[axis_i] = float(positions_rad[joint_i]) + self._master_offset_for_joint(joint_i)
+        return axis_q
+
+    def _axis_qd_from_joint_velocities(self, joint_velocities_rad_s: list[float]) -> list[float]:
+        if len(joint_velocities_rad_s) != self._num_joints:
+            raise ValueError(
+                f"Expected {self._num_joints} joint velocities, got {len(joint_velocities_rad_s)}"
+            )
+        axis_qd: list[float] = [0.0] * self._rt_num_axes
+        for axis_i, joint_i in enumerate(self._axis_to_joint):
+            if 0 <= joint_i < len(joint_velocities_rad_s):
+                axis_qd[axis_i] = float(joint_velocities_rad_s[joint_i])
+        return axis_qd
 
     def _axis_q_from_counts(self, axis_i: int, raw_counts: int) -> Optional[float]:
         cfg = self._axis_config
@@ -1034,6 +1395,14 @@ class EthercatRTCoreBackend(ActuatorBackend):
                         self._axis_error_code[axis_i] = int(error_code)
                 self._status_snapshot_event.set()
 
+            if mtype == _MSG_STATUS_MOTION_STATE and len(payload) >= _STATUS_MOTION_STATE_STRUCT.size:
+                try:
+                    parsed_state = self._parse_motion_state(payload)
+                    with self._status_lock:
+                        self._execution_status = parsed_state
+                except Exception:
+                    pass
+
             read_idx += 1
 
         # Publish new read_idx (consumer-owned).
@@ -1041,43 +1410,50 @@ class EthercatRTCoreBackend(ActuatorBackend):
         #   magic(0), capacity(4), msg_bytes(8), write_idx(12), read_idx(16), dropped(20), reserved0(24)
         self._status_shm[ring_hdr_offset + 16 : ring_hdr_offset + 20] = struct.pack("<I", read_idx)
 
+    def supports_realtime_jog(self) -> bool:
+        if not self.is_initialized or self._rt_num_axes <= 0:
+            return False
+        capability_flags = int(getattr(self._execution_status, "capability_flags", 0) or 0)
+        return capability_flags == 0 or bool(capability_flags & RTCORE_MOTION_CAP_JOG_COMMAND)
+
+    def start_realtime_jog(self, timeout_s: float) -> None:
+        self.send_realtime_jog_command([0.0] * self._num_joints, timeout_s=timeout_s)
+
+    def send_realtime_jog_command(
+        self,
+        joint_velocities_rad_s: list[float],
+        *,
+        timeout_s: float,
+    ) -> None:
+        if not self._connected:
+            raise RuntimeError("RTCore not connected (cannot send jog command)")
+        if self._rt_num_axes <= 0:
+            raise RuntimeError("RTCore did not report a valid num_axes")
+        if float(timeout_s) <= 0.0:
+            raise ValueError("Realtime jog timeout must be > 0.")
+
+        axis_mask = (1 << self._rt_num_axes) - 1 if self._rt_num_axes > 0 else 0
+        timeout_ns = int(max(1, round(float(timeout_s) * 1e9)))
+        axis_qd = self._axis_qd_from_joint_velocities(joint_velocities_rad_s)
+        self._send_cmd_jog(
+            axis_mask=axis_mask,
+            flags=_JOG_FLAG_ACTIVE,
+            timeout_ns=timeout_ns,
+            axis_qd=axis_qd,
+        )
+
+    def stop_realtime_jog(self) -> None:
+        if not self._connected:
+            return
+        self._send_cmd_jog(
+            axis_mask=0,
+            flags=_JOG_FLAG_STOP,
+            timeout_ns=0,
+            axis_qd=[0.0] * self._rt_num_axes,
+        )
+
     def _write_setpoint(self, positions_rad: list[float], axis_mask: int) -> None:
-        assert self._cmd_shm is not None
-        assert self._cmd_hdr is not None
-
-        if self._cmd_hdr.setpoint_offset == 0:
-            raise RuntimeError("RTCore did not provide a setpoint slot")
-
-        # SetpointSlotV1:
-        #   uint64 seq
-        #   uint64 target_time_ns
-        #   double q[16]
-        #   uint32 axis_mask
-        #   uint32 reserved
-        slot_off = self._cmd_hdr.setpoint_offset
-
-        target_time_ns = _now_monotonic_ns() + int(self._cmd_hdr.cycle_ns)
-
-        # Write payload first (excluding seq).
-        self._cmd_shm[slot_off + 8 : slot_off + 16] = struct.pack("<Q", target_time_ns)
-
-        # q array (16 doubles).
-        q = [0.0] * _GRADIENT_MAX_AXES
-        for i, v in enumerate(positions_rad[: _GRADIENT_MAX_AXES]):
-            q[i] = float(v)
-        self._cmd_shm[slot_off + 16 : slot_off + 16 + 16 * 8] = struct.pack("<16d", *q)
-
-        self._cmd_shm[slot_off + 16 + 16 * 8 : slot_off + 16 + 16 * 8 + 4] = struct.pack("<I", int(axis_mask))
-        self._cmd_shm[slot_off + 16 + 16 * 8 + 4 : slot_off + 16 + 16 * 8 + 8] = struct.pack("<I", 0)
-
-        # Publish seq last.
-        self._setpoint_seq += 1
-        self._cmd_shm[slot_off : slot_off + 8] = struct.pack("<Q", self._setpoint_seq)
-
-        # Wake RTCore helper thread.
-        if self._cmd_eventfd is not None:
-            try:
-                os.write(self._cmd_eventfd, struct.pack("<Q", 1))
-            except Exception:
-                pass
+        raise RuntimeError(
+            "Legacy RTCore setpoint-slot writes are disabled. Use trajectory upload/commit paths instead."
+        )
 
