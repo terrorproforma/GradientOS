@@ -263,8 +263,14 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         # Latest known axis counts from STATUS_SNAPSHOT (pos_counts per axis).
         self._axis_counts: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_torque_raw: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_statusword: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_error_code: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_mode_display: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_ds402_state: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_di_bits: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_fault_flags: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_brake_state: list[int] = [0] * _GRADIENT_MAX_AXES
         self._rt_drive_profile_code = 0
         self._rt_drive_profile_id: Optional[str] = None
         self._last_wkc_expected = 0
@@ -1441,15 +1447,32 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     self._last_master_state = int(master_state)
                 for axis_i in range(min(self._rt_num_axes, _GRADIENT_MAX_AXES)):
                     axis_off = 40 + axis_i * 28
-                    if axis_off + 10 <= len(payload):
-                        pos_counts, _torque_raw, statusword, error_code = struct.unpack_from(
-                            "<ihHH",
+                    if axis_off + 28 <= len(payload):
+                        (
+                            pos_counts,
+                            torque_raw,
+                            statusword,
+                            error_code,
+                            mode_display,
+                            ds402_state,
+                            _reserved0,
+                            di_bits,
+                            axis_fault_flags,
+                            brake_state,
+                        ) = struct.unpack_from(
+                            "<ihHHBBHxxIII",
                             payload,
                             axis_off,
                         )
                         self._axis_counts[axis_i] = int(pos_counts)
+                        self._axis_torque_raw[axis_i] = int(torque_raw)
                         self._axis_statusword[axis_i] = int(statusword)
                         self._axis_error_code[axis_i] = int(error_code)
+                        self._axis_mode_display[axis_i] = int(mode_display)
+                        self._axis_ds402_state[axis_i] = int(ds402_state)
+                        self._axis_di_bits[axis_i] = int(di_bits)
+                        self._axis_fault_flags[axis_i] = int(axis_fault_flags)
+                        self._axis_brake_state[axis_i] = int(brake_state)
                 self._status_snapshot_event.set()
 
             if mtype == _MSG_STATUS_MOTION_STATE and len(payload) >= _STATUS_MOTION_STATE_STRUCT.size:

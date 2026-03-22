@@ -3825,3 +3825,198 @@
 - Follow-up notes / risks:
   - The diagnostics are recorded automatically whenever the UI sends commands; the new panel only makes them visible.
   - The panel is intentionally summary-level; if we need persistent traces for manual tests, the next step would be a dedicated “record timing session” feature that saves snapshots over time.
+
+## 2026-03-22 03:37 +0000
+
+- Task summary:
+  - Moved timing diagnostics out of the robot control card and into their own hideable panel below the live charts.
+- What changed:
+  - Added `web-ui/src/PerformanceDiagnosticsPanel.tsx`:
+    - polls `/debug/performance` every `500 ms`
+    - renders a dedicated diagnostics panel with a hide/show toggle
+    - groups UI/API timing, controller dispatch timing, jog internals, and RTCore health into separate cards
+  - Updated `web-ui/src/App.tsx`:
+    - mounted `PerformanceDiagnosticsPanel` directly below `TelemetryCharts` in the telemetry drawer
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - removed the previously added diagnostics block and its polling state so the control card stays focused on robot actions
+- Validation:
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx`, `web-ui/src/PerformanceDiagnosticsPanel.tsx`, `web-ui/src/App.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+  - `./start-stack.sh status`
+    - confirmed controller/API/web were already up on `:3000`, `:4000`, `:8000`
+  - `./start-stack.sh`
+    - correctly refused to start duplicate services because those live processes already existed
+- Follow-up notes / risks:
+  - The diagnostics panel now sits in the operator’s chart workflow and can be hidden, but it is still a live snapshot view rather than a persistent recorder.
+  - Because the existing web process was already running, a browser refresh may be needed to see the relocated panel immediately.
+
+## 2026-03-22 03:42 +0000
+
+- Task summary:
+  - Converted telemetry into a wider tabbed workspace so charts and diagnostics are easier to use during manual testing.
+- What changed:
+  - Added `web-ui/src/TelemetryWorkspace.tsx`:
+    - provides `Live Charts` and `Diagnostics` tabs
+    - adds a show/hide toggle for the diagnostics tab itself
+  - Updated `web-ui/src/App.tsx`:
+    - widened the telemetry drawer from `30rem` to `38rem`
+    - replaced stacked telemetry content with `TelemetryWorkspace`
+  - Updated `web-ui/src/PerformanceDiagnosticsPanel.tsx`:
+    - removed the old internal hide/collapse behavior
+    - added top-level visual signal cards with progress bars for jog RTT, move ACK timing, controller dispatch, and RT jitter
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - kept diagnostics removed from the robot control card
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`, `web-ui/src/TelemetryWorkspace.tsx`, `web-ui/src/PerformanceDiagnosticsPanel.tsx`, `web-ui/src/ControlPanel.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - The tabbed layout is much more usable for operator-led testing, but diagnostics are still snapshot-oriented rather than a persistent timeline recorder.
+  - The live web process was already running, so a browser refresh is the most likely step needed to see the new tabbed telemetry workspace.
+
+## 2026-03-22 03:47 +0000
+
+- Task summary:
+  - Surfaced richer EtherCAT/RTCore servo diagnostics end to end so the telemetry tab shows available drive feedback instead of leaving the lower cards blank on that backend.
+- What changed:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - expanded `StatusSnapshotV1` unpacking to retain `torque_raw`, `mode_display`, `ds402_state`, `di_bits`, `axis_fault_flags`, and `brake_state` per axis
+  - Updated `src/gradient_os/run_controller.py`:
+    - extended `GET_JOINT_STATE` snapshots with the new per-axis arrays
+    - added RTCore axis telemetry sample building/merging so shared-memory axis diagnostics are emitted in `msg["servos"]` every telemetry tick
+    - added DS402 mode-name labeling for the UI payload
+  - Updated `src/gradient_os/api/main.py`:
+    - normalizes the new `GET_JOINT_STATE` axis arrays for `/info/joints-detailed`
+  - Updated `web-ui/src/App.tsx`:
+    - parses the richer `servos` payload fields from live telemetry
+  - Updated `web-ui/src/TelemetryCharts.tsx`:
+    - stores history for RTCore axis counts, torque raw, mode display, and DI bits
+    - renders whichever servo/drive charts are actually available
+    - adds a compact per-axis `Drive Feedback` status board with state, mode, statusword, error code, counts, and torque
+  - Updated `tests/test_api_endpoints.py`:
+    - extended mocked `GET_JOINT_STATE` coverage for the richer axis snapshot payload
+- Validation:
+  - `"/home/pi/GradientOS/.venv/bin/python" -m pytest tests/test_api_endpoints.py`
+    - passed (`43 passed`)
+  - `"/home/pi/GradientOS/.venv/bin/python" -m py_compile src/gradient_os/run_controller.py src/gradient_os/api/main.py src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`
+    - passed
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `src/gradient_os/run_controller.py`, `src/gradient_os/api/main.py`, `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`, `web-ui/src/App.tsx`, `web-ui/src/TelemetryCharts.tsx`, `tests/test_api_endpoints.py`
+    - no diagnostics
+- Follow-up notes / risks:
+  - This surfaces everything RTCore is already publishing today, but voltage/current/temp on EtherCAT still depend on whether those objects are mapped into the live PDO/status path. If the drives expose more objects than RTCore currently snapshots, the next step is extending RTCore PDO/status capture itself.
+  - The new RTCore axis telemetry is live-snapshot oriented, not a persistent recorder; if operator testing needs trace review across a motion, a recorder tab/file capture is still the next best addition.
+
+## 2026-03-22 03:49 +0000
+
+- Task summary:
+  - Fixed a telemetry UI regression that made the lower chart area disappear when optional servo series were empty.
+- What changed:
+  - Updated `web-ui/src/TelemetryCharts.tsx`:
+    - restored unconditional rendering of the original `Voltage (V)`, `Current (A)`, `Torque/Load (%)`, and `Temp (°C)` cards
+    - kept the new RTCore-specific charts (`Position Counts`, `Torque Raw`, `Mode Display`, `DI Bits`) as additive charts that only appear when data exists
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/TelemetryCharts.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - The baseline chart slots are visible again immediately, but actual EtherCAT voltage/current/temp values still depend on whether that backend supplies them.
+  - If the running web process does not hot-reload this change, a browser refresh should be enough; only restart the web process if the stale bundle persists.
+
+## 2026-03-22 03:53 +0000
+
+- Task summary:
+  - Expanded the telemetry tab so all known servo/drive charts are visible/toggleable and the UI explicitly shows which live fields EtherCAT RTCore does and does not currently stream.
+- What changed:
+  - Updated `web-ui/src/TelemetryCharts.tsx`:
+    - added per-panel show/hide toggles with local persistence
+    - added per-card `Hide` actions on joint charts, servo charts, drive feedback, and alarms
+    - added always-rendered empty-state messages for chart cards when a metric is not live
+    - added extra RTCore trend charts for `Statusword` and `Error Code`
+    - added an EtherCAT telemetry-availability note when RTCore data is present but `voltage/current/temp` are not
+    - expanded the `Drive Feedback` section into a fuller field table so all currently available live values per axis are visible
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/TelemetryCharts.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - The UI now shows the distinction clearly, but live EtherCAT `voltage/current/temp` still require RTCore/status-path work because those objects are not currently in the RTCore snapshot.
+  - If the browser still shows the old telemetry layout after refresh, restart only the web process rather than the whole robot stack.
+
+## 2026-03-22 04:00 +0000
+
+- Task summary:
+  - Removed the noisy telemetry toggle strip and fixed the empty 3D workspace by adding a visible robot fallback when the web mesh bundle is incomplete.
+- What changed:
+  - Updated `web-ui/src/TelemetryCharts.tsx`:
+    - removed the top `Panel Toggles` strip
+    - kept per-chart `Hide` buttons
+    - added a small `Restore Hidden Panels` action only when needed
+  - Updated `web-ui/src/ArmVisualizer.tsx`:
+    - added checks for URDF-referenced mesh availability in the served web asset bundle
+    - added a renderable articulated fallback robot for cases where URDF meshes are missing or the URDF loads with zero meshes
+    - uses the fallback instead of leaving the scene empty
+  - Investigated robot asset bundle contents:
+    - confirmed `web-ui/public/assets/robots/gradient-05/robot.urdf` points at `stl-files/base.stl`, `L1.stl`, etc.
+    - confirmed those STL files are not present in the shipped web assets; only URDF files and `stl-files/.gitkeep` exist
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/TelemetryCharts.tsx` and `web-ui/src/ArmVisualizer.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - The robot should now be visible again via the fallback visual, but the true CAD-like robot appearance still requires shipping the actual `gradient-05` mesh files into the web asset bundle.
+  - A browser refresh should pick up both changes; only restart the web UI process if the old bundle remains cached.
+
+## 2026-03-22 04:04 +0000
+
+- Task summary:
+  - Corrected the robot-render diagnosis, removed the fake fallback robot, and verified the real `gradient-05` mesh model renders again.
+- What changed:
+  - Updated `web-ui/src/ArmVisualizer.tsx`:
+    - removed the fallback-robot code path entirely
+    - restored direct URDF loading behavior
+  - Updated `web-ui/src/TelemetryCharts.tsx`:
+    - kept the earlier removal of the top toggle strip
+  - Investigated asset paths:
+    - direct directory listing confirmed real mesh files exist in both `robots/gradient-05/stl-files/` and `web-ui/public/assets/robots/gradient-05/stl-files/`
+    - earlier search-based conclusion that the STLs were absent was incorrect
+  - Live browser verification:
+    - opened `http://127.0.0.1:8000/` in the IDE browser
+    - confirmed the actual robot model is visible again in the main scene
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/ArmVisualizer.tsx` and `web-ui/src/TelemetryCharts.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - The real robot render is back; if the user still sees the blank scene locally, the most likely cause is a stale browser session/bundle and should be checked with a hard refresh or a targeted web UI restart.
+
+## 2026-03-22 04:23 +0000
+
+- Task summary:
+  - Investigated the live timing diagnostics and fixed a frontend command-queueing bottleneck that could make controls appear unresponsive and then flush stale motion commands later.
+- What changed:
+  - Analyzed `logs/startups/20260322-033216/controller.log` against the timing panel values:
+    - RTCore jitter/overruns were healthy
+    - controller jog dispatch stayed fast
+    - move ACK timing still reflected synchronous planning/upload cost
+    - the controller log showed bursts of repeated `SET_JOG_VELOCITY` commands from different source ports, including stale zero/nonzero interleaving
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added a single-flight, latest-wins jog send queue so `/control/jog/velocity` requests no longer stack in parallel every `50 ms`
+    - changed `stopJog()` to flush one final zero-velocity command through that queue before issuing `/control/jog/stop`
+    - added a discrete motion lock so incremental `move-line-relative`, `rotate`, `Home`, and `Rest` commands cannot pile up while one motion request is already being issued
+- Validation:
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - This fixes the browser-side stale-command pileup, which was the highest-value cause of delayed-then-burst motion behavior.
+  - The diagnostics still correctly show that queued move ACK time includes planner/upload work; if the operator still wants those actions to feel more responsive, the next slice would be changing the backend/API contract so move requests ACK earlier and planning/execution status streams separately.

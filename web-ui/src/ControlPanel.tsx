@@ -40,102 +40,9 @@ type MotionStatusResponse = {
 	execution?: MotionExecutionPayload;
 };
 
-type ApiCommandPerformance = {
-	count?: number;
-	ok_count?: number;
-	error_count?: number;
-	timeout_count?: number;
-	avg_round_trip_ms?: number;
-	max_round_trip_ms?: number;
-	last_round_trip_ms?: number;
-};
-
-type ApiUdpPerformance = {
-	last_command?: string | null;
-	last_result?: string | null;
-	last_round_trip_ms?: number | null;
-	by_command?: Record<string, ApiCommandPerformance>;
-};
-
-type RollingTimingMetric = {
-	count?: number;
-	avg_ms?: number;
-	max_ms?: number;
-	last_ms?: number;
-	slow_over_5ms?: number;
-	slow_over_20ms?: number;
-	overrun_count?: number;
-	max_overrun_ms?: number;
-	last_overrun_ms?: number;
-};
-
-type ControllerCommandPerformance = {
-	count?: number;
-	last_dispatch_ms?: number;
-	avg_dispatch_ms?: number;
-	max_dispatch_ms?: number;
-	last_interarrival_ms?: number | null;
-	avg_interarrival_ms?: number;
-	max_interarrival_ms?: number;
-	interarrival_count?: number;
-};
-
-type ControllerUdpPerformance = {
-	last_command?: string | null;
-	last_peer?: string | null;
-	last_dispatch_ms?: number | null;
-	last_receive_age_s?: number | null;
-	dispatch_ms?: RollingTimingMetric;
-	interarrival_ms?: RollingTimingMetric;
-	command_counts?: Record<string, number>;
-	per_command?: Record<string, ControllerCommandPerformance>;
-};
-
-type JogPerformance = {
-	control_frequency_hz?: number;
-	execution_policy?: string;
-	rtcore_owned?: boolean;
-	last_velocity_command_age_s?: number | null;
-	velocity_updates?: {
-		count?: number;
-		gap_count?: number;
-		avg_gap_ms?: number;
-		max_gap_ms?: number;
-		last_gap_ms?: number | null;
-		zero_velocity_updates?: number;
-		nonzero_velocity_updates?: number;
-	};
-	loop?: RollingTimingMetric;
-	stages?: {
-		feedback_read_ms?: RollingTimingMetric;
-		ik_solve_ms?: RollingTimingMetric;
-		command_send_ms?: RollingTimingMetric;
-	};
-};
-
-type RtcorePerformance = {
-	rt_last_jitter_ns?: number | null;
-	rt_max_abs_jitter_ns?: number | null;
-	rt_overrun_count?: number | null;
-	motion_last_update_age_ms?: number | null;
-};
-
-type PerformanceResponse = {
-	collected_at?: string;
-	api_udp?: ApiUdpPerformance;
-	controller?: {
-		udp?: ControllerUdpPerformance;
-		jog?: JogPerformance;
-		motion_state?: string;
-		is_jogging?: boolean;
-		last_command_age_s?: number;
-		command_link_stale?: boolean;
-	};
-	rtcore?: RtcorePerformance | null;
-};
+type JogCommandVector = [number, number, number, number, number, number];
 
 const LIVE_JOINT_FEEDBACK_POLL_MS = 20;
-const PERFORMANCE_POLL_MS = 500;
 
 type CommissioningStatus = {
 	tone: "info" | "success" | "error";
@@ -240,27 +147,6 @@ function formatMotionStateLabel(value: string | undefined): string {
 	return raw.replace(/_/g, " ").toUpperCase();
 }
 
-function formatMs(value: number | null | undefined, digits = 2): string {
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		return "--";
-	}
-	return `${value.toFixed(digits)} ms`;
-}
-
-function formatAgeSeconds(value: number | null | undefined, digits = 2): string {
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		return "--";
-	}
-	return `${value.toFixed(digits)} s`;
-}
-
-function formatNsAsUs(value: number | null | undefined, digits = 2): string {
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		return "--";
-	}
-	return `${(value / 1000).toFixed(digits)} us`;
-}
-
 async function readErrorMessage(res: Response): Promise<string> {
 	const contentType = res.headers.get("content-type") ?? "";
 	if (contentType.includes("application/json")) {
@@ -310,10 +196,10 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const [jointStepDeg, setJointStepDeg] = useState<number>(1);
 	const [customJointStepInput, setCustomJointStepInput] = useState<string>("");
 	const [pendingJointAction, setPendingJointAction] = useState<string | null>(null);
+	const [pendingMotionAction, setPendingMotionAction] = useState<string | null>(null);
 	const [commissioningStatus, setCommissioningStatus] = useState<CommissioningStatus | null>(null);
 	const [commissioningExpanded, setCommissioningExpanded] = useState<boolean>(false);
 	const [motionStatus, setMotionStatus] = useState<MotionStatusResponse | null>(null);
-	const [performanceSnapshot, setPerformanceSnapshot] = useState<PerformanceResponse | null>(null);
 	const activeDriveFaultAxes = useMemo(
 		() =>
 			(driveFaults?.axes ?? []).filter(
@@ -332,43 +218,26 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 			? motionStatus.execution.active_traj_id
 			: null);
 	const motionBusy = motionStateName === "accepted" || motionStateName === "queued" || motionStateName === "executing";
+	const motionControlsBusy = motionBusy || pendingMotionAction !== null;
 	// Realtime jog state
 	const [jogEnabled, setJogEnabled] = useState<boolean>(false);
 	const [deadman, setDeadman] = useState<boolean>(true);
 	const [linBaseMmS, setLinBaseMmS] = useState<number>(50);
 	const [angBaseDegS, setAngBaseDegS] = useState<number>(15);
-	const [lastJogCommand, setLastJogCommand] = useState<[number, number, number, number, number, number]>([0, 0, 0, 0, 0, 0]);
+	const [lastJogCommand, setLastJogCommand] = useState<JogCommandVector>([0, 0, 0, 0, 0, 0]);
 	const jogTimerRef = useRef<number | null>(null);
 	const sendJogTickRef = useRef<() => Promise<void>>(async () => {});
-	const lastSentRef = useRef<[number, number, number, number, number, number]>([0, 0, 0, 0, 0, 0]);
+	const lastSentRef = useRef<JogCommandVector>([0, 0, 0, 0, 0, 0]);
 	const lastSentAtRef = useRef<number>(0);
+	const queuedJogCommandRef = useRef<JogCommandVector | null>(null);
+	const jogSendLoopRef = useRef<Promise<void> | null>(null);
+	const pendingMotionActionRef = useRef<string | null>(null);
 	const lastRequestErrorRef = useRef<string | null>(null);
 	const keepaliveMs = 200;
 	const jogTickIntervalMs = 50;
 	const linCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
 	const angCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
 	const jointStepLabel = formatStepDegrees(jointStepDeg);
-	const perfApiUdp = performanceSnapshot?.api_udp;
-	const perfController = performanceSnapshot?.controller;
-	const perfControllerUdp = perfController?.udp;
-	const perfJog = perfController?.jog;
-	const perfRtcore = performanceSnapshot?.rtcore;
-	const perfMoveApi = perfApiUdp?.by_command?.MOVE_LINE_RELATIVE;
-	const perfWaitApi = perfApiUdp?.by_command?.WAIT_FOR_IDLE;
-	const perfJogApi = perfApiUdp?.by_command?.SET_JOG_VELOCITY;
-	const perfMoveController = perfControllerUdp?.per_command?.MOVE_LINE_RELATIVE;
-	const perfWaitController = perfControllerUdp?.per_command?.WAIT_FOR_IDLE;
-	const perfJogController = perfControllerUdp?.per_command?.SET_JOG_VELOCITY;
-	const perfSnapshotAgeSeconds = useMemo(() => {
-		if (!performanceSnapshot?.collected_at) {
-			return null;
-		}
-		const collectedAtMs = Date.parse(performanceSnapshot.collected_at);
-		if (!Number.isFinite(collectedAtMs)) {
-			return null;
-		}
-		return Math.max(0, (Date.now() - collectedAtMs) / 1000);
-	}, [performanceSnapshot]);
 
 	const reportRequestError = useCallback((err: unknown, fallback: string, silent: boolean) => {
 		const msg = (err as Error)?.message || fallback;
@@ -516,34 +385,6 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		};
 	}, [getJson]);
 
-	useEffect(() => {
-		let disposed = false;
-		let inFlight = false;
-		const tick = async () => {
-			if (disposed || inFlight) {
-				return;
-			}
-			if (typeof document !== "undefined" && document.visibilityState !== "visible") {
-				return;
-			}
-			inFlight = true;
-			const payload = await getJson<PerformanceResponse>("/debug/performance", true);
-			inFlight = false;
-			if (disposed || !payload) {
-				return;
-			}
-			setPerformanceSnapshot(payload);
-		};
-		void tick();
-		const timer = window.setInterval(() => {
-			void tick();
-		}, PERFORMANCE_POLL_MS);
-		return () => {
-			disposed = true;
-			window.clearInterval(timer);
-		};
-	}, [getJson]);
-
 	// ------------------------
 	// Realtime jog helpers
 	// ------------------------
@@ -565,6 +406,34 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const effectiveLinearMS = useMemo(() => (linBaseMmS / 1000.0) * speedMult, [linBaseMmS, speedMult]);
 	const effectiveAngularDegS = useMemo(() => angBaseDegS * speedMult, [angBaseDegS, speedMult]);
 
+	const enqueueJogCommand = useCallback((commandPayload: JogCommandVector) => {
+		queuedJogCommandRef.current = commandPayload;
+		if (!jogSendLoopRef.current) {
+			jogSendLoopRef.current = (async () => {
+				try {
+					while (queuedJogCommandRef.current) {
+						const nextCommand = queuedJogCommandRef.current;
+						queuedJogCommandRef.current = null;
+						lastSentRef.current = nextCommand;
+						lastSentAtRef.current = Date.now();
+						setLastJogCommand(nextCommand);
+						await post("/control/jog/velocity", {
+							vx: nextCommand[0],
+							vy: nextCommand[1],
+							vz: nextCommand[2],
+							v_roll: nextCommand[3],
+							v_pitch: nextCommand[4],
+							v_yaw: nextCommand[5],
+						});
+					}
+				} finally {
+					jogSendLoopRef.current = null;
+				}
+			})();
+		}
+		return jogSendLoopRef.current ?? Promise.resolve();
+	}, [post]);
+
 	const sendJogTick = useCallback(async () => {
 		const now = Date.now();
 		const v = computeJogVector();
@@ -578,7 +447,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		if (!changed && (isZeroVector || now - lastSentAtRef.current < keepaliveMs)) {
 			return;
 		}
-		const commandPayload: [number, number, number, number, number, number] = [
+		const commandPayload: JogCommandVector = [
 			Number(v[0].toFixed(6)),
 			Number(v[1].toFixed(6)),
 			Number(v[2].toFixed(6)),
@@ -586,18 +455,8 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 			Number(v[4].toFixed(3)),
 			Number(v[5].toFixed(3)),
 		];
-		await post("/control/jog/velocity", {
-			vx: commandPayload[0],
-			vy: commandPayload[1],
-			vz: commandPayload[2],
-			v_roll: commandPayload[3],
-			v_pitch: commandPayload[4],
-			v_yaw: commandPayload[5],
-		});
-		setLastJogCommand(commandPayload);
-		lastSentRef.current = v;
-		lastSentAtRef.current = now;
-	}, [computeJogVector, post]);
+		await enqueueJogCommand(commandPayload);
+	}, [computeJogVector, enqueueJogCommand]);
 
 	// Keep the interval callback hot-swapped with latest slider/deadman/base values.
 	useEffect(() => {
@@ -620,6 +479,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	}, [jogEnabled, post, deadman, jogTickIntervalMs]);
 
 	const stopJog = useCallback(async () => {
+		const zeroCommand: JogCommandVector = [0, 0, 0, 0, 0, 0];
 		setJogEnabled(false);
 		if (jogTimerRef.current) {
 			window.clearInterval(jogTimerRef.current);
@@ -627,11 +487,26 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		}
 		linCountsRef.current = { x: 0, y: 0, z: 0 };
 		angCountsRef.current = { x: 0, y: 0, z: 0 };
-		lastSentRef.current = [0, 0, 0, 0, 0, 0];
-		setLastJogCommand([0, 0, 0, 0, 0, 0]);
-		await post("/control/jog/velocity", { vx: 0, vy: 0, vz: 0, v_roll: 0, v_pitch: 0, v_yaw: 0 });
+		setLastJogCommand(zeroCommand);
+		await enqueueJogCommand(zeroCommand);
 		await post("/control/jog/stop");
-	}, [post]);
+		lastSentRef.current = zeroCommand;
+		lastSentAtRef.current = Date.now();
+	}, [enqueueJogCommand, post]);
+
+	const runDiscreteMotionCommand = useCallback(async <T,>(actionKey: string, task: () => Promise<T>) => {
+		if (motionBusy || pendingMotionActionRef.current) {
+			return null as T | null;
+		}
+		pendingMotionActionRef.current = actionKey;
+		setPendingMotionAction(actionKey);
+		try {
+			return await task();
+		} finally {
+			pendingMotionActionRef.current = null;
+			setPendingMotionAction((current) => (current === actionKey ? null : current));
+		}
+	}, [motionBusy]);
 
 	const onDeadmanToggle = useCallback(async (enabled: boolean) => {
 		setDeadman(enabled);
@@ -946,36 +821,46 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	// ------------------------
 	const performIncrementalLinearJog = useCallback(
 		async (axis: "x" | "y" | "z", direction: 1 | -1) => {
-			// Use the user-configured linear base value from the UI as the incremental step size.
-			// The field is labeled in mm/s for realtime jog, but here we treat the numeric value
-			// as a distance in millimeters for a single incremental move.
-			const stepMeters = (linBaseMmS / 1000.0) * direction;
-			const dx = axis === "x" ? stepMeters : 0;
-			const dy = axis === "y" ? stepMeters : 0;
-			const dz = axis === "z" ? stepMeters : 0;
-			await post("/control/move-line-relative", {
-				dx,
-				dy,
-				dz,
-				speed_multiplier: speedMult,
-				closed: false,
+			await runDiscreteMotionCommand(`move-line-${axis}-${direction}`, async () => {
+				// Use the user-configured linear base value from the UI as the incremental step size.
+				// The field is labeled in mm/s for realtime jog, but here we treat the numeric value
+				// as a distance in millimeters for a single incremental move.
+				const stepMeters = (linBaseMmS / 1000.0) * direction;
+				const dx = axis === "x" ? stepMeters : 0;
+				const dy = axis === "y" ? stepMeters : 0;
+				const dz = axis === "z" ? stepMeters : 0;
+				const result = await post("/control/move-line-relative", {
+					dx,
+					dy,
+					dz,
+					speed_multiplier: speedMult,
+					closed: false,
+				}) as MotionStatusResponse | null;
+				if (result) {
+					setMotionStatus(result);
+				}
 			});
 		},
-		[post, speedMult, linBaseMmS],
+		[linBaseMmS, post, runDiscreteMotionCommand, speedMult],
 	);
 
 	const performIncrementalAngularJog = useCallback(
 		async (axis: "roll" | "pitch" | "yaw", direction: 1 | -1) => {
-			// Use the user-configured angular base value from the UI as the incremental step size.
-			const angleDeg = angBaseDegS * direction;
-			const commandedAngularDegS = Math.max(1e-3, effectiveAngularDegS);
-			await post("/control/rotate", {
-				axis,
-				angle_deg: angleDeg,
-				duration_s: Math.abs(angleDeg) / commandedAngularDegS,
+			await runDiscreteMotionCommand(`rotate-${axis}-${direction}`, async () => {
+				// Use the user-configured angular base value from the UI as the incremental step size.
+				const angleDeg = angBaseDegS * direction;
+				const commandedAngularDegS = Math.max(1e-3, effectiveAngularDegS);
+				const result = await post("/control/rotate", {
+					axis,
+					angle_deg: angleDeg,
+					duration_s: Math.abs(angleDeg) / commandedAngularDegS,
+				}) as MotionStatusResponse | null;
+				if (result) {
+					setMotionStatus(result);
+				}
 			});
 		},
-		[post, angBaseDegS, effectiveAngularDegS],
+		[angBaseDegS, effectiveAngularDegS, post, runDiscreteMotionCommand],
 	);
 
 	const changeLinearCount = useCallback(async (axis: "x" | "y" | "z", delta: number) => {
@@ -1171,84 +1056,6 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 					{motionStatus
 						? `traj ${motionTrajectoryId ?? "none"} | mode ${motionStatus.execution?.active_mode_name ?? "n/a"} | queue ${motionStatus.execution?.queue_depth ?? 0}/${motionStatus.execution?.queue_capacity ?? 0} | done ${motionStatus.execution?.motion_done ? "yes" : "no"} | stale ${motionStatus.execution?.stale_command ? "yes" : "no"} | underruns ${motionStatus.execution?.underrun_count ?? 0}`
 						: "No RTCore execution metadata yet."}
-				</div>
-			</div>
-			<div className="mb-3 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3">
-				<div className="mb-2 flex items-center justify-between gap-2 text-xs text-violet-100/90">
-					<span className="font-semibold uppercase tracking-[0.18em]">Timing Diagnostics</span>
-					<span className="rounded border border-violet-400/30 bg-violet-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-violet-100">
-						{performanceSnapshot ? `live ${formatAgeSeconds(perfSnapshotAgeSeconds)}` : "waiting"}
-					</span>
-				</div>
-				<div className="mb-2 text-[11px] leading-relaxed text-slate-300">
-					Recorded automatically whenever the UI calls the API. This panel reads the live `/debug/performance`
-					snapshot, so no extra toggle is needed to capture timing while you test from the UI.
-				</div>
-				<div className="mb-3 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-2 text-[10px] text-slate-300">
-					<div className="font-semibold text-slate-200">UI -&gt; API command timing</div>
-					<div className="mt-1 tabular-nums">
-						Jog velocity RTT avg/max: {formatMs(perfJogApi?.avg_round_trip_ms)} / {formatMs(perfJogApi?.max_round_trip_ms)}
-					</div>
-					<div className="tabular-nums">
-						Move request RTT avg/max: {formatMs(perfMoveApi?.avg_round_trip_ms)} / {formatMs(perfMoveApi?.max_round_trip_ms)}
-					</div>
-					<div className="tabular-nums">
-						Wait-for-idle RTT avg/max: {formatMs(perfWaitApi?.avg_round_trip_ms)} / {formatMs(perfWaitApi?.max_round_trip_ms)}
-					</div>
-					<div className="mt-1 text-slate-400">
-						`MOVE_LINE_RELATIVE` includes planning before the ACK returns. `WAIT_FOR_IDLE` includes the full motion time.
-					</div>
-				</div>
-				<div className="mb-3 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-2 text-[10px] text-slate-300">
-					<div className="font-semibold text-slate-200">Controller UDP dispatch</div>
-					<div className="mt-1 tabular-nums">
-						Last command: {perfControllerUdp?.last_command ?? "--"} | last dispatch {formatMs(perfControllerUdp?.last_dispatch_ms)}
-					</div>
-					<div className="tabular-nums">
-						Global dispatch avg/max: {formatMs(perfControllerUdp?.dispatch_ms?.avg_ms)} / {formatMs(perfControllerUdp?.dispatch_ms?.max_ms)}
-					</div>
-					<div className="tabular-nums">
-						Global interarrival last/avg: {formatMs(perfControllerUdp?.interarrival_ms?.last_ms)} / {formatMs(perfControllerUdp?.interarrival_ms?.avg_ms)}
-					</div>
-					<div className="tabular-nums">
-						Move dispatch avg/max: {formatMs(perfMoveController?.avg_dispatch_ms)} / {formatMs(perfMoveController?.max_dispatch_ms)}
-					</div>
-					<div className="tabular-nums">
-						Jog dispatch avg/max: {formatMs(perfJogController?.avg_dispatch_ms)} / {formatMs(perfJogController?.max_dispatch_ms)}
-					</div>
-					<div className="tabular-nums">
-						Slow dispatch counts &gt;5 ms / &gt;20 ms: {perfControllerUdp?.dispatch_ms?.slow_over_5ms ?? 0} / {perfControllerUdp?.dispatch_ms?.slow_over_20ms ?? 0}
-					</div>
-					<div className="tabular-nums">
-						Controller command-link stale: {perfController?.command_link_stale ? "yes" : "no"} | last receive age {formatAgeSeconds(perfControllerUdp?.last_receive_age_s)}
-					</div>
-				</div>
-				<div className="mb-3 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-2 text-[10px] text-slate-300">
-					<div className="font-semibold text-slate-200">Jog loop internals</div>
-					<div className="mt-1 tabular-nums">
-						Loop avg/max: {formatMs(perfJog?.loop?.avg_ms)} / {formatMs(perfJog?.loop?.max_ms)}
-					</div>
-					<div className="tabular-nums">
-						Loop overshoot max: {formatMs(perfJog?.loop?.max_overrun_ms)} | overrun count {perfJog?.loop?.overrun_count ?? 0}
-					</div>
-					<div className="tabular-nums">
-						Velocity update gap avg/max: {formatMs(perfJog?.velocity_updates?.avg_gap_ms)} / {formatMs(perfJog?.velocity_updates?.max_gap_ms)}
-					</div>
-					<div className="tabular-nums">
-						Feedback read avg: {formatMs(perfJog?.stages?.feedback_read_ms?.avg_ms)} | IK avg: {formatMs(perfJog?.stages?.ik_solve_ms?.avg_ms)} | send avg: {formatMs(perfJog?.stages?.command_send_ms?.avg_ms)}
-					</div>
-					<div className="tabular-nums">
-						Jog command age: {formatAgeSeconds(perfJog?.last_velocity_command_age_s)} | controller thinks jogging: {perfController?.is_jogging ? "yes" : "no"}
-					</div>
-				</div>
-				<div className="rounded border border-slate-700/60 bg-slate-950/40 px-2 py-2 text-[10px] text-slate-300">
-					<div className="font-semibold text-slate-200">RTCore health</div>
-					<div className="mt-1 tabular-nums">
-						RT jitter current/max: {formatNsAsUs(perfRtcore?.rt_last_jitter_ns)} / {formatNsAsUs(perfRtcore?.rt_max_abs_jitter_ns)}
-					</div>
-					<div className="tabular-nums">
-						RT overruns: {perfRtcore?.rt_overrun_count ?? 0} | motion update age {formatMs(perfRtcore?.motion_last_update_age_ms)}
-					</div>
 				</div>
 			</div>
 			{/* Removed step move blocks; unified under realtime jog below */}
@@ -1830,12 +1637,14 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 						if (jogEnabled) {
 							await stopJog();
 						}
-						const result = await post("/control/home") as MotionStatusResponse | null;
-						if (result) {
-							setMotionStatus(result);
-						}
+						await runDiscreteMotionCommand("home", async () => {
+							const result = await post("/control/home") as MotionStatusResponse | null;
+							if (result) {
+								setMotionStatus(result);
+							}
+						});
 					}}
-					disabled={motionBusy}
+					disabled={motionControlsBusy}
 				>
 					Home
 				</button>
@@ -1845,12 +1654,14 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 						if (jogEnabled) {
 							await stopJog();
 						}
-						const result = await post("/control/rest") as MotionStatusResponse | null;
-						if (result) {
-							setMotionStatus(result);
-						}
+						await runDiscreteMotionCommand("rest", async () => {
+							const result = await post("/control/rest") as MotionStatusResponse | null;
+							if (result) {
+								setMotionStatus(result);
+							}
+						});
 					}}
-					disabled={motionBusy}
+					disabled={motionControlsBusy}
 				>
 					Rest
 				</button>

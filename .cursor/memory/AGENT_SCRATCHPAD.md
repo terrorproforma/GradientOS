@@ -900,3 +900,55 @@ Use this file as persistent, repo-local execution memory.
 - [tool] Confirmed that the diagnostics were already recording automatically whenever the UI calls the API, because the metrics live in `api/main.py`, `run_controller.py`, and `command_api.py`.
 - [tool] Added a live `Timing Diagnostics` panel to `web-ui/src/ControlPanel.tsx` that polls `/debug/performance` every `500 ms` and shows API RTT, controller dispatch/interarrival, jog loop timings, and RTCore jitter/overruns.
 - [self] Guardrail: label `MOVE_LINE_RELATIVE` and `WAIT_FOR_IDLE` carefully in the UI because those numbers include planning time and full motion time respectively; they are not pure network latency.
+
+### 2026-03-22 - If the operator says a panel is unusable in context, move it to the workflow surface they actually watch
+- [user] Rejected the diagnostics block inside `ControlPanel` because it crowded the robot control card and was not usable during live chart observation.
+- [self] Corrective rule: when the operator says a diagnostic belongs "below the live charts", treat that as a layout requirement, not a style preference.
+- [tool] Moved diagnostics into a dedicated `web-ui/src/PerformanceDiagnosticsPanel.tsx` component, mounted under the `Live Charts` drawer in `web-ui/src/App.tsx`, and added a hide/show toggle there.
+- [tool] Removed the duplicated diagnostics block and polling state from `web-ui/src/ControlPanel.tsx` so the UI only polls `/debug/performance` once.
+
+### 2026-03-22 - For telemetry tooling, prefer workspace tabs over stacking more panels into one narrow drawer
+- [user] Reported that even under the live charts, the diagnostics were still too cramped and asked for a wider panel plus clearer visualizations, suggesting another tab in the live charts area.
+- [self] Corrective rule: when a diagnostics surface competes with dense charts in a narrow drawer, split the tasks into tabs instead of forcing both into one scrolling column.
+- [tool] Added `web-ui/src/TelemetryWorkspace.tsx` to provide `Live Charts` / `Diagnostics` tabs plus a show/hide toggle for the diagnostics tab itself.
+- [tool] Widened the telemetry drawer in `web-ui/src/App.tsx` and upgraded `web-ui/src/PerformanceDiagnosticsPanel.tsx` with top-level signal cards / progress bars for quicker scanning.
+
+### 2026-03-22 - EtherCAT RTCore already had richer servo diagnostics, but Python/UI were dropping most of them
+- [user] Asked whether the diagnostics panel could read more feedback directly from the servos and requested that any extra telemetry coming back should be surfaced too.
+- [self] Corrective rule: when a telemetry view is blank on one backend, check whether the backend has a parallel status path before assuming the hardware cannot report the data.
+- [tool] Found that `src/gradient_rt_motion/main.cpp` already publishes `pos_counts`, `torque_raw`, `statusword`, `error_code`, `mode_display`, `ds402_state`, `di_bits`, `axis_fault_flags`, and `brake_state` in `StatusSnapshotV1`, but `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` only unpacked counts/status/error.
+- [tool] Extended the RTCore backend snapshot parsing plus `src/gradient_os/run_controller.py` joint/telemetry snapshots so EtherCAT telemetry now carries those extra per-axis fields into the UI stream on every telemetry tick.
+- [tool] Updated `web-ui/src/App.tsx` and `web-ui/src/TelemetryCharts.tsx` so the telemetry tab shows RTCore-specific charts/status chips when voltage/current/temp are unavailable on EtherCAT.
+- [self] Guardrail: expensive live register reads can stay throttled, but RTCore shared-memory status is cheap enough to publish every telemetry frame.
+- [tool] Validation: `"/home/pi/GradientOS/.venv/bin/python" -m pytest tests/test_api_endpoints.py`, `"/home/pi/GradientOS/.venv/bin/python" -m py_compile ...`, `npm run build`, and `ReadLints` on the touched files all passed.
+
+### 2026-03-22 - Do not hide the operator's baseline telemetry cards when optional data is missing
+- [self] I introduced a UI regression by filtering the lower telemetry cards out when their series arrays were empty, which made the whole lower chart area disappear until data arrived.
+- [user] Immediate feedback made it clear the missing cards read as "you removed my charts", not as a graceful empty state.
+- [self] Corrective rule: preserve the baseline card layout for operator-facing telemetry even when values are absent; add backend-specific charts only as extras, never by replacing/hiding the originals.
+- [tool] Fixed `web-ui/src/TelemetryCharts.tsx` to always render the original `Voltage`, `Current`, `Torque/Load`, and `Temp` cards, while keeping RTCore-specific charts additive-only.
+- [tool] Validation: `npm run build` in `web-ui` and `ReadLints` on `web-ui/src/TelemetryCharts.tsx` both passed.
+
+### 2026-03-22 - Make backend telemetry availability explicit instead of implying fields exist live when they do not
+- [user] Called out the mismatch between my earlier "we have torque/status/etc" explanation and the fact that some expected charts like voltage/current/temp still were not visible/populated.
+- [self] Corrective rule: distinguish between "field supported somewhere in code" and "field live on the current backend path". Especially for multi-backend telemetry, state clearly which metrics are actually streaming on EtherCAT vs only on Feetech.
+- [tool] Confirmed `feetech` is the only backend with `TELEMETRY_BLOCK*` register parsing for voltage/current/temp, while EtherCAT RTCore currently publishes counts, torque raw, mode, statusword, error code, and digital inputs.
+- [tool] Updated `web-ui/src/TelemetryCharts.tsx` to add per-panel hide/show toggles, always-rendered chart slots with empty-state messaging, an explicit telemetry-availability note for EtherCAT RTCore, and a fuller per-axis drive feedback table showing all currently available live fields.
+- [tool] Validation: `npm run build` in `web-ui` and `ReadLints` on `web-ui/src/TelemetryCharts.tsx` both passed.
+
+### 2026-03-22 - If the scene is alive but the robot is invisible, check the shipped web meshes before touching camera math
+- [user] Reported "where's the robot" while the 3D workspace still showed axes/grid, meaning rendering/camera were alive but model geometry was missing.
+- [self] Mistake: my earlier file search was wrong for this repo state. A direct directory listing showed the real `gradient-05` STL files do exist under both `robots/gradient-05/stl-files/` and `web-ui/public/assets/robots/gradient-05/stl-files/`.
+- [self] Corrective rule: for asset/render regressions involving binary files, verify with direct directory listing or runtime browser evidence instead of trusting a single search result.
+- [tool] Removed the bulky top telemetry toggle strip from `web-ui/src/TelemetryCharts.tsx` and kept per-chart hide controls plus a compact `Restore Hidden Panels` action instead.
+- [tool] Reverted the fallback robot hack from `web-ui/src/ArmVisualizer.tsx`; the real `gradient-05` mesh-based robot renders again in the live browser.
+- [tool] Validation: live browser check on `http://127.0.0.1:8000/` showed the actual robot model visible again; `npm run build` in `web-ui` and `ReadLints` on `web-ui/src/TelemetryCharts.tsx` + `web-ui/src/ArmVisualizer.tsx` both passed.
+
+### 2026-03-22 - Delayed motion then burst execution can be a browser/API queueing bug even when RTCore timing is healthy
+- [user] Reported a live run where controls sometimes felt unresponsive and then later all pushed through, causing unexpected robot motion.
+- [tool] The timing panel snapshot showed `jog dispatch` staying sub-5 ms and RT jitter staying in the low microseconds, but `move ACK` stayed around `339 ms` and `jog velocity gap` reached hundreds of ms to multi-second spikes.
+- [tool] `logs/startups/20260322-033216/controller.log` showed the concrete symptom: bursts of identical `SET_JOG_VELOCITY` commands from many source ports, with stale nonzero and zero jog commands interleaving before `JOG_STOP`.
+- [self] Root-cause rule: if the controller log shows repeated identical motion commands arriving in bursts while controller dispatch and RT jitter remain healthy, suspect client/API request pileup before changing RT motion logic.
+- [tool] Fixed `web-ui/src/ControlPanel.tsx` so realtime jog command sends are single-flight and latest-wins/coalesced instead of starting a new `fetch()` every `50 ms` while previous sends are still in flight.
+- [tool] Added a discrete-motion guard in `web-ui/src/ControlPanel.tsx` so incremental cartesian moves/rotates and `Home`/`Rest` cannot stack multiple motion requests while one command is still being issued.
+- [self] Guardrail: treat `MOVE_LINE_RELATIVE` RTT in the diagnostics panel as synchronous planning/upload time, not transport lag. Long move ACKs can make the UI feel stalled, so the frontend must coalesce or lock motion commands instead of letting stale clicks/jog updates queue up.

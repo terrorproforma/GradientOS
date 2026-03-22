@@ -2151,6 +2151,18 @@ def _parse_joint_state_response(detail: str) -> dict[str, Any]:
         normalized["axis_statusword"] = [int(item) for item in normalized["axis_statusword"]]
     if "axis_error_code" in normalized and isinstance(normalized["axis_error_code"], list):
         normalized["axis_error_code"] = [int(item) for item in normalized["axis_error_code"]]
+    if "axis_torque_raw" in normalized and isinstance(normalized["axis_torque_raw"], list):
+        normalized["axis_torque_raw"] = [int(item) for item in normalized["axis_torque_raw"]]
+    if "axis_mode_display" in normalized and isinstance(normalized["axis_mode_display"], list):
+        normalized["axis_mode_display"] = [int(item) for item in normalized["axis_mode_display"]]
+    if "axis_ds402_state_code" in normalized and isinstance(normalized["axis_ds402_state_code"], list):
+        normalized["axis_ds402_state_code"] = [int(item) for item in normalized["axis_ds402_state_code"]]
+    if "axis_di_bits" in normalized and isinstance(normalized["axis_di_bits"], list):
+        normalized["axis_di_bits"] = [int(item) for item in normalized["axis_di_bits"]]
+    if "axis_fault_flags" in normalized and isinstance(normalized["axis_fault_flags"], list):
+        normalized["axis_fault_flags"] = [int(item) for item in normalized["axis_fault_flags"]]
+    if "axis_brake_state" in normalized and isinstance(normalized["axis_brake_state"], list):
+        normalized["axis_brake_state"] = [int(item) for item in normalized["axis_brake_state"]]
     if "axis_to_joint" in normalized and isinstance(normalized["axis_to_joint"], list):
         normalized["axis_to_joint"] = [int(item) for item in normalized["axis_to_joint"]]
     if "gripper_deg" in normalized and normalized["gripper_deg"] is not None:

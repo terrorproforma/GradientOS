@@ -372,7 +372,128 @@ def _build_joint_state_snapshot() -> dict[str, object]:
         if isinstance(axis_error_code, list) and axis_error_code:
             snapshot["axis_error_code"] = [int(value) for value in axis_error_code[: len(axis_error_code)]]
 
+        axis_torque_raw = getattr(backend, "_axis_torque_raw", None)
+        if isinstance(axis_torque_raw, list) and axis_torque_raw:
+            snapshot["axis_torque_raw"] = [int(value) for value in axis_torque_raw[: len(axis_torque_raw)]]
+
+        axis_mode_display = getattr(backend, "_axis_mode_display", None)
+        if isinstance(axis_mode_display, list) and axis_mode_display:
+            mode_values = [int(value) for value in axis_mode_display[: len(axis_mode_display)]]
+            snapshot["axis_mode_display"] = mode_values
+            snapshot["axis_mode_display_name"] = [_mode_display_name(value) for value in mode_values]
+
+        axis_ds402_state = getattr(backend, "_axis_ds402_state", None)
+        if isinstance(axis_ds402_state, list) and axis_ds402_state:
+            snapshot["axis_ds402_state_code"] = [int(value) for value in axis_ds402_state[: len(axis_ds402_state)]]
+
+        axis_di_bits = getattr(backend, "_axis_di_bits", None)
+        if isinstance(axis_di_bits, list) and axis_di_bits:
+            snapshot["axis_di_bits"] = [int(value) for value in axis_di_bits[: len(axis_di_bits)]]
+
+        axis_fault_flags = getattr(backend, "_axis_fault_flags", None)
+        if isinstance(axis_fault_flags, list) and axis_fault_flags:
+            snapshot["axis_fault_flags"] = [int(value) for value in axis_fault_flags[: len(axis_fault_flags)]]
+
+        axis_brake_state = getattr(backend, "_axis_brake_state", None)
+        if isinstance(axis_brake_state, list) and axis_brake_state:
+            snapshot["axis_brake_state"] = [int(value) for value in axis_brake_state[: len(axis_brake_state)]]
+
     return snapshot
+
+
+def _mode_display_name(value: object) -> str:
+    mode_id = _coerce_int(value, 0)
+    labels = {
+        0: "unknown",
+        1: "profile_position",
+        3: "profile_velocity",
+        4: "profile_torque",
+        6: "homing",
+        7: "interpolated_position",
+        8: "cyclic_sync_position",
+        9: "cyclic_sync_velocity",
+        10: "cyclic_sync_torque",
+    }
+    return labels.get(mode_id, f"mode_{mode_id}")
+
+
+def _build_rtcore_axis_telemetry_samples(backend: object | None) -> dict[str, dict[str, object]]:
+    if backend is None:
+        return {}
+
+    axis_count = _coerce_int(getattr(backend, "_rt_num_axes", 0), 0)
+    if axis_count <= 0:
+        return {}
+
+    backend_name = None
+    try:
+        backend_name = backend_registry.get_active_backend_name()
+    except Exception:
+        backend_name = None
+
+    axis_to_joint_raw = getattr(backend, "_axis_to_joint", None)
+    axis_to_joint = axis_to_joint_raw if isinstance(axis_to_joint_raw, list) else []
+
+    axis_counts = getattr(backend, "_axis_counts", None)
+    axis_torque_raw = getattr(backend, "_axis_torque_raw", None)
+    axis_statusword = getattr(backend, "_axis_statusword", None)
+    axis_error_code = getattr(backend, "_axis_error_code", None)
+    axis_mode_display = getattr(backend, "_axis_mode_display", None)
+    axis_ds402_state = getattr(backend, "_axis_ds402_state", None)
+    axis_di_bits = getattr(backend, "_axis_di_bits", None)
+    axis_fault_flags = getattr(backend, "_axis_fault_flags", None)
+    axis_brake_state = getattr(backend, "_axis_brake_state", None)
+
+    samples: dict[str, dict[str, object]] = {}
+    for axis_i in range(axis_count):
+        logical_joint = None
+        if axis_i < len(axis_to_joint):
+            try:
+                logical_joint = int(axis_to_joint[axis_i]) + 1
+            except Exception:
+                logical_joint = None
+        key = str(logical_joint if logical_joint is not None and logical_joint > 0 else axis_i + 1)
+        sample: dict[str, object] = {
+            "axis_index": axis_i,
+            "logical_joint": logical_joint,
+        }
+
+        if isinstance(axis_counts, list) and axis_i < len(axis_counts):
+            sample["pos_counts"] = int(axis_counts[axis_i])
+        if isinstance(axis_torque_raw, list) and axis_i < len(axis_torque_raw):
+            sample["torque_raw"] = int(axis_torque_raw[axis_i])
+        statusword = None
+        if isinstance(axis_statusword, list) and axis_i < len(axis_statusword):
+            statusword = int(axis_statusword[axis_i])
+            sample["statusword"] = statusword
+            sample["statusword_hex"] = f"0x{statusword & 0xFFFF:04x}"
+        if isinstance(axis_error_code, list) and axis_i < len(axis_error_code):
+            error_code = int(axis_error_code[axis_i])
+            sample["error_code"] = error_code
+            sample["error_code_hex"] = f"0x{error_code & 0xFFFF:04x}"
+        if isinstance(axis_mode_display, list) and axis_i < len(axis_mode_display):
+            mode_display = int(axis_mode_display[axis_i])
+            sample["mode_display"] = mode_display
+            sample["mode_display_name"] = _mode_display_name(mode_display)
+        if isinstance(axis_ds402_state, list) and axis_i < len(axis_ds402_state):
+            sample["ds402_state_code"] = int(axis_ds402_state[axis_i])
+        if isinstance(axis_di_bits, list) and axis_i < len(axis_di_bits):
+            di_bits = int(axis_di_bits[axis_i])
+            sample["di_bits"] = di_bits
+            sample["di_bits_hex"] = f"0x{di_bits:08x}"
+        if isinstance(axis_fault_flags, list) and axis_i < len(axis_fault_flags):
+            sample["axis_fault_flags"] = int(axis_fault_flags[axis_i])
+        if isinstance(axis_brake_state, list) and axis_i < len(axis_brake_state):
+            sample["brake_state"] = int(axis_brake_state[axis_i])
+        if statusword is not None:
+            drive_state = backend_registry.decode_drive_statusword_for_backend(backend_name, statusword)
+            if isinstance(drive_state, dict):
+                state_name = str(drive_state.get("state", "")).strip()
+                if state_name:
+                    sample["status_names"] = [state_name]
+                    sample["ds402_state"] = state_name
+        samples[key] = sample
+    return samples
 
 
 def _should_log_received_udp_command(
@@ -1051,13 +1172,13 @@ Examples:
                     
                     # --- Servo telemetry (voltage/temp/current/torque + alarms) ---
                     now = time.time()
+                    backend = None
+                    try:
+                        backend = backend_registry.get_active_backend()
+                    except Exception:
+                        backend = None
                     if now - last_extra_ts >= 0.5:
                         last_extra_ts = now
-                        backend = None
-                        try:
-                            backend = backend_registry.get_active_backend()
-                        except Exception:
-                            backend = None
                         try:
                             # Get present servo IDs from backend or use configured IDs
                             if backend and hasattr(backend, 'present_servo_ids'):
@@ -1107,6 +1228,20 @@ Examples:
                             )
                         except Exception:
                             pass
+                    try:
+                        rtcore_servos = _build_rtcore_axis_telemetry_samples(backend)
+                        if rtcore_servos:
+                            existing = msg.get("servos")
+                            if isinstance(existing, dict):
+                                for sid, sample in rtcore_servos.items():
+                                    if sid in existing and isinstance(existing[sid], dict):
+                                        existing[sid].update(sample)
+                                    else:
+                                        existing[sid] = sample
+                            else:
+                                msg["servos"] = rtcore_servos
+                    except Exception:
+                        pass
                     
                     # Drain any alerts collected by lower layers and attach them
                     try:

@@ -40,7 +40,7 @@ import {
   type TopologyEdgeOverlay,
   type StepTransform,
 } from "./ArmVisualizer";
-import { TelemetryCharts } from "./TelemetryCharts";
+import { TelemetryWorkspace } from "./TelemetryWorkspace";
 import ControlPanel from "./ControlPanel";
 import {
   buildProgramTree,
@@ -74,6 +74,23 @@ type ServoSample = {
   led_alarm_condition?: number;
   unloading_bits?: string;
   led_alarm_bits?: string;
+  pos_counts?: number;
+  torque_raw?: number;
+  statusword?: number;
+  statusword_hex?: string;
+  error_code?: number;
+  error_code_hex?: string;
+  mode_display?: number;
+  mode_display_name?: string;
+  ds402_state?: string;
+  ds402_state_code?: number;
+  di_bits?: number;
+  di_bits_hex?: string;
+  axis_fault_flags?: number;
+  brake_state?: number;
+  logical_joint?: number | null;
+  axis_index?: number;
+  status_names?: string[];
 };
 
 type DriveFaultReference = {
@@ -4494,6 +4511,25 @@ export default function App() {
             if (typeof s.led_alarm_condition === "number") sample.led_alarm_condition = s.led_alarm_condition;
             if (typeof s.unloading_bits === "string") sample.unloading_bits = s.unloading_bits;
             if (typeof s.led_alarm_bits === "string") sample.led_alarm_bits = s.led_alarm_bits;
+            if (typeof s.pos_counts === "number") sample.pos_counts = s.pos_counts;
+            if (typeof s.torque_raw === "number") sample.torque_raw = s.torque_raw;
+            if (typeof s.statusword === "number") sample.statusword = s.statusword;
+            if (typeof s.statusword_hex === "string") sample.statusword_hex = s.statusword_hex;
+            if (typeof s.error_code === "number") sample.error_code = s.error_code;
+            if (typeof s.error_code_hex === "string") sample.error_code_hex = s.error_code_hex;
+            if (typeof s.mode_display === "number") sample.mode_display = s.mode_display;
+            if (typeof s.mode_display_name === "string") sample.mode_display_name = s.mode_display_name;
+            if (typeof s.ds402_state === "string") sample.ds402_state = s.ds402_state;
+            if (typeof s.ds402_state_code === "number") sample.ds402_state_code = s.ds402_state_code;
+            if (typeof s.di_bits === "number") sample.di_bits = s.di_bits;
+            if (typeof s.di_bits_hex === "string") sample.di_bits_hex = s.di_bits_hex;
+            if (typeof s.axis_fault_flags === "number") sample.axis_fault_flags = s.axis_fault_flags;
+            if (typeof s.brake_state === "number") sample.brake_state = s.brake_state;
+            if (typeof s.logical_joint === "number") sample.logical_joint = s.logical_joint;
+            if (typeof s.axis_index === "number") sample.axis_index = s.axis_index;
+            if (Array.isArray(s.status_names)) {
+              sample.status_names = s.status_names.filter((value): value is string => typeof value === "string");
+            }
             out[k] = sample;
           }
         }
@@ -5965,7 +6001,7 @@ export default function App() {
       ? "amber"
       : null;
   const activeDrawerWidthClass = activePanel === "telemetry"
-    ? "w-[30rem] max-w-[calc(100vw-7rem)]"
+    ? "w-[38rem] max-w-[calc(100vw-7rem)]"
     : activePanel === "tools"
       ? "w-[23rem] max-w-[calc(100vw-7rem)]"
       : "w-[20rem] max-w-[calc(100vw-7rem)]";
@@ -6272,7 +6308,7 @@ export default function App() {
             />
           )
         : activePanel === "telemetry"
-          ? <TelemetryCharts latest={latest} />
+          ? <TelemetryWorkspace latest={latest} apiHost={normalizedApiHost} />
         : null;
 
   return (

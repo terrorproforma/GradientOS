@@ -1605,6 +1605,75 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     };
     attachActiveToolVisualRef.current = attachActiveToolVisual;
 
+    const mountRobotInstance = (robot: URDFRobot, metadata: {
+      robotId: string;
+      urdfPath: string;
+    }) => {
+      if (disposed) {
+        return;
+      }
+      console.info("[ArmVisualizer] URDF loaded", {
+        robotId: metadata.robotId,
+        urdfPath: metadata.urdfPath,
+        jointNames: Object.keys(robot.joints),
+        linkNames: Object.keys(robot.links),
+      });
+
+      robot.scale.setScalar(ROBOT_SCALE);
+      const defaultMaterial = new THREE.MeshStandardMaterial({
+        color: 0x1e293b,
+        metalness: 0.1,
+        roughness: 0.8,
+      });
+      const accentMaterial = new THREE.MeshStandardMaterial({
+        color: 0x38bdf8,
+        metalness: 0.2,
+        roughness: 0.5,
+      });
+
+      robot.traverse((obj) => {
+        if ((obj as THREE.Mesh).isMesh) {
+          const mesh = obj as THREE.Mesh;
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+          const material =
+            mesh.name.toLowerCase().includes("wrist") ||
+            mesh.name.toLowerCase().includes("tool")
+              ? accentMaterial
+              : defaultMaterial;
+
+          if (Array.isArray(mesh.material)) {
+            mesh.material.forEach((mat) => {
+              (mat as THREE.Material).dispose();
+            });
+          } else if (mesh.material) {
+            (mesh.material as THREE.Material).dispose();
+          }
+          mesh.material = material;
+        }
+      });
+
+      scene.add(robot);
+      attachActiveToolVisual(robot, activeToolRef.current);
+
+      robotRef.current = robot;
+      if (!currentAnglesRef.current) {
+        currentAnglesRef.current = new Array(6).fill(0);
+      }
+      if (!targetAnglesRef.current) {
+        targetAnglesRef.current = new Array(6).fill(0);
+      }
+
+      const initialiseScene = () => {
+        alignToGroundAndUpdateBounds({ snapCamera: true, applySnapshot: true });
+        isGroundedRef.current = true;
+      };
+
+      initialiseScene();
+      updateBoundsVisibility(showBoundingBoxRef.current);
+      renderer.render(scene, camera);
+    };
+
     const loadRobotModel = async () => {
       try {
         const urdfConfig = await resolveRobotUrdfConfig(robotId);
@@ -1620,65 +1689,10 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
             if (disposed) {
               return;
             }
-            console.info("[ArmVisualizer] URDF loaded", {
+            mountRobotInstance(robot, {
               robotId: urdfConfig.robotId,
               urdfPath: urdfConfig.urdfPath,
-              jointNames: Object.keys(robot.joints),
-              linkNames: Object.keys(robot.links),
             });
-            robot.scale.setScalar(ROBOT_SCALE);
-            const defaultMaterial = new THREE.MeshStandardMaterial({
-              color: 0x1e293b,
-              metalness: 0.1,
-              roughness: 0.8,
-            });
-            const accentMaterial = new THREE.MeshStandardMaterial({
-              color: 0x38bdf8,
-              metalness: 0.2,
-              roughness: 0.5,
-            });
-
-            robot.traverse((obj) => {
-              if ((obj as THREE.Mesh).isMesh) {
-                const mesh = obj as THREE.Mesh;
-                mesh.castShadow = true;
-                mesh.receiveShadow = true;
-                const material =
-                  mesh.name.toLowerCase().includes("wrist") ||
-                  mesh.name.toLowerCase().includes("tool")
-                    ? accentMaterial
-                    : defaultMaterial;
-
-                if (Array.isArray(mesh.material)) {
-                  mesh.material.forEach((mat) => {
-                    (mat as THREE.Material).dispose();
-                  });
-                } else if (mesh.material) {
-                  (mesh.material as THREE.Material).dispose();
-                }
-                mesh.material = material;
-              }
-            });
-
-            scene.add(robot);
-            attachActiveToolVisual(robot, activeToolRef.current);
-
-            robotRef.current = robot;
-            if (!currentAnglesRef.current) {
-              currentAnglesRef.current = new Array(6).fill(0);
-            }
-            if (!targetAnglesRef.current) {
-              targetAnglesRef.current = new Array(6).fill(0);
-            }
-
-            const initialiseScene = () => {
-              alignToGroundAndUpdateBounds({ snapCamera: true, applySnapshot: true });
-              isGroundedRef.current = true;
-            };
-
-            initialiseScene();
-            updateBoundsVisibility(showBoundingBoxRef.current);
-            renderer.render(scene, camera);
           },
           undefined,
           (error) => {
