@@ -32,9 +32,121 @@ _SAFE_JOINT_MOVE_FREQUENCY_HZ = 100
 _SAFE_JOINT_MOVE_MIN_DURATION_S = 0.25
 _WAIT_FOR_IDLE_DEFAULT_TIMEOUT_S = 30.0
 _WAIT_FOR_IDLE_POLL_INTERVAL_S = 0.01
+_RTCORE_ACK_REFRESH_TIMEOUT_S = 0.15
+_RTCORE_ACK_REFRESH_POLL_INTERVAL_S = 0.005
 _RTCORE_TERMINAL_EXECUTION_STATES = {"idle", "completed", "aborted", "faulted", "underrun"}
 _PROGRAM_TERMINAL_STATES = {"completed", "aborted", "faulted", "timeout", "interrupted"}
 _PROGRAM_ACTIVE_STATES = {"planning", "accepted", "executing"}
+_JOG_PERF_LOCK = threading.Lock()
+
+
+def _new_jog_perf_state() -> dict[str, object]:
+    return {
+        "control_frequency_hz": 0,
+        "execution_policy": "",
+        "rtcore_owned": False,
+        "last_velocity_command_age_s": None,
+        "velocity_updates": {
+            "count": 0,
+            "gap_count": 0,
+            "avg_gap_ms": 0.0,
+            "max_gap_ms": 0.0,
+            "last_gap_ms": None,
+            "last_update_monotonic_s": None,
+            "zero_velocity_updates": 0,
+            "nonzero_velocity_updates": 0,
+        },
+        "loop": {
+            "count": 0,
+            "avg_ms": 0.0,
+            "max_ms": 0.0,
+            "last_ms": 0.0,
+            "overrun_count": 0,
+            "max_overrun_ms": 0.0,
+            "last_overrun_ms": 0.0,
+        },
+        "stages": {
+            "feedback_read_ms": {"count": 0, "avg_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0},
+            "ik_solve_ms": {"count": 0, "avg_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0},
+            "command_send_ms": {"count": 0, "avg_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0},
+        },
+    }
+
+
+_JOG_PERF: dict[str, object] = _new_jog_perf_state()
+
+
+def _update_perf_metric(metric: dict[str, object], value_ms: float) -> None:
+    count = int(metric.get("count", 0)) + 1
+    avg_ms = float(metric.get("avg_ms", 0.0))
+    metric["count"] = count
+    metric["last_ms"] = float(value_ms)
+    metric["avg_ms"] = avg_ms + ((float(value_ms) - avg_ms) / float(count))
+    metric["max_ms"] = max(float(metric.get("max_ms", 0.0)), float(value_ms))
+
+
+def _jog_perf_update(**kwargs: object) -> None:
+    with _JOG_PERF_LOCK:
+        _JOG_PERF.update(kwargs)
+
+
+def _record_jog_stage_metric(stage_name: str, value_ms: float) -> None:
+    with _JOG_PERF_LOCK:
+        stages = _JOG_PERF.setdefault("stages", {})
+        if not isinstance(stages, dict):
+            return
+        metric = stages.setdefault(stage_name, {"count": 0, "avg_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0})
+        if isinstance(metric, dict):
+            _update_perf_metric(metric, value_ms)
+
+
+def _record_jog_loop_metric(loop_ms: float, *, target_period_ms: float) -> None:
+    with _JOG_PERF_LOCK:
+        loop = _JOG_PERF.setdefault("loop", {})
+        if not isinstance(loop, dict):
+            return
+        _update_perf_metric(loop, loop_ms)
+        overrun_ms = max(0.0, float(loop_ms) - float(target_period_ms))
+        loop["last_overrun_ms"] = overrun_ms
+        if overrun_ms > 0.0:
+            loop["overrun_count"] = int(loop.get("overrun_count", 0)) + 1
+            loop["max_overrun_ms"] = max(float(loop.get("max_overrun_ms", 0.0)), overrun_ms)
+
+
+def _record_jog_velocity_update(velocity_vector: np.ndarray) -> None:
+    now = time.monotonic()
+    with _JOG_PERF_LOCK:
+        updates = _JOG_PERF.setdefault("velocity_updates", {})
+        if not isinstance(updates, dict):
+            return
+        last_ts = updates.get("last_update_monotonic_s")
+        if isinstance(last_ts, (int, float)):
+            gap_ms = max(0.0, (now - float(last_ts)) * 1000.0)
+            gap_count = int(updates.get("gap_count", 0)) + 1
+            avg_gap = float(updates.get("avg_gap_ms", 0.0))
+            updates["gap_count"] = gap_count
+            updates["last_gap_ms"] = gap_ms
+            updates["avg_gap_ms"] = avg_gap + ((gap_ms - avg_gap) / float(gap_count))
+            updates["max_gap_ms"] = max(float(updates.get("max_gap_ms", 0.0)), gap_ms)
+        updates["last_update_monotonic_s"] = now
+        updates["count"] = int(updates.get("count", 0)) + 1
+        if bool(np.any(np.abs(velocity_vector) > 1e-9)):
+            updates["nonzero_velocity_updates"] = int(updates.get("nonzero_velocity_updates", 0)) + 1
+        else:
+            updates["zero_velocity_updates"] = int(updates.get("zero_velocity_updates", 0)) + 1
+        _JOG_PERF["last_velocity_command_age_s"] = 0.0
+
+
+def get_jog_performance_snapshot() -> dict[str, object]:
+    with _JOG_PERF_LOCK:
+        snapshot = json.loads(json.dumps(_JOG_PERF))
+    last_cmd = utils.trajectory_state_get("last_jog_command_time", 0.0)
+    if isinstance(last_cmd, (int, float)) and last_cmd > 0.0:
+        snapshot["last_velocity_command_age_s"] = max(0.0, time.monotonic() - float(last_cmd))
+    snapshot["execution_policy"] = str(utils.trajectory_state.get("jog_execution_policy", "") or "")
+    snapshot["rtcore_owned"] = bool(_get_rtcore_jog_backend() is not None)
+    snapshot["control_frequency_hz"] = int(JOG_CONTROL_FREQUENCY_HZ) if "JOG_CONTROL_FREQUENCY_HZ" in globals() else 0
+    return snapshot
 
 
 def _safe_int(value: object, default: int = 0) -> int:
@@ -232,6 +344,88 @@ def _get_rtcore_execution_backend_and_status():
         return backend, None
 
 
+def _get_backend_last_submitted_trajectory_id(backend) -> int:
+    if backend is None:
+        return 0
+    getter = getattr(backend, "get_last_submitted_trajectory_id", None)
+    if not callable(getter):
+        return 0
+    try:
+        return int(getter() or 0)
+    except Exception:
+        return 0
+
+
+def _rtcore_status_observes_new_submission(
+    execution_status,
+    *,
+    baseline_active_traj_id: int,
+    submitted_traj_id: int,
+) -> bool:
+    active_traj_id = int(getattr(execution_status, "active_traj_id", 0) or 0)
+    queue_depth = int(getattr(execution_status, "queue_depth", 0) or 0)
+    observed_state = str(getattr(execution_status, "state_name", "idle")).strip().lower() or "idle"
+    motion_done = bool(getattr(execution_status, "motion_done", False))
+
+    if active_traj_id > baseline_active_traj_id:
+        return True
+    if active_traj_id > 0 and queue_depth > 0:
+        return True
+    if submitted_traj_id > baseline_active_traj_id and (
+        active_traj_id == submitted_traj_id
+        or observed_state not in _RTCORE_TERMINAL_EXECUTION_STATES
+        or not motion_done
+    ):
+        return True
+    return False
+
+
+def _refresh_rtcore_execution_status_for_new_submission(
+    backend,
+    execution_status,
+    *,
+    accepted: bool,
+    controller_motion_state: str,
+    controller_thread_running: bool,
+):
+    submitted_traj_id = _get_backend_last_submitted_trajectory_id(backend)
+    if backend is None or execution_status is None:
+        return execution_status, submitted_traj_id
+    if not accepted or not (controller_thread_running or controller_motion_state == "executing"):
+        return execution_status, submitted_traj_id
+
+    baseline_active_traj_id = int(getattr(execution_status, "active_traj_id", 0) or 0)
+    if _rtcore_status_observes_new_submission(
+        execution_status,
+        baseline_active_traj_id=baseline_active_traj_id,
+        submitted_traj_id=submitted_traj_id,
+    ):
+        return execution_status, submitted_traj_id
+
+    status_getter = getattr(backend, "get_execution_status", None)
+    if not callable(status_getter):
+        return execution_status, submitted_traj_id
+
+    latest_status = execution_status
+    latest_submitted_traj_id = submitted_traj_id
+    deadline = time.monotonic() + _RTCORE_ACK_REFRESH_TIMEOUT_S
+    while time.monotonic() <= deadline:
+        time.sleep(_RTCORE_ACK_REFRESH_POLL_INTERVAL_S)
+        latest_submitted_traj_id = _get_backend_last_submitted_trajectory_id(backend)
+        try:
+            latest_status = status_getter()
+        except Exception:
+            break
+        if _rtcore_status_observes_new_submission(
+            latest_status,
+            baseline_active_traj_id=baseline_active_traj_id,
+            submitted_traj_id=latest_submitted_traj_id,
+        ):
+            break
+
+    return latest_status, latest_submitted_traj_id
+
+
 def _backend_supports_rtcore_execution() -> bool:
     backend, status = _get_rtcore_execution_backend_and_status()
     return backend is not None and status is not None
@@ -308,6 +502,8 @@ def _motion_payload_is_active(payload: dict[str, object]) -> bool:
     queue_depth = int(execution.get("queue_depth", 0) or 0)
     motion_done = bool(execution.get("motion_done", False))
 
+    if motion_done and queue_depth == 0 and state_name in _RTCORE_TERMINAL_EXECUTION_STATES:
+        return False
     if active_traj_id > 0 or queue_depth > 0:
         return True
     if state_name in {"accepted", "queued", "executing"}:
@@ -413,16 +609,16 @@ def _build_motion_execution_metadata(
 
     if execution_status is not None:
         source_of_truth = "rtcore"
+        execution_status, submitted_traj_id = _refresh_rtcore_execution_status_for_new_submission(
+            backend,
+            execution_status,
+            accepted=accepted,
+            controller_motion_state=controller_motion_state,
+            controller_thread_running=controller_thread_running,
+        )
         active_traj_id = int(getattr(execution_status, "active_traj_id", 0) or 0)
-        submitted_traj_id = 0
         trajectory_timing: dict[str, object] = {}
         if backend is not None:
-            getter = getattr(backend, "get_last_submitted_trajectory_id", None)
-            if callable(getter):
-                try:
-                    submitted_traj_id = int(getter() or 0)
-                except Exception:
-                    submitted_traj_id = 0
             timing_getter = getattr(backend, "get_last_trajectory_timing", None)
             if callable(timing_getter):
                 try:
@@ -437,7 +633,7 @@ def _build_motion_execution_metadata(
                         }
                 except Exception:
                     trajectory_timing = {}
-        trajectory_id = active_traj_id or submitted_traj_id
+        trajectory_id = submitted_traj_id if submitted_traj_id > active_traj_id else (active_traj_id or submitted_traj_id)
         observed_state = (
             str(getattr(execution_status, "state_name", "idle")).strip().lower() or "idle"
         )
@@ -508,20 +704,22 @@ def get_motion_execution_status() -> dict[str, object]:
     backend, execution_status = _get_rtcore_execution_backend_and_status()
     snapshot = utils.trajectory_state_snapshot()
     controller_thread_running = bool(snapshot.get("is_running", False))
+    controller_motion_state = str(snapshot.get("motion_state", "IDLE")).strip().lower() or "idle"
     active_program = bool(snapshot.get("active_program_name"))
     if execution_status is not None:
-        submitted_traj_id = 0
-        if backend is not None:
-            getter = getattr(backend, "get_last_submitted_trajectory_id", None)
-            if callable(getter):
-                try:
-                    submitted_traj_id = int(getter() or 0)
-                except Exception:
-                    submitted_traj_id = 0
+        execution_status, submitted_traj_id = _refresh_rtcore_execution_status_for_new_submission(
+            backend,
+            execution_status,
+            accepted=True,
+            controller_motion_state=controller_motion_state,
+            controller_thread_running=controller_thread_running,
+        )
         accepted = bool(
             int(getattr(execution_status, "active_traj_id", 0) or 0) > 0
             or submitted_traj_id > 0
             or int(getattr(execution_status, "last_update_ns", 0) or 0) > 0
+            or controller_thread_running
+            or controller_motion_state not in {"idle", ""}
         )
         queue_depth = int(getattr(execution_status, "queue_depth", 0) or 0)
         active_traj_id = int(getattr(execution_status, "active_traj_id", 0) or 0)
@@ -1753,22 +1951,16 @@ def handle_get_position(sock: 'socket.socket', addr: tuple):
     pose_mx = ik_solver.get_fk_matrix(current_angles)
 
     if pose_mx is not None:
-        # Position rounded to 3 decimals
         pos_xyz = pose_mx[:3, 3]
-        pos_rounded = [round(float(p), 3) for p in pos_xyz]
-        # Orientation as Euler XYZ degrees, rounded
         euler_deg = R.from_matrix(pose_mx[:3, :3]).as_euler('xyz', degrees=True)
-        euler_rounded = [round(float(e), 2) for e in euler_deg]
-        
-        # Keep the wire format consistent with the API contract (`joints_deg`).
         angles_deg = np.rad2deg(current_angles)
-        angles_rounded = [round(float(a), 4) for a in angles_deg]
-
-        pos_str = ",".join(map(str, pos_rounded))
-        euler_str = ",".join(map(str, euler_rounded))
-        angles_str = ",".join(map(str, angles_rounded))
+        pos_str = ",".join(f"{float(value):.8f}" for value in pos_xyz)
+        euler_str = ",".join(f"{float(value):.8f}" for value in euler_deg)
+        angles_str = ",".join(f"{float(value):.8f}" for value in angles_deg)
+        pos_log = ",".join(f"{float(value):.4f}" for value in pos_xyz)
+        euler_log = ",".join(f"{float(value):.3f}" for value in euler_deg)
         
-        print(f"[Pi] Sending pose: pos={pos_str} eulerXYZdeg={euler_str}")
+        print(f"[Pi] Sending pose: pos={pos_log} eulerXYZdeg={euler_log}")
         print(f"[Pi] Sending joint angles: {angles_str}")
 
         # Extended format: CURRENT_POSE,x,y,z,roll,pitch,yaw,<angles...>
@@ -2224,6 +2416,7 @@ def _jog_controller_thread():
     last_status_log_time = time.monotonic()
     timeout_zero_logged = False
     was_paused_for_motion = False
+    target_period_ms = 1000.0 / float(JOG_CONTROL_FREQUENCY_HZ)
 
     while utils.trajectory_state.get("is_jogging"):
         loop_start_time = time.monotonic()
@@ -2268,7 +2461,12 @@ def _jog_controller_thread():
 
         # Resync from physical feedback each loop so jog IK follows the real arm
         # instead of integrating indefinitely from the last commanded posture.
+        feedback_read_started = time.monotonic()
         fresh_q = servo_driver.get_current_arm_state_rad(verbose=False)
+        _record_jog_stage_metric(
+            "feedback_read_ms",
+            max(0.0, (time.monotonic() - feedback_read_started) * 1000.0),
+        )
         if fresh_q is not None:
             q_current = np.asarray(fresh_q, dtype=float)
 
@@ -2316,10 +2514,15 @@ def _jog_controller_thread():
                 pass
 
         # 4. Solve IK for the new target pose
+        ik_started = time.monotonic()
         q_target = ik_solver.solve_ik(
             target_position=target_position,
             target_orientation_matrix=target_orientation,
             initial_joint_angles=q_current
+        )
+        _record_jog_stage_metric(
+            "ik_solve_ms",
+            max(0.0, (time.monotonic() - ik_started) * 1000.0),
         )
         
         if q_target is not None:
@@ -2336,6 +2539,7 @@ def _jog_controller_thread():
                 if utils.trajectory_state.get("jog_debug", False):
                     dq = q_clamped - q_current
                     print(f"[Jog] q_delta(rad)={np.round(dq, 5)} | lin={np.round(linear_vel,4)} m/s, ang={np.round(angular_deg_s,1)} deg/s, dt={dt:.4f}s")
+                command_send_started = time.monotonic()
                 if rtcore_jog_owned:
                     send_realtime_jog_command = getattr(rtcore_jog_backend, "send_realtime_jog_command", None)
                     if not callable(send_realtime_jog_command):
@@ -2349,6 +2553,10 @@ def _jog_controller_thread():
                 else:
                     # 6. Command servos to the clamped angles. High speed, zero accel for responsiveness.
                     servo_driver.set_servo_positions(q_clamped, 800, 0)
+                _record_jog_stage_metric(
+                    "command_send_ms",
+                    max(0.0, (time.monotonic() - command_send_started) * 1000.0),
+                )
                 q_current = q_clamped # Update our state for the next iteration's IK
             except Exception as e:
                 print(f"[Jog] WARNING: Failed to clamp/apply joint limits: {e}")
@@ -2406,6 +2614,10 @@ def _jog_controller_thread():
             if utils.trajectory_state.get("jog_debug", False):
                 print(f"[Jog] dt={dt*1000:.1f}ms, v_lin={np.round(linear_vel,3)}, v_ang(deg/s)={np.round(angular_deg_s,1)}")
             last_status_log_time = now
+        _record_jog_loop_metric(
+            max(0.0, (time.monotonic() - loop_start_time) * 1000.0),
+            target_period_ms=target_period_ms,
+        )
 
     print("[Jog] Jog controller thread stopped.")
     if rtcore_jog_owned:
@@ -2424,6 +2636,7 @@ def _jog_controller_thread():
 
 def handle_jog_start():
     """Starts the real-time jogging mode."""
+    global _JOG_PERF
     if utils.trajectory_state.get("is_running") or utils.trajectory_state.get("is_jogging"):
         print("[Jog] ERROR: Another motion is already active. Cannot start jog mode.")
         return
@@ -2437,6 +2650,11 @@ def handle_jog_start():
     utils.trajectory_state["jog_execution_policy"] = (
         "rtcore_joint_velocity" if rtcore_jog_backend is not None else "controller_cartesian_loop"
     )
+    with _JOG_PERF_LOCK:
+        _JOG_PERF = _new_jog_perf_state()
+        _JOG_PERF["control_frequency_hz"] = int(JOG_CONTROL_FREQUENCY_HZ)
+        _JOG_PERF["execution_policy"] = str(utils.trajectory_state["jog_execution_policy"])
+        _JOG_PERF["rtcore_owned"] = bool(rtcore_jog_backend is not None)
 
     if rtcore_jog_backend is not None:
         try:
@@ -2466,6 +2684,7 @@ def handle_jog_stop():
         thread.join(timeout=0.5)
     utils.trajectory_state["jog_thread"] = None
     utils.trajectory_state["jog_execution_policy"] = ""
+    _jog_perf_update(execution_policy="", rtcore_owned=False)
 
     if rtcore_jog_backend is not None:
         try:
@@ -2491,8 +2710,10 @@ def handle_set_jog_velocity(vx, vy, vz, v_roll, v_pitch, v_yaw):
     if not utils.trajectory_state.get("is_jogging"):
         return # Ignore if not in jog mode
 
-    utils.trajectory_state["jog_velocities"] = np.array([vx, vy, vz, v_roll, v_pitch, v_yaw], dtype=float)
+    velocity_vector = np.array([vx, vy, vz, v_roll, v_pitch, v_yaw], dtype=float)
+    utils.trajectory_state["jog_velocities"] = velocity_vector
     utils.trajectory_state["last_jog_command_time"] = time.monotonic()
+    _record_jog_velocity_update(velocity_vector)
     try:
         # Lightweight log when non-zero or on significant change
         v = utils.trajectory_state["jog_velocities"]

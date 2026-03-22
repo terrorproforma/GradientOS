@@ -11,7 +11,9 @@ type Props = {
 
 type JointInfoResponse = {
 	arm_deg?: number[];
+	arm_rad?: number[];
 	gripper_deg?: number;
+	gripper_rad?: number;
 };
 
 type MotionExecutionPayload = {
@@ -38,7 +40,102 @@ type MotionStatusResponse = {
 	execution?: MotionExecutionPayload;
 };
 
+type ApiCommandPerformance = {
+	count?: number;
+	ok_count?: number;
+	error_count?: number;
+	timeout_count?: number;
+	avg_round_trip_ms?: number;
+	max_round_trip_ms?: number;
+	last_round_trip_ms?: number;
+};
+
+type ApiUdpPerformance = {
+	last_command?: string | null;
+	last_result?: string | null;
+	last_round_trip_ms?: number | null;
+	by_command?: Record<string, ApiCommandPerformance>;
+};
+
+type RollingTimingMetric = {
+	count?: number;
+	avg_ms?: number;
+	max_ms?: number;
+	last_ms?: number;
+	slow_over_5ms?: number;
+	slow_over_20ms?: number;
+	overrun_count?: number;
+	max_overrun_ms?: number;
+	last_overrun_ms?: number;
+};
+
+type ControllerCommandPerformance = {
+	count?: number;
+	last_dispatch_ms?: number;
+	avg_dispatch_ms?: number;
+	max_dispatch_ms?: number;
+	last_interarrival_ms?: number | null;
+	avg_interarrival_ms?: number;
+	max_interarrival_ms?: number;
+	interarrival_count?: number;
+};
+
+type ControllerUdpPerformance = {
+	last_command?: string | null;
+	last_peer?: string | null;
+	last_dispatch_ms?: number | null;
+	last_receive_age_s?: number | null;
+	dispatch_ms?: RollingTimingMetric;
+	interarrival_ms?: RollingTimingMetric;
+	command_counts?: Record<string, number>;
+	per_command?: Record<string, ControllerCommandPerformance>;
+};
+
+type JogPerformance = {
+	control_frequency_hz?: number;
+	execution_policy?: string;
+	rtcore_owned?: boolean;
+	last_velocity_command_age_s?: number | null;
+	velocity_updates?: {
+		count?: number;
+		gap_count?: number;
+		avg_gap_ms?: number;
+		max_gap_ms?: number;
+		last_gap_ms?: number | null;
+		zero_velocity_updates?: number;
+		nonzero_velocity_updates?: number;
+	};
+	loop?: RollingTimingMetric;
+	stages?: {
+		feedback_read_ms?: RollingTimingMetric;
+		ik_solve_ms?: RollingTimingMetric;
+		command_send_ms?: RollingTimingMetric;
+	};
+};
+
+type RtcorePerformance = {
+	rt_last_jitter_ns?: number | null;
+	rt_max_abs_jitter_ns?: number | null;
+	rt_overrun_count?: number | null;
+	motion_last_update_age_ms?: number | null;
+};
+
+type PerformanceResponse = {
+	collected_at?: string;
+	api_udp?: ApiUdpPerformance;
+	controller?: {
+		udp?: ControllerUdpPerformance;
+		jog?: JogPerformance;
+		motion_state?: string;
+		is_jogging?: boolean;
+		last_command_age_s?: number;
+		command_link_stale?: boolean;
+	};
+	rtcore?: RtcorePerformance | null;
+};
+
 const LIVE_JOINT_FEEDBACK_POLL_MS = 20;
+const PERFORMANCE_POLL_MS = 500;
 
 type CommissioningStatus = {
 	tone: "info" | "success" | "error";
@@ -143,6 +240,27 @@ function formatMotionStateLabel(value: string | undefined): string {
 	return raw.replace(/_/g, " ").toUpperCase();
 }
 
+function formatMs(value: number | null | undefined, digits = 2): string {
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return "--";
+	}
+	return `${value.toFixed(digits)} ms`;
+}
+
+function formatAgeSeconds(value: number | null | undefined, digits = 2): string {
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return "--";
+	}
+	return `${value.toFixed(digits)} s`;
+}
+
+function formatNsAsUs(value: number | null | undefined, digits = 2): string {
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return "--";
+	}
+	return `${(value / 1000).toFixed(digits)} us`;
+}
+
 async function readErrorMessage(res: Response): Promise<string> {
 	const contentType = res.headers.get("content-type") ?? "";
 	if (contentType.includes("application/json")) {
@@ -195,6 +313,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const [commissioningStatus, setCommissioningStatus] = useState<CommissioningStatus | null>(null);
 	const [commissioningExpanded, setCommissioningExpanded] = useState<boolean>(false);
 	const [motionStatus, setMotionStatus] = useState<MotionStatusResponse | null>(null);
+	const [performanceSnapshot, setPerformanceSnapshot] = useState<PerformanceResponse | null>(null);
 	const activeDriveFaultAxes = useMemo(
 		() =>
 			(driveFaults?.axes ?? []).filter(
@@ -225,9 +344,31 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const lastSentAtRef = useRef<number>(0);
 	const lastRequestErrorRef = useRef<string | null>(null);
 	const keepaliveMs = 200;
+	const jogTickIntervalMs = 50;
 	const linCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
 	const angCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
 	const jointStepLabel = formatStepDegrees(jointStepDeg);
+	const perfApiUdp = performanceSnapshot?.api_udp;
+	const perfController = performanceSnapshot?.controller;
+	const perfControllerUdp = perfController?.udp;
+	const perfJog = perfController?.jog;
+	const perfRtcore = performanceSnapshot?.rtcore;
+	const perfMoveApi = perfApiUdp?.by_command?.MOVE_LINE_RELATIVE;
+	const perfWaitApi = perfApiUdp?.by_command?.WAIT_FOR_IDLE;
+	const perfJogApi = perfApiUdp?.by_command?.SET_JOG_VELOCITY;
+	const perfMoveController = perfControllerUdp?.per_command?.MOVE_LINE_RELATIVE;
+	const perfWaitController = perfControllerUdp?.per_command?.WAIT_FOR_IDLE;
+	const perfJogController = perfControllerUdp?.per_command?.SET_JOG_VELOCITY;
+	const perfSnapshotAgeSeconds = useMemo(() => {
+		if (!performanceSnapshot?.collected_at) {
+			return null;
+		}
+		const collectedAtMs = Date.parse(performanceSnapshot.collected_at);
+		if (!Number.isFinite(collectedAtMs)) {
+			return null;
+		}
+		return Math.max(0, (Date.now() - collectedAtMs) / 1000);
+	}, [performanceSnapshot]);
 
 	const reportRequestError = useCallback((err: unknown, fallback: string, silent: boolean) => {
 		const msg = (err as Error)?.message || fallback;
@@ -375,6 +516,34 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		};
 	}, [getJson]);
 
+	useEffect(() => {
+		let disposed = false;
+		let inFlight = false;
+		const tick = async () => {
+			if (disposed || inFlight) {
+				return;
+			}
+			if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+				return;
+			}
+			inFlight = true;
+			const payload = await getJson<PerformanceResponse>("/debug/performance", true);
+			inFlight = false;
+			if (disposed || !payload) {
+				return;
+			}
+			setPerformanceSnapshot(payload);
+		};
+		void tick();
+		const timer = window.setInterval(() => {
+			void tick();
+		}, PERFORMANCE_POLL_MS);
+		return () => {
+			disposed = true;
+			window.clearInterval(timer);
+		};
+	}, [getJson]);
+
 	// ------------------------
 	// Realtime jog helpers
 	// ------------------------
@@ -400,10 +569,13 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		const now = Date.now();
 		const v = computeJogVector();
 		const last = lastSentRef.current;
+		const isZeroVector =
+			v[0] === 0 && v[1] === 0 && v[2] === 0 &&
+			v[3] === 0 && v[4] === 0 && v[5] === 0;
 		const changed =
 			v[0] !== last[0] || v[1] !== last[1] || v[2] !== last[2] ||
 			v[3] !== last[3] || v[4] !== last[4] || v[5] !== last[5];
-		if (!changed && now - lastSentAtRef.current < keepaliveMs) {
+		if (!changed && (isZeroVector || now - lastSentAtRef.current < keepaliveMs)) {
 			return;
 		}
 		const commandPayload: [number, number, number, number, number, number] = [
@@ -443,9 +615,9 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 			}
 			jogTimerRef.current = window.setInterval(() => {
 				sendJogTickRef.current().catch(() => {});
-			}, 20);
+			}, jogTickIntervalMs);
 		}
-	}, [jogEnabled, post, deadman]);
+	}, [jogEnabled, post, deadman, jogTickIntervalMs]);
 
 	const stopJog = useCallback(async () => {
 		setJogEnabled(false);
@@ -999,6 +1171,84 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 					{motionStatus
 						? `traj ${motionTrajectoryId ?? "none"} | mode ${motionStatus.execution?.active_mode_name ?? "n/a"} | queue ${motionStatus.execution?.queue_depth ?? 0}/${motionStatus.execution?.queue_capacity ?? 0} | done ${motionStatus.execution?.motion_done ? "yes" : "no"} | stale ${motionStatus.execution?.stale_command ? "yes" : "no"} | underruns ${motionStatus.execution?.underrun_count ?? 0}`
 						: "No RTCore execution metadata yet."}
+				</div>
+			</div>
+			<div className="mb-3 rounded-lg border border-violet-500/20 bg-violet-500/5 p-3">
+				<div className="mb-2 flex items-center justify-between gap-2 text-xs text-violet-100/90">
+					<span className="font-semibold uppercase tracking-[0.18em]">Timing Diagnostics</span>
+					<span className="rounded border border-violet-400/30 bg-violet-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-violet-100">
+						{performanceSnapshot ? `live ${formatAgeSeconds(perfSnapshotAgeSeconds)}` : "waiting"}
+					</span>
+				</div>
+				<div className="mb-2 text-[11px] leading-relaxed text-slate-300">
+					Recorded automatically whenever the UI calls the API. This panel reads the live `/debug/performance`
+					snapshot, so no extra toggle is needed to capture timing while you test from the UI.
+				</div>
+				<div className="mb-3 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-2 text-[10px] text-slate-300">
+					<div className="font-semibold text-slate-200">UI -&gt; API command timing</div>
+					<div className="mt-1 tabular-nums">
+						Jog velocity RTT avg/max: {formatMs(perfJogApi?.avg_round_trip_ms)} / {formatMs(perfJogApi?.max_round_trip_ms)}
+					</div>
+					<div className="tabular-nums">
+						Move request RTT avg/max: {formatMs(perfMoveApi?.avg_round_trip_ms)} / {formatMs(perfMoveApi?.max_round_trip_ms)}
+					</div>
+					<div className="tabular-nums">
+						Wait-for-idle RTT avg/max: {formatMs(perfWaitApi?.avg_round_trip_ms)} / {formatMs(perfWaitApi?.max_round_trip_ms)}
+					</div>
+					<div className="mt-1 text-slate-400">
+						`MOVE_LINE_RELATIVE` includes planning before the ACK returns. `WAIT_FOR_IDLE` includes the full motion time.
+					</div>
+				</div>
+				<div className="mb-3 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-2 text-[10px] text-slate-300">
+					<div className="font-semibold text-slate-200">Controller UDP dispatch</div>
+					<div className="mt-1 tabular-nums">
+						Last command: {perfControllerUdp?.last_command ?? "--"} | last dispatch {formatMs(perfControllerUdp?.last_dispatch_ms)}
+					</div>
+					<div className="tabular-nums">
+						Global dispatch avg/max: {formatMs(perfControllerUdp?.dispatch_ms?.avg_ms)} / {formatMs(perfControllerUdp?.dispatch_ms?.max_ms)}
+					</div>
+					<div className="tabular-nums">
+						Global interarrival last/avg: {formatMs(perfControllerUdp?.interarrival_ms?.last_ms)} / {formatMs(perfControllerUdp?.interarrival_ms?.avg_ms)}
+					</div>
+					<div className="tabular-nums">
+						Move dispatch avg/max: {formatMs(perfMoveController?.avg_dispatch_ms)} / {formatMs(perfMoveController?.max_dispatch_ms)}
+					</div>
+					<div className="tabular-nums">
+						Jog dispatch avg/max: {formatMs(perfJogController?.avg_dispatch_ms)} / {formatMs(perfJogController?.max_dispatch_ms)}
+					</div>
+					<div className="tabular-nums">
+						Slow dispatch counts &gt;5 ms / &gt;20 ms: {perfControllerUdp?.dispatch_ms?.slow_over_5ms ?? 0} / {perfControllerUdp?.dispatch_ms?.slow_over_20ms ?? 0}
+					</div>
+					<div className="tabular-nums">
+						Controller command-link stale: {perfController?.command_link_stale ? "yes" : "no"} | last receive age {formatAgeSeconds(perfControllerUdp?.last_receive_age_s)}
+					</div>
+				</div>
+				<div className="mb-3 rounded border border-slate-700/60 bg-slate-950/40 px-2 py-2 text-[10px] text-slate-300">
+					<div className="font-semibold text-slate-200">Jog loop internals</div>
+					<div className="mt-1 tabular-nums">
+						Loop avg/max: {formatMs(perfJog?.loop?.avg_ms)} / {formatMs(perfJog?.loop?.max_ms)}
+					</div>
+					<div className="tabular-nums">
+						Loop overshoot max: {formatMs(perfJog?.loop?.max_overrun_ms)} | overrun count {perfJog?.loop?.overrun_count ?? 0}
+					</div>
+					<div className="tabular-nums">
+						Velocity update gap avg/max: {formatMs(perfJog?.velocity_updates?.avg_gap_ms)} / {formatMs(perfJog?.velocity_updates?.max_gap_ms)}
+					</div>
+					<div className="tabular-nums">
+						Feedback read avg: {formatMs(perfJog?.stages?.feedback_read_ms?.avg_ms)} | IK avg: {formatMs(perfJog?.stages?.ik_solve_ms?.avg_ms)} | send avg: {formatMs(perfJog?.stages?.command_send_ms?.avg_ms)}
+					</div>
+					<div className="tabular-nums">
+						Jog command age: {formatAgeSeconds(perfJog?.last_velocity_command_age_s)} | controller thinks jogging: {perfController?.is_jogging ? "yes" : "no"}
+					</div>
+				</div>
+				<div className="rounded border border-slate-700/60 bg-slate-950/40 px-2 py-2 text-[10px] text-slate-300">
+					<div className="font-semibold text-slate-200">RTCore health</div>
+					<div className="mt-1 tabular-nums">
+						RT jitter current/max: {formatNsAsUs(perfRtcore?.rt_last_jitter_ns)} / {formatNsAsUs(perfRtcore?.rt_max_abs_jitter_ns)}
+					</div>
+					<div className="tabular-nums">
+						RT overruns: {perfRtcore?.rt_overrun_count ?? 0} | motion update age {formatMs(perfRtcore?.motion_last_update_age_ms)}
+					</div>
 				</div>
 			</div>
 			{/* Removed step move blocks; unified under realtime jog below */}

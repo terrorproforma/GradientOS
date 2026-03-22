@@ -175,6 +175,56 @@ def test_handle_wait_for_idle_returns_timeout_when_motion_stays_active(monkeypat
     assert result["execution"]["wait_terminal_state"] == "timeout"
 
 
+def test_handle_wait_for_idle_treats_rtcore_completed_with_latched_traj_id_as_idle(monkeypatch):
+    statuses = iter(
+        [
+            {
+                "accepted": True,
+                "state": "executing",
+                "completion_scope": "rtcore_execution",
+                "trajectory_id": 1,
+                "source_of_truth": "rtcore",
+                "execution": {
+                    "controller_thread_running": False,
+                    "rtcore_status_present": True,
+                    "active_mode_name": "trajectory",
+                    "state_name": "executing",
+                    "active_traj_id": 1,
+                    "queue_depth": 1,
+                    "motion_done": False,
+                },
+            },
+            {
+                "accepted": True,
+                "state": "completed",
+                "completion_scope": "rtcore_execution",
+                "trajectory_id": 1,
+                "source_of_truth": "rtcore",
+                "execution": {
+                    "controller_thread_running": False,
+                    "rtcore_status_present": True,
+                    "active_mode_name": "trajectory",
+                    "state_name": "completed",
+                    "active_traj_id": 1,
+                    "queue_depth": 0,
+                    "motion_done": True,
+                },
+            },
+        ]
+    )
+
+    monkeypatch.setattr(command_api, "get_motion_execution_status", lambda: next(statuses))
+    monkeypatch.setattr(command_api.time, "sleep", lambda _seconds: None)
+
+    result = command_api.handle_wait_for_idle(timeout_s=1.0)
+
+    assert result["state"] == "completed"
+    assert result["waited_for_motion"] is True
+    assert result["wait_timed_out"] is False
+    assert result["execution"]["wait_terminal_state"] == "completed"
+    assert result["execution"]["wait_last_active_state_name"] == "executing"
+
+
 def test_get_motion_execution_status_surfaces_terminal_program_summary(monkeypatch):
     class _Backend:
         @staticmethod
@@ -238,6 +288,94 @@ def test_get_motion_execution_status_surfaces_terminal_program_summary(monkeypat
     assert result["program_completed_loop_count"] == 1
     assert result["program"]["terminal_reason"] == "completed"
     assert result["program"]["segment_execution_policy"] == "rtcore_queued"
+
+
+def test_build_motion_execution_metadata_refreshes_stale_rtcore_ack_snapshot(monkeypatch):
+    class _Status:
+        def __init__(self, *, active_traj_id, state_name, queue_depth, motion_done, last_update_ns):
+            self.active_traj_id = active_traj_id
+            self.active_mode = 2
+            self.active_mode_name = "trajectory"
+            self.state = 4 if state_name == "completed" else 1
+            self.state_name = state_name
+            self.current_point_index = 99 if active_traj_id else None
+            self.queue_depth = queue_depth
+            self.queue_capacity = 4096
+            self.last_event_code = 291
+            self.underrun_count = 0
+            self.stale_command = False
+            self.motion_done = motion_done
+            self.capability_flags = 6
+            self.active_command_seq = 12 if active_traj_id == 2 else 13
+            self.last_update_ns = last_update_ns
+
+    old_status = _Status(
+        active_traj_id=2,
+        state_name="completed",
+        queue_depth=0,
+        motion_done=True,
+        last_update_ns=100,
+    )
+    fresh_status = _Status(
+        active_traj_id=3,
+        state_name="queued",
+        queue_depth=1,
+        motion_done=False,
+        last_update_ns=200,
+    )
+
+    class _Backend:
+        def __init__(self):
+            self._submitted_values = iter([2, 3])
+            self._statuses = iter([fresh_status])
+
+        def get_last_submitted_trajectory_id(self):
+            return next(self._submitted_values, 3)
+
+        def get_execution_status(self):
+            return next(self._statuses, fresh_status)
+
+        @staticmethod
+        def get_last_trajectory_timing():
+            return {
+                "requested_frequency_hz": 100,
+                "effective_frequency_hz": 100,
+                "cycle_ns": 1_000_000,
+                "step_ns": 10_000_000,
+                "cycles_per_point": 10,
+            }
+
+    monkeypatch.setattr(
+        command_api.utils,
+        "trajectory_state_snapshot",
+        lambda: {
+            "motion_state": "EXECUTING",
+            "is_running": True,
+            "last_correlation_id": "corr-123",
+            "active_program_name": None,
+        },
+    )
+    monkeypatch.setattr(
+        command_api,
+        "_get_rtcore_execution_backend_and_status",
+        lambda: (_Backend(), old_status),
+    )
+    monkeypatch.setattr(command_api.time, "sleep", lambda _seconds: None)
+
+    result = command_api._build_motion_execution_metadata(
+        accepted=True,
+        completion_scope="rtcore_execution",
+        state="accepted",
+        use_rtcore_status=True,
+    )
+
+    assert result["state"] == "accepted"
+    assert result["trajectory_id"] == 3
+    assert result["source_of_truth"] == "rtcore"
+    assert result["execution"]["active_traj_id"] == 3
+    assert result["execution"]["state_name"] == "queued"
+    assert result["execution"]["queue_depth"] == 1
+    assert result["execution"]["last_submitted_traj_id"] == 3
 
 
 def test_realtime_jog_loop_uses_rtcore_joint_velocity_backend(monkeypatch):

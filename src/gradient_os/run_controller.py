@@ -16,6 +16,7 @@ import traceback
 import sys
 import os
 import signal
+import copy
 import numpy as np
 import argparse
 import threading
@@ -58,6 +59,142 @@ IK_BACKEND_CHOICES = ["ikfast", "numeric"]
 _DEFAULT_RTCORE_SOCKET_PATH = "/run/gradient-rt-motion/ipc.sock"
 _RTCORE_SERVICE_NAME = "gradient-rt-motion.service"
 _DEFAULT_RTCORE_METRICS_PATH = "/run/gradient-rt-motion/metrics.json"
+_CONTROLLER_PERF_LOCK = threading.Lock()
+_CONTROLLER_PERF: dict[str, object] = {
+    "udp": {
+        "last_command": None,
+        "last_peer": None,
+        "last_receive_monotonic_s": None,
+        "last_dispatch_ms": None,
+        "dispatch_ms": {
+            "count": 0,
+            "avg_ms": 0.0,
+            "max_ms": 0.0,
+            "last_ms": 0.0,
+            "slow_over_5ms": 0,
+            "slow_over_20ms": 0,
+        },
+        "interarrival_ms": {
+            "count": 0,
+            "avg_ms": 0.0,
+            "max_ms": 0.0,
+            "last_ms": 0.0,
+        },
+        "recent_udp_reset_count": 0,
+        "command_counts": {},
+        "per_command": {},
+    }
+}
+
+
+def _update_rolling_metric(metric: dict[str, object], value_ms: float) -> None:
+    count = int(metric.get("count", 0)) + 1
+    avg_ms = float(metric.get("avg_ms", 0.0))
+    metric["count"] = count
+    metric["last_ms"] = float(value_ms)
+    metric["avg_ms"] = avg_ms + ((float(value_ms) - avg_ms) / float(count))
+    metric["max_ms"] = max(float(metric.get("max_ms", 0.0)), float(value_ms))
+
+
+def _record_controller_udp_reset(count: int) -> None:
+    with _CONTROLLER_PERF_LOCK:
+        udp = _CONTROLLER_PERF.setdefault("udp", {})
+        if isinstance(udp, dict):
+            udp["recent_udp_reset_count"] = int(count)
+
+
+def _record_controller_command_metric(
+    *,
+    command: str,
+    peer: str,
+    receive_monotonic_s: float,
+    interarrival_ms: float | None,
+    dispatch_ms: float,
+) -> None:
+    with _CONTROLLER_PERF_LOCK:
+        udp = _CONTROLLER_PERF.setdefault("udp", {})
+        if not isinstance(udp, dict):
+            return
+        udp["last_command"] = str(command)
+        udp["last_peer"] = str(peer)
+        udp["last_receive_monotonic_s"] = float(receive_monotonic_s)
+        udp["last_dispatch_ms"] = float(dispatch_ms)
+
+        dispatch_metric = udp.setdefault(
+            "dispatch_ms",
+            {"count": 0, "avg_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0, "slow_over_5ms": 0, "slow_over_20ms": 0},
+        )
+        if isinstance(dispatch_metric, dict):
+            _update_rolling_metric(dispatch_metric, dispatch_ms)
+            if dispatch_ms > 5.0:
+                dispatch_metric["slow_over_5ms"] = int(dispatch_metric.get("slow_over_5ms", 0)) + 1
+            if dispatch_ms > 20.0:
+                dispatch_metric["slow_over_20ms"] = int(dispatch_metric.get("slow_over_20ms", 0)) + 1
+
+        if interarrival_ms is not None:
+            gap_metric = udp.setdefault(
+                "interarrival_ms",
+                {"count": 0, "avg_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0},
+            )
+            if isinstance(gap_metric, dict):
+                _update_rolling_metric(gap_metric, interarrival_ms)
+
+        command_counts = udp.setdefault("command_counts", {})
+        if isinstance(command_counts, dict):
+            command_counts[command] = int(command_counts.get(command, 0)) + 1
+
+        per_command = udp.setdefault("per_command", {})
+        if isinstance(per_command, dict):
+            command_entry = per_command.setdefault(
+                command,
+                {
+                    "count": 0,
+                    "last_dispatch_ms": 0.0,
+                    "avg_dispatch_ms": 0.0,
+                    "max_dispatch_ms": 0.0,
+                    "last_interarrival_ms": None,
+                    "avg_interarrival_ms": 0.0,
+                    "max_interarrival_ms": 0.0,
+                    "interarrival_count": 0,
+                },
+            )
+            if isinstance(command_entry, dict):
+                count = int(command_entry.get("count", 0)) + 1
+                avg_dispatch = float(command_entry.get("avg_dispatch_ms", 0.0))
+                command_entry["count"] = count
+                command_entry["last_dispatch_ms"] = float(dispatch_ms)
+                command_entry["avg_dispatch_ms"] = avg_dispatch + (
+                    (float(dispatch_ms) - avg_dispatch) / float(count)
+                )
+                command_entry["max_dispatch_ms"] = max(
+                    float(command_entry.get("max_dispatch_ms", 0.0)),
+                    float(dispatch_ms),
+                )
+                if interarrival_ms is not None:
+                    gap_count = int(command_entry.get("interarrival_count", 0)) + 1
+                    avg_gap = float(command_entry.get("avg_interarrival_ms", 0.0))
+                    command_entry["interarrival_count"] = gap_count
+                    command_entry["last_interarrival_ms"] = float(interarrival_ms)
+                    command_entry["avg_interarrival_ms"] = avg_gap + (
+                        (float(interarrival_ms) - avg_gap) / float(gap_count)
+                    )
+                    command_entry["max_interarrival_ms"] = max(
+                        float(command_entry.get("max_interarrival_ms", 0.0)),
+                        float(interarrival_ms),
+                    )
+
+
+def _get_controller_performance_snapshot(now_monotonic: float) -> dict[str, object]:
+    with _CONTROLLER_PERF_LOCK:
+        snapshot = copy.deepcopy(_CONTROLLER_PERF)
+    udp = snapshot.get("udp")
+    if isinstance(udp, dict):
+        last_receive = udp.get("last_receive_monotonic_s")
+        if isinstance(last_receive, (int, float)):
+            udp["last_receive_age_s"] = max(0.0, float(now_monotonic) - float(last_receive))
+        else:
+            udp["last_receive_age_s"] = None
+    return snapshot
 
 
 def _install_shutdown_signal_handlers() -> None:
@@ -178,6 +315,94 @@ def _send_controller_ack(sock: socket.socket, addr, command: str, payload: dict[
 def _send_motion_status(sock: socket.socket, addr, payload: dict[str, object]) -> None:
     message = f"MOTION_STATUS,{_encode_controller_payload_b64(payload)}"
     sock.sendto(message.encode("utf-8"), addr)
+
+
+def _build_joint_state_snapshot() -> dict[str, object]:
+    read_source = "live_feedback"
+    try:
+        current_angles_rad = servo_driver.get_current_arm_state_rad(verbose=False)
+    except Exception as exc:
+        print(f"[Controller] WARNING: joint snapshot live read failed: {exc}")
+        current_angles_rad = list(utils.current_logical_joint_angles_rad)
+        read_source = "cached_fallback"
+
+    arm_rad = [float(value) for value in current_angles_rad]
+    arm_deg = [float(np.rad2deg(value)) for value in arm_rad]
+    snapshot: dict[str, object] = {
+        "arm_rad": arm_rad,
+        "arm_deg": arm_deg,
+        "read_source": read_source,
+        "numeric_precision": "float64",
+    }
+
+    if utils.gripper_present:
+        gripper_rad = float(utils.current_gripper_angle_rad)
+        snapshot["gripper_rad"] = gripper_rad
+        snapshot["gripper_deg"] = float(np.rad2deg(gripper_rad))
+
+    try:
+        backend = backend_registry.get_active_backend()
+        snapshot["backend_name"] = backend_registry.get_active_backend_name()
+    except Exception:
+        backend = None
+
+    if backend is not None:
+        sync_read_positions = getattr(backend, "sync_read_positions", None)
+        if callable(sync_read_positions):
+            try:
+                raw_positions = sync_read_positions(timeout_s=0.05)
+                if isinstance(raw_positions, dict) and raw_positions:
+                    max_axis = max(int(axis_i) for axis_i in raw_positions.keys())
+                    snapshot["axis_counts"] = [
+                        int(raw_positions[i]) if i in raw_positions else None
+                        for i in range(max_axis + 1)
+                    ]
+            except Exception:
+                pass
+
+        axis_to_joint = getattr(backend, "_axis_to_joint", None)
+        if isinstance(axis_to_joint, list) and axis_to_joint:
+            snapshot["axis_to_joint"] = [int(value) for value in axis_to_joint]
+
+        axis_statusword = getattr(backend, "_axis_statusword", None)
+        if isinstance(axis_statusword, list) and axis_statusword:
+            snapshot["axis_statusword"] = [int(value) for value in axis_statusword[: len(axis_statusword)]]
+
+        axis_error_code = getattr(backend, "_axis_error_code", None)
+        if isinstance(axis_error_code, list) and axis_error_code:
+            snapshot["axis_error_code"] = [int(value) for value in axis_error_code[: len(axis_error_code)]]
+
+    return snapshot
+
+
+def _should_log_received_udp_command(
+    message: str,
+    *,
+    monotonic_now: float,
+    log_state: dict[str, float],
+) -> bool:
+    command = message.split(",", 1)[0].strip().upper()
+    throttle_key: str | None = None
+    interval_s = 1.0
+
+    if command in {"GET_JOINT_ANGLES", "GET_MOTION_STATUS", "GET_STATUS"}:
+        throttle_key = command
+    elif command == "SET_JOG_VELOCITY":
+        try:
+            values = [float(token) for token in message.split(",")[1:7]]
+            if len(values) == 6 and all(abs(value) <= 1e-12 for value in values):
+                throttle_key = "SET_JOG_VELOCITY_ZERO"
+        except Exception:
+            throttle_key = None
+
+    if throttle_key is None:
+        return True
+
+    last_logged = log_state.get(throttle_key, 0.0)
+    if monotonic_now - last_logged < interval_s:
+        return False
+    log_state[throttle_key] = monotonic_now
+    return True
 
 
 def _load_rtcore_metrics_snapshot(path: str) -> dict[str, object] | None:
@@ -909,6 +1134,7 @@ Examples:
         last_udp_reset_warning_monotonic = 0.0
         was_command_link_stale = False
         recent_udp_reset_count = 0
+        received_command_log_state: dict[str, float] = {}
         utils.trajectory_state_update(
             command_link_stale=False,
             last_command_age_s=0.0,
@@ -929,6 +1155,7 @@ Examples:
                     if getattr(exc, "winerror", None) == 10054:
                         recent_udp_reset_count += 1
                         utils.trajectory_state_set("recent_udp_reset_count", recent_udp_reset_count)
+                        _record_controller_udp_reset(recent_udp_reset_count)
                         now = time.monotonic()
                         if now - last_udp_reset_warning_monotonic >= udp_reset_log_throttle_s:
                             print(
@@ -940,9 +1167,11 @@ Examples:
                     raise
                 now_monotonic = time.monotonic()
                 link_was_stale = was_command_link_stale
+                interarrival_ms = max(0.0, (now_monotonic - last_command_rx_monotonic) * 1000.0)
                 last_command_rx_monotonic = now_monotonic
                 was_command_link_stale = False
                 recent_udp_reset_count = 0
+                _record_controller_udp_reset(0)
                 utils.trajectory_state_update(
                     command_link_stale=False,
                     last_command_age_s=0.0,
@@ -953,7 +1182,14 @@ Examples:
                 if link_was_stale:
                     print("[Controller] UDP command link restored.")
                 message = data.decode("utf-8").strip()
-                print(f"[Controller] Received: '{message}' from {addr}")
+                command = message.split(",", 1)[0].strip().upper()
+                dispatch_started_monotonic = time.monotonic()
+                if _should_log_received_udp_command(
+                    message,
+                    monotonic_now=now_monotonic,
+                    log_state=received_command_log_state,
+                ):
+                    print(f"[Controller] Received: '{message}' from {addr}")
 
                 # --- High-Priority Commands ---
                 if message.upper() == "STOP":
@@ -1370,16 +1606,36 @@ Examples:
                         print("[Controller] Error parsing SET_JOG_DEBUG.")
 
                 elif command == "GET_JOINT_ANGLES":
-                    try:
-                        current_angles_rad = servo_driver.get_current_arm_state_rad(verbose=False)
-                    except Exception as e:
-                        print(f"[Controller] WARNING: GET_JOINT_ANGLES live read failed: {e}")
-                        current_angles_rad = utils.current_logical_joint_angles_rad
-                    arm_deg = np.rad2deg(current_angles_rad)
-                    reply = "JOINT_ANGLES," + ",".join(f"{deg:.2f}" for deg in arm_deg)
-                    if utils.gripper_present:
-                        gripper_deg = np.rad2deg(utils.current_gripper_angle_rad)
-                        reply += f",{gripper_deg:.2f}"
+                    snapshot = _build_joint_state_snapshot()
+                    arm_deg = [float(value) for value in snapshot.get("arm_deg", [])]
+                    reply = "JOINT_ANGLES," + ",".join(f"{deg:.8f}" for deg in arm_deg)
+                    gripper_deg = snapshot.get("gripper_deg")
+                    if isinstance(gripper_deg, (float, int)):
+                        reply += f",{float(gripper_deg):.8f}"
+                    sock.sendto(reply.encode("utf-8"), addr)
+
+                elif command == "GET_JOINT_STATE":
+                    snapshot = _build_joint_state_snapshot()
+                    reply = "JOINT_STATE_JSON," + json.dumps(snapshot, separators=(",", ":"), ensure_ascii=True)
+                    sock.sendto(reply.encode("utf-8"), addr)
+
+                elif command == "GET_PERFORMANCE_STATE":
+                    controller_perf = _get_controller_performance_snapshot(time.monotonic())
+                    payload = {
+                        "udp": controller_perf.get("udp", {}) if isinstance(controller_perf, dict) else {},
+                        "jog": command_api.get_jog_performance_snapshot(),
+                        "motion_state": str(utils.get_motion_state()).lower(),
+                        "is_running": bool(utils.trajectory_state.get("is_running")),
+                        "is_jogging": bool(utils.trajectory_state.get("is_jogging")),
+                        "last_command_age_s": float(utils.trajectory_state_get("last_command_age_s", 0.0)),
+                        "command_link_stale": bool(utils.trajectory_state_get("command_link_stale", False)),
+                        "recent_udp_reset_count": int(utils.trajectory_state_get("recent_udp_reset_count", 0)),
+                    }
+                    reply = "PERFORMANCE_STATE_JSON," + json.dumps(
+                        payload,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    )
                     sock.sendto(reply.encode("utf-8"), addr)
 
                 elif command == "REFRESH_LIMITS":
@@ -1901,6 +2157,15 @@ Examples:
                                 command_api.handle_set_gripper_state(np.rad2deg(gripper_rad), speed, accel)
                     except ValueError:
                         print(f"[Controller] Error: Could not parse joint angle command '{message}'")
+
+                dispatch_elapsed_ms = max(0.0, (time.monotonic() - dispatch_started_monotonic) * 1000.0)
+                _record_controller_command_metric(
+                    command=command,
+                    peer=f"{addr[0]}:{addr[1]}",
+                    receive_monotonic_s=now_monotonic,
+                    interarrival_ms=interarrival_ms,
+                    dispatch_ms=dispatch_elapsed_ms,
+                )
 
             except socket.timeout:
                 now_monotonic = time.monotonic()

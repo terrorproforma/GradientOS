@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import struct
+import time
 from pathlib import Path
 
 import pytest
@@ -10,8 +11,10 @@ from gradient_os.arm_controller.backends import registry as backend_registry
 from gradient_os.arm_controller.backends.ethercat_rtcore.backend import (
     EthercatRTCoreBackend,
     RTCoreExecutionStatus,
+    _TRAJ_POINTF_HAS_VELOCITY,
     _AxisConfig,
 )
+from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import RTCORE_EXEC_STATE_COMPLETED
 from gradient_os.arm_controller.backends.simulation.backend import SimulationBackend
 from gradient_os.arm_controller.robots.gradient05.config import Gradient05Config
 from gradient_os import ik_solver
@@ -335,6 +338,8 @@ def test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing(monkeyp
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
     monkeypatch.setattr(backend, "get_rtcore_cycle_ns", lambda: 1_000_000)
+    backend._rt_num_axes = 6
+    backend._axis_to_joint = [0, 1, 2, 3, 4, 5]
 
     captured: dict[str, object] = {}
     status = RTCoreExecutionStatus(
@@ -381,26 +386,31 @@ def test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing(monkeyp
         "wait_for_trajectory_complete",
         _wait_for_trajectory_complete,
     )
+    joint_path = [
+        [0.1, 0.2, 0.0, 0.0, 0.0, 0.0],
+        [0.2, 0.3, 0.0, 0.0, 0.0, 0.0],
+        [0.3, 0.4, 0.0, 0.0, 0.0, 0.0],
+    ]
 
     result = backend.execute_joint_trajectory(
-        [[0.1, 0.2], [0.2, 0.3], [0.3, 0.4]],
+        joint_path,
         frequency=333,
     )
 
     assert result is status
     assert captured["begin"] == 3
     assert captured["commit"] == 55
-    assert captured["points"] == (
-        55,
-        [
-            {"positions_rad": [0.1, 0.2], "t_from_start_ns": 0},
-            {"positions_rad": [0.2, 0.3], "t_from_start_ns": 4_000_000},
-            {"positions_rad": [0.3, 0.4], "t_from_start_ns": 8_000_000},
-        ],
-    )
+    points_traj_id, points_payload = captured["points"]
+    assert points_traj_id == 55
+    assert len(points_payload) == 3
+    for idx, point in enumerate(points_payload):
+        assert point["positions_rad"] == joint_path[idx]
+        assert point["flags"] == _TRAJ_POINTF_HAS_VELOCITY
+        assert point["t_from_start_ns"] == idx * 4_000_000
+        assert point["qd"] == pytest.approx([25.0, 25.0, 0.0, 0.0, 0.0, 0.0])
     wait_traj_id, wait_timeout_s = captured["wait"]
     assert wait_traj_id == 55
-    assert wait_timeout_s == pytest.approx(2.012)
+    assert wait_timeout_s == pytest.approx(5.012)
     assert backend.get_last_trajectory_timing() == {
         "requested_frequency_hz": 333,
         "effective_frequency_hz": 250,
@@ -439,6 +449,75 @@ def test_ethercat_backend_parses_motion_state_status(monkeypatch, tmp_path):
     assert status.motion_done is True
     assert status.capability_flags == 0x1
     assert status.active_command_seq == 42
+
+
+def test_ethercat_backend_wait_for_trajectory_complete_ignores_stale_previous_completion(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+
+    statuses = iter(
+        [
+            RTCoreExecutionStatus(
+                active_mode=2,
+                active_mode_name="trajectory",
+                state=RTCORE_EXEC_STATE_COMPLETED,
+                state_name="completed",
+                active_traj_id=1,
+                current_point_index=401,
+                queue_depth=0,
+                queue_capacity=4096,
+                last_event_code=291,
+                underrun_count=0,
+                stale_command=False,
+                motion_done=True,
+                capability_flags=0,
+                active_command_seq=100,
+                last_update_ns=1000,
+            ),
+            RTCoreExecutionStatus(
+                active_mode=2,
+                active_mode_name="trajectory",
+                state=3,
+                state_name="executing",
+                active_traj_id=2,
+                current_point_index=5,
+                queue_depth=10,
+                queue_capacity=4096,
+                last_event_code=290,
+                underrun_count=0,
+                stale_command=False,
+                motion_done=False,
+                capability_flags=0,
+                active_command_seq=101,
+                last_update_ns=1100,
+            ),
+            RTCoreExecutionStatus(
+                active_mode=2,
+                active_mode_name="trajectory",
+                state=RTCORE_EXEC_STATE_COMPLETED,
+                state_name="completed",
+                active_traj_id=2,
+                current_point_index=401,
+                queue_depth=0,
+                queue_capacity=4096,
+                last_event_code=291,
+                underrun_count=0,
+                stale_command=False,
+                motion_done=True,
+                capability_flags=0,
+                active_command_seq=101,
+                last_update_ns=1200,
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(backend, "get_execution_status", lambda: next(statuses))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    result = backend.wait_for_trajectory_complete(2, timeout_s=0.1)
+
+    assert result.active_traj_id == 2
+    assert result.state_name == "completed"
 
 
 def test_ethercat_backend_sends_realtime_jog_command(monkeypatch, tmp_path):

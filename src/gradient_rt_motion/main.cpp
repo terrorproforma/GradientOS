@@ -46,6 +46,10 @@ using gradient::ipc::v1::AxisStatusV1;
 namespace {
 
 std::atomic<bool> g_stop{false};
+// Real drives can settle a few counts away from the commanded final setpoint
+// even after the final trajectory point is due. Exact equality caused valid
+// queued moves to remain "executing" until the Python-side wait timed out.
+constexpr int32_t kTrajectoryCompletionToleranceCounts = 128;
 
 extern "C" void handle_signal(int) {
   g_stop.store(true, std::memory_order_relaxed);
@@ -56,6 +60,23 @@ uint64_t now_monotonic_ns() {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL +
          static_cast<uint64_t>(ts.tv_nsec);
+}
+
+double clamp_double_to_i32_range(double value) {
+  const double min_v = static_cast<double>(std::numeric_limits<int32_t>::min());
+  const double max_v = static_cast<double>(std::numeric_limits<int32_t>::max());
+  if (value < min_v) {
+    return min_v;
+  }
+  if (value > max_v) {
+    return max_v;
+  }
+  return value;
+}
+
+int32_t clamp_round_to_i32(double value) {
+  const double clamped = clamp_double_to_i32_range(value);
+  return static_cast<int32_t>(std::llround(clamped));
 }
 
 void logf(const char* fmt, ...) {
@@ -1161,7 +1182,9 @@ int main(int argc, char** argv) {
   struct TrajectoryPointRuntime {
     uint64_t t_from_start_ns = 0;
     uint32_t axis_mask = 0;
-    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> target_counts{};
+    uint32_t flags = 0;
+    std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> target_counts{};
+    std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> velocity_counts_per_s{};
   };
 
   struct PendingTrajectoryUpload {
@@ -1267,6 +1290,7 @@ int main(int argc, char** argv) {
     }
 
     const uint64_t period = opt.cycle_ns;
+    const double period_s = static_cast<double>(period) / 1e9;
     uint64_t next_ns = now_monotonic_ns();
     bool shutdown_active = false;
     uint64_t shutdown_until_ns = 0;
@@ -2088,6 +2112,7 @@ int main(int argc, char** argv) {
         }
 
         std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> target_counts{};
+        std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> target_velocity_counts_per_s{};
         uint32_t sp_mask = 0;
         const uint64_t abort_req =
             trajectory_abort_request.exchange(0, std::memory_order_acq_rel);
@@ -2180,9 +2205,39 @@ int main(int argc, char** argv) {
         }
 
         if (active_trajectory && active_traj_point_count > 0) {
+          std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> target_counts_interp{};
+          auto load_point_targets = [&](const TrajectoryPointRuntime& point) {
+            sp_mask = point.axis_mask;
+            target_counts_interp = point.target_counts;
+            target_velocity_counts_per_s = point.velocity_counts_per_s;
+          };
+          auto segment_velocity_for_axis = [&](const TrajectoryPointRuntime& p0,
+                                               const TrajectoryPointRuntime& p1,
+                                               uint32_t axis_i) -> double {
+            const uint64_t dt_ns = p1.t_from_start_ns - p0.t_from_start_ns;
+            if (dt_ns == 0) {
+              return 0.0;
+            }
+            const double dt_s = static_cast<double>(dt_ns) / 1e9;
+            const bool p0_has_velocity =
+                (p0.flags & gradient::ipc::v1::TRAJ_POINTF_HAS_VELOCITY) != 0u;
+            const bool p1_has_velocity =
+                (p1.flags & gradient::ipc::v1::TRAJ_POINTF_HAS_VELOCITY) != 0u;
+            if (p0_has_velocity && p1_has_velocity) {
+              return 0.5 * (p0.velocity_counts_per_s[axis_i] + p1.velocity_counts_per_s[axis_i]);
+            }
+            if (p0_has_velocity) {
+              return p0.velocity_counts_per_s[axis_i];
+            }
+            if (p1_has_velocity) {
+              return p1.velocity_counts_per_s[axis_i];
+            }
+            return (p1.target_counts[axis_i] - p0.target_counts[axis_i]) / dt_s;
+          };
+
           sp_mask = active_traj_axis_mask;
           if (active_traj_point_count == 1) {
-            target_counts = active_traj_points[0].target_counts;
+            load_point_targets(active_traj_points[0]);
             motion_current_point_index.store(0, std::memory_order_relaxed);
             motion_queue_depth.store(0, std::memory_order_relaxed);
           } else {
@@ -2214,11 +2269,21 @@ int main(int argc, char** argv) {
                 motion_done.store(1, std::memory_order_relaxed);
                 motion_last_update_ns.store(diag_now_ns, std::memory_order_relaxed);
               } else if (elapsed_ns <= p0.t_from_start_ns) {
-                target_counts = p0.target_counts;
-                sp_mask = p0.axis_mask;
+                load_point_targets(p0);
+                for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+                  if ((sp_mask & (1u << i)) == 0u) {
+                    continue;
+                  }
+                  target_velocity_counts_per_s[i] = segment_velocity_for_axis(p0, p1, i);
+                }
               } else if (elapsed_ns >= p1.t_from_start_ns) {
-                target_counts = p1.target_counts;
-                sp_mask = p1.axis_mask;
+                load_point_targets(p1);
+                for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+                  if ((sp_mask & (1u << i)) == 0u) {
+                    continue;
+                  }
+                  target_velocity_counts_per_s[i] = segment_velocity_for_axis(p0, p1, i);
+                }
               } else {
                 const double alpha =
                     static_cast<double>(elapsed_ns - p0.t_from_start_ns) /
@@ -2226,19 +2291,36 @@ int main(int argc, char** argv) {
                 sp_mask = p0.axis_mask | p1.axis_mask;
                 for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
                   if ((sp_mask & (1u << i)) == 0u) {
-                    target_counts[i] = 0;
+                    target_counts_interp[i] = 0.0;
+                    target_velocity_counts_per_s[i] = 0.0;
                     continue;
                   }
-                  const double interp =
-                      static_cast<double>(p0.target_counts[i]) +
-                      (static_cast<double>(p1.target_counts[i] - p0.target_counts[i]) * alpha);
-                  target_counts[i] = static_cast<int32_t>(std::llround(interp));
+                  target_counts_interp[i] =
+                      p0.target_counts[i] + ((p1.target_counts[i] - p0.target_counts[i]) * alpha);
+                  const bool p0_has_velocity =
+                      (p0.flags & gradient::ipc::v1::TRAJ_POINTF_HAS_VELOCITY) != 0u;
+                  const bool p1_has_velocity =
+                      (p1.flags & gradient::ipc::v1::TRAJ_POINTF_HAS_VELOCITY) != 0u;
+                  if (p0_has_velocity && p1_has_velocity) {
+                    target_velocity_counts_per_s[i] =
+                        p0.velocity_counts_per_s[i] +
+                        ((p1.velocity_counts_per_s[i] - p0.velocity_counts_per_s[i]) * alpha);
+                  } else {
+                    target_velocity_counts_per_s[i] = segment_velocity_for_axis(p0, p1, i);
+                  }
                 }
               }
             } else {
-              target_counts = active_traj_points[active_traj_point_count - 1].target_counts;
-              sp_mask = active_traj_points[active_traj_point_count - 1].axis_mask;
+              load_point_targets(active_traj_points[active_traj_point_count - 1]);
             }
+          }
+          for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+            if ((sp_mask & (1u << i)) == 0u) {
+              target_counts[i] = 0;
+              target_velocity_counts_per_s[i] = 0.0;
+              continue;
+            }
+            target_counts[i] = clamp_round_to_i32(target_counts_interp[i]);
           }
         } else if (active_jog) {
           bool any_nonzero_velocity = false;
@@ -2296,6 +2378,7 @@ int main(int argc, char** argv) {
                 }
                 jog_target_counts_float[i] += active_jog_velocity_counts_per_s[i] * period_s;
                 target_counts[i] = static_cast<int32_t>(std::llround(jog_target_counts_float[i]));
+                target_velocity_counts_per_s[i] = active_jog_velocity_counts_per_s[i];
               }
             }
           }
@@ -2360,6 +2443,7 @@ int main(int argc, char** argv) {
               if ((sp_mask & (1u << i)) != 0u) {
                 const int32_t desired = target_counts[i];
                 const int32_t max_step = opt.axis[i].max_step_counts_per_cycle;
+                const double desired_velocity = target_velocity_counts_per_s[i];
                 if (max_step > 0) {
                   const int32_t cur = hold_target_counts[i];
                   const int64_t delta = static_cast<int64_t>(desired) - static_cast<int64_t>(cur);
@@ -2373,6 +2457,18 @@ int main(int argc, char** argv) {
                 } else {
                   hold_target_counts[i] = desired;
                 }
+                const double max_velocity_from_step = static_cast<double>(max_step) / period_s;
+                if (max_step > 0) {
+                  if (desired_velocity > max_velocity_from_step) {
+                    target_vel_out = clamp_round_to_i32(max_velocity_from_step);
+                  } else if (desired_velocity < -max_velocity_from_step) {
+                    target_vel_out = clamp_round_to_i32(-max_velocity_from_step);
+                  } else {
+                    target_vel_out = clamp_round_to_i32(desired_velocity);
+                  }
+                } else {
+                  target_vel_out = clamp_round_to_i32(desired_velocity);
+                }
               }
             } else {
               // Track feedback until OP; keeps 0x607A aligned during state transitions.
@@ -2385,7 +2481,6 @@ int main(int argc, char** argv) {
               fault_reset_left[i]--;
             }
             target_pos_out = hold_target_counts[i];
-            target_vel_out = 0;
             target_torque_out = 0;
             mode_out = want_enable ? 8 : 0;
             tp_func_out = 0;
@@ -2445,7 +2540,12 @@ int main(int argc, char** argv) {
                 ds402 == gradient::ipc::v1::DS402_FAULT_REACTION_ACTIVE) {
               any_faulted = true;
             }
-            if (latest_feedback.pos_counts[i] != final_point.target_counts[i]) {
+            const int32_t final_target_counts = clamp_round_to_i32(final_point.target_counts[i]);
+            const int64_t error_counts =
+                static_cast<int64_t>(latest_feedback.pos_counts[i]) -
+                static_cast<int64_t>(final_target_counts);
+            if (error_counts < -static_cast<int64_t>(kTrajectoryCompletionToleranceCounts) ||
+                error_counts > static_cast<int64_t>(kTrajectoryCompletionToleranceCounts)) {
               all_axes_at_target = false;
             }
           }
@@ -3413,21 +3513,25 @@ int main(int argc, char** argv) {
                     TrajectoryPointRuntime runtime_point{};
                     runtime_point.t_from_start_ns = cmd->t_from_start_ns;
                     runtime_point.axis_mask = (cmd->axis_mask != 0u) ? cmd->axis_mask : pending_upload.axis_mask;
+                    runtime_point.flags = cmd->flags;
                     for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
                       if ((runtime_point.axis_mask & (1u << i)) == 0u) {
-                        runtime_point.target_counts[i] = 0;
+                        runtime_point.target_counts[i] = 0.0;
+                        runtime_point.velocity_counts_per_s[i] = 0.0;
                         continue;
                       }
                       const double cpu = opt.axis[i].counts_per_unit;
                       const int sgn = opt.axis[i].sign;
-                      const double raw = cmd->q[i] * cpu;
-                      long long counts = static_cast<long long>(sgn) * std::llround(raw);
-                      if (counts > static_cast<long long>(std::numeric_limits<int32_t>::max())) {
-                        counts = static_cast<long long>(std::numeric_limits<int32_t>::max());
-                      } else if (counts < static_cast<long long>(std::numeric_limits<int32_t>::min())) {
-                        counts = static_cast<long long>(std::numeric_limits<int32_t>::min());
+                      const double raw_counts = cmd->q[i] * cpu * static_cast<double>(sgn);
+                      runtime_point.target_counts[i] = clamp_double_to_i32_range(raw_counts);
+                      if ((cmd->flags & gradient::ipc::v1::TRAJ_POINTF_HAS_VELOCITY) != 0u) {
+                        const double raw_velocity =
+                            cmd->qd[i] * cpu * static_cast<double>(sgn);
+                        runtime_point.velocity_counts_per_s[i] =
+                            clamp_double_to_i32_range(raw_velocity);
+                      } else {
+                        runtime_point.velocity_counts_per_s[i] = 0.0;
                       }
-                      runtime_point.target_counts[i] = static_cast<int32_t>(counts);
                     }
                     pending_upload.points[pending_upload.point_count] = runtime_point;
                     pending_upload.point_count += 1;

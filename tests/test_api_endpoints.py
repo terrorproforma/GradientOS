@@ -149,6 +149,49 @@ def patch_send(monkeypatch):
             "CURRENT_POSE,0.1,0.2,0.3,10.0,20.0,30.0,1,2,3,4,5,6",
         ),
         "GET_JOINT_ANGLES": (True, "JOINT_ANGLES,1,2,3,4,5,6,7"),
+        "GET_JOINT_STATE": (
+            True,
+            "JOINT_STATE_JSON,"
+            + json.dumps(
+                {
+                    "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                    "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    "gripper_rad": 0.7,
+                    "gripper_deg": 7.0,
+                    "axis_counts": [101, 202, 303, 404, 505, 606],
+                    "axis_to_joint": [0, 1, 2, 3, 4, 5],
+                    "backend_name": "ethercat_rtcore",
+                    "read_source": "live_feedback",
+                    "numeric_precision": "float64",
+                },
+                separators=(",", ":"),
+            ),
+        ),
+        "GET_PERFORMANCE_STATE": (
+            True,
+            "PERFORMANCE_STATE_JSON,"
+            + json.dumps(
+                {
+                    "udp": {
+                        "last_command": "SET_JOG_VELOCITY",
+                        "last_dispatch_ms": 1.25,
+                        "dispatch_ms": {"count": 3, "avg_ms": 0.9, "max_ms": 1.25, "last_ms": 1.25},
+                        "interarrival_ms": {"count": 3, "avg_ms": 52.0, "max_ms": 60.0, "last_ms": 50.0},
+                    },
+                    "jog": {
+                        "control_frequency_hz": 50,
+                        "loop": {"count": 4, "avg_ms": 3.1, "max_ms": 4.0, "last_ms": 3.2, "overrun_count": 0},
+                    },
+                    "motion_state": "executing",
+                    "is_running": False,
+                    "is_jogging": True,
+                    "last_command_age_s": 0.02,
+                    "command_link_stale": False,
+                    "recent_udp_reset_count": 0,
+                },
+                separators=(",", ":"),
+            ),
+        ),
         "GET_GRIPPER_STATE": (True, "GRIPPER_STATE,45.0,2048"),
         "GET_ALL_POSITIONS": (
             True,
@@ -688,7 +731,64 @@ def test_info_pose(client):
 def test_info_joints(client):
     resp = client.get("/info/joints")
     assert resp.status_code == 200
-    assert resp.json() == {"arm_deg": [1, 2, 3, 4, 5, 6], "gripper_deg": 7}
+    body = resp.json()
+    assert body["arm_deg"] == [1, 2, 3, 4, 5, 6]
+    assert body["arm_rad"] == pytest.approx([
+        0.017453292519943295,
+        0.03490658503988659,
+        0.05235987755982989,
+        0.06981317007977318,
+        0.08726646259971647,
+        0.10471975511965978,
+    ])
+    assert body["gripper_deg"] == 7
+    assert body["gripper_rad"] == pytest.approx(0.12217304763960307)
+
+
+def test_info_joints_detailed(client):
+    resp = client.get("/info/joints-detailed")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "gripper_rad": 0.7,
+        "gripper_deg": 7.0,
+        "axis_counts": [101, 202, 303, 404, 505, 606],
+        "axis_to_joint": [0, 1, 2, 3, 4, 5],
+        "backend_name": "ethercat_rtcore",
+        "read_source": "live_feedback",
+        "numeric_precision": "float64",
+    }
+
+
+def test_debug_performance(client, monkeypatch, tmp_path):
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "rt_frequency_hz": 1000,
+                "rt_last_jitter_ns": 1200,
+                "rt_max_abs_jitter_ns": 3200,
+                "rt_overrun_count": 2,
+                "wkc_actual": 14,
+                "wkc_expected": 14,
+                "motion_active_command_seq": 77,
+                "motion_last_update_age_ms": 4.2,
+                "feedback_cycle_jitter_ns": 800,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GRADIENT_RTCORE_METRICS", str(metrics_path))
+
+    resp = client.get("/debug/performance")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["controller"]["motion_state"] == "executing"
+    assert body["controller"]["udp"]["last_command"] == "SET_JOG_VELOCITY"
+    assert body["controller"]["jog"]["control_frequency_hz"] == 50
+    assert body["rtcore"]["rt_frequency_hz"] == 1000
+    assert body["rtcore"]["rt_overrun_count"] == 2
 
 
 def test_info_gripper(client):

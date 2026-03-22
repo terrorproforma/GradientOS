@@ -65,6 +65,7 @@ _MSG_CMD_TRAJECTORY_ABORT = 0x0123
 _MSG_CMD_JOG = 0x0130
 
 _MODE_CSP = 8
+_TRAJ_POINTF_HAS_VELOCITY = 1 << 0
 _TRAJ_POINTF_LAST_POINT = 1 << 1
 _JOG_FLAG_ACTIVE = 1 << 0
 _JOG_FLAG_STOP = 1 << 1
@@ -88,6 +89,8 @@ _AXIS_CONFIG_STRUCT = struct.Struct("<II16I16d16i16B16x16d")  # 424 bytes
 _STATUS_SNAPSHOT_HEADER_STRUCT = struct.Struct("<IIIIqqQ")
 _STATUS_MOTION_STATE_STRUCT = struct.Struct("<IIQIIIIIIIIQQ")  # 64 bytes
 
+_TRAJECTORY_WAIT_SETTLE_MARGIN_S = 5.0
+
 
 def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
@@ -96,6 +99,49 @@ def _align_up(value: int, alignment: int) -> int:
 def _now_monotonic_ns() -> int:
     # Use monotonic clock to match RTCore.
     return time.monotonic_ns()
+
+
+def _estimate_joint_path_velocities(
+    joint_path: list[list[float]],
+    *,
+    step_s: float,
+) -> list[list[float]]:
+    """Estimate per-sample joint velocities for scheduled RTCore motion."""
+    if step_s <= 0.0:
+        raise ValueError("step_s must be positive")
+    if not joint_path:
+        return []
+
+    point_count = len(joint_path)
+    if point_count == 1:
+        return [[0.0] * len(joint_path[0])]
+
+    velocities: list[list[float]] = []
+    for idx, point in enumerate(joint_path):
+        joint_count = len(point)
+        if idx == 0:
+            prev_point = point
+            next_point = joint_path[idx + 1]
+            denom_s = step_s
+        elif idx == point_count - 1:
+            prev_point = joint_path[idx - 1]
+            next_point = point
+            denom_s = step_s
+        else:
+            prev_point = joint_path[idx - 1]
+            next_point = joint_path[idx + 1]
+            denom_s = step_s * 2.0
+
+        if len(prev_point) != joint_count or len(next_point) != joint_count:
+            raise ValueError("All joint trajectory points must have the same length")
+
+        velocities.append(
+            [
+                (float(next_point[joint_i]) - float(prev_point[joint_i])) / denom_s
+                for joint_i in range(joint_count)
+            ]
+        )
+    return velocities
 
 
 @dataclass(frozen=True)
@@ -474,7 +520,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         *,
         timeout_s: Optional[float] = None,
     ) -> RTCoreExecutionStatus:
-        if not joint_path:
+        if joint_path is None or len(joint_path) == 0:
             raise ValueError("joint_path must not be empty")
         timing = self.resolve_trajectory_frequency(frequency)
         requested_frequency_hz = int(timing["requested_frequency_hz"])
@@ -490,27 +536,38 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 f" cycle_ns={int(timing['cycle_ns'])}"
                 f" cycles_per_point={int(timing['cycles_per_point'])}"
             )
+        step_s = step_ns / 1e9
+        joint_velocities = _estimate_joint_path_velocities(joint_path, step_s=step_s)
         traj_id = self.begin_trajectory(expected_points=len(joint_path))
-        points = [
-            {
-                "positions_rad": list(q),
-                "t_from_start_ns": idx * step_ns,
-            }
-            for idx, q in enumerate(joint_path)
-        ]
+        points = []
+        for idx, (q, qd) in enumerate(zip(joint_path, joint_velocities, strict=True)):
+            points.append(
+                {
+                    "positions_rad": list(q),
+                    "qd": self._axis_qd_from_joint_velocities(list(qd)),
+                    "flags": _TRAJ_POINTF_HAS_VELOCITY,
+                    "t_from_start_ns": idx * step_ns,
+                }
+            )
         self.enqueue_trajectory_points(traj_id, points)
         self.commit_trajectory(traj_id)
 
         wait_timeout_s = timeout_s
         if wait_timeout_s is None:
-            wait_timeout_s = max(2.0, (len(joint_path) / float(frequency_hz)) + 2.0)
+            duration_s = len(joint_path) / float(frequency_hz)
+            wait_timeout_s = max(
+                _TRAJECTORY_WAIT_SETTLE_MARGIN_S,
+                duration_s + _TRAJECTORY_WAIT_SETTLE_MARGIN_S,
+            )
         return self.wait_for_trajectory_complete(traj_id, timeout_s=wait_timeout_s)
 
     def wait_for_trajectory_complete(self, traj_id: int, *, timeout_s: float) -> RTCoreExecutionStatus:
         deadline = time.monotonic() + max(0.0, float(timeout_s))
+        saw_target_trajectory = False
         while time.monotonic() <= deadline:
             status = self.get_execution_status()
             if status.active_traj_id == int(traj_id):
+                saw_target_trajectory = True
                 if status.state in (
                     RTCORE_EXEC_STATE_COMPLETED,
                     RTCORE_EXEC_STATE_ABORTED,
@@ -518,7 +575,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     RTCORE_EXEC_STATE_UNDERRUN,
                 ):
                     return status
-            elif status.motion_done and status.last_update_ns > 0:
+            elif saw_target_trajectory and status.motion_done and status.last_update_ns > 0:
                 # A newer trajectory or stop/abort command superseded this one.
                 return status
             time.sleep(0.01)

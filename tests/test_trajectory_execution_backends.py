@@ -1,4 +1,5 @@
 import sys
+import threading
 from unittest.mock import MagicMock
 
 sys.modules.setdefault("scipy.signal", MagicMock())
@@ -146,6 +147,55 @@ def test_open_loop_executor_offloads_rtcore_trajectory_backend(monkeypatch):
     ]
     assert backend.prepare_calls == []
     assert backend.sync_write_calls == []
+
+
+def test_open_loop_executor_resets_motion_state_when_owning_lifecycle(monkeypatch):
+    backend = FakeRTCoreTrajectoryBackend(actual_positions=[0.0, 0.0])
+    _configure_backend_executor_test(monkeypatch, backend)
+
+    utils.trajectory_state.update(
+        {
+            "thread": threading.current_thread(),
+            "is_running": True,
+            "motion_state": "EXECUTING",
+        }
+    )
+
+    trajectory_execution._open_loop_executor_thread(
+        joint_path=[[0.1, -0.2], [0.2, -0.3]],
+        frequency=100,
+        diagnostics=False,
+        owns_trajectory_state=True,
+    )
+
+    assert utils.trajectory_state["is_running"] is False
+    assert utils.trajectory_state["thread"] is None
+    assert utils.get_motion_state() == "IDLE"
+
+
+def test_closed_loop_executor_resets_motion_state_when_owning_lifecycle(monkeypatch):
+    backend = FakeBackend(actual_positions=[0.1, -0.2])
+    _configure_backend_executor_test(monkeypatch, backend)
+
+    utils.trajectory_state.update(
+        {
+            "thread": threading.current_thread(),
+            "is_running": True,
+            "motion_state": "EXECUTING",
+        }
+    )
+
+    trajectory_execution._closed_loop_executor_thread(
+        joint_path=[[0.3, -0.4], [0.35, -0.45]],
+        frequency=50,
+        diagnostics=False,
+        return_telemetry=False,
+        owns_trajectory_state=True,
+    )
+
+    assert utils.trajectory_state["is_running"] is False
+    assert utils.trajectory_state["thread"] is None
+    assert utils.get_motion_state() == "IDLE"
 
 
 def test_trajectory_executor_records_program_completion(monkeypatch):

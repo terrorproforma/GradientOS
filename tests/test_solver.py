@@ -115,3 +115,32 @@ def test_batch_preparation_matches_single_pose_adapter(monkeypatch):
     finally:
         monkeypatch.setattr(ik_solver, "_BACKEND_NAME", original_backend)
         monkeypatch.setattr(ik_solver, "IK_SOLVER", original_solver)
+
+
+def test_batch_solver_output_is_normalized_to_python_lists(monkeypatch):
+    class _ArrayReturningSolver:
+        def solve_ik_path(self, poses_batch, initial_joint_angles):
+            return np.array(
+                [
+                    [0.1, -0.2, 0.3, -0.4, 0.5, -0.6],
+                    [0.2, -0.1, 0.4, -0.3, 0.6, -0.5],
+                ],
+                dtype=float,
+            )
+
+    original_solver = ik_solver.IK_SOLVER
+    try:
+        monkeypatch.setattr(ik_solver, "IK_SOLVER", _ArrayReturningSolver())
+        joint_path = ik_solver.solve_ik_path_batch(
+            path_points=[[0.2, 0.0, 0.2], [0.21, 0.0, 0.2]],
+            initial_joint_angles=[0.0] * 6,
+            target_orientations=[np.eye(3, dtype=float), np.eye(3, dtype=float)],
+        )
+    finally:
+        monkeypatch.setattr(ik_solver, "IK_SOLVER", original_solver)
+
+    assert isinstance(joint_path, list)
+    assert joint_path
+    assert all(isinstance(point, list) for point in joint_path)
+    assert joint_path[0][0] == pytest.approx(0.1)
+    assert joint_path[1][-1] == pytest.approx(-0.5)

@@ -1149,6 +1149,10 @@ def _open_loop_executor_thread(
                 utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
                 utils.trajectory_state.pop('diagnostics_session_id', None)
                 utils.trajectory_state.pop('diagnostics_folder_type', None)
+                try:
+                    utils.set_motion_state("IDLE")
+                except Exception:
+                    pass
             print("[Pi OL] Open-Loop Executor finished.")
         if return_telemetry:
             return telemetry_result
@@ -1275,6 +1279,10 @@ def _open_loop_executor_thread(
             # Clean up session keys
             utils.trajectory_state.pop('diagnostics_session_id', None)
             utils.trajectory_state.pop('diagnostics_folder_type', None)
+            try:
+                utils.set_motion_state("IDLE")
+            except Exception:
+                pass
         print("[Pi OL] Open-Loop Executor finished.")
 
         if return_telemetry:
@@ -1636,6 +1644,10 @@ def _closed_loop_executor_thread(
             utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
             utils.trajectory_state.pop('diagnostics_session_id', None)
             utils.trajectory_state.pop('diagnostics_folder_type', None)
+            try:
+                utils.set_motion_state("IDLE")
+            except Exception:
+                pass
 
         if return_telemetry:
             return telemetry_result

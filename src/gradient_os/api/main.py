@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import socket
+import threading
+import time
 from contextlib import closing, asynccontextmanager
 from typing import Any, Dict, Tuple
 
@@ -48,6 +50,83 @@ _CONTROLLER_REPLY_MAX_BYTES = 65535
 _DEFAULT_MONITOR_TELEMETRY_HZ = 50
 _DEFAULT_MOVE_LINE_CLOSED_LOOP = False
 _SAFE_HOME_REST_MAX_MOTOR_RPM = 100.0
+_DEFAULT_RTCORE_METRICS_PATH = "/run/gradient-rt-motion/metrics.json"
+_API_PERF_LOCK = threading.Lock()
+_API_PERF: dict[str, Any] = {
+    "last_command": None,
+    "last_result": None,
+    "last_round_trip_ms": None,
+    "by_command": {},
+}
+
+
+def _command_label(message: str) -> str:
+    return message.split(",", 1)[0].strip().upper()
+
+
+def _record_api_command_metric(message: str, *, ok: bool, round_trip_ms: float, timed_out: bool) -> None:
+    command = _command_label(message)
+    with _API_PERF_LOCK:
+        _API_PERF["last_command"] = command
+        _API_PERF["last_result"] = "ok" if ok else ("timeout" if timed_out else "error")
+        _API_PERF["last_round_trip_ms"] = float(round_trip_ms)
+        by_command = _API_PERF.setdefault("by_command", {})
+        entry = by_command.setdefault(
+            command,
+            {
+                "count": 0,
+                "ok_count": 0,
+                "error_count": 0,
+                "timeout_count": 0,
+                "avg_round_trip_ms": 0.0,
+                "max_round_trip_ms": 0.0,
+                "last_round_trip_ms": 0.0,
+            },
+        )
+        count = int(entry.get("count", 0)) + 1
+        avg_ms = float(entry.get("avg_round_trip_ms", 0.0))
+        entry["count"] = count
+        entry["last_round_trip_ms"] = float(round_trip_ms)
+        entry["avg_round_trip_ms"] = avg_ms + ((float(round_trip_ms) - avg_ms) / float(count))
+        entry["max_round_trip_ms"] = max(float(entry.get("max_round_trip_ms", 0.0)), float(round_trip_ms))
+        if ok:
+            entry["ok_count"] = int(entry.get("ok_count", 0)) + 1
+        elif timed_out:
+            entry["timeout_count"] = int(entry.get("timeout_count", 0)) + 1
+        else:
+            entry["error_count"] = int(entry.get("error_count", 0)) + 1
+
+
+def _get_api_command_metrics_snapshot() -> dict[str, Any]:
+    with _API_PERF_LOCK:
+        return json.loads(json.dumps(_API_PERF))
+
+
+def _load_rtcore_metrics_summary() -> dict[str, Any] | None:
+    metrics_path = os.environ.get("GRADIENT_RTCORE_METRICS", _DEFAULT_RTCORE_METRICS_PATH)
+    try:
+        with open(metrics_path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return {"error": str(exc), "metrics_path": metrics_path}
+
+    if not isinstance(raw, dict):
+        return {"error": "metrics payload was not a JSON object", "metrics_path": metrics_path}
+
+    return {
+        "metrics_path": metrics_path,
+        "rt_frequency_hz": raw.get("rt_frequency_hz"),
+        "rt_last_jitter_ns": raw.get("rt_last_jitter_ns"),
+        "rt_max_abs_jitter_ns": raw.get("rt_max_abs_jitter_ns"),
+        "rt_overrun_count": raw.get("rt_overrun_count"),
+        "wkc_actual": raw.get("wkc_actual"),
+        "wkc_expected": raw.get("wkc_expected"),
+        "motion_active_command_seq": raw.get("motion_active_command_seq"),
+        "motion_last_update_age_ms": raw.get("motion_last_update_age_ms"),
+        "feedback_cycle_jitter_ns": raw.get("feedback_cycle_jitter_ns"),
+    }
 
 
 def _default_controller_port() -> int:
@@ -101,22 +180,53 @@ def _send_controller_command(
     message: str, timeout: float = 0.5, expect_response: bool = True
 ) -> Tuple[bool, str]:
     host, port = _resolve_controller_endpoint()
+    started = time.perf_counter()
     with closing(socket.socket(socket.AF_INET, socket.SOCK_DGRAM)) as sock:
         sock.settimeout(max(0.05, timeout))
         try:
             sock.sendto(message.encode("utf-8"), (host, port))
         except OSError as exc:
+            _record_api_command_metric(
+                message,
+                ok=False,
+                round_trip_ms=max(0.0, (time.perf_counter() - started) * 1000.0),
+                timed_out=False,
+            )
             return False, f"Socket error sending '{message}': {exc}"
         else:
             if not expect_response:
+                _record_api_command_metric(
+                    message,
+                    ok=True,
+                    round_trip_ms=max(0.0, (time.perf_counter() - started) * 1000.0),
+                    timed_out=False,
+                )
                 return True, ""
         try:
             data, _addr = sock.recvfrom(_CONTROLLER_REPLY_MAX_BYTES)
         except socket.timeout:
+            _record_api_command_metric(
+                message,
+                ok=False,
+                round_trip_ms=max(0.0, (time.perf_counter() - started) * 1000.0),
+                timed_out=True,
+            )
             return False, f"No response for command '{message}'"
         except OSError as exc:
+            _record_api_command_metric(
+                message,
+                ok=False,
+                round_trip_ms=max(0.0, (time.perf_counter() - started) * 1000.0),
+                timed_out=False,
+            )
             return False, f"Socket receive error for '{message}': {exc}"
     text = data.decode("utf-8", errors="ignore")
+    _record_api_command_metric(
+        message,
+        ok=not text.startswith("ERROR"),
+        round_trip_ms=max(0.0, (time.perf_counter() - started) * 1000.0),
+        timed_out=False,
+    )
     if text.startswith("ERROR"):
         return False, text
     return True, text
@@ -1234,19 +1344,45 @@ def create_app() -> FastAPI:
     @api.get("/info/joints", summary="Current joint angles")
     async def info_joints():
         detail = await run_in_threadpool(_controller_call_or_503, "GET_JOINT_ANGLES")
-        parts = detail.split(",")
-        if not parts or parts[0] != "JOINT_ANGLES":
-            raise HTTPException(status_code=502, detail=f"Malformed joint reply: {detail}")
         try:
-            angles = list(map(float, parts[1:]))
+            arm, gripper = _parse_joint_angles_response(detail)
         except ValueError as exc:
-            raise HTTPException(status_code=502, detail=f"Invalid joint data: {exc}") from exc
-        arm = angles[:6]
-        gripper = angles[6] if len(angles) > 6 else None
-        payload = {"arm_deg": arm}
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        payload = {
+            "arm_deg": arm,
+            "arm_rad": [float(np.deg2rad(value)) for value in arm],
+        }
         if gripper is not None:
             payload["gripper_deg"] = gripper
+            payload["gripper_rad"] = float(np.deg2rad(gripper))
         return payload
+
+    @api.get("/info/joints-detailed", summary="Current joint angles with raw feedback detail")
+    async def info_joints_detailed():
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_JOINT_STATE", timeout=1.0)
+        try:
+            payload = _parse_joint_state_response(detail)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        arm_deg = payload.get("arm_deg")
+        arm_rad = payload.get("arm_rad")
+        if not isinstance(arm_deg, list) or not isinstance(arm_rad, list):
+            raise HTTPException(status_code=502, detail=f"Malformed detailed joint reply: {detail}")
+        return payload
+
+    @api.get("/debug/performance", summary="Controller/API/RTCore performance snapshot")
+    async def debug_performance():
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_PERFORMANCE_STATE", timeout=1.0)
+        try:
+            controller_payload = _parse_performance_state_response(detail)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            "collected_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "api_udp": _get_api_command_metrics_snapshot(),
+            "controller": controller_payload,
+            "rtcore": _load_rtcore_metrics_summary(),
+        }
 
     @api.get("/info/gripper", summary="Gripper angle snapshot")
     async def info_gripper():
@@ -1971,6 +2107,70 @@ def _get_live_joint_angles_from_controller(timeout: float = 1.0) -> list[float]:
     if len(joints) == 0:
         raise HTTPException(status_code=502, detail="Controller returned no joint angles in pose reply.")
     return joints
+
+
+def _parse_joint_angles_response(detail: str) -> tuple[list[float], float | None]:
+    parts = detail.split(",")
+    if not parts or parts[0] != "JOINT_ANGLES":
+        raise ValueError(f"Malformed joint reply: {detail}")
+    try:
+        angles = [float(value) for value in parts[1:]]
+    except ValueError as exc:
+        raise ValueError(f"Invalid joint data: {exc}") from exc
+    arm = angles[:6]
+    gripper = angles[6] if len(angles) > 6 else None
+    return arm, gripper
+
+
+def _parse_joint_state_response(detail: str) -> dict[str, Any]:
+    prefix = "JOINT_STATE_JSON,"
+    if not detail.startswith(prefix):
+        raise ValueError(f"Malformed detailed joint reply: {detail}")
+    try:
+        payload = json.loads(detail[len(prefix) :])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid detailed joint payload: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Detailed joint payload must be a JSON object.")
+
+    def _coerce_float_list(value: Any) -> list[float]:
+        if not isinstance(value, list):
+            raise ValueError("Expected a list of floats in detailed joint payload.")
+        return [float(item) if item is not None else None for item in value]  # type: ignore[list-item]
+
+    normalized: dict[str, Any] = dict(payload)
+    if "arm_deg" in normalized:
+        normalized["arm_deg"] = _coerce_float_list(normalized["arm_deg"])
+    if "arm_rad" in normalized:
+        normalized["arm_rad"] = _coerce_float_list(normalized["arm_rad"])
+    if "axis_counts" in normalized and isinstance(normalized["axis_counts"], list):
+        normalized["axis_counts"] = [
+            (int(item) if item is not None else None) for item in normalized["axis_counts"]
+        ]
+    if "axis_statusword" in normalized and isinstance(normalized["axis_statusword"], list):
+        normalized["axis_statusword"] = [int(item) for item in normalized["axis_statusword"]]
+    if "axis_error_code" in normalized and isinstance(normalized["axis_error_code"], list):
+        normalized["axis_error_code"] = [int(item) for item in normalized["axis_error_code"]]
+    if "axis_to_joint" in normalized and isinstance(normalized["axis_to_joint"], list):
+        normalized["axis_to_joint"] = [int(item) for item in normalized["axis_to_joint"]]
+    if "gripper_deg" in normalized and normalized["gripper_deg"] is not None:
+        normalized["gripper_deg"] = float(normalized["gripper_deg"])
+    if "gripper_rad" in normalized and normalized["gripper_rad"] is not None:
+        normalized["gripper_rad"] = float(normalized["gripper_rad"])
+    return normalized
+
+
+def _parse_performance_state_response(detail: str) -> dict[str, Any]:
+    prefix = "PERFORMANCE_STATE_JSON,"
+    if not detail.startswith(prefix):
+        raise ValueError(f"Malformed performance reply: {detail}")
+    try:
+        payload = json.loads(detail[len(prefix) :])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid performance payload: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Performance payload must be a JSON object.")
+    return payload
 
 
 async def _plan_point(payload: dict) -> dict[str, Any]:

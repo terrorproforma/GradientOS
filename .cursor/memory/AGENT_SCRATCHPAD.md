@@ -814,3 +814,89 @@ Use this file as persistent, repo-local execution memory.
 - [user] Asked how to completely shut down the EtherCAT master and RTCore after seeing `./start-stack.sh stop` leave the hardware stack in `BUS_UP_DISARMED`.
 - [self] Guardrail: when answering stack shutdown questions, check `start-stack.sh` usage/teardown flow instead of inferring from terminal output alone; `stop` is intentionally a soft stop, while `stop --hard` additionally stops `gradient-rt-motion.service` and `ethercat.service`.
 - [tool] Manual fallback path confirmed in repo docs/scripts: `sudo systemctl stop gradient-rt-motion.service` then `sudo systemctl stop ethercat.service`; use `./start-stack.sh probe` to confirm RTCore/master report `DOWN`.
+
+### 2026-03-21 - Scheduled RTCore completion must tolerate real feedback settle error
+- [user] Reported that the web UI now works and telemetry streams, but linear move buttons produced no visible response while ready-state / brake actions still worked.
+- [tool] `logs/startups/latest/controller.log` showed `MOVE_LINE_RELATIVE` requests reaching the controller, planning successfully, and starting the RTCore open-loop executor, followed by `TimeoutError: Timed out waiting for RTCore trajectory ... to complete`.
+- [self] Root cause pattern: scheduled RTCore completion in `src/gradient_rt_motion/main.cpp` was requiring exact final encoder-count equality on every commanded axis, which is too strict for real EtherCAT drives even when the trajectory has effectively finished.
+- [tool] Implemented two concrete mitigations:
+- [tool] `src/gradient_rt_motion/main.cpp` now treats a queued trajectory as completed once the final point is due and every commanded axis is within a small encoder-count tolerance instead of demanding exact equality.
+- [tool] `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` now gives RTCore scheduled motion a larger post-plan settle margin before Python declares a completion timeout.
+- [self] Guardrail: if a live motion command plans and uploads successfully but the executor times out later, inspect RTCore completion semantics before blaming the UI button path.
+- [tool] Deployment nuance: `start-stack.sh` launches `gradient-rt-motion.service`, and that systemd unit runs `/usr/local/bin/gradient-rt-motion`; a local repo build alone does not change live hardware behavior until the RTCore binary is installed/replaced.
+
+### 2026-03-21 - Live EtherCAT RTCore retest succeeded after service install and wait-predicate fixes
+- [tool] Installed the patched RTCore binary through `./systemd/rt-motion/install.sh`, which rebuilt `src/gradient_rt_motion/gradient-rt-motion` and deployed it to `/usr/local/bin/gradient-rt-motion` for `gradient-rt-motion.service`.
+- [tool] Cold-started the stack, powered up successfully, and live-tested a tiny scheduled move via `/control/move-line-relative` with `dx=0.002`, `speed_multiplier=0.1`, `closed=false`.
+- [tool] Observed the end effector move from about `x=0.809` to `x=0.811` m on the second retest while `WAIT_FOR_IDLE` returned `completed` instead of timing out.
+- [self] Additional race found: `EthercatRTCoreBackend.wait_for_trajectory_complete()` could accept a stale `motion_done` snapshot from the previous trajectory before seeing the new `traj_id`; fix is to ignore supersession-style completion until the target trajectory has been observed once.
+- [self] Residual risk: RTCore status snapshots/ACKs can still look stale at submit time on back-to-back moves (`state_name=completed` or an older `trajectory_id` in the immediate ACK) even though the physical move path now works. Treat that as an observability freshness issue to clean up next, not proof that motion failed.
+
+### 2026-03-21 - For live motion bugs, preserve operator-visible symptoms in the handoff and prioritize the likely concrete failure site
+- [user] Explicitly asked for a fresh-chat handoff that treats movement and jog commands as the main validation target, preserves the dirty worktree, and does not gaslight operator observations such as UI error banners.
+- [self] Corrective rule: if the operator reports a specific UI motion error, carry that exact banner text into the next handoff and investigate that symptom first instead of downgrading it to unrelated background noise.
+- [tool] Current high-value rotate blocker to carry forward: `ERROR,ROTATE,The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()`.
+- [self] Likely immediate fix: make the orientation-path handoff NumPy-safe before `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py::execute_joint_trajectory(...)` evaluates `if not joint_path`; either normalize `_execute_orientation_path()` output to a plain list or change the backend emptiness check to use length/shape-safe logic.
+- [self] Guardrail: keep non-EtherCAT backends compatible while patching this; simulation and Feetech should not inherit EtherCAT RTCore assumptions unless real RTCore support exists there.
+
+### 2026-03-21 - For RTCore accepted-ACK freshness, the controller may need a tiny submission-observation window
+- [tool] Live validation after the rotate fix reproduced the remaining observability bug concretely: immediate `MOVE_LINE_RELATIVE` ACKs could show the previous completed RTCore trajectory even while controller state already said `executing`.
+- [self] Root cause: `src/gradient_os/arm_controller/command_api.py::_build_motion_execution_metadata(...)` was being called immediately after a background executor thread started, before that thread had necessarily uploaded/committed the new RTCore trajectory.
+- [tool] Working fix: normalize batch-IK output in `src/gradient_os/ik_solver.py`, make `execute_joint_trajectory(...)` emptiness checks NumPy-safe, and add a short RTCore-status refresh loop in `command_api.py` so accepted ACKs wait briefly to observe the newly submitted trajectory id/status before serializing metadata.
+- [tool] Proven live outcome after the refresh fix and a clean stack restart: immediate tiny linear-move ACK now reported the fresh RTCore state (`trajectory_id=1`, `state_name=executing`, `queue_depth=392`) instead of the stale previous-completed snapshot.
+- [self] Residual risk: after motion completion, `controller_motion_state` can still remain `"executing"` in some `WAIT_FOR_IDLE` / `GET_MOTION_STATUS` payloads even though `controller_thread_running=false` and RTCore reports `completed`. Treat that as a separate controller-state cleanup, not a regression of the move path.
+- [tool] Operational lesson: `POST /control/restart-controller` was not a clean hot-reload path here; it led to launcher/controller/API teardown and disarmed the robot. For Python control-path changes, prefer a clean `./start-stack.sh` restart when live validation is needed.
+
+### 2026-03-21 - Top-level executor threads must restore controller motion state, not just clear thread bookkeeping
+- [self] Root cause for the last status mismatch: `src/gradient_os/arm_controller/trajectory_execution.py` top-level `_open_loop_executor_thread(...)` and `_closed_loop_executor_thread(...)` cleared `is_running/thread` on completion but did not call `utils.set_motion_state("IDLE")` in their owning-lifecycle teardown.
+- [tool] Working fix: when an executor owns lifecycle management (`owns_trajectory_state=True` and it is the registered trajectory thread), it now restores `motion_state` to `IDLE` at teardown, matching the program executor's existing behavior.
+- [tool] Added regression tests in `tests/test_trajectory_execution_backends.py` proving both top-level open-loop and closed-loop executors reset the controller motion state back to `IDLE` when they finish.
+- [tool] Proven live outcome on run `20260321-231102`: after a tiny RTCore-backed `MOVE_LINE_RELATIVE`, both `POST /control/wait-for-idle` and `GET /control/motion-status` reported `execution.controller_motion_state="idle"` with `controller_thread_running=false` while RTCore reported `completed`.
+
+### 2026-03-21 - Scheduled RTCore motion was still losing smoothing information before CSP output
+- [user] Reported that jog and linear moves basically worked, but joint history still looked stop-start/jerky and one jog command showed a 1-2 s delay before motion.
+- [tool] `terminals/1.txt` only showed poll cadence and repeated zero-jog keepalives; it did not contain the actual joint samples needed to judge smoothness, so raw captures are necessary for this class of issue.
+- [tool] Inspection of `src/gradient_rt_motion/main.cpp` showed RTCore already interpolated queued trajectories at 1 kHz, so the remaining problem was not simply "100 Hz uploads with no RT interpolation".
+- [self] More plausible root cause: scheduled uploads were rounding every uploaded waypoint to integer counts immediately and discarding the optional per-point `qd` velocity channel, so RTCore replay could only use rounded position counts and always wrote `target_vel_out = 0`.
+- [tool] Implemented a concrete smoothing patch:
+- [tool] `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` now estimates per-sample joint velocities for scheduled trajectories, maps them to RT axes, and uploads them with `TRAJ_POINTF_HAS_VELOCITY`.
+- [tool] `src/gradient_rt_motion/main.cpp` now stores scheduled trajectory points as double-precision counts instead of pre-rounded integers, rounds only at the final CSP write boundary, carries interpolated/slope-derived velocity feedforward through replay, and writes nonzero `target_vel_out` for scheduled motion and RTCore jog.
+- [tool] Regression coverage updated in `tests/test_gradient05_limits_and_backends.py`; focused RTCore backend tests passed and `src/gradient_rt_motion` rebuilt successfully.
+- [tool] Live deployment nuance discovered: `./systemd/rt-motion/install.sh` copies the binary but only runs `systemctl start`; if `gradient-rt-motion.service` is already active that does **not** reload the new executable. Explicit `sudo systemctl restart gradient-rt-motion.service` is required before live retest.
+- [tool] Live retest on run `20260321-233817`: installed binary, explicitly restarted RTCore, cold-started the stack, powered up, ran a tiny `/control/move-line-relative` (`dx=0.002`, `speed_multiplier=0.1`, `closed=false`), received a fresh executing ACK, and completed successfully. Saved capture artifacts:
+- [tool] `diagnostics/live_capture/20260321-233918-move-line-relative-summary.json`
+- [tool] `diagnostics/live_capture/20260321-233918-move-line-relative-joints.csv`
+- [self] Important measurement caveat: `/info/joints` / UDP `GET_JOINT_ANGLES` only expose 0.01 deg precision, and `/run/gradient-rt-motion/metrics.json` updates at 10 Hz, so current captures are too coarse to conclusively quantify smoothness improvement. They confirm command acceptance/completion, not a final verdict on jerk elimination.
+- [self] Next best slice if the operator still sees stop-start motion: add a higher-resolution target/feedback capture path (raw counts or RTCore trace) instead of relying on rounded API/UI joint readouts.
+
+### 2026-03-21 - Treat operator-observed physical motion as ground truth, and fix observability precision before arguing from charts
+- [user] Explicitly clarified that when reporting jerk/lag they are watching the real robot move, not only reading logs or charts; logs are supplemental evidence for the agent, not the primary symptom source.
+- [self] Guardrail: if the operator reports visible motion artifacts, assume the physical symptom is real even when current telemetry is too coarse to prove it. Improve the readout path instead of downgrading the report.
+- [tool] Found that `run_controller.py::GET_JOINT_ANGLES` still rounded to 0.01 deg and `command_api.py::GET_POSITION` still rounded joint values on the wire, so observability itself was throwing away useful motion detail after the RTCore smoothing fix.
+- [tool] Added high-precision joint readout support:
+- [tool] `GET_JOINT_ANGLES` now emits high-precision degrees, `GET_JOINT_STATE` now returns a JSON snapshot with `arm_rad`, `arm_deg`, and backend raw axis counts when available, and `api/main.py` exposes `/info/joints-detailed` for capture/debug use without bloating the hot `/info/joints` poll path too much.
+- [tool] Side fix for responsiveness/noise: `web-ui/src/ControlPanel.tsx` no longer keeps spamming unchanged zero jog vectors on the keepalive timer, and the jog tick interval was relaxed from 20 ms to 50 ms.
+- [self] Guardrail: zero-velocity jog keepalives are not free; if they are unchanged, prefer one explicit zero on transition plus controller-side timeout semantics over periodic zero spam.
+ 
+### 2026-03-22 - Lag diagnosis needs stitched timing across API, controller UDP, jog loop, and RTCore
+- [user] Asked for concrete analytics/logs to catch lag and identify bottlenecks when motion still occasionally looks delayed between command issue and command receipt.
+- [self] Corrective rule: when the complaint is "lag between issue and receive", do not add more generic console spam first; instrument the exact handoff layers with rolling timing data so the slow hop is observable.
+- [tool] Added controller-side UDP performance stats in `src/gradient_os/run_controller.py` and a new `GET_PERFORMANCE_STATE` UDP command so timing can be queried without scraping logs.
+- [tool] Added jog-loop timing stats in `src/gradient_os/arm_controller/command_api.py` covering velocity update cadence, loop duration/overruns, and stage timings for feedback read, IK solve, and command send.
+- [tool] Added API-side UDP round-trip timing plus `GET /debug/performance` in `src/gradient_os/api/main.py`, which merges API metrics, controller metrics, and RTCore `metrics.json` jitter/overrun data into one snapshot.
+- [self] Guardrail: the first thing to inspect on future lag reports should be `/debug/performance`; compare API UDP round-trip, controller dispatch time/interarrival gaps, jog overrun counts, and RTCore jitter before changing motion logic again.
+
+### 2026-03-22 - Live tiny-move retest showed queued-move delay is mostly planning plus intended motion time, not transport lag
+- [tool] Cold-started the stack headless from a hard stop; RTCore and EtherCAT returned to `BUS_UP_DISARMED`, then powered up successfully for live testing.
+- [tool] Ran three tiny queued `/control/move-line-relative` commands (`+2 mm`, `+2 mm`, `-4 mm`, all `closed=false`, `speed_multiplier=0.08`) plus a tiny realtime jog pulse (`vx=0.008 m/s` with 6 updates at ~50 ms cadence).
+- [tool] `/debug/performance` and launcher logs agreed that API/controller command transport was fast: `SAFE_POWER_UP` dispatch about `0.7 ms`, `SET_JOG_VELOCITY` dispatch about `0.84 ms` avg / `1.64 ms` max, API UDP round-trip for jog about `0.05 ms`, and RTCore jitter stayed around `1.7-2.0 us` with `rt_overrun_count=0`.
+- [self] Important interpretation: the visibly "slow" queued moves were dominated by synchronous planning/upload and the commanded trajectory duration, not a blocked command pipe. Live logs showed batch IK about `229-313 ms`, total plan/prepare about `486-643 ms`, then RTCore execution about `4.07 s`, `4.08 s`, and `5.94 s` for the tiny queued trajectories.
+- [self] Guardrail: `WAIT_FOR_IDLE` timing is not a command-latency metric; it intentionally includes the whole motion duration. Likewise `MOVE_LINE_RELATIVE` HTTP time includes planning before the ACK is returned.
+- [self] Metrics nuance: the jog loop marked every cycle as an "overrun" because the current threshold counts any loop slightly above `20.0 ms`; observed max overshoot was only about `0.11 ms`, so treat this as scheduler granularity / threshold noise unless it climbs into multi-millisecond territory.
+
+### 2026-03-22 - UI-driven diagnostics should be visible where the operator tests, not only in API output
+- [user] Asked how to ensure timing diagnostics record while testing with the web UI, and whether the UI itself exposes enough information to spot end-to-end bottlenecks.
+- [self] Corrective rule: if instrumentation exists only in backend endpoints, surface the most decision-useful subset in the operator-facing UI so live testing does not require juggling curl calls during motion.
+- [tool] Confirmed that the diagnostics were already recording automatically whenever the UI calls the API, because the metrics live in `api/main.py`, `run_controller.py`, and `command_api.py`.
+- [tool] Added a live `Timing Diagnostics` panel to `web-ui/src/ControlPanel.tsx` that polls `/debug/performance` every `500 ms` and shows API RTT, controller dispatch/interarrival, jog loop timings, and RTCore jitter/overruns.
+- [self] Guardrail: label `MOVE_LINE_RELATIVE` and `WAIT_FOR_IDLE` carefully in the UI because those numbers include planning time and full motion time respectively; they are not pure network latency.

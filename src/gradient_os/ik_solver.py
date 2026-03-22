@@ -106,6 +106,22 @@ def _prepare_backend_target_pose(target_position, target_orientation_matrix, bac
 
     return target_pos, target_rotation
 
+
+def _normalize_joint_path_output(joint_solutions):
+    """Return batch IK results as a plain list-of-lists for downstream callers."""
+    if joint_solutions is None:
+        return None
+
+    joint_solutions_np = np.asarray(joint_solutions, dtype=np.float64)
+    if joint_solutions_np.ndim == 1:
+        return [joint_solutions_np.tolist()]
+    if joint_solutions_np.ndim != 2:
+        raise ValueError(
+            "Batch IK solver returned an unexpected shape: "
+            f"{joint_solutions_np.shape}"
+        )
+    return joint_solutions_np.tolist()
+
 # -----------------------------------------------------------
 # Backend selection helper – import the chosen solver only once
 # -----------------------------------------------------------
@@ -446,7 +462,9 @@ def solve_ik_path_batch(path_points, initial_joint_angles=None, target_orientati
         poses_batch[i, 3:] = backend_rotation.flatten()
 
     # Call the new batch solver in the wrapper
-    joint_solutions = IK_SOLVER.solve_ik_path(poses_batch, start_angles_np)
+    joint_solutions = _normalize_joint_path_output(
+        IK_SOLVER.solve_ik_path(poses_batch, start_angles_np)
+    )
 
     # --- Optional Diagnostics Logging ---
     if joint_solutions is not None and os.environ.get("MINI_ARM_IK_LOG", "0") == "1":
