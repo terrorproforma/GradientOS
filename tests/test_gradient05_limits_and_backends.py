@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import struct
+import threading
 import time
 from pathlib import Path
 
@@ -11,7 +12,11 @@ from gradient_os.arm_controller.backends import registry as backend_registry
 from gradient_os.arm_controller.backends.ethercat_rtcore.backend import (
     EthercatRTCoreBackend,
     RTCoreExecutionStatus,
+    _MAGIC_RING,
+    _MSG_HEADER_STRUCT,
+    _RING_HEADER_STRUCT,
     _TRAJ_POINTF_HAS_VELOCITY,
+    _ShmHeader,
     _AxisConfig,
 )
 from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import RTCORE_EXEC_STATE_COMPLETED
@@ -418,6 +423,61 @@ def test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing(monkeyp
         "step_ns": 4_000_000,
         "cycles_per_point": 4,
     }
+
+
+def test_ethercat_backend_cmd_ring_write_waits_for_space():
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._cmd_shm = bytearray(256)
+    backend._cmd_hdr = _ShmHeader(
+        kind=1,
+        num_axes=6,
+        cycle_ns=1_000_000,
+        topology_hash=0,
+        ring_offset=0,
+        ring_capacity=1,
+        ring_msg_bytes=64,
+        setpoint_offset=0,
+    )
+    backend._cmd_eventfd = None
+    backend._cmd_seq = 11
+
+    ring_hdr_off, ring_entries_off = backend._cmd_ring_offsets()
+    backend._cmd_shm[ring_hdr_off : ring_hdr_off + _RING_HEADER_STRUCT.size] = _RING_HEADER_STRUCT.pack(
+        _MAGIC_RING,
+        1,
+        64,
+        1,
+        0,
+        0,
+        0,
+    )
+
+    def _free_ring_slot() -> None:
+        time.sleep(0.01)
+        backend._cmd_shm[ring_hdr_off + 16 : ring_hdr_off + 20] = struct.pack("<I", 1)
+
+    drainer = threading.Thread(target=_free_ring_slot)
+    drainer.start()
+    backend._cmd_ring_write(0x1234, b"abc")
+    drainer.join(timeout=1.0)
+
+    header = backend._cmd_shm[ring_hdr_off : ring_hdr_off + _RING_HEADER_STRUCT.size]
+    magic, capacity, msg_bytes, write_idx, read_idx, dropped, reserved0 = _RING_HEADER_STRUCT.unpack(header)
+    assert magic == _MAGIC_RING
+    assert capacity == 1
+    assert msg_bytes == 64
+    assert write_idx == 2
+    assert read_idx == 1
+    assert dropped == 0
+
+    msg_header = backend._cmd_shm[ring_entries_off : ring_entries_off + _MSG_HEADER_STRUCT.size]
+    msg_type, flags, size_bytes, seq, time_ns = _MSG_HEADER_STRUCT.unpack(msg_header)
+    assert msg_type == 0x1234
+    assert flags == 0
+    assert size_bytes == _MSG_HEADER_STRUCT.size + 3
+    assert seq == 11
+    assert time_ns > 0
+    assert bytes(backend._cmd_shm[ring_entries_off + _MSG_HEADER_STRUCT.size : ring_entries_off + _MSG_HEADER_STRUCT.size + 3]) == b"abc"
 
 
 def test_ethercat_backend_parses_motion_state_status(monkeypatch, tmp_path):

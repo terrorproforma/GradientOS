@@ -58,6 +58,7 @@ _API_PERF: dict[str, Any] = {
     "last_round_trip_ms": None,
     "by_command": {},
 }
+_DEFAULT_JOG_SESSION_LEASE_TIMEOUT_S = 0.4
 
 
 def _command_label(message: str) -> str:
@@ -570,6 +571,51 @@ def create_app() -> FastAPI:
                 return {"detail_token": token}
             raise
 
+    def _parse_controller_error_payload(detail: str, command: str) -> dict[str, Any] | None:
+        prefix = f"ERROR,{command},"
+        if not detail.startswith(prefix):
+            return None
+        token = detail[len(prefix) :].strip()
+        if not token:
+            return {"code": "CONTROLLER_ERROR", "message": detail}
+        try:
+            return _decode_payload_b64(token)
+        except HTTPException:
+            return {"code": "CONTROLLER_ERROR", "message": detail}
+
+    def _status_code_for_jog_session_error(code: str) -> int:
+        normalized = str(code or "").strip().upper()
+        if normalized.startswith("INVALID_"):
+            return 400
+        if normalized in {"OWNER_CONFLICT", "SESSION_ALREADY_ACTIVE", "STALE_SEQUENCE", "WRONG_SESSION", "MOTION_ACTIVE"}:
+            return 409
+        if normalized in {"SESSION_EXPIRED"}:
+            return 410
+        if normalized in {"SESSION_NOT_FOUND", "SESSION_INACTIVE"}:
+            return 404
+        return 503
+
+    def _controller_jog_session_call(command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        message = command
+        if payload is not None:
+            message += f",{_encode_payload_b64(payload)}"
+        ok, detail = _send_controller_command(message, timeout=1.0, expect_response=True)
+        if not ok:
+            error_payload = _parse_controller_error_payload(detail, command)
+            if error_payload is not None:
+                raise HTTPException(
+                    status_code=_status_code_for_jog_session_error(str(error_payload.get("code", ""))),
+                    detail=error_payload,
+                )
+            raise HTTPException(status_code=503, detail=detail)
+        return _parse_controller_ack_payload(detail, command)
+
+    def _jog_session_owner_id(payload: dict[str, Any]) -> str:
+        owner_id = str(payload.get("owner_id", "") or "").strip()
+        if not owner_id:
+            raise HTTPException(status_code=400, detail="owner_id is required")
+        return owner_id
+
     def _parse_motion_status_reply(detail: str) -> dict[str, Any]:
         prefix = "MOTION_STATUS,"
         if not detail.startswith(prefix):
@@ -736,6 +782,37 @@ def create_app() -> FastAPI:
 
     def _parse_bool_token(token: str) -> bool:
         return token.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _coerce_request_bool(name: str, raw: Any, *, default: bool | None = None) -> bool:
+        if raw is None:
+            if default is None:
+                raise HTTPException(status_code=400, detail=f"{name} is required")
+            return bool(default)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            if float(raw) in {0.0, 1.0}:
+                return bool(raw)
+            raise HTTPException(status_code=400, detail=f"{name} must be a boolean")
+        token = str(raw).strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+        if token in {"0", "false", "no", "off"}:
+            return False
+        raise HTTPException(status_code=400, detail=f"{name} must be a boolean")
+
+    def _coerce_request_int(name: str, raw: Any, *, default: int | None = None) -> int:
+        if raw is None:
+            if default is None:
+                raise HTTPException(status_code=400, detail=f"{name} is required")
+            return int(default)
+        if isinstance(raw, bool):
+            raise HTTPException(status_code=400, detail=f"{name} must be an integer")
+        try:
+            value = int(raw)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"{name} must be an integer") from exc
+        return value
 
     @api.post("/control/stop", summary="Emergency stop")
     async def control_stop():
@@ -1082,42 +1159,87 @@ def create_app() -> FastAPI:
         await run_in_threadpool(_controller_call_or_503, cmd, timeout=1.0, expect_response=False)
         return {"status": "ok"}
 
-    @api.post("/control/jog/start", summary="Begin realtime jog mode")
-    async def control_jog_start():
-        await run_in_threadpool(_controller_call_or_503, "JOG_START", timeout=1.0, expect_response=False)
-        return {"status": "ok"}
-
-    @api.post("/control/jog/stop", summary="Stop realtime jog mode")
-    async def control_jog_stop():
-        await run_in_threadpool(_controller_call_or_503, "JOG_STOP", timeout=1.0, expect_response=False)
-        return {"status": "ok"}
-
-    @api.post("/control/jog/velocity", summary="Set realtime jog velocity vector")
-    async def control_jog_velocity(payload: dict[str, Any]):
-        def _num(name: str) -> float:
-            try:
-                return float(payload.get(name, 0.0))
-            except Exception:
-                raise HTTPException(status_code=400, detail=f"{name} must be a number")
-        vx = _num("vx"); vy = _num("vy"); vz = _num("vz")
-        v_roll = _num("v_roll"); v_pitch = _num("v_pitch"); v_yaw = _num("v_yaw")
-        cmd = f"SET_JOG_VELOCITY,{vx},{vy},{vz},{v_roll},{v_pitch},{v_yaw}"
-        await run_in_threadpool(_controller_call_or_503, cmd, timeout=1.0, expect_response=False)
-        return {"status": "ok"}
-
-    @api.post("/control/jog/deadman", summary="Enable/disable jog deadman")
-    async def control_jog_deadman(payload: dict[str, Any]):
-        enabled = bool(payload.get("enabled", True))
-        cmd = f"SET_JOG_DEADMAN,{'true' if enabled else 'false'}"
-        await run_in_threadpool(_controller_call_or_503, cmd, timeout=1.0, expect_response=False)
-        return {"status": "ok"}
-
     @api.post("/control/jog/debug", summary="Enable/disable jog debug logging")
     async def control_jog_debug(payload: dict[str, Any]):
-        enabled = bool(payload.get("enabled", False))
+        enabled = _coerce_request_bool("enabled", payload.get("enabled"), default=False)
         cmd = f"SET_JOG_DEBUG,{'true' if enabled else 'false'}"
         await run_in_threadpool(_controller_call_or_503, cmd, timeout=1.0, expect_response=False)
         return {"status": "ok"}
+
+    @api.post("/control/jog/session/start", summary="Start a controller-owned jog session")
+    async def control_jog_session_start(payload: dict[str, Any]):
+        def _num(name: str, default: float = 0.0) -> float:
+            try:
+                return float(payload.get(name, default))
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"{name} must be a number")
+
+        session_payload: dict[str, Any] = {
+            "owner_id": _jog_session_owner_id(payload),
+            "seq": _coerce_request_int("seq", payload.get("seq"), default=0),
+            "deadman": _coerce_request_bool("deadman", payload.get("deadman"), default=True),
+            "vx": _num("vx"),
+            "vy": _num("vy"),
+            "vz": _num("vz"),
+            "v_roll": _num("v_roll"),
+            "v_pitch": _num("v_pitch"),
+            "v_yaw": _num("v_yaw"),
+            "gripper_velocity_deg_s": _num("gripper_velocity_deg_s"),
+        }
+        if "lease_timeout_s" in payload:
+            session_payload["lease_timeout_s"] = _num("lease_timeout_s", _DEFAULT_JOG_SESSION_LEASE_TIMEOUT_S)
+        snapshot = await run_in_threadpool(_controller_jog_session_call, "JOG_SESSION_START", session_payload)
+        return {"status": "ok", "session": snapshot}
+
+    @api.post("/control/jog/session/update", summary="Update an active controller-owned jog session")
+    async def control_jog_session_update(payload: dict[str, Any]):
+        session_id = str(payload.get("session_id", "") or "").strip()
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+
+        def _num(name: str, default: float = 0.0) -> float:
+            try:
+                return float(payload.get(name, default))
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"{name} must be a number")
+
+        session_payload: dict[str, Any] = {
+            "session_id": session_id,
+            "owner_id": _jog_session_owner_id(payload),
+            "seq": _coerce_request_int("seq", payload.get("seq"), default=0),
+            "deadman": _coerce_request_bool("deadman", payload.get("deadman"), default=True),
+            "vx": _num("vx"),
+            "vy": _num("vy"),
+            "vz": _num("vz"),
+            "v_roll": _num("v_roll"),
+            "v_pitch": _num("v_pitch"),
+            "v_yaw": _num("v_yaw"),
+            "gripper_velocity_deg_s": _num("gripper_velocity_deg_s"),
+        }
+        if "lease_timeout_s" in payload:
+            session_payload["lease_timeout_s"] = _num("lease_timeout_s", _DEFAULT_JOG_SESSION_LEASE_TIMEOUT_S)
+        snapshot = await run_in_threadpool(_controller_jog_session_call, "JOG_SESSION_UPDATE", session_payload)
+        return {"status": "ok", "session": snapshot}
+
+    @api.post("/control/jog/session/stop", summary="Stop a controller-owned jog session")
+    async def control_jog_session_stop(payload: dict[str, Any]):
+        session_id = str(payload.get("session_id", "") or "").strip()
+        if not session_id:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        session_payload: dict[str, Any] = {
+            "session_id": session_id,
+            "reason": str(payload.get("reason", "client-stop") or "client-stop"),
+        }
+        owner_id = str(payload.get("owner_id", "") or "").strip()
+        if owner_id:
+            session_payload["owner_id"] = owner_id
+        snapshot = await run_in_threadpool(_controller_jog_session_call, "JOG_SESSION_STOP", session_payload)
+        return {"status": "ok", "session": snapshot}
+
+    @api.get("/control/jog/session/state", summary="Current controller-owned jog session state")
+    async def control_jog_session_state():
+        snapshot = await run_in_threadpool(_controller_jog_session_call, "GET_JOG_SESSION_STATE")
+        return {"status": "ok", "session": snapshot}
 
     @api.get("/info/status", summary="Controller status snapshot")
     async def info_status():

@@ -324,8 +324,17 @@ def _load_occ_api() -> _OccApi:
         )
     except Exception as exc:
         raise TopologyDependencyError(
-            "No usable OpenCascade Python binding found. Install `pythonocc-core` or a compatible `OCP` build."
+            _missing_occ_dependency_message()
         ) from exc
+
+
+def _missing_occ_dependency_message() -> str:
+    return (
+        "No usable OpenCascade Python binding found. "
+        "Install the CAD extra with `uv pip install -e '.[cad]'`. "
+        "If you are installing packages manually, use a compatible binding "
+        "such as `cadquery-ocp` or `pythonocc-core`."
+    )
 
 
 def _bootstrap_ocp_namespace_from_lowercase_package() -> None:

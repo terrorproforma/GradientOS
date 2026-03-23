@@ -90,6 +90,8 @@ _STATUS_SNAPSHOT_HEADER_STRUCT = struct.Struct("<IIIIqqQ")
 _STATUS_MOTION_STATE_STRUCT = struct.Struct("<IIQIIIIIIIIQQ")  # 64 bytes
 
 _TRAJECTORY_WAIT_SETTLE_MARGIN_S = 5.0
+_CMD_RING_WRITE_WAIT_S = 0.5
+_CMD_RING_WRITE_RETRY_S = 0.001
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -1059,18 +1061,22 @@ class EthercatRTCoreBackend(ActuatorBackend):
             raise RuntimeError("cmd_shm not mapped")
 
         ring_hdr_off, ring_entries_off = self._cmd_ring_offsets()
-        hdr_bytes = self._cmd_shm[ring_hdr_off : ring_hdr_off + _RING_HEADER_STRUCT.size]
-        magic, capacity, msg_bytes, write_idx, read_idx, dropped, reserved0 = _RING_HEADER_STRUCT.unpack(hdr_bytes)
-        if magic != _MAGIC_RING:
-            raise RuntimeError("cmd ring header magic mismatch")
-        if capacity == 0 or msg_bytes == 0:
-            raise RuntimeError("cmd ring has invalid sizing")
-
-        if (write_idx - read_idx) >= capacity:
-            # Producer increments dropped on overflow.
-            dropped += 1
-            self._cmd_shm[ring_hdr_off + 20 : ring_hdr_off + 24] = struct.pack("<I", dropped)
-            raise RuntimeError("cmd ring overflow")
+        deadline = time.monotonic() + _CMD_RING_WRITE_WAIT_S
+        while True:
+            hdr_bytes = self._cmd_shm[ring_hdr_off : ring_hdr_off + _RING_HEADER_STRUCT.size]
+            magic, capacity, msg_bytes, write_idx, read_idx, dropped, reserved0 = _RING_HEADER_STRUCT.unpack(hdr_bytes)
+            if magic != _MAGIC_RING:
+                raise RuntimeError("cmd ring header magic mismatch")
+            if capacity == 0 or msg_bytes == 0:
+                raise RuntimeError("cmd ring has invalid sizing")
+            if (write_idx - read_idx) < capacity:
+                break
+            if time.monotonic() >= deadline:
+                # Producer increments dropped on overflow.
+                dropped += 1
+                self._cmd_shm[ring_hdr_off + 20 : ring_hdr_off + 24] = struct.pack("<I", dropped)
+                raise RuntimeError("cmd ring overflow")
+            time.sleep(_CMD_RING_WRITE_RETRY_S)
 
         slot = write_idx % capacity
         off = ring_entries_off + (slot * msg_bytes)
@@ -1496,8 +1502,42 @@ class EthercatRTCoreBackend(ActuatorBackend):
         capability_flags = int(getattr(self._execution_status, "capability_flags", 0) or 0)
         return capability_flags == 0 or bool(capability_flags & RTCORE_MOTION_CAP_JOG_COMMAND)
 
-    def start_realtime_jog(self, timeout_s: float) -> None:
+    def supports_joint_velocity_lease_jog(self) -> bool:
+        return self.supports_realtime_jog()
+
+    def get_jog_capabilities(self) -> dict[str, object]:
+        return {
+            "joint_velocity_lease": bool(self.supports_joint_velocity_lease_jog()),
+            "realtime_jog_compat": bool(self.supports_realtime_jog()),
+            "backend": "ethercat_rtcore",
+            "watchdog_source": "rtcore_motor_side",
+        }
+
+    def start_joint_velocity_lease_jog(self, timeout_s: float) -> None:
         self.send_realtime_jog_command([0.0] * self._num_joints, timeout_s=timeout_s)
+
+    def update_joint_velocity_lease_jog(
+        self,
+        joint_velocities_rad_s: list[float],
+        timeout_s: float,
+    ) -> None:
+        self.send_realtime_jog_command(
+            joint_velocities_rad_s,
+            timeout_s=timeout_s,
+        )
+
+    def stop_joint_velocity_lease_jog(self) -> None:
+        if not self._connected:
+            return
+        self._send_cmd_jog(
+            axis_mask=0,
+            flags=_JOG_FLAG_STOP,
+            timeout_ns=0,
+            axis_qd=[0.0] * self._rt_num_axes,
+        )
+
+    def start_realtime_jog(self, timeout_s: float) -> None:
+        self.start_joint_velocity_lease_jog(timeout_s=timeout_s)
 
     def send_realtime_jog_command(
         self,
@@ -1523,14 +1563,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         )
 
     def stop_realtime_jog(self) -> None:
-        if not self._connected:
-            return
-        self._send_cmd_jog(
-            axis_mask=0,
-            flags=_JOG_FLAG_STOP,
-            timeout_ns=0,
-            axis_qd=[0.0] * self._rt_num_axes,
-        )
+        self.stop_joint_velocity_lease_jog()
 
     def _write_setpoint(self, positions_rad: list[float], axis_mask: int) -> None:
         raise RuntimeError(

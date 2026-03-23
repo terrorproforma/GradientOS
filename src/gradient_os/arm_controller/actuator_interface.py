@@ -269,6 +269,63 @@ class ActuatorBackend(ABC):
             list[float]: Joint positions in radians, one per logical joint.
         """
         pass
+
+    # =========================================================================
+    # Optional leased jog capabilities
+    # =========================================================================
+
+    def supports_joint_velocity_lease_jog(self) -> bool:
+        """
+        Whether this backend supports a backend-owned joint-velocity jog mode
+        refreshed by a controller lease/watchdog.
+
+        Backends that do not override this method must return False so callers
+        can fall back to the controller-side Cartesian jog loop safely.
+        """
+        return False
+
+    def start_joint_velocity_lease_jog(self, timeout_s: float) -> None:
+        """
+        Enter backend-native leased joint-velocity jog mode.
+
+        Callers must check `supports_joint_velocity_lease_jog()` first.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support leased joint-velocity jog."
+        )
+
+    def update_joint_velocity_lease_jog(
+        self,
+        joint_velocities_rad_s: list[float],
+        timeout_s: float,
+    ) -> None:
+        """
+        Refresh the backend jog watchdog with a new joint-velocity command.
+
+        Callers must check `supports_joint_velocity_lease_jog()` first.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support leased joint-velocity jog."
+        )
+
+    def stop_joint_velocity_lease_jog(self) -> None:
+        """
+        Exit backend-native leased joint-velocity jog mode and stop motion.
+
+        Callers must check `supports_joint_velocity_lease_jog()` first.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support leased joint-velocity jog."
+        )
+
+    def get_jog_capabilities(self) -> dict[str, object]:
+        """
+        Return lightweight metadata describing jog execution support.
+        """
+        return {
+            "joint_velocity_lease": bool(self.supports_joint_velocity_lease_jog()),
+            "realtime_jog_compat": False,
+        }
     
     # =========================================================================
     # Single Actuator Control (for gripper, calibration, etc.)

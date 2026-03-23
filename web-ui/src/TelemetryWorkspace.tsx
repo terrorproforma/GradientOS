@@ -2,8 +2,46 @@ import { useEffect, useState } from "react";
 import type { TelemetryEvent } from "./TelemetryCharts";
 import { TelemetryCharts } from "./TelemetryCharts";
 import { PerformanceDiagnosticsPanel } from "./PerformanceDiagnosticsPanel";
+import type { PerformanceResponse } from "./PerformanceDiagnosticsPanel";
 
 type TelemetryTab = "charts" | "diagnostics";
+const PERFORMANCE_POLL_MS = 500;
+
+async function readErrorMessage(res: Response): Promise<string> {
+  const contentType = res.headers.get("content-type") ?? "";
+  if (contentType.includes("application/json")) {
+    try {
+      const payload = (await res.json()) as { detail?: unknown; message?: unknown };
+      if (payload && typeof payload === "object") {
+        if (
+          payload.detail &&
+          typeof payload.detail === "object" &&
+          typeof (payload.detail as { message?: unknown }).message === "string"
+        ) {
+          return String((payload.detail as { message: string }).message);
+        }
+        if (typeof payload.detail === "string") {
+          return payload.detail;
+        }
+        if (typeof payload.message === "string") {
+          return payload.message;
+        }
+        return JSON.stringify(payload);
+      }
+    } catch {
+      // Fall through to plain text handling.
+    }
+  }
+  try {
+    const text = (await res.text()).trim();
+    if (text) {
+      return text;
+    }
+  } catch {
+    // Ignore read failures and use the HTTP status line.
+  }
+  return `${res.status} ${res.statusText}`;
+}
 
 export function TelemetryWorkspace({
   latest,
@@ -14,12 +52,53 @@ export function TelemetryWorkspace({
 }) {
   const [activeTab, setActiveTab] = useState<TelemetryTab>("charts");
   const [diagnosticsVisible, setDiagnosticsVisible] = useState<boolean>(true);
+  const [diagnosticsSnapshot, setDiagnosticsSnapshot] = useState<PerformanceResponse | null>(null);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!diagnosticsVisible && activeTab === "diagnostics") {
       setActiveTab("charts");
     }
   }, [activeTab, diagnosticsVisible]);
+
+  useEffect(() => {
+    let disposed = false;
+    let inFlight = false;
+    const tick = async () => {
+      if (disposed || inFlight) {
+        return;
+      }
+      inFlight = true;
+      try {
+        const res = await fetch(`${apiHost}/debug/performance`, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        if (!res.ok) {
+          throw new Error(await readErrorMessage(res));
+        }
+        const payload = (await res.json()) as PerformanceResponse;
+        if (!disposed) {
+          setDiagnosticsSnapshot(payload);
+          setDiagnosticsError(null);
+        }
+      } catch (err) {
+        if (!disposed) {
+          setDiagnosticsError((err as Error)?.message || "Failed to load timing diagnostics.");
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => {
+      void tick();
+    }, PERFORMANCE_POLL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [apiHost]);
 
   const tabs: Array<{ id: TelemetryTab; label: string }> = diagnosticsVisible
     ? [
@@ -64,7 +143,7 @@ export function TelemetryWorkspace({
       {activeTab === "charts" ? (
         <TelemetryCharts latest={latest} />
       ) : (
-        <PerformanceDiagnosticsPanel apiHost={apiHost} />
+        <PerformanceDiagnosticsPanel snapshot={diagnosticsSnapshot} error={diagnosticsError} />
       )}
     </div>
   );

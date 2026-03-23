@@ -18,6 +18,12 @@ def _payload_token(payload: dict[str, object]) -> str:
     return base64.urlsafe_b64encode(body).decode("ascii")
 
 
+def _decode_command_payload(command: str) -> dict[str, object]:
+    _, payload_b64 = command.split(",", 1)
+    payload_json = base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+    return json.loads(payload_json)
+
+
 @contextmanager
 def patch_send(monkeypatch):
     accepted_motion_payload = {
@@ -189,7 +195,7 @@ def patch_send(monkeypatch):
             + json.dumps(
                 {
                     "udp": {
-                        "last_command": "SET_JOG_VELOCITY",
+                        "last_command": "JOG_SESSION_UPDATE",
                         "last_dispatch_ms": 1.25,
                         "dispatch_ms": {"count": 3, "avg_ms": 0.9, "max_ms": 1.25, "last_ms": 1.25},
                         "interarrival_ms": {"count": 3, "avg_ms": 52.0, "max_ms": 60.0, "last_ms": 50.0},
@@ -319,6 +325,27 @@ def patch_send(monkeypatch):
         },
         "allow_unsafe_overrides": False,
     }
+    session_state = {
+        "session_present": False,
+        "session_active": False,
+        "session_id": None,
+        "owner_id": None,
+        "state": "idle",
+        "deadman": False,
+        "paused_for_motion": False,
+        "lease_timeout_s": 0.4,
+        "lease_remaining_s": None,
+        "last_update_age_s": None,
+        "last_seq_received": -1,
+        "last_seq_applied": -1,
+        "lease_expiry_count": 0,
+        "pause_for_motion_count": 0,
+        "backend_mode": "joint_velocity_lease",
+        "backend_timeout_s": 0.2,
+        "last_stop_reason": None,
+        "stale_packet_rejects": 0,
+        "owner_conflict_rejects": 0,
+    }
 
     def _kin_reply(prefix: str) -> tuple[bool, str]:
         return True, f"{prefix},{json.dumps(kinematics_state, separators=(',', ':'))}"
@@ -328,8 +355,89 @@ def patch_send(monkeypatch):
             return None
         return int(parts[1])
 
+    def _session_error(command_name: str, code: str, message: str) -> tuple[bool, str]:
+        return False, f"ERROR,{command_name},{_payload_token({'code': code, 'message': message})}"
+
     def fake_send(command, timeout=0.5, expect_response=True):
         call_log.append((command, timeout, expect_response))
+        if command.startswith("JOG_SESSION_START,"):
+            payload = json.loads(base64.urlsafe_b64decode(command.split(",", 1)[1].encode("ascii")).decode("utf-8"))
+            owner_id = str(payload.get("owner_id", "")).strip()
+            if session_state["session_active"] and session_state["owner_id"] != owner_id:
+                session_state["owner_conflict_rejects"] += 1
+                return _session_error("JOG_SESSION_START", "OWNER_CONFLICT", "Another jog session owner is already active.")
+            session_state.update({
+                "session_present": True,
+                "session_active": True,
+                "session_id": "session-123",
+                "owner_id": owner_id,
+                "state": "active",
+                "deadman": bool(payload.get("deadman", True)),
+                "lease_remaining_s": 0.4,
+                "last_update_age_s": 0.0,
+                "last_seq_received": int(payload.get("seq", 0)),
+                "last_stop_reason": None,
+            })
+            return True, f"ACK,JOG_SESSION_START,{_payload_token(dict(session_state))}"
+        if command.startswith("JOG_SESSION_UPDATE,"):
+            payload = json.loads(base64.urlsafe_b64decode(command.split(",", 1)[1].encode("ascii")).decode("utf-8"))
+            session_id = str(payload.get("session_id", "")).strip()
+            if session_id != session_state["session_id"]:
+                return _session_error("JOG_SESSION_UPDATE", "WRONG_SESSION", "Jog session id does not match the active session.")
+            seq = int(payload.get("seq", 0))
+            if seq <= int(session_state["last_seq_received"]):
+                session_state["stale_packet_rejects"] += 1
+                return _session_error("JOG_SESSION_UPDATE", "STALE_SEQUENCE", "Jog session update sequence is stale.")
+            session_state.update({
+                "deadman": bool(payload.get("deadman", True)),
+                "lease_remaining_s": 0.4,
+                "last_update_age_s": 0.0,
+                "last_seq_received": seq,
+                "last_seq_applied": seq,
+            })
+            return True, f"ACK,JOG_SESSION_UPDATE,{_payload_token(dict(session_state))}"
+        if command.startswith("JOG_SESSION_STOP,"):
+            payload = json.loads(base64.urlsafe_b64decode(command.split(",", 1)[1].encode("ascii")).decode("utf-8"))
+            session_id = str(payload.get("session_id", "")).strip()
+            if session_id != session_state["session_id"]:
+                return _session_error("JOG_SESSION_STOP", "WRONG_SESSION", "Jog session id does not match the active session.")
+            session_state.update({
+                "session_active": False,
+                "state": "stopped",
+                "deadman": False,
+                "lease_remaining_s": 0.0,
+                "last_stop_reason": str(payload.get("reason", "client-stop")),
+            })
+            return True, f"ACK,JOG_SESSION_STOP,{_payload_token(dict(session_state))}"
+        if command == "GET_JOG_SESSION_STATE":
+            return True, f"ACK,GET_JOG_SESSION_STATE,{_payload_token(dict(session_state))}"
+        if command == "GET_PERFORMANCE_STATE":
+            return (
+                True,
+                "PERFORMANCE_STATE_JSON,"
+                + json.dumps(
+                    {
+                        "udp": {
+                            "last_command": "JOG_SESSION_UPDATE",
+                            "last_dispatch_ms": 1.25,
+                            "dispatch_ms": {"count": 3, "avg_ms": 0.9, "max_ms": 1.25, "last_ms": 1.25},
+                            "interarrival_ms": {"count": 3, "avg_ms": 52.0, "max_ms": 60.0, "last_ms": 50.0},
+                        },
+                        "jog": {
+                            "control_frequency_hz": 50,
+                            "loop": {"count": 4, "avg_ms": 3.1, "max_ms": 4.0, "last_ms": 3.2, "overrun_count": 0},
+                        },
+                        "jog_session": dict(session_state),
+                        "motion_state": "executing",
+                        "is_running": False,
+                        "is_jogging": bool(session_state["session_active"]),
+                        "last_command_age_s": 0.02,
+                        "command_link_stale": False,
+                        "recent_udp_reset_count": 0,
+                    },
+                    separators=(",", ":"),
+                )
+            )
         if command == "GET_RUNTIME_CONFIG":
             return True, f"RUNTIME_CONFIG,{json.dumps(runtime_state, separators=(',', ':'))}"
         if command.startswith("ROTATE,"):
@@ -817,10 +925,140 @@ def test_debug_performance(client, monkeypatch, tmp_path):
     assert resp.status_code == 200
     body = resp.json()
     assert body["controller"]["motion_state"] == "executing"
-    assert body["controller"]["udp"]["last_command"] == "SET_JOG_VELOCITY"
+    assert body["controller"]["udp"]["last_command"] == "JOG_SESSION_UPDATE"
     assert body["controller"]["jog"]["control_frequency_hz"] == 50
+    assert body["controller"]["jog_session"]["state"] == "idle"
+    assert body["controller"]["jog_session"]["session_active"] is False
     assert body["rtcore"]["rt_frequency_hz"] == 1000
     assert body["rtcore"]["rt_overrun_count"] == 2
+
+
+def test_control_jog_session_start_update_stop_and_state(client):
+    start_len = len(client.command_calls)
+
+    resp = client.post(
+        "/control/jog/session/start",
+        json={
+            "owner_id": "ui-a",
+            "seq": 0,
+            "deadman": True,
+            "vx": 0.05,
+            "vy": 0.0,
+            "vz": 0.0,
+            "v_roll": 0.0,
+            "v_pitch": 0.0,
+            "v_yaw": 0.0,
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session"]["session_active"] is True
+    assert body["session"]["session_id"] == "session-123"
+    assert body["session"]["last_seq_received"] == 0
+
+    commands = [entry[0] for entry in client.command_calls[start_len:]]
+    assert len(commands) == 1
+    assert commands[0].startswith("JOG_SESSION_START,")
+
+    update_len = len(client.command_calls)
+    resp = client.post(
+        "/control/jog/session/update",
+        json={
+            "session_id": "session-123",
+            "owner_id": "ui-a",
+            "seq": 1,
+            "deadman": True,
+            "vx": 0.01,
+            "vy": 0.0,
+            "vz": 0.0,
+            "v_roll": 0.0,
+            "v_pitch": 0.0,
+            "v_yaw": 0.0,
+        },
+    )
+    assert resp.status_code == 200
+    update_body = resp.json()
+    assert update_body["session"]["last_seq_received"] == 1
+
+    state_resp = client.get("/control/jog/session/state")
+    assert state_resp.status_code == 200
+    assert state_resp.json()["session"]["session_id"] == "session-123"
+
+    stop_len = len(client.command_calls)
+    resp = client.post(
+        "/control/jog/session/stop",
+        json={
+            "session_id": "session-123",
+            "owner_id": "ui-a",
+            "reason": "ui-release",
+        },
+    )
+    assert resp.status_code == 200
+    stop_body = resp.json()
+    assert stop_body["session"]["session_active"] is False
+    assert stop_body["session"]["last_stop_reason"] == "ui-release"
+    stop_commands = [entry[0] for entry in client.command_calls[update_len:]]
+    assert stop_commands[0].startswith("JOG_SESSION_UPDATE,")
+    assert stop_commands[1] == "GET_JOG_SESSION_STATE"
+    assert stop_commands[2].startswith("JOG_SESSION_STOP,")
+
+
+def test_control_jog_session_payload_parsing_is_fail_closed(client):
+    start_len = len(client.command_calls)
+
+    resp = client.post(
+        "/control/jog/session/start",
+        json={
+            "owner_id": "ui-a",
+            "seq": "4",
+            "deadman": "false",
+            "vx": 0.05,
+            "vy": 0.0,
+            "vz": 0.0,
+            "v_roll": 0.0,
+            "v_pitch": 0.0,
+            "v_yaw": 0.0,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["session"]["deadman"] is False
+
+    start_command = client.command_calls[start_len][0]
+    start_payload = _decode_command_payload(start_command)
+    assert start_payload["seq"] == 4
+    assert start_payload["deadman"] is False
+
+    bad_resp = client.post(
+        "/control/jog/session/update",
+        json={
+            "session_id": "session-123",
+            "owner_id": "ui-a",
+            "seq": "not-an-int",
+            "deadman": True,
+            "vx": 0.01,
+            "vy": 0.0,
+            "vz": 0.0,
+            "v_roll": 0.0,
+            "v_pitch": 0.0,
+            "v_yaw": 0.0,
+        },
+    )
+    assert bad_resp.status_code == 400
+    assert bad_resp.json()["detail"] == "seq must be an integer"
+
+
+def test_legacy_jog_routes_are_removed(client):
+    legacy_requests = [
+        ("post", "/control/jog/start", None),
+        ("post", "/control/jog/stop", None),
+        ("post", "/control/jog/velocity", {"vx": 0.0, "vy": 0.0, "vz": 0.0, "v_roll": 0.0, "v_pitch": 0.0, "v_yaw": 0.0}),
+        ("post", "/control/jog/deadman", {"enabled": False}),
+        ("post", "/control/jog/state", {"active": False}),
+    ]
+
+    for method, path, payload in legacy_requests:
+        response = getattr(client, method)(path, json=payload) if payload is not None else getattr(client, method)(path)
+        assert response.status_code == 404
 
 
 def test_info_gripper(client):

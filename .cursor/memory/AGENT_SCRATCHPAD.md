@@ -952,3 +952,122 @@ Use this file as persistent, repo-local execution memory.
 - [tool] Fixed `web-ui/src/ControlPanel.tsx` so realtime jog command sends are single-flight and latest-wins/coalesced instead of starting a new `fetch()` every `50 ms` while previous sends are still in flight.
 - [tool] Added a discrete-motion guard in `web-ui/src/ControlPanel.tsx` so incremental cartesian moves/rotates and `Home`/`Rest` cannot stack multiple motion requests while one command is still being issued.
 - [self] Guardrail: treat `MOVE_LINE_RELATIVE` RTT in the diagnostics panel as synchronous planning/upload time, not transport lag. Long move ACKs can make the UI feel stalled, so the frontend must coalesce or lock motion commands instead of letting stale clicks/jog updates queue up.
+
+### 2026-03-22 - Diagnostics collection tied to a hidden UI tab is not reliable enough for live motion debugging
+- [user] Reported that the latest run still showed lag and that if the diagnostics tab was not open, the diagnostics did not appear to record.
+- [tool] Confirmed the architecture bug in `web-ui/src/TelemetryWorkspace.tsx` and `web-ui/src/PerformanceDiagnosticsPanel.tsx`: the `/debug/performance` polling loop only existed inside the diagnostics component, so sampling stopped whenever the `Diagnostics` tab was not selected.
+- [tool] Latest run `logs/startups/20260322-051448/controller.log` still showed two separate timing truths:
+- [tool] queued `MOVE_LINE_RELATIVE,0.05,...` spent about `303 ms` in planning before execution, then about `2.0 s` in RTCore motion time
+- [tool] jog still showed bursts of repeated identical `SET_JOG_VELOCITY` commands, so a backend-side safety net was still worthwhile even after the frontend single-flight fix
+- [tool] Updated `web-ui/src/TelemetryWorkspace.tsx` so diagnostics polling runs continuously while the telemetry workspace is mounted, regardless of whether the `Diagnostics` tab is selected, and removed the old visibility-gate dependency by making `PerformanceDiagnosticsPanel.tsx` presentational.
+- [tool] Added API-side duplicate jog coalescing in `src/gradient_os/api/main.py` so identical `POST /control/jog/velocity` payloads arriving within a very short window are acknowledged but not forwarded repeatedly to the controller.
+- [self] Guardrail: for operator diagnostics, put recording/sampling in an always-mounted path, and for safety-critical motion inputs add backend-side coalescing or dedupe so one stale/noisy browser session cannot flood the controller even if a UI-side fix regresses or a stale bundle stays open.
+
+### 2026-03-22 - Any jog dedupe optimization must remain strictly fail-closed on release/disconnect
+- [user] Explicitly reinforced the safety invariant: while jogging, if the button is not being held the robot must stop moving, and if the frontend drops mid-hold we must not leave motion logically stuck "on".
+- [tool] Existing controller safety path already mattered here: `src/gradient_os/arm_controller/command_api.py` keeps `JOG_VELOCITY_TIMEOUT_S = 0.5`, zeros jog velocities on timeout, enforces `jog_deadman`, and `handle_jog_stop()` tears the jog thread down.
+- [self] Corrective rule: never let API/frontend dedupe suppress a zero-release command. Nonzero duplicates can be coalesced, but zero commands and deadman-off transitions must always be forwarded immediately.
+- [tool] Hardened `src/gradient_os/api/main.py` so:
+- [tool] all-zero jog vectors are never coalesced
+- [tool] coalescing state resets on `JOG_START`, `JOG_STOP`, and `SET_JOG_DEADMAN,false`
+- [tool] `/debug/performance` still reports coalescing counters for visibility
+- [tool] Hardened `web-ui/src/ControlPanel.tsx` so page hide / unload / panel teardown triggers a best-effort jog failsafe stop: send deadman false, send zero velocity, send jog stop, and clear the local jog timer/count state.
+- [tool] Added regression coverage in `tests/test_api_endpoints.py` proving that duplicate nonzero jog commands may be coalesced but duplicate zero-release jog commands are still forwarded every time.
+- [self] Guardrail: for jog safety, rely on layered fail-safe semantics, not a single happy-path stop message: pointer release zero, UI teardown best-effort stop, API no-zero-coalesce rule, controller deadman gate, and controller timeout zeroing.
+
+### 2026-03-22 - STEP topology failure on this Pi was a missing CAD binding, not a bad STEP parser
+- [tool] The live error banner `Failed to load CAD topology: {"detail":"No usable OpenCascade Python binding found..."}` matched the backend import failure in `src/gradient_os/cad/topology_service.py`, before any STEP geometry was parsed.
+- [tool] On this host, neither `OCC` nor `OCP` was installed initially in `.venv`; `cadquery-ocp` installed cleanly and `_load_occ_api()` then succeeded.
+- [self] Mistake: I first assumed the Raspberry Pi-friendly package would be `cadquery-ocp-arm`, but both `uv` and `pip` could not resolve a usable Linux wheel here.
+- [self] Corrective rule: for OpenCascade bring-up on Linux ARM64 in this repo, test the actual wheel resolution on the target host before codifying package advice; prefer the package that proves importable (`cadquery-ocp` here), not the one that sounds platform-specific.
+- [tool] Repo guardrails added:
+- [tool] `pyproject.toml` `cad` extra now installs `cadquery-ocp`
+- [tool] `setup.sh` now prompts for CAD STEP topology support explicitly
+- [tool] `docs/README.md` now documents the `cad` extra
+- [tool] `topology_service.py` now returns an actionable install hint pointing to `uv pip install -e '.[cad]'`
+- [tool] Validation: `pytest tests/test_topology_service.py`, `py_compile src/gradient_os/cad/topology_service.py`, `uv pip install -e ".[cad]"`, and a direct `_load_occ_api()` import check all passed.
+
+### 2026-03-22 - If scheduled moves “freeze” but status polling stays alive, check RTCore command-ring backpressure before blaming the whole controller
+- [user] Reported that the latest controller run seemed completely unresponsive.
+- [tool] Latest startup log `logs/startups/20260322-183832/controller.log` showed the controller still answering `GET_MOTION_STATUS`, `GET_JOINT_ANGLES`, and `GET_PERFORMANCE_STATE`, but a scheduled move thread crashed on the third `MOVE_LINE_RELATIVE` with `RuntimeError: cmd ring overflow`.
+- [self] Corrective rule: distinguish “controller process dead” from “motion worker failed while polls still work”. If only scheduled motion dies after back-to-back moves, inspect RTCore command-ring producer/consumer pressure before changing UI timing again.
+- [tool] Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` so `_cmd_ring_write()` waits briefly for ring space to free up instead of failing immediately on a transient full-ring sample.
+- [tool] Added regression coverage in `tests/test_gradient05_limits_and_backends.py` proving a temporarily full RTCore command ring can drain and then accept the pending write without raising.
+- [tool] Validation: `python3 -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` and `pytest -q tests/test_gradient05_limits_and_backends.py -k "execute_joint_trajectory_uses_quantized_timing or cmd_ring_write_waits_for_space"` both passed.
+
+### 2026-03-22 - A diagnostics error banner captured after stack shutdown can coexist with healthy last-sample metrics
+- [user] Shared a diagnostics screenshot taken after shutdown and asked whether the controller still looked unresponsive.
+- [tool] Newest run `logs/startups/20260322-211403/controller.log` showed all scheduled moves and rotates finishing cleanly with `RTCore trajectory execution finished: state=completed` and no `cmd ring overflow`.
+- [tool] `logs/startups/20260322-211403/api.log` returned `GET /debug/performance` as `200 OK` throughout the run, then only switched to `503 Service Unavailable` during normal shutdown.
+- [self] Corrective rule: when a screenshot is taken after shutdown, treat a “No response for command …” banner as a post-stop polling failure unless the live logs show matching errors before SIGTERM. The timing tiles may simply be the last good sample frozen on screen.
+- [tool] Remaining live issue in that run was jog cadence, not a dead controller: the controller still logged repeated `SET_JOG_VELOCITY` bursts plus `Jog Timeout 0.50s` zeroing events, and the API log still showed many `POST /control/jog/velocity` requests during each jog burst.
+
+### 2026-03-22 - For safe manual jog, the browser should publish intent while the API owns the steady heartbeat and lease-expiry stop
+- [user] Asked to fix the diagnostics confusion first, then step back and rethink the jog sender architecture with safety as the primary constraint.
+- [self] Corrective rule: do not let a browser tab be the only component responsible for maintaining a safety-critical realtime cadence to the controller. Let the UI publish current intent, but move the stable command heartbeat and disconnect lease handling into the API.
+- [tool] Updated `web-ui/src/PerformanceDiagnosticsPanel.tsx` so a failed `/debug/performance` poll no longer keeps a misleading `live` badge; the panel now marks the snapshot `offline/stale` and explicitly says it is showing the last successful sample plus the last poll error.
+- [tool] Added an API-side jog bridge in `src/gradient_os/api/main.py` with a new `POST /control/jog/state` endpoint:
+- [tool] the UI now sends full jog intent (`active`, `deadman`, velocity vector)
+- [tool] the API bridge owns the steady controller-side jog cadence
+- [tool] lease expiry fails closed with zero velocity, deadman false, and jog stop
+- [tool] `/debug/performance` now exposes `api_jog_bridge` state for visibility
+- [tool] Updated `web-ui/src/ControlPanel.tsx` to use `/control/jog/state` instead of streaming separate start/deadman/velocity requests as the primary path, while keeping the unload/page-hide failsafe as a best-effort inactive state publish.
+- [tool] Added API regression coverage in `tests/test_api_endpoints.py` for the new jog state bridge start/stop sequence and for the new diagnostics payload field.
+- [tool] Validation: `python3 -m py_compile src/gradient_os/api/main.py`, `pytest -q tests/test_api_endpoints.py -k "debug_performance or control_jog_velocity_zero_release_is_never_coalesced or control_jog_state_bridge_starts_and_stops_jog"`, `npm run build` in `web-ui`, and `ReadLints` on edited files all passed.
+
+### 2026-03-22 - Startup log review should quantify live polling load before blaming RTCore or controller responsiveness
+- [user] The target architecture is controller-owned jog sessions with backend-native execution where available; review startup logs against that direction, not only for hardware faults.
+- [tool] `logs/startups/20260322-220241` was a clean idle bring-up: `responding=6/6`, `operational=6/6`, no disarmed drive faults, and a clean soft stop back to `BUS_UP_DISARMED`.
+- [tool] `logs/startups/20260322-220715` showed healthy hardware too, but active UI use generated very high control-plane traffic: `26729` `GET /info/joints`, `29044` `GET /control/motion-status`, `996` `GET /debug/performance`, and `722` `POST /control/jog/state` requests in one run.
+- [tool] The same active run still fanned those requests into legacy controller commands (`29` `JOG_START`, `58` `SET_JOG_DEADMAN`, `2641` `SET_JOG_VELOCITY`, `29` `JOG_STOP`), so ownership is still effectively request/heartbeat-shaped rather than session/sequence-shaped.
+- [self] Corrective rule: when reviewing jog behavior, inspect both `api.log` request volume and `controller.log` command fan-out together. High-rate polling plus legacy `JOG_*` fan-out is an architecture smell even when the bus itself is healthy.
+- [tool] During shutdown, `logs/startups/20260322-220715/api.log` ended with `ERROR: ASGI callable returned without completing response.` plus several `503 Service Unavailable` responses; treat that as teardown/drain behavior to harden, not as a live-motion fault.
+
+### 2026-03-23 - Controller-owned jog sessions should make the API thin, even for compatibility endpoints
+- [user] Asked to implement the new controller-owned jog architecture and thin API from the attached plan, not just discuss it.
+- [tool] Added `src/gradient_os/arm_controller/jog_session.py` plus backend capability hooks so the controller now owns session id, owner, lease, sequence, pause-for-motion, stale packet rejects, and backend-mode diagnostics.
+- [tool] Updated `src/gradient_os/run_controller.py`, `src/gradient_os/api/main.py`, and `web-ui/src/ControlPanel.tsx` so the main path is now `JOG_SESSION_START/UPDATE/STOP` via thin REST proxies (`/control/jog/session/*`) and the UI keeps local `session_id` / `seq` state.
+- [self] Corrective rule: if a compatibility endpoint must remain during a migration, keep it stateless if possible. Here `/control/jog/state` became a deprecated thin mapper that emits legacy controller commands directly, instead of reviving an API-owned lease/heartbeat thread.
+- [tool] Validation that specifically covered the refactor slice passed: `pytest -q tests/test_api_endpoints.py tests/test_jog_session_manager.py`, `pytest -q tests/test_gradient05_limits_and_backends.py -k "realtime_jog or jog"`, `python -m py_compile ...command_api.py run_controller.py api/main.py...`, and `npm run build` in `web-ui`.
+- [self] Guardrail: when diagnostics move from API-owned state to controller-owned state, update both the payload shape and the UI renderer in the same change so the operator never ends up reading stale architecture labels like `api_jog_bridge`.
+
+### 2026-03-23 - For new-agent handoffs, update the plan doc with implemented state, not just desired architecture
+- [user] Explicitly asked for the jog-session plan document itself to be updated with full handoff notes for a fresh agent.
+- [self] Corrective rule: when a refactor is partly complete and the user asks for a handoff, update the original plan file so it reflects reality: completed slices, touched files, validations run, remaining risks, and the exact next steps.
+- [tool] Updated `/home/pi/.cursor/plans/jog-session-refactor_01c763e3.plan.md` to mark completed rollout slices, add a current implementation status section, and include a detailed next-agent handoff focused on live RTCore validation and compatibility cleanup.
+
+### 2026-03-23 - Safety-critical REST booleans must never rely on Python truthiness
+- [self] Mistake pattern: plain `bool(payload.get(...))` is unsafe for API request parsing because string inputs like `"false"` evaluate truthy and can accidentally keep `active` or `deadman` enabled.
+- [self] Corrective rule: for jog-related REST endpoints, explicitly coerce booleans from `true/false/1/0/yes/no/on/off` and reject anything else with `400`, especially for fail-closed fields like `active`, `deadman`, and `enabled`.
+- [tool] Hardened `src/gradient_os/api/main.py` so `/control/jog/state`, `/control/jog/deadman`, `/control/jog/debug`, and `/control/jog/session/start|update` now use explicit boolean parsing plus integer parsing for `seq`, returning `400` instead of leaking malformed values into `500`s.
+- [tool] Removed the orphaned `_ApiJogStateBridge` implementation from `src/gradient_os/api/main.py` after confirming it no longer had any references in the controller-owned session architecture.
+- [tool] Added regression coverage in `tests/test_api_endpoints.py` proving string `"false"` stays fail-closed on jog endpoints and malformed session `seq` values are rejected cleanly.
+- [tool] Validation: `"/home/pi/GradientOS/.venv/bin/python" -m pytest -q tests/test_api_endpoints.py tests/test_jog_session_manager.py`, `"/home/pi/GradientOS/.venv/bin/python" -m py_compile src/gradient_os/api/main.py`, and `ReadLints` on touched files all passed.
+
+### 2026-03-23 - When removing a deprecated control path, delete the observability and secondary-UI remnants too
+- [user] Explicitly asked to remove all remaining legacy jog fallback surfaces so there is no chance of silently falling back onto the old implementation.
+- [self] Corrective rule: for architecture cleanups, do not stop at the primary API/controller handlers. Also remove stale diagnostics fields, docs, tests, and secondary UIs that still imply the old contract exists.
+- [tool] Removed legacy jog REST routes from `src/gradient_os/api/main.py`, removed the legacy adapter functions from `src/gradient_os/arm_controller/command_api.py`, and changed `src/gradient_os/run_controller.py` so stale `JOG_START` / `SET_JOG_*` callers now receive explicit `LEGACY_JOG_REMOVED` errors instead of compatibility behavior.
+- [tool] Updated `web-ui/src/PerformanceDiagnosticsPanel.tsx` and `docs/README.md` / `docs/command_api.md` so operator-facing diagnostics and docs now refer only to `JOG_SESSION_*` and the session endpoints.
+- [tool] Disabled the old desktop UDP jog panel in `src/gradient_os/ui/pages/real_control_page.py` so the supported jog path remains the web `ControlPanel` -> API session endpoints -> controller session manager.
+- [tool] Validation: `"/home/pi/GradientOS/.venv/bin/python" -m pytest -q tests/test_api_endpoints.py tests/test_jog_session_manager.py`, `"/home/pi/GradientOS/.venv/bin/python" -m py_compile src/gradient_os/api/main.py src/gradient_os/run_controller.py src/gradient_os/arm_controller/command_api.py src/gradient_os/ui/pages/real_control_page.py src/gradient_os/ui_start.py`, `npm run build` in `web-ui`, and `ReadLints` on touched files all passed.
+
+### 2026-03-23 - Live architecture validation should separate non-invasive session-path proof from armed motion proof
+- [user] Approved proceeding with live validation after the legacy-path cleanup.
+- [self] Corrective rule: when a live robotics stack is up but disarmed, still validate the live control-plane invariants first: removed-route enforcement, removed-UDP enforcement, session start/update/owner-conflict/expiry/stop semantics, and diagnostics/logs proving the active path. Then explicitly label motion-coupled/watchdog cases as still unproven instead of overstating coverage.
+- [tool] Started a fresh live stack run `20260323-025500` and confirmed healthy bring-up (`responding=6/6`, `operational=6/6`, `wkc=18`).
+- [tool] Live checks passed:
+  - removed legacy REST jog routes returned `404`
+  - removed legacy UDP `JOG_START` returned structured `LEGACY_JOG_REMOVED`
+  - `JOG_SESSION_START/UPDATE/STOP` succeeded live with `backend_mode=joint_velocity_lease`
+  - owner conflict returned `409 OWNER_CONFLICT`
+  - lease expiry transitioned to `expired`
+  - explicit `pagehide` stop transitioned to `stopped`
+  - stale updates after `expired`/`stopped` returned `SESSION_INACTIVE`
+  - `controller.log` showed `JOG_SESSION_*` commands only for the supported path
+- [self] Guardrail: if a deliberate legacy-probe command appears once in the controller log during validation, distinguish that from fallback usage. Here the single logged `JOG_START` was the intentional negative test that produced `LEGACY_JOG_REMOVED`.
+
+### 2026-03-23 - If the user says they hard-stopped the stack/RTCore, verify runtime state before assuming the API is still up
+- [user] Clarified that the stack had been intentionally stopped and that I needed to restart it again before continuing.
+- [self] Corrective rule: after a user-triggered hard stop, do not treat connection-refused on `:4000` as mysterious flakiness. Re-check the supervised stack state and restart it explicitly before continuing live validation.
+- [tool] Restarted the supervised stack with `./start-stack.sh` into run `20260323-030328` and confirmed healthy bring-up again (`responding=6/6`, `operational=6/6`, `wkc=18`, API on `:4000`, web on `:8000`).

@@ -202,12 +202,10 @@ class MainWindow(QMainWindow):
             if current_page == self.real_control:
                 # Avoid logging high-frequency jog commands to keep UI responsive
                 if not (
-                    command_str.startswith("SET_JOG_VELOCITY")
-                    or command_str.startswith("SET_GRIPPER_JOG_VELOCITY")
-                    or command_str.startswith("SET_JOG_DEADMAN")
+                    command_str.startswith("JOG_SESSION_START")
+                    or command_str.startswith("JOG_SESSION_UPDATE")
+                    or command_str.startswith("JOG_SESSION_STOP")
                     or command_str.startswith("SET_JOG_DEBUG")
-                    or command_str.startswith("JOG_START")
-                    or command_str.startswith("JOG_STOP")
                 ):
                     self.real_control.log_message(f"Sent: {command_str}")
         except Exception as e:

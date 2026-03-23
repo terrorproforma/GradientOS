@@ -312,6 +312,26 @@ def _send_controller_ack(sock: socket.socket, addr, command: str, payload: dict[
     sock.sendto(message.encode("utf-8"), addr)
 
 
+def _send_controller_error_payload(
+    sock: socket.socket,
+    addr,
+    command: str,
+    code: str,
+    message: str,
+    payload: dict[str, object] | None = None,
+) -> None:
+    body = {
+        "code": str(code),
+        "message": str(message),
+    }
+    if payload:
+        body.update(payload)
+    sock.sendto(
+        f"ERROR,{command},{_encode_controller_payload_b64(body)}".encode("utf-8"),
+        addr,
+    )
+
+
 def _send_motion_status(sock: socket.socket, addr, payload: dict[str, object]) -> None:
     message = f"MOTION_STATUS,{_encode_controller_payload_b64(payload)}"
     sock.sendto(message.encode("utf-8"), addr)
@@ -508,13 +528,6 @@ def _should_log_received_udp_command(
 
     if command in {"GET_JOINT_ANGLES", "GET_MOTION_STATUS", "GET_STATUS"}:
         throttle_key = command
-    elif command == "SET_JOG_VELOCITY":
-        try:
-            values = [float(token) for token in message.split(",")[1:7]]
-            if len(values) == 6 and all(abs(value) <= 1e-12 for value in values):
-                throttle_key = "SET_JOG_VELOCITY_ZERO"
-        except Exception:
-            throttle_key = None
 
     if throttle_key is None:
         return True
@@ -1688,50 +1701,71 @@ Examples:
                 # ------------------------------------------------------------------
                 # NEW: Real-time Cartesian Jogging
                 # ------------------------------------------------------------------
-                elif command == "JOG_START":
+                elif command == "JOG_SESSION_START":
                     try:
-                        command_api.handle_jog_start()
-                        try:
-                            sock.sendto("ACK,JOG_START".encode("utf-8"), addr)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        print(f"[Controller] Error starting jog: {e}")
+                        payload_b64 = parts[1].strip() if len(parts) > 1 else ""
+                        if not payload_b64:
+                            raise ValueError("Missing base64 payload")
+                        payload_json = base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+                        payload = json.loads(payload_json)
+                        snapshot = command_api.handle_jog_session_start(payload)
+                        _send_controller_ack(sock, addr, "JOG_SESSION_START", snapshot)
+                    except Exception as exc:
+                        code = getattr(exc, "code", "JOG_SESSION_START_FAILED")
+                        payload = getattr(exc, "payload", None)
+                        _send_controller_error_payload(sock, addr, "JOG_SESSION_START", code, str(exc), payload)
 
-                elif command == "JOG_STOP":
+                elif command == "JOG_SESSION_UPDATE":
                     try:
-                        command_api.handle_jog_stop()
-                        try:
-                            sock.sendto("ACK,JOG_STOP".encode("utf-8"), addr)
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        print(f"[Controller] Error stopping jog: {e}")
+                        payload_b64 = parts[1].strip() if len(parts) > 1 else ""
+                        if not payload_b64:
+                            raise ValueError("Missing base64 payload")
+                        payload_json = base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+                        payload = json.loads(payload_json)
+                        snapshot = command_api.handle_jog_session_update(payload)
+                        _send_controller_ack(sock, addr, "JOG_SESSION_UPDATE", snapshot)
+                    except Exception as exc:
+                        code = getattr(exc, "code", "JOG_SESSION_UPDATE_FAILED")
+                        payload = getattr(exc, "payload", None)
+                        _send_controller_error_payload(sock, addr, "JOG_SESSION_UPDATE", code, str(exc), payload)
 
-                elif command == "SET_JOG_VELOCITY":
+                elif command == "JOG_SESSION_STOP":
                     try:
-                        # Expect 6 numeric values: vx, vy, vz (m/s), v_roll, v_pitch, v_yaw (deg/s)
-                        if len(parts) < 7:
-                            print("[Controller] Error: SET_JOG_VELOCITY requires 6 values.")
-                        else:
-                            vx, vy, vz, v_roll, v_pitch, v_yaw = map(float, parts[1:7])
-                            command_api.handle_set_jog_velocity(vx, vy, vz, v_roll, v_pitch, v_yaw)
-                    except ValueError:
-                        print("[Controller] Error: Non-numeric value in SET_JOG_VELOCITY.")
+                        payload_b64 = parts[1].strip() if len(parts) > 1 else ""
+                        if not payload_b64:
+                            raise ValueError("Missing base64 payload")
+                        payload_json = base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+                        payload = json.loads(payload_json)
+                        snapshot = command_api.handle_jog_session_stop(payload)
+                        _send_controller_ack(sock, addr, "JOG_SESSION_STOP", snapshot)
+                    except Exception as exc:
+                        code = getattr(exc, "code", "JOG_SESSION_STOP_FAILED")
+                        payload = getattr(exc, "payload", None)
+                        _send_controller_error_payload(sock, addr, "JOG_SESSION_STOP", code, str(exc), payload)
 
-                elif command == "SET_GRIPPER_JOG_VELOCITY":
+                elif command == "GET_JOG_SESSION_STATE":
                     try:
-                        rate = float(parts[1]) if len(parts) > 1 else 0.0
-                        command_api.handle_set_gripper_jog_velocity(rate)
-                    except ValueError:
-                        print("[Controller] Error: Non-numeric value in SET_GRIPPER_JOG_VELOCITY.")
+                        snapshot = command_api.handle_get_jog_session_state()
+                        _send_controller_ack(sock, addr, "GET_JOG_SESSION_STATE", snapshot)
+                    except Exception as exc:
+                        code = getattr(exc, "code", "GET_JOG_SESSION_STATE_FAILED")
+                        payload = getattr(exc, "payload", None)
+                        _send_controller_error_payload(sock, addr, "GET_JOG_SESSION_STATE", code, str(exc), payload)
 
-                elif command == "SET_JOG_DEADMAN":
-                    try:
-                        flag = parts[1].strip().lower() in {"true","1","yes","on","hold"}
-                        command_api.handle_set_jog_deadman(flag)
-                    except Exception:
-                        print("[Controller] Error parsing SET_JOG_DEADMAN.")
+                elif command in {
+                    "JOG_START",
+                    "JOG_STOP",
+                    "SET_JOG_VELOCITY",
+                    "SET_GRIPPER_JOG_VELOCITY",
+                    "SET_JOG_DEADMAN",
+                }:
+                    _send_controller_error_payload(
+                        sock,
+                        addr,
+                        command,
+                        "LEGACY_JOG_REMOVED",
+                        "Legacy jog UDP commands were removed. Use JOG_SESSION_* through the API session endpoints.",
+                    )
 
                 elif command == "SET_JOG_DEBUG":
                     try:
@@ -1756,12 +1790,14 @@ Examples:
 
                 elif command == "GET_PERFORMANCE_STATE":
                     controller_perf = _get_controller_performance_snapshot(time.monotonic())
+                    jog_session = command_api.handle_get_jog_session_state()
                     payload = {
                         "udp": controller_perf.get("udp", {}) if isinstance(controller_perf, dict) else {},
                         "jog": command_api.get_jog_performance_snapshot(),
                         "motion_state": str(utils.get_motion_state()).lower(),
                         "is_running": bool(utils.trajectory_state.get("is_running")),
-                        "is_jogging": bool(utils.trajectory_state.get("is_jogging")),
+                        "is_jogging": bool(jog_session.get("session_active", False)),
+                        "jog_session": jog_session,
                         "last_command_age_s": float(utils.trajectory_state_get("last_command_age_s", 0.0)),
                         "command_link_stale": bool(utils.trajectory_state_get("command_link_stale", False)),
                         "recent_udp_reset_count": int(utils.trajectory_state_get("recent_udp_reset_count", 0)),

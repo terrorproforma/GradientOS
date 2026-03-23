@@ -23,6 +23,7 @@ from . import robot_config
 from . import servo_driver
 from . import trajectory_execution
 from . import pid_tuner
+from .jog_session import JogSessionError, JogSessionManager
 from .backends import registry as backend_registry
 from ..kinematics import runtime as kinematics_runtime
 
@@ -140,10 +141,23 @@ def _record_jog_velocity_update(velocity_vector: np.ndarray) -> None:
 def get_jog_performance_snapshot() -> dict[str, object]:
     with _JOG_PERF_LOCK:
         snapshot = json.loads(json.dumps(_JOG_PERF))
-    last_cmd = utils.trajectory_state_get("last_jog_command_time", 0.0)
-    if isinstance(last_cmd, (int, float)) and last_cmd > 0.0:
-        snapshot["last_velocity_command_age_s"] = max(0.0, time.monotonic() - float(last_cmd))
-    snapshot["execution_policy"] = str(utils.trajectory_state.get("jog_execution_policy", "") or "")
+    session_snapshot = {}
+    try:
+        session_snapshot = _JOG_SESSION_MANAGER.get_snapshot()
+    except Exception:
+        session_snapshot = {}
+    last_update_age_s = session_snapshot.get("last_update_age_s")
+    if isinstance(last_update_age_s, (int, float)):
+        snapshot["last_velocity_command_age_s"] = max(0.0, float(last_update_age_s))
+    else:
+        last_cmd = utils.trajectory_state_get("last_jog_command_time", 0.0)
+        if isinstance(last_cmd, (int, float)) and last_cmd > 0.0:
+            snapshot["last_velocity_command_age_s"] = max(0.0, time.monotonic() - float(last_cmd))
+    snapshot["execution_policy"] = str(
+        session_snapshot.get("backend_mode")
+        or utils.trajectory_state.get("jog_execution_policy", "")
+        or ""
+    )
     snapshot["rtcore_owned"] = bool(_get_rtcore_jog_backend() is not None)
     snapshot["control_frequency_hz"] = int(JOG_CONTROL_FREQUENCY_HZ) if "JOG_CONTROL_FREQUENCY_HZ" in globals() else 0
     return snapshot
@@ -435,6 +449,13 @@ def _get_rtcore_jog_backend():
     backend = _get_active_backend()
     if backend is None:
         return None
+    supports_joint_velocity_lease_jog = getattr(backend, "supports_joint_velocity_lease_jog", None)
+    if callable(supports_joint_velocity_lease_jog):
+        try:
+            if bool(supports_joint_velocity_lease_jog()):
+                return backend
+        except Exception:
+            pass
     supports = getattr(backend, "supports_realtime_jog", None)
     if not callable(supports):
         return None
@@ -1287,7 +1308,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
     if utils.trajectory_state.get("is_jogging"):
         print("[Pi Trajectory] Jog mode is active; stopping jog before trajectory run.")
         try:
-            handle_jog_stop()
+            stop_active_jog_session(reason="motion-start")
         except Exception as e:
             print(f"[Pi Trajectory] WARNING: Failed to stop jog mode cleanly: {e}")
         if utils.trajectory_state.get("is_jogging"):
@@ -2393,74 +2414,216 @@ def handle_get_gripper_state(sock: 'socket.socket', addr: tuple):
 # -----------------------------------------------------------------------------
 
 JOG_CONTROL_FREQUENCY_HZ = 50
-JOG_VELOCITY_TIMEOUT_S = 0.5  # If no command received in this time, stop
+JOG_CONTROLLER_LEASE_TIMEOUT_S = 0.4
+JOG_BACKEND_LEASE_TIMEOUT_S = 0.2
+JOG_VELOCITY_TIMEOUT_S = JOG_CONTROLLER_LEASE_TIMEOUT_S
 MAX_JOG_LINEAR_M_S = 0.2      # Safety cap per-axis
 MAX_JOG_ANGULAR_DEG_S = 180.0 # Safety cap per-axis
 MAX_GRIPPER_JOG_DEG_S = 90.0 # Safety cap for gripper rotation rate
+_JOG_SESSION_MANAGER = JogSessionManager()
+
+
+def _jog_execution_policy(jog_backend) -> str:
+    return "joint_velocity_lease" if jog_backend is not None else "controller_cartesian_loop"
+
+
+def _jog_backend_timeout_s(jog_backend) -> float | None:
+    if jog_backend is None:
+        return None
+    return min(JOG_CONTROLLER_LEASE_TIMEOUT_S, JOG_BACKEND_LEASE_TIMEOUT_S)
+
+
+def _coerce_jog_vector(
+    vx: object,
+    vy: object,
+    vz: object,
+    v_roll: object,
+    v_pitch: object,
+    v_yaw: object,
+) -> tuple[float, float, float, float, float, float]:
+    return (
+        float(vx),
+        float(vy),
+        float(vz),
+        float(v_roll),
+        float(v_pitch),
+        float(v_yaw),
+    )
+
+
+def _jog_vector_from_payload(payload: dict[str, object]) -> tuple[float, float, float, float, float, float]:
+    return _coerce_jog_vector(
+        payload.get("vx", 0.0),
+        payload.get("vy", 0.0),
+        payload.get("vz", 0.0),
+        payload.get("v_roll", 0.0),
+        payload.get("v_pitch", 0.0),
+        payload.get("v_yaw", 0.0),
+    )
+
+
+def _sync_jog_trajectory_state(*, touch_last_command: bool = False) -> dict[str, object]:
+    snapshot = _JOG_SESSION_MANAGER.get_snapshot()
+    control = _JOG_SESSION_MANAGER.get_control_state()
+    utils.trajectory_state_update(
+        is_jogging=bool(snapshot.get("session_active", False)),
+        jog_deadman=bool(control.get("deadman", False)),
+        jog_velocities=np.array(control.get("velocity_vector", _coerce_jog_vector(0, 0, 0, 0, 0, 0)), dtype=float),
+        jog_gripper_velocity_deg_s=float(control.get("gripper_velocity_deg_s", 0.0) or 0.0),
+        jog_execution_policy=str(snapshot.get("backend_mode") or ""),
+        jog_session_id=snapshot.get("session_id"),
+        jog_session_owner_id=snapshot.get("owner_id"),
+        jog_session_state=str(snapshot.get("state") or "idle"),
+    )
+    if touch_last_command:
+        utils.trajectory_state_set("last_jog_command_time", time.monotonic())
+    return snapshot
+
+
+def _reset_jog_perf(execution_policy: str, rtcore_owned: bool) -> None:
+    global _JOG_PERF
+    with _JOG_PERF_LOCK:
+        _JOG_PERF = _new_jog_perf_state()
+        _JOG_PERF["control_frequency_hz"] = int(JOG_CONTROL_FREQUENCY_HZ)
+        _JOG_PERF["execution_policy"] = str(execution_policy)
+        _JOG_PERF["rtcore_owned"] = bool(rtcore_owned)
+
+
+def _ensure_jog_thread_running() -> None:
+    thread = utils.trajectory_state.get("jog_thread")
+    if thread is not None and thread.is_alive():
+        return
+    jog_thread = threading.Thread(target=_jog_controller_thread, daemon=True)
+    utils.trajectory_state["jog_thread"] = jog_thread
+    jog_thread.start()
+
+
+def _wait_for_jog_thread_stop(timeout_s: float = 0.5) -> None:
+    thread = utils.trajectory_state.get("jog_thread")
+    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=timeout_s)
+    if thread is None or not thread.is_alive():
+        utils.trajectory_state["jog_thread"] = None
+
+
+def handle_get_jog_session_state() -> dict[str, object]:
+    return _JOG_SESSION_MANAGER.get_snapshot()
+
+
+def handle_jog_session_start(payload: dict[str, object]) -> dict[str, object]:
+    if bool(utils.trajectory_state_get("is_running", False)):
+        raise JogSessionError("MOTION_ACTIVE", "Cannot start jog while another motion is running.")
+    jog_backend = _get_rtcore_jog_backend()
+    execution_policy = _jog_execution_policy(jog_backend)
+    snapshot = _JOG_SESSION_MANAGER.start_session(
+        owner_id=str(payload.get("owner_id", "") or ""),
+        seq=int(payload.get("seq", 0)),
+        lease_timeout_s=float(payload.get("lease_timeout_s", JOG_CONTROLLER_LEASE_TIMEOUT_S)),
+        deadman=bool(payload.get("deadman", False)),
+        velocity_vector=_jog_vector_from_payload(payload),
+        gripper_velocity_deg_s=float(payload.get("gripper_velocity_deg_s", 0.0) or 0.0),
+        backend_mode=execution_policy,
+        backend_timeout_s=_jog_backend_timeout_s(jog_backend),
+        session_id=str(payload.get("session_id", "") or "") or None,
+    )
+    print(f"[Jog] Starting jog session {snapshot.get('session_id')} ({execution_policy})")
+    _reset_jog_perf(execution_policy, jog_backend is not None)
+    _sync_jog_trajectory_state(touch_last_command=True)
+    _ensure_jog_thread_running()
+    return snapshot
+
+
+def handle_jog_session_update(payload: dict[str, object]) -> dict[str, object]:
+    snapshot = _JOG_SESSION_MANAGER.update_session(
+        session_id=str(payload.get("session_id", "") or ""),
+        owner_id=str(payload.get("owner_id", "") or ""),
+        seq=int(payload.get("seq", 0)),
+        lease_timeout_s=float(payload["lease_timeout_s"]) if "lease_timeout_s" in payload else None,
+        deadman=bool(payload.get("deadman", False)),
+        velocity_vector=_jog_vector_from_payload(payload),
+        gripper_velocity_deg_s=float(payload.get("gripper_velocity_deg_s", 0.0) or 0.0),
+    )
+    velocity_vector = np.array(_jog_vector_from_payload(payload), dtype=float)
+    _record_jog_velocity_update(velocity_vector)
+    _sync_jog_trajectory_state(touch_last_command=True)
+    try:
+        if utils.trajectory_state.get("jog_debug", False) and np.any(np.abs(velocity_vector) > 1e-6):
+            print(f"[Jog] Session update: lin(m/s)={np.round(velocity_vector[:3],3)}, ang(deg/s)={np.round(velocity_vector[3:],1)}")
+    except Exception:
+        pass
+    return snapshot
+
+
+def handle_jog_session_stop(payload: dict[str, object]) -> dict[str, object]:
+    reason = str(payload.get("reason", "client-stop") or "client-stop")
+    snapshot = _JOG_SESSION_MANAGER.stop_session(
+        session_id=str(payload.get("session_id", "") or "") or None,
+        owner_id=str(payload.get("owner_id", "") or "") or None,
+        reason=reason,
+        allow_missing=True,
+    )
+    print(f"[Jog] Stopping jog session {snapshot.get('session_id')} ({reason})")
+    _sync_jog_trajectory_state()
+    _wait_for_jog_thread_stop()
+    return snapshot
+
+
+def stop_active_jog_session(reason: str = "controller-stop") -> dict[str, object]:
+    return handle_jog_session_stop({"reason": str(reason or "controller-stop")})
+
 
 def _jog_controller_thread():
-    """
-    This is the heart of the real-time jogging feature. It runs in a tight loop,
-    continuously calculating and commanding small IK movements based on the
-    latest velocity commands stored in the global trajectory_state.
-    """
     print("[Jog] Jog controller thread started.")
-
-    rtcore_jog_backend = _get_rtcore_jog_backend()
-    rtcore_jog_owned = rtcore_jog_backend is not None
-
-    # Get initial state
+    jog_backend = _get_rtcore_jog_backend()
+    jog_backend_timeout_s = _jog_backend_timeout_s(jog_backend)
+    jog_backend_active = False
     q_current = servo_driver.get_current_arm_state_rad(verbose=False)
-
     last_loop_time = time.monotonic()
     last_status_log_time = time.monotonic()
-    timeout_zero_logged = False
     was_paused_for_motion = False
     target_period_ms = 1000.0 / float(JOG_CONTROL_FREQUENCY_HZ)
 
-    while utils.trajectory_state.get("is_jogging"):
+    while True:
+        session_snapshot = _JOG_SESSION_MANAGER.expire_if_needed()
+        if not bool(session_snapshot.get("session_active", False)):
+            break
+
         loop_start_time = time.monotonic()
         dt = loop_start_time - last_loop_time
         last_loop_time = loop_start_time
 
-        # If a non-jog motion starts, pause jogging to avoid fighting other controllers.
-        # When the motion ends, resync q_current from the physical robot so we do not
-        # "snap back" to stale internal state.
-        if utils.trajectory_state.get("is_running"):
-            if rtcore_jog_owned:
+        if bool(utils.trajectory_state_get("is_running", False)):
+            _JOG_SESSION_MANAGER.pause_for_motion()
+            _sync_jog_trajectory_state()
+            if jog_backend_active and jog_backend is not None:
                 try:
-                    stop_realtime_jog = getattr(rtcore_jog_backend, "stop_realtime_jog", None)
-                    if callable(stop_realtime_jog):
-                        stop_realtime_jog()
+                    stop_joint_velocity_lease_jog = getattr(jog_backend, "stop_joint_velocity_lease_jog", None)
+                    if callable(stop_joint_velocity_lease_jog):
+                        stop_joint_velocity_lease_jog()
                 except Exception as exc:
-                    print(f"[Jog] WARNING: Failed to pause RTCore jog cleanly: {exc}")
+                    print(f"[Jog] WARNING: Failed to pause backend jog cleanly: {exc}")
+                jog_backend_active = False
             was_paused_for_motion = True
             loop_duration = time.monotonic() - loop_start_time
             sleep_time = (1.0 / JOG_CONTROL_FREQUENCY_HZ) - loop_duration
             if sleep_time > 0:
                 time.sleep(sleep_time)
             continue
-        elif was_paused_for_motion:
+
+        if was_paused_for_motion:
             fresh_q = servo_driver.get_current_arm_state_rad(verbose=False)
             if fresh_q is not None:
                 q_current = fresh_q
+            _JOG_SESSION_MANAGER.resume_after_motion()
+            _sync_jog_trajectory_state()
             last_loop_time = time.monotonic()
             was_paused_for_motion = False
             continue
 
-        # --- Safety Timeout ---
-        # If we haven't received a velocity command recently, set velocities to zero.
-        time_since_last_cmd = time.monotonic() - utils.trajectory_state["last_jog_command_time"]
-        if time_since_last_cmd > JOG_VELOCITY_TIMEOUT_S:
-            utils.trajectory_state["jog_velocities"] = np.zeros(6, dtype=float)
-            if not timeout_zero_logged:
-                print(f"[Jog] Timeout {time_since_last_cmd:.3f}s > {JOG_VELOCITY_TIMEOUT_S:.2f}s; zeroing jog velocities.")
-                timeout_zero_logged = True
-        else:
-            timeout_zero_logged = False
+        control = _JOG_SESSION_MANAGER.get_control_state()
+        if not bool(control.get("session_active", False)):
+            break
 
-        # Resync from physical feedback each loop so jog IK follows the real arm
-        # instead of integrating indefinitely from the last commanded posture.
         feedback_read_started = time.monotonic()
         fresh_q = servo_driver.get_current_arm_state_rad(verbose=False)
         _record_jog_stage_metric(
@@ -2470,63 +2633,45 @@ def _jog_controller_thread():
         if fresh_q is not None:
             q_current = np.asarray(fresh_q, dtype=float)
 
-        # 1. Get current pose from FK
         current_pose_matrix = ik_solver.get_fk_matrix(q_current)
         if current_pose_matrix is None:
             print("[Jog] ERROR: FK failed during jog loop. Stopping.")
             break
-        
+
         current_position = current_pose_matrix[:3, 3]
         current_orientation = current_pose_matrix[:3, :3]
         if utils.trajectory_state.get("jog_debug", False):
             try:
-                curr_eul_deg = R.from_matrix(current_orientation).as_euler('xyz', degrees=True)
+                curr_eul_deg = R.from_matrix(current_orientation).as_euler("xyz", degrees=True)
                 print(f"[Jog] CURR pos(m)={np.round(current_position,4)} eulXYZ(deg)={np.round(curr_eul_deg,2)}")
             except Exception:
                 pass
-        
-        # 2. Get target velocities from global state (respect deadman gate)
-        velocities = utils.trajectory_state["jog_velocities"]
-        if not utils.trajectory_state.get("jog_deadman", False):
-            # If deadman not held, force zero velocities (gripper included)
-            if utils.trajectory_state.get("jog_debug", False):
-                print("[Jog] Deadman not held → zeroing velocities.")
-            velocities = np.zeros(6, dtype=float)
-            utils.trajectory_state["jog_gripper_velocity_deg_s"] = 0.0
-        # Apply backend safety caps component-wise
+
+        velocities = np.asarray(control.get("velocity_vector", _coerce_jog_vector(0, 0, 0, 0, 0, 0)), dtype=float)
         linear_vel = np.clip(velocities[:3], -MAX_JOG_LINEAR_M_S, MAX_JOG_LINEAR_M_S)
         angular_deg_s = np.clip(velocities[3:], -MAX_JOG_ANGULAR_DEG_S, MAX_JOG_ANGULAR_DEG_S)
-        
-        # 3. Calculate target pose for this time step
-        # Integrate linear velocity to get new position
         target_position = current_position + linear_vel * dt
-        
-        # Integrate angular velocity as explicit XYZ Euler deltas so realtime
-        # jog matches the step-rotate path's labeled roll/pitch/yaw semantics.
-        delta_rotation = R.from_euler('xyz', angular_deg_s * dt, degrees=True).as_matrix()
-        # Apply the small rotation in the base frame, matching `handle_rotate_command()`.
+        delta_rotation = R.from_euler("xyz", angular_deg_s * dt, degrees=True).as_matrix()
         target_orientation = delta_rotation @ current_orientation
         if utils.trajectory_state.get("jog_debug", False):
             try:
-                targ_eul_deg = R.from_matrix(target_orientation).as_euler('xyz', degrees=True)
+                targ_eul_deg = R.from_matrix(target_orientation).as_euler("xyz", degrees=True)
                 print(f"[Jog] TARG pos(m)={np.round(target_position,4)} eulXYZ(deg)={np.round(targ_eul_deg,2)} vel_lin={np.round(linear_vel,4)} vel_ang(deg/s)={np.round(angular_deg_s,1)} dt={dt:.4f}")
             except Exception:
                 pass
 
-        # 4. Solve IK for the new target pose
         ik_started = time.monotonic()
         q_target = ik_solver.solve_ik(
             target_position=target_position,
             target_orientation_matrix=target_orientation,
-            initial_joint_angles=q_current
+            initial_joint_angles=q_current,
         )
         _record_jog_stage_metric(
             "ik_solve_ms",
             max(0.0, (time.monotonic() - ik_started) * 1000.0),
         )
-        
+
         if q_target is not None:
-            # 5. Enforce logical joint limits before commanding
             try:
                 q_arr = np.array(q_target, dtype=float)
                 limits = np.array(utils.LOGICAL_JOINT_LIMITS_RAD, dtype=float)
@@ -2540,63 +2685,62 @@ def _jog_controller_thread():
                     dq = q_clamped - q_current
                     print(f"[Jog] q_delta(rad)={np.round(dq, 5)} | lin={np.round(linear_vel,4)} m/s, ang={np.round(angular_deg_s,1)} deg/s, dt={dt:.4f}s")
                 command_send_started = time.monotonic()
-                if rtcore_jog_owned:
-                    send_realtime_jog_command = getattr(rtcore_jog_backend, "send_realtime_jog_command", None)
-                    if not callable(send_realtime_jog_command):
-                        raise RuntimeError("RTCore jog backend does not expose send_realtime_jog_command()")
+                if jog_backend is not None:
+                    if not jog_backend_active:
+                        start_joint_velocity_lease_jog = getattr(jog_backend, "start_joint_velocity_lease_jog", None)
+                        if not callable(start_joint_velocity_lease_jog):
+                            raise RuntimeError("Jog backend does not expose start_joint_velocity_lease_jog()")
+                        start_joint_velocity_lease_jog(timeout_s=jog_backend_timeout_s or JOG_BACKEND_LEASE_TIMEOUT_S)
+                        jog_backend_active = True
+                    update_joint_velocity_lease_jog = getattr(jog_backend, "update_joint_velocity_lease_jog", None)
+                    if not callable(update_joint_velocity_lease_jog):
+                        raise RuntimeError("Jog backend does not expose update_joint_velocity_lease_jog()")
                     dt_safe = max(dt, 1.0 / float(JOG_CONTROL_FREQUENCY_HZ))
                     joint_velocity_cmd = ((q_clamped - q_current) / dt_safe).tolist()
-                    send_realtime_jog_command(
+                    update_joint_velocity_lease_jog(
                         joint_velocity_cmd,
-                        timeout_s=JOG_VELOCITY_TIMEOUT_S,
+                        timeout_s=jog_backend_timeout_s or JOG_BACKEND_LEASE_TIMEOUT_S,
                     )
                 else:
-                    # 6. Command servos to the clamped angles. High speed, zero accel for responsiveness.
                     servo_driver.set_servo_positions(q_clamped, 800, 0)
                 _record_jog_stage_metric(
                     "command_send_ms",
                     max(0.0, (time.monotonic() - command_send_started) * 1000.0),
                 )
-                q_current = q_clamped # Update our state for the next iteration's IK
-            except Exception as e:
-                print(f"[Jog] WARNING: Failed to clamp/apply joint limits: {e}")
+                q_current = q_clamped
+                _JOG_SESSION_MANAGER.mark_seq_applied(int(control.get("last_seq_received", -1)))
+            except Exception as exc:
+                print(f"[Jog] WARNING: Failed to clamp/apply joint limits: {exc}")
         else:
-            # If IK fails, we don't command anything and just try again next cycle.
-            # This can happen if the target is unreachable.
             print("[Jog] WARNING: IK solution not found for step.")
-            if rtcore_jog_owned:
+            if jog_backend is not None and jog_backend_active:
                 try:
-                    send_realtime_jog_command = getattr(rtcore_jog_backend, "send_realtime_jog_command", None)
-                    if callable(send_realtime_jog_command):
-                        send_realtime_jog_command(
+                    update_joint_velocity_lease_jog = getattr(jog_backend, "update_joint_velocity_lease_jog", None)
+                    if callable(update_joint_velocity_lease_jog):
+                        update_joint_velocity_lease_jog(
                             [0.0] * len(q_current),
-                            timeout_s=JOG_VELOCITY_TIMEOUT_S,
+                            timeout_s=jog_backend_timeout_s or JOG_BACKEND_LEASE_TIMEOUT_S,
                         )
                 except Exception as exc:
-                    print(f"[Jog] WARNING: Failed to zero RTCore jog command after IK miss: {exc}")
+                    print(f"[Jog] WARNING: Failed to zero backend jog command after IK miss: {exc}")
 
-        # --- Maintain loop frequency ---
         loop_duration = time.monotonic() - loop_start_time
         sleep_time = (1.0 / JOG_CONTROL_FREQUENCY_HZ) - loop_duration
         if sleep_time > 0:
             time.sleep(sleep_time)
 
-        # 6. Update gripper if present, integrating jog velocity with safety caps
         try:
             if utils.gripper_present:
-                rate_deg_s = float(utils.trajectory_state.get("jog_gripper_velocity_deg_s", 0.0))
-                # Apply backend cap
+                rate_deg_s = float(control.get("gripper_velocity_deg_s", 0.0) or 0.0)
                 rate_deg_s = float(np.clip(rate_deg_s, -MAX_GRIPPER_JOG_DEG_S, MAX_GRIPPER_JOG_DEG_S))
                 if abs(rate_deg_s) > 1e-3:
                     current_deg = float(np.rad2deg(utils.current_gripper_angle_rad))
                     target_deg = current_deg + rate_deg_s * dt
-                    # Clamp to physical limits
                     min_rad, max_rad = utils.GRIPPER_LIMITS_RAD
                     target_rad_unclamped = float(np.deg2rad(target_deg))
                     target_rad = float(np.clip(target_rad_unclamped, min_rad, max_rad))
                     if abs(target_rad - target_rad_unclamped) > 1e-6:
                         print("[Jog] NOTE: Gripper target clamped to limits.")
-                    # Choose a reasonable speed scaling from requested rate
                     speed_scaled = max(100, min(800, int(abs(rate_deg_s) * 4 + 100)))
                     servo_driver.set_single_servo_position_rads(
                         servo_id=utils.SERVO_ID_GRIPPER,
@@ -2605,10 +2749,9 @@ def _jog_controller_thread():
                         accel=0,
                     )
                     utils.current_gripper_angle_rad = target_rad
-        except Exception as e:
-            print(f"[Jog] WARNING: Gripper jog update failed: {e}")
+        except Exception as exc:
+            print(f"[Jog] WARNING: Gripper jog update failed: {exc}")
 
-        # Periodic status log (every ~0.5 s)
         now = time.monotonic()
         if now - last_status_log_time > 0.5:
             if utils.trajectory_state.get("jog_debug", False):
@@ -2620,139 +2763,25 @@ def _jog_controller_thread():
         )
 
     print("[Jog] Jog controller thread stopped.")
-    if rtcore_jog_owned:
+    if jog_backend is not None and jog_backend_active:
         try:
-            stop_realtime_jog = getattr(rtcore_jog_backend, "stop_realtime_jog", None)
-            if callable(stop_realtime_jog):
-                stop_realtime_jog()
+            stop_joint_velocity_lease_jog = getattr(jog_backend, "stop_joint_velocity_lease_jog", None)
+            if callable(stop_joint_velocity_lease_jog):
+                stop_joint_velocity_lease_jog()
         except Exception as exc:
-            print(f"[Jog] WARNING: Failed to stop RTCore jog on thread exit: {exc}")
-    # Ensure global state reflects the jog thread is no longer active.
-    utils.trajectory_state["is_jogging"] = False
-    utils.trajectory_state["jog_execution_policy"] = ""
+            print(f"[Jog] WARNING: Failed to stop backend jog on thread exit: {exc}")
+    if jog_backend is None:
+        current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
+        if current_angles:
+            servo_driver.set_servo_positions(current_angles, 0, 100)
+    _sync_jog_trajectory_state()
     if utils.trajectory_state.get("jog_thread") is threading.current_thread():
         utils.trajectory_state["jog_thread"] = None
 
 
-def handle_jog_start():
-    """Starts the real-time jogging mode."""
-    global _JOG_PERF
-    if utils.trajectory_state.get("is_running") or utils.trajectory_state.get("is_jogging"):
-        print("[Jog] ERROR: Another motion is already active. Cannot start jog mode.")
-        return
-
-    rtcore_jog_backend = _get_rtcore_jog_backend()
-    print("[Jog] Starting jog mode...")
-    utils.trajectory_state["is_jogging"] = True
-    utils.trajectory_state["last_jog_command_time"] = time.monotonic()
-    utils.trajectory_state["jog_velocities"] = np.zeros(6, dtype=float)
-    utils.trajectory_state["jog_gripper_velocity_deg_s"] = 0.0
-    utils.trajectory_state["jog_execution_policy"] = (
-        "rtcore_joint_velocity" if rtcore_jog_backend is not None else "controller_cartesian_loop"
-    )
-    with _JOG_PERF_LOCK:
-        _JOG_PERF = _new_jog_perf_state()
-        _JOG_PERF["control_frequency_hz"] = int(JOG_CONTROL_FREQUENCY_HZ)
-        _JOG_PERF["execution_policy"] = str(utils.trajectory_state["jog_execution_policy"])
-        _JOG_PERF["rtcore_owned"] = bool(rtcore_jog_backend is not None)
-
-    if rtcore_jog_backend is not None:
-        try:
-            start_realtime_jog = getattr(rtcore_jog_backend, "start_realtime_jog", None)
-            if callable(start_realtime_jog):
-                start_realtime_jog(timeout_s=JOG_VELOCITY_TIMEOUT_S)
-        except Exception as exc:
-            utils.trajectory_state["is_jogging"] = False
-            utils.trajectory_state["jog_execution_policy"] = ""
-            raise RuntimeError(f"Failed to start RTCore jog mode: {exc}") from exc
-
-    jog_thread = threading.Thread(target=_jog_controller_thread, daemon=True)
-    utils.trajectory_state["jog_thread"] = jog_thread
-    jog_thread.start()
-
-
-def handle_jog_stop():
-    """Stops the real-time jogging mode."""
-    print("[Jog] Stopping jog mode...")
-    rtcore_jog_backend = _get_rtcore_jog_backend()
-    utils.trajectory_state["is_jogging"] = False # Signal the thread to exit
-    utils.trajectory_state["jog_gripper_velocity_deg_s"] = 0.0
-
-    # Give the jog thread a moment to stop
-    thread = utils.trajectory_state.get("jog_thread")
-    if thread and thread.is_alive():
-        thread.join(timeout=0.5)
-    utils.trajectory_state["jog_thread"] = None
-    utils.trajectory_state["jog_execution_policy"] = ""
-    _jog_perf_update(execution_policy="", rtcore_owned=False)
-
-    if rtcore_jog_backend is not None:
-        try:
-            stop_realtime_jog = getattr(rtcore_jog_backend, "stop_realtime_jog", None)
-            if callable(stop_realtime_jog):
-                stop_realtime_jog()
-        except Exception as exc:
-            print(f"[Jog] WARNING: Failed to stop RTCore jog mode: {exc}")
-
-    if rtcore_jog_backend is None:
-        # Hard stop the servos as a final safety measure for non-RT backends.
-        current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
-        if current_angles:
-            servo_driver.set_servo_positions(current_angles, 0, 100)
-    
-    print("[Jog] Jog mode stopped.")
-
-def handle_set_jog_velocity(vx, vy, vz, v_roll, v_pitch, v_yaw):
-    """
-    Updates the target velocities for the active jogging session.
-    This is expected to be called at a high frequency by the client.
-    """
-    if not utils.trajectory_state.get("is_jogging"):
-        return # Ignore if not in jog mode
-
-    velocity_vector = np.array([vx, vy, vz, v_roll, v_pitch, v_yaw], dtype=float)
-    utils.trajectory_state["jog_velocities"] = velocity_vector
-    utils.trajectory_state["last_jog_command_time"] = time.monotonic()
-    _record_jog_velocity_update(velocity_vector)
-    try:
-        # Lightweight log when non-zero or on significant change
-        v = utils.trajectory_state["jog_velocities"]
-        if utils.trajectory_state.get("jog_debug", False) and np.any(np.abs(v) > 1e-6):
-            print(f"[Jog] Vel update: lin(m/s)={np.round(v[:3],3)}, ang(deg/s)={np.round(v[3:],1)}")
-    except Exception:
-        pass
-
-
-def handle_set_jog_deadman(enabled: bool):
-    """Sets the jog deadman gate. When False, all jog rates are forced to zero."""
-    utils.trajectory_state["jog_deadman"] = bool(enabled)
-    # Touch the timestamp so timeout doesn't immediately zero after engage
-    utils.trajectory_state["last_jog_command_time"] = time.monotonic()
-    if not enabled:
-        utils.trajectory_state["jog_velocities"] = np.zeros(6, dtype=float)
-        utils.trajectory_state["jog_gripper_velocity_deg_s"] = 0.0
-    if utils.trajectory_state.get("jog_debug", False):
-        print(f"[Jog] Deadman set to {enabled}")
-
-
 def handle_set_jog_debug(enabled: bool):
-    """Enables/disables verbose jog logging."""
     utils.trajectory_state["jog_debug"] = bool(enabled)
     print(f"[Jog] Debug logging set to {enabled}")
-
-
-def handle_set_gripper_jog_velocity(rate_deg_s: float):
-    """
-    Sets the gripper jogging angular rate in degrees/second. Takes effect when
-    jog mode is active. Backend safety caps apply.
-    """
-    if not utils.trajectory_state.get("is_jogging"):
-        return
-    try:
-        utils.trajectory_state["jog_gripper_velocity_deg_s"] = float(rate_deg_s)
-        utils.trajectory_state["last_jog_command_time"] = time.monotonic()
-    except Exception:
-        pass
 
 
 # -----------------------------------------------------------------------------

@@ -302,10 +302,12 @@ gradient-api          # FastAPI proxy that exposes REST/SSE telemetry
 
 Component extras:
 - Core (`gradient-controller`, `gradient-api`) are installed by default.
+- CAD STEP topology extraction requires the `cad` extra: `uv pip install -e .[cad]`.
+  - This installs `cadquery-ocp`, which provides the `OCP` module used for STEP topology parsing.
 - UI/CLI tooling requires the `ui` extra: `uv pip install -e .[ui]`.
 - Camera/vision tooling (including telemetry capture) lives behind the `vision` extra: `uv pip install -e .[vision]`.
 - Raspberry Pi CSI cameras need the separate `picamera` extra: `uv pip install -e .[picamera]`.
-- Combine extras as needed, e.g. `uv pip install -e .[ui,vision,ai]` for full tooling.
+- Combine extras as needed, e.g. `uv pip install -e .[cad,ui,vision,ai]` for full tooling.
 - Raspberry Pi camera support still needs the system `picamera2` stack (typically installed via `sudo apt install -y python3-libcamera python3-picamera2`).
 
 Notes:
@@ -346,7 +348,11 @@ Notes:
 - With **realtime jog off** (default), each Cartesian button press issues a single incremental move whose step size is fully controlled by the numeric fields in the jog card:
 - Translation buttons call `/control/move-line-relative` with a step of `Linear` millimeters (from the `Linear (mm/s)` input) along the selected axis, converted to meters in the payload. The request includes the current speed multiplier from the UI slider as `speed_multiplier`, and now defaults to `closed: false` so the controller uses the RTCore queued path on EtherCAT backends. Compatibility requests for `closed: true` no longer pull scheduled EtherCAT motion timing back into Python.
   - Orientation buttons call `/control/rotate` with a step of `Angular` degrees (from the `Angular (deg/s)` input) about the requested axis (`roll`, `pitch`, or `yaw`). The API forwards the relative `ROTATE` command directly, so the web UI now shares the controller's queued/open-loop orientation path and structured motion metadata instead of reconstructing a fresh absolute Euler target first.
-- With **realtime jog on** (press the **Start** button in the Realtime Jog block), the same buttons switch to press‑and‑hold behavior and the UI streams velocity vectors through `/control/jog/velocity`. The `Deadman` checkbox still gates whether any motion is commanded in this mode, and the `Linear` / `Angular` fields are interpreted as base linear and angular rates for the realtime vector.
+- With **realtime jog on** (press the **Start** button in the Realtime Jog block), the same buttons switch to press-and-hold behavior and the UI uses the controller-owned session flow:
+  - `POST /control/jog/session/start` on first hold
+  - `POST /control/jog/session/update` while held with monotonically increasing `seq`
+  - `POST /control/jog/session/stop` on release and page teardown
+  The `Deadman` checkbox still gates whether any motion is commanded in this mode, and the `Linear` / `Angular` fields are interpreted as base linear and angular rates for the realtime vector.
 - On EtherCAT RTCore, those streamed jog vectors are now converted into joint-velocity jog commands whose timed execution and stale-command timeout live in RTCore; simulation and Feetech still use the existing controller-owned realtime jog loop.
 - Jog start/stop avoids re‑issuing servo commands when the jog vector is zero: the controller caches the last posture, skips IK work whenever both linear and angular rates are zero, and only sends new setpoints when an axis is actually pressed. This prevents the robot from creeping when operators simply toggle realtime on/off.
 

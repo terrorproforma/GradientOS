@@ -41,6 +41,30 @@ type MotionStatusResponse = {
 };
 
 type JogCommandVector = [number, number, number, number, number, number];
+type JogStatePayload = {
+	active: boolean;
+	deadman: boolean;
+	vx: number;
+	vy: number;
+	vz: number;
+	v_roll: number;
+	v_pitch: number;
+	v_yaw: number;
+};
+
+type JogSessionSnapshot = {
+	session_id?: string | null;
+	state?: string;
+	last_seq_received?: number;
+	last_seq_applied?: number;
+	lease_remaining_s?: number | null;
+	last_stop_reason?: string | null;
+};
+
+type JogSessionResponse = {
+	status?: string;
+	session?: JogSessionSnapshot;
+};
 
 const LIVE_JOINT_FEEDBACK_POLL_MS = 20;
 
@@ -95,6 +119,24 @@ type DriveFaultSnapshot = {
 
 const JOINT_STEP_OPTIONS_DEG = [0.25, 1, 5] as const;
 const MIN_CUSTOM_JOINT_STEP_DEG = 0.001;
+
+function createJogOwnerId(): string {
+	try {
+		if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+			return crypto.randomUUID();
+		}
+	} catch {
+		// Fall through to timestamp-based fallback.
+	}
+	return `web-ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isJogSessionTerminalError(message: string | null | undefined): boolean {
+	if (!message) {
+		return false;
+	}
+	return /SESSION_EXPIRED|OWNER_CONFLICT|WRONG_SESSION|SESSION_NOT_FOUND|SESSION_INACTIVE/.test(message);
+}
 
 function formatDriveFaultAxisLabel(axis: DriveFaultAxis): string {
 	if (typeof axis.logical_joint === "number" && Number.isFinite(axis.logical_joint)) {
@@ -227,13 +269,20 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const [lastJogCommand, setLastJogCommand] = useState<JogCommandVector>([0, 0, 0, 0, 0, 0]);
 	const jogTimerRef = useRef<number | null>(null);
 	const sendJogTickRef = useRef<() => Promise<void>>(async () => {});
+	const jogEnabledRef = useRef<boolean>(false);
+	const deadmanRef = useRef<boolean>(true);
 	const lastSentRef = useRef<JogCommandVector>([0, 0, 0, 0, 0, 0]);
 	const lastSentAtRef = useRef<number>(0);
-	const queuedJogCommandRef = useRef<JogCommandVector | null>(null);
-	const jogSendLoopRef = useRef<Promise<void> | null>(null);
+	const queuedJogStateRef = useRef<JogStatePayload | null>(null);
+	const queuedJogStateSilentRef = useRef<boolean>(true);
+	const jogStatePublishLoopRef = useRef<Promise<void> | null>(null);
+	const jogOwnerIdRef = useRef<string>(createJogOwnerId());
+	const jogSessionIdRef = useRef<string | null>(null);
+	const jogSessionSeqRef = useRef<number>(-1);
+	const jogSessionStatusRef = useRef<string>("idle");
 	const pendingMotionActionRef = useRef<string | null>(null);
 	const lastRequestErrorRef = useRef<string | null>(null);
-	const keepaliveMs = 200;
+	const keepaliveMs = 100;
 	const jogTickIntervalMs = 50;
 	const linCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
 	const angCountsRef = useRef<{ x: number; y: number; z: number }>({ x: 0, y: 0, z: 0 });
@@ -406,33 +455,104 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const effectiveLinearMS = useMemo(() => (linBaseMmS / 1000.0) * speedMult, [linBaseMmS, speedMult]);
 	const effectiveAngularDegS = useMemo(() => angBaseDegS * speedMult, [angBaseDegS, speedMult]);
 
-	const enqueueJogCommand = useCallback((commandPayload: JogCommandVector) => {
-		queuedJogCommandRef.current = commandPayload;
-		if (!jogSendLoopRef.current) {
-			jogSendLoopRef.current = (async () => {
+	const buildJogStatePayload = useCallback((
+		commandPayload: JogCommandVector,
+		overrides?: Partial<Pick<JogStatePayload, "active" | "deadman">>,
+	): JogStatePayload => ({
+		active: overrides?.active ?? jogEnabledRef.current,
+		deadman: overrides?.deadman ?? deadmanRef.current,
+		vx: commandPayload[0],
+		vy: commandPayload[1],
+		vz: commandPayload[2],
+		v_roll: commandPayload[3],
+		v_pitch: commandPayload[4],
+		v_yaw: commandPayload[5],
+	}), []);
+
+	const resetJogSessionTracking = useCallback(() => {
+		jogSessionIdRef.current = null;
+		jogSessionSeqRef.current = -1;
+		jogSessionStatusRef.current = "idle";
+	}, []);
+
+	const enqueueJogState = useCallback((payload: JogStatePayload, silent = true) => {
+		const hadPendingPayload = queuedJogStateRef.current !== null;
+		queuedJogStateRef.current = payload;
+		queuedJogStateSilentRef.current = hadPendingPayload ? (queuedJogStateSilentRef.current && silent) : silent;
+		if (!jogStatePublishLoopRef.current) {
+			jogStatePublishLoopRef.current = (async () => {
 				try {
-					while (queuedJogCommandRef.current) {
-						const nextCommand = queuedJogCommandRef.current;
-						queuedJogCommandRef.current = null;
+					while (queuedJogStateRef.current) {
+						const nextPayload = queuedJogStateRef.current;
+						const nextSilent = queuedJogStateSilentRef.current;
+						queuedJogStateRef.current = null;
+						queuedJogStateSilentRef.current = true;
+						const nextCommand: JogCommandVector = [
+							nextPayload.vx,
+							nextPayload.vy,
+							nextPayload.vz,
+							nextPayload.v_roll,
+							nextPayload.v_pitch,
+							nextPayload.v_yaw,
+						];
 						lastSentRef.current = nextCommand;
 						lastSentAtRef.current = Date.now();
 						setLastJogCommand(nextCommand);
-						await post("/control/jog/velocity", {
-							vx: nextCommand[0],
-							vy: nextCommand[1],
-							vz: nextCommand[2],
-							v_roll: nextCommand[3],
-							v_pitch: nextCommand[4],
-							v_yaw: nextCommand[5],
-						});
+						if (!nextPayload.active) {
+							resetJogSessionTracking();
+							continue;
+						}
+						const nextSeq = jogSessionSeqRef.current + 1;
+						const requestBody = {
+							owner_id: jogOwnerIdRef.current,
+							seq: nextSeq,
+							deadman: nextPayload.deadman,
+							vx: nextPayload.vx,
+							vy: nextPayload.vy,
+							vz: nextPayload.vz,
+							v_roll: nextPayload.v_roll,
+							v_pitch: nextPayload.v_pitch,
+							v_yaw: nextPayload.v_yaw,
+						};
+						const response = (jogSessionIdRef.current
+							? await post(
+								"/control/jog/session/update",
+								{ session_id: jogSessionIdRef.current, ...requestBody },
+								nextSilent,
+							)
+							: await post("/control/jog/session/start", requestBody, nextSilent)) as JogSessionResponse | null;
+						const session = response?.session;
+						if (session?.session_id) {
+							jogSessionIdRef.current = session.session_id;
+							jogSessionSeqRef.current = typeof session.last_seq_received === "number"
+								? session.last_seq_received
+								: nextSeq;
+							jogSessionStatusRef.current = session.state ?? "active";
+						} else if (isJogSessionTerminalError(lastRequestErrorRef.current)) {
+							const zeroCommand: JogCommandVector = [0, 0, 0, 0, 0, 0];
+							setJogEnabled(false);
+							if (jogTimerRef.current) {
+								window.clearInterval(jogTimerRef.current);
+								jogTimerRef.current = null;
+							}
+							linCountsRef.current = { x: 0, y: 0, z: 0 };
+							angCountsRef.current = { x: 0, y: 0, z: 0 };
+							queuedJogStateRef.current = null;
+							queuedJogStateSilentRef.current = true;
+							setLastJogCommand(zeroCommand);
+							lastSentRef.current = zeroCommand;
+							lastSentAtRef.current = Date.now();
+							jogEnabledRef.current = false;
+							resetJogSessionTracking();
+						}
 					}
 				} finally {
-					jogSendLoopRef.current = null;
+					jogStatePublishLoopRef.current = null;
 				}
 			})();
 		}
-		return jogSendLoopRef.current ?? Promise.resolve();
-	}, [post]);
+		return jogStatePublishLoopRef.current ?? Promise.resolve();
+	}, [post, resetJogSessionTracking]);
 
 	const sendJogTick = useCallback(async () => {
 		const now = Date.now();
@@ -455,30 +575,23 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 			Number(v[4].toFixed(3)),
 			Number(v[5].toFixed(3)),
 		];
-		await enqueueJogCommand(commandPayload);
-	}, [computeJogVector, enqueueJogCommand]);
+		void enqueueJogState(buildJogStatePayload(commandPayload), true);
+	}, [buildJogStatePayload, computeJogVector, enqueueJogState]);
 
 	// Keep the interval callback hot-swapped with latest slider/deadman/base values.
 	useEffect(() => {
 		sendJogTickRef.current = sendJogTick;
 	}, [sendJogTick]);
 
-	const ensureJogStarted = useCallback(async () => {
-		if (!jogEnabled) {
-			setJogEnabled(true);
-			await post("/control/jog/start");
-			await post("/control/jog/deadman", { enabled: deadman });
-			// start timer
-			if (jogTimerRef.current) {
-				window.clearInterval(jogTimerRef.current);
-			}
-			jogTimerRef.current = window.setInterval(() => {
-				sendJogTickRef.current().catch(() => {});
-			}, jogTickIntervalMs);
-		}
-	}, [jogEnabled, post, deadman, jogTickIntervalMs]);
+	useEffect(() => {
+		jogEnabledRef.current = jogEnabled;
+	}, [jogEnabled]);
 
-	const stopJog = useCallback(async () => {
+	useEffect(() => {
+		deadmanRef.current = deadman;
+	}, [deadman]);
+
+	const stopJogLocally = useCallback((clearSessionTracking = false) => {
 		const zeroCommand: JogCommandVector = [0, 0, 0, 0, 0, 0];
 		setJogEnabled(false);
 		if (jogTimerRef.current) {
@@ -487,12 +600,119 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		}
 		linCountsRef.current = { x: 0, y: 0, z: 0 };
 		angCountsRef.current = { x: 0, y: 0, z: 0 };
+		queuedJogStateRef.current = null;
+		queuedJogStateSilentRef.current = true;
 		setLastJogCommand(zeroCommand);
-		await enqueueJogCommand(zeroCommand);
-		await post("/control/jog/stop");
 		lastSentRef.current = zeroCommand;
 		lastSentAtRef.current = Date.now();
-	}, [enqueueJogCommand, post]);
+		jogEnabledRef.current = false;
+		if (clearSessionTracking) {
+			resetJogSessionTracking();
+		}
+	}, [resetJogSessionTracking]);
+
+	const postJsonBestEffort = useCallback((path: string, body?: unknown) => {
+		const payload = body === undefined ? "" : JSON.stringify(body);
+		if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+			try {
+				const blob = new Blob([payload], { type: "application/json" });
+				if (navigator.sendBeacon(`${apiHost}${path}`, blob)) {
+					return;
+				}
+			} catch {
+				// Fall through to fetch keepalive.
+			}
+		}
+		if (typeof fetch === "function") {
+			void fetch(`${apiHost}${path}`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: payload || undefined,
+				keepalive: true,
+			}).catch(() => {});
+		}
+	}, [apiHost]);
+
+	const requestJogFailsafeStop = useCallback(() => {
+		const sessionId = jogSessionIdRef.current;
+		if (!jogEnabledRef.current && !sessionId) {
+			return;
+		}
+		stopJogLocally();
+		if (sessionId) {
+			postJsonBestEffort("/control/jog/session/stop", {
+				session_id: sessionId,
+				owner_id: jogOwnerIdRef.current,
+				reason: "pagehide",
+			});
+		}
+		resetJogSessionTracking();
+	}, [postJsonBestEffort, resetJogSessionTracking, stopJogLocally]);
+
+	useEffect(() => {
+		const handlePageHide = () => {
+			requestJogFailsafeStop();
+		};
+		const handleVisibilityChange = () => {
+			if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+				requestJogFailsafeStop();
+			}
+		};
+		window.addEventListener("pagehide", handlePageHide);
+		window.addEventListener("beforeunload", handlePageHide);
+		document.addEventListener("visibilitychange", handleVisibilityChange);
+		return () => {
+			document.removeEventListener("visibilitychange", handleVisibilityChange);
+			window.removeEventListener("beforeunload", handlePageHide);
+			window.removeEventListener("pagehide", handlePageHide);
+			if (jogEnabledRef.current || jogSessionIdRef.current) {
+				const sessionId = jogSessionIdRef.current;
+				if (sessionId) {
+					postJsonBestEffort("/control/jog/session/stop", {
+						session_id: sessionId,
+						owner_id: jogOwnerIdRef.current,
+						reason: "component-unmount",
+					});
+				}
+				resetJogSessionTracking();
+			}
+		};
+	}, [postJsonBestEffort, requestJogFailsafeStop, resetJogSessionTracking]);
+
+	const ensureJogStarted = useCallback(async () => {
+		if (!jogEnabled) {
+			setJogEnabled(true);
+			jogEnabledRef.current = true;
+			// start timer
+			if (jogTimerRef.current) {
+				window.clearInterval(jogTimerRef.current);
+			}
+			jogTimerRef.current = window.setInterval(() => {
+				sendJogTickRef.current().catch(() => {});
+			}, jogTickIntervalMs);
+			await enqueueJogState(buildJogStatePayload([0, 0, 0, 0, 0, 0], { active: true, deadman }), false);
+		}
+	}, [buildJogStatePayload, deadman, enqueueJogState, jogEnabled, jogTickIntervalMs]);
+
+	const stopJog = useCallback(async () => {
+		const sessionId = jogSessionIdRef.current;
+		stopJogLocally();
+		try {
+			if (jogStatePublishLoopRef.current) {
+				await jogStatePublishLoopRef.current;
+			}
+		} catch {
+			// Ignore prior publish failure and still try the stop request.
+		}
+		if (sessionId) {
+			await post("/control/jog/session/stop", {
+				session_id: sessionId,
+				owner_id: jogOwnerIdRef.current,
+				reason: "ui-release",
+			}, false);
+		}
+		resetJogSessionTracking();
+	}, [post, resetJogSessionTracking, stopJogLocally]);
 
 	const runDiscreteMotionCommand = useCallback(async <T,>(actionKey: string, task: () => Promise<T>) => {
 		if (motionBusy || pendingMotionActionRef.current) {
@@ -510,8 +730,20 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 
 	const onDeadmanToggle = useCallback(async (enabled: boolean) => {
 		setDeadman(enabled);
-		await post("/control/jog/deadman", { enabled });
-	}, [post]);
+		deadmanRef.current = enabled;
+		if (jogEnabledRef.current) {
+			const vector = enabled ? computeJogVector() : ([0, 0, 0, 0, 0, 0] as JogCommandVector);
+			const commandPayload: JogCommandVector = [
+				Number(vector[0].toFixed(6)),
+				Number(vector[1].toFixed(6)),
+				Number(vector[2].toFixed(6)),
+				Number(vector[3].toFixed(3)),
+				Number(vector[4].toFixed(3)),
+				Number(vector[5].toFixed(3)),
+			];
+			await enqueueJogState(buildJogStatePayload(commandPayload, { active: true, deadman: enabled }), false);
+		}
+	}, [buildJogStatePayload, computeJogVector, enqueueJogState]);
 	const onDebugToggle = useCallback(async (enabled: boolean) => {
 		await post("/control/jog/debug", { enabled });
 	}, [post]);

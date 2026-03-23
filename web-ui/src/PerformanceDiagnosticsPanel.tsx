@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 
 type ApiCommandPerformance = {
   count?: number;
@@ -80,12 +80,33 @@ type RtcorePerformance = {
   motion_last_update_age_ms?: number | null;
 };
 
-type PerformanceResponse = {
+export type PerformanceResponse = {
   collected_at?: string;
   api_udp?: ApiUdpPerformance;
   controller?: {
     udp?: ControllerUdpPerformance;
     jog?: JogPerformance;
+    jog_session?: {
+      session_present?: boolean;
+      session_active?: boolean;
+      session_id?: string | null;
+      owner_id?: string | null;
+      state?: string;
+      deadman?: boolean;
+      paused_for_motion?: boolean;
+      lease_timeout_s?: number | null;
+      lease_remaining_s?: number | null;
+      last_update_age_s?: number | null;
+      last_seq_received?: number;
+      last_seq_applied?: number;
+      lease_expiry_count?: number;
+      pause_for_motion_count?: number;
+      backend_mode?: string | null;
+      backend_timeout_s?: number | null;
+      last_stop_reason?: string | null;
+      stale_packet_rejects?: number;
+      owner_conflict_rejects?: number;
+    };
     motion_state?: string;
     is_jogging?: boolean;
     last_command_age_s?: number;
@@ -93,8 +114,6 @@ type PerformanceResponse = {
   };
   rtcore?: RtcorePerformance | null;
 };
-
-const PERFORMANCE_POLL_MS = 500;
 
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) {
@@ -122,42 +141,6 @@ function formatNsAsUs(value: number | null | undefined, digits = 2): string {
     return "--";
   }
   return `${(value / 1000).toFixed(digits)} us`;
-}
-
-async function readErrorMessage(res: Response): Promise<string> {
-  const contentType = res.headers.get("content-type") ?? "";
-  if (contentType.includes("application/json")) {
-    try {
-      const payload = (await res.json()) as { detail?: unknown; message?: unknown };
-      if (payload && typeof payload === "object") {
-        if (
-          payload.detail &&
-          typeof payload.detail === "object" &&
-          typeof (payload.detail as { message?: unknown }).message === "string"
-        ) {
-          return String((payload.detail as { message: string }).message);
-        }
-        if (typeof payload.detail === "string") {
-          return payload.detail;
-        }
-        if (typeof payload.message === "string") {
-          return payload.message;
-        }
-        return JSON.stringify(payload);
-      }
-    } catch {
-      // Fall through to plain text handling.
-    }
-  }
-  try {
-    const text = (await res.text()).trim();
-    if (text) {
-      return text;
-    }
-  } catch {
-    // Ignore read failures and use the HTTP status line.
-  }
-  return `${res.status} ${res.statusText}`;
 }
 
 function DiagnosticsMetricCard({
@@ -214,10 +197,13 @@ function DiagnosticsSignalCard({
   );
 }
 
-export function PerformanceDiagnosticsPanel({ apiHost }: { apiHost: string }) {
-  const [snapshot, setSnapshot] = useState<PerformanceResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
+export function PerformanceDiagnosticsPanel({
+  snapshot,
+  error,
+}: {
+  snapshot: PerformanceResponse | null;
+  error: string | null;
+}) {
   const snapshotAgeSeconds = useMemo(() => {
     if (!snapshot?.collected_at) {
       return null;
@@ -229,59 +215,32 @@ export function PerformanceDiagnosticsPanel({ apiHost }: { apiHost: string }) {
     return Math.max(0, (Date.now() - collectedAtMs) / 1000);
   }, [snapshot]);
 
-  useEffect(() => {
-    let disposed = false;
-    let inFlight = false;
-    const tick = async () => {
-      if (disposed || inFlight) {
-        return;
-      }
-      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
-        return;
-      }
-      inFlight = true;
-      try {
-        const res = await fetch(`${apiHost}/debug/performance`, {
-          method: "GET",
-          headers: { Accept: "application/json" },
-        });
-        if (!res.ok) {
-          throw new Error(await readErrorMessage(res));
-        }
-        const payload = (await res.json()) as PerformanceResponse;
-        if (!disposed) {
-          setSnapshot(payload);
-          setError(null);
-        }
-      } catch (err) {
-        if (!disposed) {
-          setError((err as Error)?.message || "Failed to load timing diagnostics.");
-        }
-      } finally {
-        inFlight = false;
-      }
-    };
-    void tick();
-    const timer = window.setInterval(() => {
-      void tick();
-    }, PERFORMANCE_POLL_MS);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  }, [apiHost]);
-
   const apiUdp = snapshot?.api_udp;
   const controller = snapshot?.controller;
   const controllerUdp = controller?.udp;
   const jog = controller?.jog;
+  const jogSession = controller?.jog_session;
   const rtcore = snapshot?.rtcore;
+  const hasError = Boolean(error);
+  const isStale = !hasError && typeof snapshotAgeSeconds === "number" && snapshotAgeSeconds > 2.0;
+  const statusTone = hasError ? "border-amber-400/35 bg-amber-400/10 text-amber-100" : isStale
+    ? "border-amber-400/25 bg-amber-400/10 text-amber-100"
+    : snapshot
+      ? "border-cyan-400/25 bg-cyan-400/10 text-cyan-100"
+      : "border-slate-700/60 bg-slate-900/60 text-slate-300";
+  const statusLabel = hasError
+    ? `offline ${formatAgeSeconds(snapshotAgeSeconds)}`
+    : isStale
+      ? `stale ${formatAgeSeconds(snapshotAgeSeconds)}`
+      : snapshot
+        ? `live ${formatAgeSeconds(snapshotAgeSeconds)}`
+        : "waiting";
 
   const moveApi = apiUdp?.by_command?.MOVE_LINE_RELATIVE;
   const waitApi = apiUdp?.by_command?.WAIT_FOR_IDLE;
-  const jogApi = apiUdp?.by_command?.SET_JOG_VELOCITY;
+  const jogApi = apiUdp?.by_command?.JOG_SESSION_UPDATE ?? apiUdp?.by_command?.JOG_SESSION_START;
   const moveController = controllerUdp?.per_command?.MOVE_LINE_RELATIVE;
-  const jogController = controllerUdp?.per_command?.SET_JOG_VELOCITY;
+  const jogController = controllerUdp?.per_command?.JOG_SESSION_UPDATE ?? controllerUdp?.per_command?.JOG_SESSION_START;
   const jogLoop = jog?.loop;
   const jogFeedback = jog?.stages?.feedback_read_ms;
   const jogIk = jog?.stages?.ik_solve_ms;
@@ -334,13 +293,19 @@ export function PerformanceDiagnosticsPanel({ apiHost }: { apiHost: string }) {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <span className="rounded-full border border-cyan-400/25 bg-cyan-400/10 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-cyan-100">
-            {snapshot ? `live ${formatAgeSeconds(snapshotAgeSeconds)}` : "waiting"}
+          <span className={`rounded-full border px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.18em] ${statusTone}`}>
+            {statusLabel}
           </span>
         </div>
       </div>
 
-      {error ? (
+      {error && snapshot ? (
+        <div className="mt-3 rounded-xl border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+          Diagnostics polling is offline. Showing the last successful sample from {formatAgeSeconds(snapshotAgeSeconds)} ago.
+          {" "}Last error: {error}
+        </div>
+      ) : null}
+      {error && !snapshot ? (
         <div className="mt-3 rounded-xl border border-rose-500/25 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">
           {error}
         </div>
@@ -360,9 +325,10 @@ export function PerformanceDiagnosticsPanel({ apiHost }: { apiHost: string }) {
 
       <div className="mt-4 grid gap-3 xl:grid-cols-2">
         <DiagnosticsMetricCard title="UI to API timing">
-          <div className="tabular-nums">Jog velocity RTT avg/max: {formatMs(jogApi?.avg_round_trip_ms)} / {formatMs(jogApi?.max_round_trip_ms)}</div>
+          <div className="tabular-nums">Jog session RTT avg/max: {formatMs(jogApi?.avg_round_trip_ms)} / {formatMs(jogApi?.max_round_trip_ms)}</div>
           <div className="tabular-nums">Move request RTT avg/max: {formatMs(moveApi?.avg_round_trip_ms)} / {formatMs(moveApi?.max_round_trip_ms)}</div>
           <div className="tabular-nums">Wait-for-idle RTT avg/max: {formatMs(waitApi?.avg_round_trip_ms)} / {formatMs(waitApi?.max_round_trip_ms)}</div>
+          <div className="tabular-nums">Controller session: {jogSession?.state ?? "idle"} | lease {formatAgeSeconds(jogSession?.lease_remaining_s)} | update age {formatAgeSeconds(jogSession?.last_update_age_s)}</div>
           <div className="pt-1 text-[10px] leading-relaxed text-slate-500">
             `MOVE_LINE_RELATIVE` includes planning before the ACK returns. `WAIT_FOR_IDLE` includes the full motion time.
           </div>
@@ -386,13 +352,15 @@ export function PerformanceDiagnosticsPanel({ apiHost }: { apiHost: string }) {
           <div className="tabular-nums">IK avg/max: {formatMs(jogIk?.avg_ms)} / {formatMs(jogIk?.max_ms)}</div>
           <div className="tabular-nums">Command send avg/max: {formatMs(jogSend?.avg_ms)} / {formatMs(jogSend?.max_ms)}</div>
           <div className="tabular-nums">Jog command age: {formatAgeSeconds(jog?.last_velocity_command_age_s)}</div>
+          <div className="tabular-nums">Lease expiries: {jogSession?.lease_expiry_count ?? 0} | stale seq rejects {jogSession?.stale_packet_rejects ?? 0}</div>
         </DiagnosticsMetricCard>
 
         <DiagnosticsMetricCard title="RTCore health">
           <div className="tabular-nums">RT jitter current/max: {formatNsAsUs(rtcore?.rt_last_jitter_ns)} / {formatNsAsUs(rtcore?.rt_max_abs_jitter_ns)}</div>
           <div className="tabular-nums">RT overruns: {rtcore?.rt_overrun_count ?? 0} | motion update age {formatMs(rtcore?.motion_last_update_age_ms)}</div>
           <div className="tabular-nums">Controller motion state: {(controller?.motion_state ?? "--").toUpperCase()}</div>
-          <div className="tabular-nums">Controller jogging: {controller?.is_jogging ? "yes" : "no"} | exec policy {jog?.execution_policy ?? "--"}</div>
+          <div className="tabular-nums">Controller jogging: {controller?.is_jogging ? "yes" : "no"} | exec policy {jogSession?.backend_mode ?? jog?.execution_policy ?? "--"}</div>
+          <div className="tabular-nums">Owner conflicts: {jogSession?.owner_conflict_rejects ?? 0} | last stop {jogSession?.last_stop_reason ?? "--"}</div>
         </DiagnosticsMetricCard>
       </div>
     </section>

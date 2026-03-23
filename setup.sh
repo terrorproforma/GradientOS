@@ -94,6 +94,7 @@ headline "GradientOS Setup"
 
 EXTRA_SPEC="core"
 SELECTED_DESC=("core (controller/API)")
+want_cad=false
 want_ui=false
 want_vision=false
 want_ai=false
@@ -107,6 +108,9 @@ if $QUIET; then
 else
   say "You'll be guided through optional components."
   echo
+  if ask_yes_no "Install CAD STEP topology support (OpenCascade bindings)?" n; then
+    want_cad=true
+  fi
   if ask_yes_no "Install the Gradient UI (PySide6 desktop app)?" n; then
     want_ui=true
   fi
@@ -148,6 +152,9 @@ append_extra() {
   SELECTED_DESC+=("$desc")
 }
 
+if $want_cad; then
+  append_extra cad "cad (STEP topology)"
+fi
 if $want_ui; then
   append_extra ui "ui (desktop app)"
 fi

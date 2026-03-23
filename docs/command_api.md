@@ -89,34 +89,28 @@ SET_ORIENTATION,0,30,0,0.25
 SET_ORIENTATION,0,30,0,1.5,true
 ```
 
-#### `JOG_START`
--   **Syntax:** `JOG_START`
--   **Description:** Enables real-time Cartesian jogging mode. On EtherCAT RTCore, the controller now uses its current Cartesian/IK bridge only to derive joint-velocity intent, then sends dedicated RTCore jog commands so the final timed execution and stale-command timeout live in RTCore. On non-RT backends, the existing controller-owned jog loop remains in place. This mode can run in parallel with trajectory recording and telemetry.
-    -   Backend safety: Linear and angular jog rates are capped server-side; IK solutions are clamped to `LOGICAL_JOINT_LIMITS_RAD` before commanding.
+#### `JOG_SESSION_START`
+-   **Syntax:** `JOG_SESSION_START,<payload_b64>`
+-   **Description:** Starts a controller-owned jog session. This is the primary jog entrypoint for new clients. The payload is base64url-encoded JSON containing `owner_id`, `seq`, `deadman`, and the six Cartesian velocity fields (`vx`, `vy`, `vz`, `v_roll`, `v_pitch`, `v_yaw`). Optional fields include `gripper_velocity_deg_s`, `lease_timeout_s`, and `session_id` (normally controller-generated).
+-   **Reply behavior:** Returns `ACK,JOG_SESSION_START,<payload_b64>` on success, where the payload is the controller session snapshot. Validation and ownership failures return `ERROR,JOG_SESSION_START,<payload_b64>` with structured error fields such as `code`, `message`, and optional details.
 
-#### `SET_JOG_VELOCITY`
--   **Syntax:** `SET_JOG_VELOCITY,vx,vy,vz,v_roll,v_pitch,v_yaw`
--   **Description:** Updates the target jogging velocities.
--   **Parameters:**
-    -   `vx, vy, vz` (float, required): Linear velocities in meters/second (base frame).
-    -   `v_roll, v_pitch, v_yaw` (float, required): Angular rates in degrees/second (XYZ intrinsic order).
--   Notes: If no `SET_JOG_VELOCITY` is received for the jog timeout window, the controller forces zero intent locally and EtherCAT RTCore jog also times out in RT for a controlled stop instead of lingering on the last non-zero command.
+#### `JOG_SESSION_UPDATE`
+-   **Syntax:** `JOG_SESSION_UPDATE,<payload_b64>`
+-   **Description:** Renews and updates an active controller-owned jog session. The payload must include `session_id`, `owner_id`, `seq`, `deadman`, and the current velocity vector. Sequence numbers must increase monotonically per session.
+-   **Reply behavior:** Returns a session snapshot on success. Stale sequence numbers, wrong owners, expired leases, and wrong session ids are rejected with structured controller errors.
 
-#### `JOG_STOP`
--   **Syntax:** `JOG_STOP`
--   **Description:** Disables jogging mode. On EtherCAT RTCore this sends an explicit RTCore jog-stop command; on non-RT backends it falls back to the previous direct stop behavior.
+#### `JOG_SESSION_STOP`
+-   **Syntax:** `JOG_SESSION_STOP,<payload_b64>`
+-   **Description:** Stops a controller-owned jog session. The payload must include `session_id`; `owner_id` and `reason` are optional but recommended so conflicts and stop reasons stay diagnosable.
+-   **Reply behavior:** Returns the terminal session snapshot after stop processing.
 
-#### `SET_GRIPPER_JOG_VELOCITY`
--   **Syntax:** `SET_GRIPPER_JOG_VELOCITY,rate_deg_s`
--   **Description:** Sets the gripper jog angular rate in degrees/second. Effective only while jog mode is active. The backend enforces safety caps and joint limits.
-
-#### `SET_JOG_DEADMAN`
--   **Syntax:** `SET_JOG_DEADMAN,flag`
--   **Description:** Enables (`true`) or disables (`false`) the jog deadman gate. When disabled, all jog velocities (including gripper) are forced to zero internally.
+#### `GET_JOG_SESSION_STATE`
+-   **Syntax:** `GET_JOG_SESSION_STATE`
+-   **Description:** Returns the current controller-owned jog session snapshot for diagnostics, including owner/session identity, lease state, sequence tracking, pause state, backend mode, and rejection counters.
 
 #### `SET_JOG_DEBUG`
 -   **Syntax:** `SET_JOG_DEBUG,flag`
--   **Description:** Turns verbose jog logging on/off. When enabled, the controller logs velocity updates and periodic status lines.
+-   **Description:** Turns verbose session-jog logging on/off. When enabled, the controller logs accepted session updates and periodic jog-loop status lines.
 
 ### State & Utility Commands
 

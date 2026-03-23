@@ -48,8 +48,7 @@ core = [
     "uvicorn[standard]==0.32.0",
 ]
 cad = [
-    "pythonocc-core",
-    "OCP",
+    "cadquery-ocp",
 ]
 ui = [
     "PySide6==6.8.0.2",

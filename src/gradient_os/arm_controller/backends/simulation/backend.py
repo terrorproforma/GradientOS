@@ -81,6 +81,9 @@ class SimulationBackend(ActuatorBackend):
         self._positions = [0.0] * self._num_joints
         self._gripper_position = 0.0
         self._raw_positions: dict[int, int] = {}
+        self._lease_jog_active = False
+        self._lease_jog_timeout_s = 0.0
+        self._lease_jog_vector = [0.0] * self._num_joints
 
         if self._robot_config:
             self._actuator_ids = list(self._robot_config.get("actuator_ids", []))
@@ -295,6 +298,40 @@ class SimulationBackend(ActuatorBackend):
     
     def get_gripper_position(self) -> Optional[float]:
         return self._gripper_position if self._has_gripper else None
+
+    def supports_joint_velocity_lease_jog(self) -> bool:
+        return True
+
+    def get_jog_capabilities(self) -> dict[str, object]:
+        return {
+            "joint_velocity_lease": True,
+            "realtime_jog_compat": False,
+            "backend": "simulation",
+            "watchdog_source": "controller_simulated",
+        }
+
+    def start_joint_velocity_lease_jog(self, timeout_s: float) -> None:
+        self._lease_jog_active = True
+        self._lease_jog_timeout_s = max(0.0, float(timeout_s))
+        self._lease_jog_vector = [0.0] * self._num_joints
+
+    def update_joint_velocity_lease_jog(
+        self,
+        joint_velocities_rad_s: list[float],
+        timeout_s: float,
+    ) -> None:
+        if len(joint_velocities_rad_s) != self._num_joints:
+            raise ValueError(
+                f"Expected {self._num_joints} joint velocities, got {len(joint_velocities_rad_s)}"
+            )
+        self._lease_jog_active = True
+        self._lease_jog_timeout_s = max(0.0, float(timeout_s))
+        self._lease_jog_vector = [float(value) for value in joint_velocities_rad_s]
+
+    def stop_joint_velocity_lease_jog(self) -> None:
+        self._lease_jog_active = False
+        self._lease_jog_timeout_s = 0.0
+        self._lease_jog_vector = [0.0] * self._num_joints
     
     def get_present_actuator_ids(self) -> set[int]:
         ids = set(self._actuator_ids)
