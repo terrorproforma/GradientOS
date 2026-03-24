@@ -33,6 +33,12 @@ def patch_send(monkeypatch):
         "completion_scope": "rtcore_execution",
         "trajectory_id": 7,
         "source_of_truth": "rtcore",
+        "safe_for_power_transition": False,
+        "power_transition_blockers": ["active_trajectory", "queued_motion"],
+        "power_transition_blocker_details": [
+            {"code": "active_trajectory", "message": "An RTCore trajectory is still latched or active.", "active_traj_id": 7},
+            {"code": "queued_motion", "message": "Queued RTCore motion points are still pending.", "queue_depth": 1},
+        ],
         "execution": {
             "controller_motion_state": "executing",
             "controller_thread_running": False,
@@ -45,6 +51,12 @@ def patch_send(monkeypatch):
             "motion_done": False,
             "stale_command": False,
             "underrun_count": 0,
+            "safe_for_power_transition": False,
+            "power_transition_blockers": ["active_trajectory", "queued_motion"],
+            "power_transition_blocker_details": [
+                {"code": "active_trajectory", "message": "An RTCore trajectory is still latched or active.", "active_traj_id": 7},
+                {"code": "queued_motion", "message": "Queued RTCore motion points are still pending.", "queue_depth": 1},
+            ],
         },
     }
     completed_motion_payload = {
@@ -53,6 +65,9 @@ def patch_send(monkeypatch):
         "completion_scope": "rtcore_execution",
         "trajectory_id": 7,
         "source_of_truth": "rtcore",
+        "safe_for_power_transition": True,
+        "power_transition_blockers": [],
+        "power_transition_blocker_details": [],
         "execution": {
             "controller_motion_state": "idle",
             "controller_thread_running": False,
@@ -65,7 +80,41 @@ def patch_send(monkeypatch):
             "motion_done": True,
             "stale_command": False,
             "underrun_count": 0,
+            "safe_for_power_transition": True,
+            "power_transition_blockers": [],
+            "power_transition_blocker_details": [],
         },
+    }
+    safe_power_up_payload = {
+        **completed_motion_payload,
+        "power_action": "power_up",
+        "code": "POWER_UP_SENT",
+        "message": "Drive power-up requested after neutral-state verification.",
+        "safe_for_power_transition": True,
+        "power_transition_blockers": [],
+        "power_transition_blocker_details": [],
+        "backend_handled": True,
+    }
+    safe_power_down_payload = {
+        **completed_motion_payload,
+        "power_action": "power_down",
+        "code": "POWER_DOWN_SENT",
+        "message": "Drive power-down requested with safe stop/disarm sequencing.",
+        "safe_for_power_transition": True,
+        "power_transition_blockers": [],
+        "power_transition_blocker_details": [],
+        "waited_for_idle": True,
+        "backend_handled": True,
+    }
+    reset_faults_payload = {
+        **completed_motion_payload,
+        "power_action": "reset_faults",
+        "code": "RESET_FAULTS_SENT",
+        "message": "Drive fault reset requested. Drives remain disarmed until an explicit safe power-up.",
+        "safe_for_power_transition": True,
+        "power_transition_blockers": [],
+        "power_transition_blocker_details": [],
+        "disarmed_after_reset": True,
     }
     active_program = {
         "name": "alpha",
@@ -141,13 +190,13 @@ def patch_send(monkeypatch):
     }
     responses = {
         "STOP": (True, f"ACK,STOP,{_payload_token({**completed_motion_payload, 'state': 'aborted'})}"),
-        "SAFE_POWER_UP": (True, "ACK,SAFE_POWER_UP,POWER_UP_SENT"),
-        "SAFE_POWER_DOWN": (True, "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"),
-        "SAFE_POWER_DOWN,wait": (True, "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"),
+        "SAFE_POWER_UP": (True, f"ACK,SAFE_POWER_UP,{_payload_token(safe_power_up_payload)}"),
+        "SAFE_POWER_DOWN": (True, f"ACK,SAFE_POWER_DOWN,{_payload_token({**safe_power_down_payload, 'waited_for_idle': False})}"),
+        "SAFE_POWER_DOWN,wait": (True, f"ACK,SAFE_POWER_DOWN,{_payload_token(safe_power_down_payload)}"),
         "WAIT_FOR_IDLE": (True, f"ACK,WAIT_FOR_IDLE,{_payload_token(completed_motion_payload)}"),
         "WAIT_FOR_IDLE,12.5": (True, f"ACK,WAIT_FOR_IDLE,{_payload_token({**completed_motion_payload, 'wait_timeout_s': 12.5, 'waited_for_motion': True, 'wait_timed_out': False})}"),
-        "RESET_FAULTS": (True, "ACK,RESET_FAULTS,ALL"),
-        "RESET_FAULTS,1": (True, "ACK,RESET_FAULTS,JOINT,1"),
+        "RESET_FAULTS": (True, f"ACK,RESET_FAULTS,{_payload_token({**reset_faults_payload, 'joint': None})}"),
+        "RESET_FAULTS,1": (True, f"ACK,RESET_FAULTS,{_payload_token({**reset_faults_payload, 'joint': 1})}"),
         "ZERO_JOINT,3": (True, "ACK,ZERO_JOINT,3"),
         "GET_MOTION_STATUS": (True, f"MOTION_STATUS,{_payload_token(accepted_program_motion_payload)}"),
         "GET_STATUS": (True, "STATUS,gripper_present,True"),
@@ -604,12 +653,13 @@ def patch_send(monkeypatch):
             preview_name="__planner_preview__",
             weld_metadata=None,
             sections=None,
+            pose_waypoints=None,
         ):
             if not points:
                 raise ValueError("no points")
             body = dict(planner_payload)
             body["name"] = preview_name
-            body["waypoints"] = points
+            body["waypoints"] = pose_waypoints if pose_waypoints is not None else points
             body["cartesian_path"] = points
             body["trajectory"] = dict(DummyCommandApi.sample_traj)
             if weld_metadata:
@@ -663,6 +713,9 @@ def patch_send(monkeypatch):
     monkeypatch.setattr(
         "gradient_os.api.main._WELD_PROGRAM_DIR", tempfile.mkdtemp(prefix="weld-programs-")
     )
+    monkeypatch.setattr(
+        "gradient_os.api.main._ROBOT_PROGRAM_DIR", tempfile.mkdtemp(prefix="robot-programs-")
+    )
     runtime_cfg_path = os.path.join(tempfile.mkdtemp(prefix="runtime-config-"), "runtime.json")
     monkeypatch.setenv("GRADIENT_RUNTIME_CONFIG_PATH", runtime_cfg_path)
     tool_library_root = tempfile.mkdtemp(prefix="tool-library-")
@@ -691,16 +744,20 @@ def test_control_stop(client):
 def test_control_power_down(client):
     resp = client.post("/control/power-down")
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"
-    assert resp.json()["waited_for_idle"] is False
-    assert client.command_calls[-1] == ("SAFE_POWER_DOWN", 5.0, True)
+    body = resp.json()
+    assert body["detail"].startswith("ACK,SAFE_POWER_DOWN,")
+    assert body["code"] == "POWER_DOWN_SENT"
+    assert body["waited_for_idle"] is True
+    assert client.command_calls[-1] == ("SAFE_POWER_DOWN,wait", 5.0, True)
 
 
 def test_control_power_down_waits_when_requested(client):
     resp = client.post("/control/power-down", json={"wait_for_idle": True})
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "ACK,SAFE_POWER_DOWN,POWER_DOWN_SENT"
-    assert resp.json()["waited_for_idle"] is True
+    body = resp.json()
+    assert body["detail"].startswith("ACK,SAFE_POWER_DOWN,")
+    assert body["code"] == "POWER_DOWN_SENT"
+    assert body["waited_for_idle"] is True
     assert client.command_calls[-1] == ("SAFE_POWER_DOWN,wait", 5.0, True)
 
 
@@ -729,6 +786,8 @@ def test_control_motion_status(client):
     assert body["state"] == "accepted"
     assert body["trajectory_id"] == 7
     assert body["execution"]["state_name"] == "queued"
+    assert body["safe_for_power_transition"] is False
+    assert body["power_transition_blockers"] == ["active_trajectory", "queued_motion"]
     assert body["program"]["name"] == "alpha"
     assert body["program"]["state"] == "executing"
     assert body["program_current_step_type"] == "pause"
@@ -763,23 +822,52 @@ def test_control_set_orientation_returns_motion_metadata(client):
 def test_control_reset_faults_all(client):
     resp = client.post("/control/reset-faults")
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "ACK,RESET_FAULTS,ALL"
-    assert resp.json()["joint"] is None
+    body = resp.json()
+    assert body["detail"].startswith("ACK,RESET_FAULTS,")
+    assert body["joint"] is None
+    assert body["code"] == "RESET_FAULTS_SENT"
+    assert body["disarmed_after_reset"] is True
     assert client.command_calls[-1] == ("RESET_FAULTS", 5.0, True)
 
 
 def test_control_power_up(client):
     resp = client.post("/control/power-up")
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "ACK,SAFE_POWER_UP,POWER_UP_SENT"
+    body = resp.json()
+    assert body["detail"].startswith("ACK,SAFE_POWER_UP,")
+    assert body["code"] == "POWER_UP_SENT"
+    assert body["backend_handled"] is True
     assert client.command_calls[-1] == ("SAFE_POWER_UP", 5.0, True)
+
+
+def test_control_power_up_returns_conflict_when_safety_gate_blocks(client, monkeypatch):
+    error_payload = {
+        "accepted": False,
+        "code": "POWER_UP_BLOCKED",
+        "message": "Drive power-up blocked until motion is neutral, fault-free, and synchronized.",
+        "power_transition_blockers": ["active_trajectory"],
+    }
+
+    def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
+        if command == "SAFE_POWER_UP":
+            return False, f"ERROR,SAFE_POWER_UP,{_payload_token(error_payload)}"
+        return True, "ACK"
+
+    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
+
+    resp = client.post("/control/power-up")
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == error_payload
 
 
 def test_control_reset_faults_joint(client):
     resp = client.post("/control/reset-faults", json={"joint": 1})
     assert resp.status_code == 200
-    assert resp.json()["detail"] == "ACK,RESET_FAULTS,JOINT,1"
-    assert resp.json()["joint"] == 1
+    body = resp.json()
+    assert body["detail"].startswith("ACK,RESET_FAULTS,")
+    assert body["joint"] == 1
+    assert body["code"] == "RESET_FAULTS_SENT"
     assert client.command_calls[-1] == ("RESET_FAULTS,1", 5.0, True)
 
 
@@ -1226,6 +1314,8 @@ def test_trajectory_run(client):
     resp = client.post("/trajectory/run", json={"name": "alpha"})
     assert resp.status_code == 200
     body = resp.json()
+    assert body["runtime_mode"] == "live"
+    assert body["execution_mode"] == "live"
     assert body["completion_scope"] == "controller_program_thread"
     assert body["state"] == "accepted"
     assert body["program"]["name"] == "alpha"
@@ -1238,14 +1328,26 @@ def test_trajectory_run(client):
 def test_trajectory_plan_points_success(client):
     resp = client.post(
         "/trajectory/plan-points",
-        json={"points": [{"x": 0.1, "y": 0.2, "z": 0.3}, [0.4, 0.5, 0.6]]},
+        json={
+            "waypoints": [
+                {
+                    "x": 0.1,
+                    "y": 0.2,
+                    "z": 0.3,
+                    "orientation_euler_deg": {"roll": 10.0, "pitch": 20.0, "yaw": 30.0},
+                },
+                {"x": 0.4, "y": 0.5, "z": 0.6, "rollDeg": 11.0, "pitchDeg": 21.0, "yawDeg": 31.0},
+            ]
+        },
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["name"] == "__planner_preview__"
     assert body["trajectory"]["moves"][0]["vector"] == [0.1, 0.2, 0.3]
-    assert client.command_calls[-1][0].startswith("PLAN_TRAJECTORY_POINTS,0.1,0.2,0.3,0.4,0.5,0.6")
-    assert client.command_calls[-1][2] is True
+    assert body["source"]["mode"] == "pose_waypoints"
+    assert body["waypoints"][0]["orientation_euler_deg"]["roll"] == pytest.approx(10.0)
+    assert body["waypoints"][1]["orientation_euler_deg"]["yaw"] == pytest.approx(31.0)
+    assert client.command_calls[-1] == ("GET_POSITION", 1.0, True)
 
 
 def test_trajectory_plan_points_validation(client):
@@ -1253,6 +1355,23 @@ def test_trajectory_plan_points_validation(client):
     resp = client.post("/trajectory/plan-points", json={"points": [{"x": 1.0}]})
     assert resp.status_code == 400
     assert len(client.command_calls) == start_len
+
+
+def test_trajectory_run_simulation_mode_conflict(client, monkeypatch):
+    runtime_state = api_main.runtime_config.get_runtime_config_snapshot()
+    runtime_state["active"]["mode"]["sim"] = True
+    runtime_state["active"]["servo_backend"]["effective_backend"] = "simulation"
+
+    def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
+        if command == "GET_RUNTIME_CONFIG":
+            return True, "RUNTIME_CONFIG," + json.dumps(runtime_state, separators=(",", ":"))
+        return True, "ACK"
+
+    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
+
+    resp = client.post("/trajectory/run", json={"name": "alpha", "execution_mode": "live"})
+    assert resp.status_code == 409
+    assert "SIM mode" in resp.json()["detail"]
 
 
 def test_trajectory_detail(client):
@@ -1343,6 +1462,35 @@ def test_weld_program_save_list_load(client):
     assert payload["weld_draft"]["edgeId"] == "part_0:edge_00000"
     assert payload["weld_draft"]["spinAngleDeg"] == pytest.approx(17.0)
     assert payload["step"]["filename"] == "fixture.step"
+
+
+def test_robot_program_save_list_load_for_trajectory(client):
+    save_resp = client.post(
+        "/robot-program/save",
+        json={
+            "kind": "trajectory",
+            "name": "demo_traj",
+            "waypoints": [
+                {"x": 0.1, "y": 0.2, "z": 0.3, "rollDeg": 1.0, "pitchDeg": 2.0, "yawDeg": 3.0},
+                {"x": 0.4, "y": 0.5, "z": 0.6},
+            ],
+            "metadata": {"note": "demo"},
+            "planned_trajectory": {"name": "__planner_preview__"},
+        },
+    )
+    assert save_resp.status_code == 200
+    assert save_resp.json() == {"status": "ok", "name": "demo_traj", "kind": "trajectory"}
+
+    list_resp = client.get("/robot-program/list", params={"kind": "trajectory"})
+    assert list_resp.status_code == 200
+    assert "demo_traj" in list_resp.json()["programs"]
+
+    load_resp = client.get("/robot-program/demo_traj", params={"kind": "trajectory"})
+    assert load_resp.status_code == 200
+    payload = load_resp.json()
+    assert payload["kind"] == "trajectory"
+    assert payload["authoring"]["waypoints"][0]["orientation_euler_deg"]["yaw"] == pytest.approx(3.0)
+    assert payload["authoring"]["metadata"]["note"] == "demo"
 
 
 def test_preview_execute_clear(client, monkeypatch):

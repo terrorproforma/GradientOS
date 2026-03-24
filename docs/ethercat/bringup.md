@@ -333,3 +333,73 @@ using the Sampler config in:
 
 See: `scripts/sampler/README.md`.
 
+#### Safe power-cycle validation (no motion commands)
+
+For the RTCore drive-power safety contract, the commissioning validation should
+use a no-motion enable/disable cycle and verify both the hardware probe and the
+controller motion-status contract.
+
+From the repo root:
+
+```bash
+# 1) Full shutdown: controller/API/web + RTCore + EtherCAT
+./start-stack.sh stop --hard
+
+# 2) Start controller + API only (leave web UI out of the test)
+./start-stack.sh --headless
+
+# 3) Confirm the stack comes back disarmed
+./start-stack.sh probe
+curl http://127.0.0.1:4000/control/motion-status
+
+# Expect before power-up:
+# - physical_state=BUS_UP_DISARMED
+# - driver_state=DISARMED
+# - all axes SwitchOnDisabled
+# - /control/motion-status => state=idle, active_traj_id=0, queue_depth=0,
+#   safe_for_power_transition=true
+
+# 4) Explicitly enable drives
+curl -X POST http://127.0.0.1:4000/control/power-up \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# 5) Verify enabled state
+./start-stack.sh probe
+
+# Expect after power-up:
+# - physical_state=ACTIVE
+# - armed=1
+# - enable_mask=0x3f
+# - op_enabled_axes=6/6
+# - all drive error codes remain 0x0000
+
+# 6) Send NO motion commands
+
+# 7) Explicitly power down using the safe path
+curl -X POST http://127.0.0.1:4000/control/power-down \
+  -H "Content-Type: application/json" \
+  -d '{"wait_for_idle": true}'
+
+# 8) Verify the stack returns to a disarmed-safe state
+./start-stack.sh probe
+curl http://127.0.0.1:4000/control/motion-status
+
+# Expect after power-down:
+# - physical_state=BUS_UP_DISARMED
+# - driver_state=DISARMED
+# - op_enabled_axes=0/6
+# - /control/motion-status => idle, active_traj_id=0,
+#   safe_for_power_transition=true
+
+# 9) Return the host to a fully inactive state when done
+./start-stack.sh stop --hard
+```
+
+Important:
+
+- Do not send `MOVE_*`, `ROTATE`, `SET_ORIENTATION`, `APPLY_JOINT_SETPOINT`, or jog commands during this validation.
+- After the 2026-03-24 fix, RTCore-backed `STOP` intentionally skips the legacy
+  "hold current position" write so safe power-down does not accidentally create
+  a one-point RTCore trajectory and relatch `active_traj_id`.
+

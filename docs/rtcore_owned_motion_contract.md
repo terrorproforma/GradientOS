@@ -46,6 +46,48 @@ RTCore is the source of truth for execution lifecycle:
 
 Higher layers should stop inferring completion from Python thread joins or joint polling alone.
 
+## Power-Transition Safety Contract
+
+For EtherCAT RTCore-backed drive power transitions, higher layers should treat
+the following as the safe/neutral contract:
+
+- `neutral` means:
+  - no controller program thread running
+  - no active RTCore trajectory
+  - no queued RTCore motion
+  - no active jog command
+  - `motion_done=true`
+  - `stale_command=false`
+  - no live drive faults
+  - feedback has been synchronized to the current hold target
+- `safe_for_power_transition` is the derived boolean exported by the controller/API
+  and should be the single gating signal for UI/operator power-up flows.
+- `power_transition_blockers` / `power_transition_blocker_details` are the
+  structured refusal reasons when the system is not neutral.
+
+Power actions must follow this contract:
+
+- `power-up`
+  - rejected unless `safe_for_power_transition=true`
+  - synchronizes command targets from live feedback before `arm -> CSP -> enable`
+- `power-down`
+  - stops jog
+  - aborts RTCore trajectory ownership
+  - waits for neutral execution state when requested
+  - disables axes
+  - disarms
+- `fault reset`
+  - first forces stop/abort/disarm behavior
+  - then pulses DS402 fault reset
+  - must leave the system `BUS_UP_DISARMED`, never implicitly re-enabled
+
+Important compatibility rule:
+
+- On RTCore-backed EtherCAT, the generic controller `STOP` path must **not**
+  send the legacy "hold current position" write through `servo_driver`, because
+  that write becomes a one-point RTCore trajectory and can falsely relatch
+  motion status during power-down.
+
 ## Shared-Memory / Ring Contract
 
 Current compatibility path:
@@ -109,3 +151,32 @@ No higher layer should assume that controller acceptance means physical completi
 For scheduled EtherCAT RTCore motion, higher-level `closed_loop=true` request flags should not reactivate a Python-timed sample loop. Those requests should be coerced onto the RTCore queued path or rejected explicitly.
 
 Until every higher-level caller is migrated, the repo should treat compatibility fields and wait helpers as transitional scaffolding and prefer RTCore status snapshots over ad hoc polling wherever possible.
+
+## Live Validation Reference
+
+The safe no-motion power-cycle validation for this contract is:
+
+1. `./start-stack.sh stop --hard`
+2. `./start-stack.sh --headless`
+3. Verify `./start-stack.sh probe` reports `physical_state=BUS_UP_DISARMED`
+4. Verify `GET /control/motion-status` reports:
+   - `state=idle`
+   - `active_traj_id=0`
+   - `queue_depth=0`
+   - `safe_for_power_transition=true`
+5. `POST /control/power-up`
+6. Verify `./start-stack.sh probe` reports:
+   - `physical_state=ACTIVE`
+   - `op_enabled_axes=6/6`
+   - all axes `OperationEnabled`
+   - all drive errors `0x0000`
+7. Send **no motion commands**
+8. `POST /control/power-down` with `{"wait_for_idle": true}`
+9. Verify:
+   - `./start-stack.sh probe` returns to `physical_state=BUS_UP_DISARMED`
+   - `GET /control/motion-status` returns to `idle` with `active_traj_id=0`
+   - `safe_for_power_transition=true`
+10. `./start-stack.sh stop --hard`
+
+This validation was re-run after fixing the RTCore-backed `STOP` path so it no
+longer injected a one-point hold trajectory during power-down.

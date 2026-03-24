@@ -33,6 +33,23 @@ type MotionExecutionPayload = {
 	motion_done?: boolean;
 	stale_command?: boolean;
 	underrun_count?: number;
+	safe_for_power_transition?: boolean;
+	power_transition_blockers?: string[];
+	power_transition_blocker_details?: PowerTransitionBlocker[];
+	power_transition_feedback_synchronized?: boolean;
+	power_transition_faulted_axis_count?: number;
+	power_transition_active_jog?: boolean;
+};
+
+type PowerTransitionBlocker = {
+	code?: string;
+	message?: string;
+	active_traj_id?: number;
+	queue_depth?: number;
+	active_jog_axis_mask?: number;
+	faulted_axis_count?: number;
+	faulted_axis_indices?: number[];
+	reason?: string;
 };
 
 type MotionStatusResponse = {
@@ -44,6 +61,15 @@ type MotionStatusResponse = {
 	trajectory_id?: number;
 	source_of_truth?: string;
 	execution?: MotionExecutionPayload;
+	safe_for_power_transition?: boolean;
+	power_transition_blockers?: string[];
+	power_transition_blocker_details?: PowerTransitionBlocker[];
+	power_action?: string;
+	code?: string;
+	message?: string;
+	waited_for_idle?: boolean;
+	disarmed_after_reset?: boolean;
+	backend_handled?: boolean;
 };
 
 type JogCommandVector = [number, number, number, number, number, number];
@@ -212,6 +238,35 @@ function formatMotionStateLabel(value: string | undefined): string {
 	return raw.replace(/_/g, " ").toUpperCase();
 }
 
+function formatPowerTransitionBlocker(blocker: PowerTransitionBlocker): string {
+	const code = (blocker.code ?? "").trim().toLowerCase();
+	if (code === "active_trajectory") {
+		return `Active trajectory ${blocker.active_traj_id ?? "unknown"} is still latched.`;
+	}
+	if (code === "queued_motion") {
+		return `Queued RTCore motion remains pending (${blocker.queue_depth ?? 0} points).`;
+	}
+	if (code === "active_jog") {
+		return "A jog command is still active.";
+	}
+	if (code === "stale_command") {
+		return "RTCore reports a stale command and must be resynchronized.";
+	}
+	if (code === "fault_present") {
+		return `One or more drive faults are still present (${blocker.faulted_axis_count ?? 0}).`;
+	}
+	if (code === "not_synchronized") {
+		return "Live feedback has not been synchronized to a safe hold target yet.";
+	}
+	if (code === "controller_thread_running") {
+		return "A controller motion/program thread is still running.";
+	}
+	if (code === "motion_active") {
+		return "RTCore still reports active motion execution.";
+	}
+	return blocker.message?.trim() || "Power transition is currently blocked.";
+}
+
 async function readErrorMessage(res: Response): Promise<string> {
 	const contentType = res.headers.get("content-type") ?? "";
 	if (contentType.includes("application/json")) {
@@ -316,6 +371,21 @@ export function ControlPanel({
 			: null);
 	const motionBusy = motionStateName === "accepted" || motionStateName === "queued" || motionStateName === "executing";
 	const motionControlsBusy = motionBusy || pendingMotionAction !== null;
+	const powerTransitionBlockerDetails = (
+		motionStatus?.power_transition_blocker_details
+		?? motionStatus?.execution?.power_transition_blocker_details
+		?? []
+	) as PowerTransitionBlocker[];
+	const powerTransitionSafe = motionStatus?.safe_for_power_transition ?? motionStatus?.execution?.safe_for_power_transition;
+	const powerTransitionKnown = typeof powerTransitionSafe === "boolean";
+	const powerUpBlocked =
+		activeDriveFaultAxes.length > 0
+		|| (powerTransitionKnown ? powerTransitionSafe !== true : true);
+	const powerUpBlockerMessage = activeDriveFaultAxes.length > 0
+		? "Clear all drive faults before enabling the drives."
+		: powerTransitionBlockerDetails.length > 0
+			? powerTransitionBlockerDetails.map(formatPowerTransitionBlocker).join(" ")
+			: "Waiting for the motion-state safety check before enabling the drives.";
 	// Realtime jog state
 	const [jogEnabled, setJogEnabled] = useState<boolean>(false);
 	const [deadman, setDeadman] = useState<boolean>(true);
@@ -1081,22 +1151,26 @@ export function ControlPanel({
 				: "Requesting RTCore drive fault reset for all axes...",
 		});
 		try {
-			const result = await post("/control/reset-faults", isSingleJoint ? { joint: jointNumber } : undefined);
+			const result = await post(
+				"/control/reset-faults",
+				isSingleJoint ? { joint: jointNumber } : undefined,
+			) as MotionStatusResponse | null;
 			if (result) {
+				setMotionStatus(result);
 				const refreshed = await refreshJointAngles(false);
 				setCommissioningStatus(
 					refreshed
 						? {
 							tone: "success",
 							message: isSingleJoint
-								? `Drive fault reset requested for J${jointNumber}. Live joint feedback refreshed.`
-								: "Drive fault reset requested for all axes. Live joint feedback refreshed.",
+								? `Drive fault reset requested for J${jointNumber}. Drives remain disarmed until an explicit safe power-up. Live joint feedback refreshed.`
+								: "Drive fault reset requested for all axes. Drives remain disarmed until an explicit safe power-up. Live joint feedback refreshed.",
 						}
 						: {
 							tone: "success",
 							message: isSingleJoint
-								? `Drive fault reset requested for J${jointNumber}. Refresh joint feedback after the drive recovers.`
-								: "Drive fault reset requested for all axes. Refresh joint feedback after the drives recover.",
+								? `Drive fault reset requested for J${jointNumber}. Drives remain disarmed until an explicit safe power-up. Refresh joint feedback after the drive recovers.`
+								: "Drive fault reset requested for all axes. Drives remain disarmed until an explicit safe power-up. Refresh joint feedback after the drives recover.",
 						},
 				);
 			} else {
@@ -1110,14 +1184,21 @@ export function ControlPanel({
 		} finally {
 			setPendingJointAction(null);
 		}
-	}, [pendingJointAction, post, refreshJointAngles]);
+	}, [pendingJointAction, post, refreshJointAngles, setMotionStatus]);
 
 	const handlePowerUpDrives = useCallback(async () => {
 		if (pendingJointAction) {
 			return;
 		}
+		if (powerUpBlocked) {
+			setCommissioningStatus({
+				tone: "error",
+				message: powerUpBlockerMessage,
+			});
+			return;
+		}
 		const confirmed = window.confirm(
-			"Power up RTCore-controlled drives now? This will arm and enable the configured axes.",
+			"Power up RTCore-controlled drives now? This will only proceed if the runtime is neutral, synchronized, and fault-free.",
 		);
 		if (!confirmed) {
 			return;
@@ -1128,18 +1209,19 @@ export function ControlPanel({
 			message: "Requesting drive power-up...",
 		});
 		try {
-			const result = await post("/control/power-up");
+			const result = await post("/control/power-up") as MotionStatusResponse | null;
 			if (result) {
+				setMotionStatus(result);
 				const refreshed = await refreshJointAngles(false);
 				setCommissioningStatus(
 					refreshed
 						? {
 							tone: "success",
-							message: "Drive power-up requested. Live joint feedback refreshed.",
+							message: "Drive power-up requested after a safe-state check. Live joint feedback refreshed.",
 						}
 						: {
 							tone: "success",
-							message: "Drive power-up requested. Refresh joint feedback after the axes finish enabling.",
+							message: "Drive power-up requested after a safe-state check. Refresh joint feedback after the axes finish enabling.",
 						},
 				);
 			} else {
@@ -1151,7 +1233,7 @@ export function ControlPanel({
 		} finally {
 			setPendingJointAction(null);
 		}
-	}, [pendingJointAction, post, refreshJointAngles]);
+	}, [pendingJointAction, post, powerUpBlocked, powerUpBlockerMessage, refreshJointAngles, setMotionStatus]);
 
 	const handlePowerDownDrives = useCallback(async () => {
 		if (pendingJointAction) {
@@ -1169,18 +1251,19 @@ export function ControlPanel({
 			message: "Requesting drive power-down...",
 		});
 		try {
-			const result = await post("/control/power-down");
+			const result = await post("/control/power-down", { wait_for_idle: true }) as MotionStatusResponse | null;
 			if (result) {
+				setMotionStatus(result);
 				const refreshed = await refreshJointAngles(false);
 				setCommissioningStatus(
 					refreshed
 						? {
 							tone: "success",
-							message: "Drive power-down requested. Live joint feedback refreshed.",
+							message: "Drive power-down requested with safe stop/disarm sequencing. Live joint feedback refreshed.",
 						}
 						: {
 							tone: "success",
-							message: "Drive power-down requested. Refresh joint feedback after the axes disarm.",
+							message: "Drive power-down requested with safe stop/disarm sequencing. Refresh joint feedback after the axes disarm.",
 						},
 				);
 			} else {
@@ -1192,7 +1275,7 @@ export function ControlPanel({
 		} finally {
 			setPendingJointAction(null);
 		}
-	}, [pendingJointAction, post, refreshJointAngles]);
+	}, [pendingJointAction, post, refreshJointAngles, setMotionStatus]);
 
 	// ------------------------
 	// Incremental jog helpers
@@ -1315,8 +1398,8 @@ export function ControlPanel({
 						onClick={() => {
 							void handlePowerUpDrives();
 						}}
-						disabled={pendingJointAction !== null || !requiresExplicitDrivePower || isDrivePowerActive}
-						title="Explicitly arm and enable RTCore-controlled axes"
+						disabled={pendingJointAction !== null || !requiresExplicitDrivePower || isDrivePowerActive || powerUpBlocked}
+						title={powerUpBlocked ? powerUpBlockerMessage : "Explicitly arm and enable RTCore-controlled axes"}
 					>
 						{pendingJointAction === "power-up" ? "..." : "Power Up Drives"}
 					</button>
@@ -1439,6 +1522,24 @@ export function ControlPanel({
 					{motionStatus
 						? `traj ${motionTrajectoryId ?? "none"} | mode ${motionStatus.execution?.active_mode_name ?? "n/a"} | queue ${motionStatus.execution?.queue_depth ?? 0}/${motionStatus.execution?.queue_capacity ?? 0} | done ${motionStatus.execution?.motion_done ? "yes" : "no"} | stale ${motionStatus.execution?.stale_command ? "yes" : "no"} | underruns ${motionStatus.execution?.underrun_count ?? 0}`
 						: "No RTCore execution metadata yet."}
+				</div>
+				<div
+					className={`mt-2 rounded border px-2 py-2 text-[10px] leading-relaxed ${
+						powerTransitionKnown && powerTransitionSafe
+							? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100"
+							: "border-amber-500/30 bg-amber-400/10 text-amber-100"
+					}`}
+				>
+					<div className="font-semibold uppercase tracking-[0.14em]">
+						{powerTransitionKnown && powerTransitionSafe
+							? "Safe For Power Transition"
+							: "Power-Up Blocked"}
+					</div>
+					<div className="mt-1">
+						{powerTransitionKnown && powerTransitionSafe
+							? "Runtime is neutral and synchronized; explicit drive enable is allowed."
+							: powerUpBlockerMessage}
+					</div>
 				</div>
 			</div>
 			{/* Removed step move blocks; unified under realtime jog below */}

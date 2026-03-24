@@ -36,6 +36,7 @@ _WAIT_FOR_IDLE_DEFAULT_TIMEOUT_S = 30.0
 _WAIT_FOR_IDLE_POLL_INTERVAL_S = 0.01
 _RTCORE_ACK_REFRESH_TIMEOUT_S = 0.15
 _RTCORE_ACK_REFRESH_POLL_INTERVAL_S = 0.005
+_POWER_TRANSITION_DEFAULT_TIMEOUT_S = 1.0
 _RTCORE_TERMINAL_EXECUTION_STATES = {"idle", "completed", "aborted", "faulted", "underrun"}
 _PROGRAM_TERMINAL_STATES = {"completed", "aborted", "faulted", "timeout", "interrupted"}
 _PROGRAM_ACTIVE_STATES = {"planning", "accepted", "executing"}
@@ -993,6 +994,119 @@ def _finalize_wait_for_idle_payload(
     return payload
 
 
+def _get_backend_power_transition_snapshot(backend) -> dict[str, object]:
+    if backend is None:
+        return {}
+    getter = getattr(backend, "get_power_transition_snapshot", None)
+    if not callable(getter):
+        return {}
+    try:
+        snapshot = getter()
+    except Exception:
+        return {}
+    return dict(snapshot) if isinstance(snapshot, dict) else {}
+
+
+def _build_power_transition_guard(
+    *,
+    controller_motion_state: str,
+    controller_thread_running: bool,
+    backend,
+    execution_status,
+) -> dict[str, object]:
+    blockers: list[dict[str, object]] = []
+
+    if controller_thread_running:
+        blockers.append(
+            {
+                "code": "controller_thread_running",
+                "message": "A controller motion/program thread is still running.",
+                "controller_motion_state": controller_motion_state,
+            }
+        )
+
+    if execution_status is not None:
+        active_traj_id = int(getattr(execution_status, "active_traj_id", 0) or 0)
+        queue_depth = int(getattr(execution_status, "queue_depth", 0) or 0)
+        state_name = str(getattr(execution_status, "state_name", "idle") or "idle").strip().lower() or "idle"
+        active_mode_name = (
+            str(getattr(execution_status, "active_mode_name", "idle") or "idle").strip().lower() or "idle"
+        )
+        stale_command = bool(getattr(execution_status, "stale_command", False))
+
+        if active_traj_id > 0:
+            blockers.append(
+                {
+                    "code": "active_trajectory",
+                    "message": "An RTCore trajectory is still latched or active.",
+                    "active_traj_id": active_traj_id,
+                }
+            )
+        if queue_depth > 0:
+            blockers.append(
+                {
+                    "code": "queued_motion",
+                    "message": "Queued RTCore motion points are still pending.",
+                    "queue_depth": queue_depth,
+                }
+            )
+        if state_name in {"accepted", "queued", "executing"} and active_traj_id == 0 and queue_depth == 0:
+            blockers.append(
+                {
+                    "code": "motion_active",
+                    "message": "RTCore still reports active motion execution.",
+                    "state_name": state_name,
+                    "active_mode_name": active_mode_name,
+                }
+            )
+        if stale_command:
+            blockers.append(
+                {
+                    "code": "stale_command",
+                    "message": "RTCore reports a stale command; resynchronization is required before enable.",
+                }
+            )
+
+    backend_snapshot = _get_backend_power_transition_snapshot(backend)
+    active_jog = bool(backend_snapshot.get("active_jog", False))
+    faulted_axis_count = int(backend_snapshot.get("faulted_axis_count", 0) or 0)
+    feedback_synchronized = bool(backend_snapshot.get("feedback_synchronized", False))
+    if active_jog:
+        blockers.append(
+            {
+                "code": "active_jog",
+                "message": "A jog command is still active in RTCore.",
+                "active_jog_axis_mask": int(backend_snapshot.get("active_jog_axis_mask", 0) or 0),
+            }
+        )
+    if faulted_axis_count > 0:
+        blockers.append(
+            {
+                "code": "fault_present",
+                "message": "One or more drives are still faulted.",
+                "faulted_axis_count": faulted_axis_count,
+                "faulted_axis_indices": list(backend_snapshot.get("faulted_axis_indices", [])),
+            }
+        )
+    if backend is not None and not feedback_synchronized:
+        blockers.append(
+            {
+                "code": "not_synchronized",
+                "message": "Live feedback is not synchronized yet; keep the drives disarmed.",
+            }
+        )
+
+    blocker_codes = [str(item.get("code", "")).strip() for item in blockers if str(item.get("code", "")).strip()]
+    return {
+        "safe_for_power_transition": len(blockers) == 0,
+        "power_transition_blockers": blocker_codes,
+        "power_transition_blocker_details": blockers,
+        "power_transition_feedback_synchronized": feedback_synchronized,
+        "power_transition_faulted_axis_count": faulted_axis_count,
+        "power_transition_active_jog": active_jog,
+    }
+
+
 def _build_motion_execution_metadata(
     *,
     accepted: bool,
@@ -1106,6 +1220,29 @@ def _build_motion_execution_metadata(
         "source_of_truth": source_of_truth,
         "execution": execution,
     }
+    power_transition_guard = _build_power_transition_guard(
+        controller_motion_state=controller_motion_state,
+        controller_thread_running=controller_thread_running,
+        backend=backend,
+        execution_status=execution_status,
+    )
+    execution.update(
+        {
+            "safe_for_power_transition": bool(power_transition_guard["safe_for_power_transition"]),
+            "power_transition_blockers": list(power_transition_guard["power_transition_blockers"]),
+            "power_transition_blocker_details": list(power_transition_guard["power_transition_blocker_details"]),
+            "power_transition_feedback_synchronized": bool(
+                power_transition_guard["power_transition_feedback_synchronized"]
+            ),
+            "power_transition_faulted_axis_count": int(
+                power_transition_guard["power_transition_faulted_axis_count"]
+            ),
+            "power_transition_active_jog": bool(power_transition_guard["power_transition_active_jog"]),
+        }
+    )
+    payload["safe_for_power_transition"] = bool(power_transition_guard["safe_for_power_transition"])
+    payload["power_transition_blockers"] = list(power_transition_guard["power_transition_blockers"])
+    payload["power_transition_blocker_details"] = list(power_transition_guard["power_transition_blocker_details"])
     if extra:
         payload.update(extra)
     _attach_program_status(payload, snapshot)
@@ -2287,11 +2424,22 @@ def handle_stop_command():
         backend = backend_registry.get_active_backend()
     except Exception:
         backend = None
+    try:
+        stop_active_jog_session(reason="controller-stop")
+    except Exception as exc:
+        print(f"[Controller] WARNING: active jog session stop failed: {exc}")
     if backend is not None and hasattr(backend, "abort_trajectory"):
         try:
             backend.abort_trajectory()  # type: ignore[attr-defined]
         except Exception as e:
             print(f"[Controller] WARNING: RTCore trajectory abort failed: {e}")
+
+    if backend is not None and callable(getattr(backend, "get_execution_status", None)):
+        # EtherCAT RTCore owns its own stop/disarm semantics. Sending a legacy
+        # "hold current position" write here would itself become a one-point
+        # RTCore trajectory and can re-latch motion status during power-down.
+        print("[Controller] RTCore-backed stop: skipping legacy brake write.")
+        return
 
     # Also send an immediate brake command to the physical servos
     # by commanding them to their current position with zero speed.
@@ -2302,6 +2450,29 @@ def handle_stop_command():
         servo_driver.set_servo_positions(current_angles, 0, 100)
     else:
         print("[Controller] WARNING: Could not get current position to send brake command.")
+
+
+def _power_transition_result(
+    *,
+    action: str,
+    accepted: bool,
+    code: str,
+    message: str,
+    motion_payload: dict[str, object] | None = None,
+    extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload = dict(motion_payload) if isinstance(motion_payload, dict) else get_motion_execution_status()
+    payload.update(
+        {
+            "accepted": bool(accepted),
+            "power_action": str(action),
+            "code": str(code),
+            "message": str(message),
+        }
+    )
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def handle_move_to_position_absolute(x: float, y: float, z: float):
@@ -2613,7 +2784,7 @@ def handle_apply_joint_setpoint(
     )
 
 
-def handle_safe_power_down(wait_for_idle: bool = False) -> str:
+def handle_safe_power_down(wait_for_idle: bool = False) -> dict[str, object]:
     """
     Best-effort transition the active actuator backend into a non-active state.
 
@@ -2635,29 +2806,62 @@ def handle_safe_power_down(wait_for_idle: bool = False) -> str:
     try:
         backend = backend_registry.get_active_backend()
     except Exception as e:
-        msg = f"NO_ACTIVE_BACKEND:{e}"
+        msg = f"No active backend: {e}"
         print(f"[Controller] WARNING: {msg}")
-        return msg
+        return _power_transition_result(
+            action="power_down",
+            accepted=False,
+            code="POWER_DOWN_UNAVAILABLE",
+            message=msg,
+            extra={"waited_for_idle": bool(wait_for_idle)},
+        )
 
     safe_power_down = getattr(backend, "safe_power_down", None)
     if not callable(safe_power_down):
         print("[Controller] Active backend does not implement safe_power_down().")
-        return "BACKEND_NOOP"
+        return _power_transition_result(
+            action="power_down",
+            accepted=True,
+            code="BACKEND_NOOP",
+            message="Active backend does not implement safe_power_down().",
+            extra={"waited_for_idle": bool(wait_for_idle), "backend_handled": False},
+        )
 
     try:
-        handled = bool(safe_power_down())
-        if handled:
-            print("[Controller] Backend safe power-down command sent.")
-            return "POWER_DOWN_SENT"
-        print("[Controller] Backend reported no special power-down action.")
-        return "BACKEND_NOOP"
+        try:
+            handled = bool(
+                safe_power_down(
+                    wait_for_idle=wait_for_idle,
+                    timeout_s=_POWER_TRANSITION_DEFAULT_TIMEOUT_S,
+                )
+            )
+        except TypeError:
+            handled = bool(safe_power_down())
+        print("[Controller] Backend safe power-down command sent.")
+        return _power_transition_result(
+            action="power_down",
+            accepted=True,
+            code="POWER_DOWN_SENT" if handled else "BACKEND_NOOP",
+            message=(
+                "Drive power-down requested with safe stop/disarm sequencing."
+                if handled
+                else "Backend reported no special power-down action."
+            ),
+            extra={"waited_for_idle": bool(wait_for_idle), "backend_handled": bool(handled)},
+        )
     except Exception as e:
-        msg = f"POWER_DOWN_FAILED:{e}"
+        msg = f"Power-down failed: {e}"
         print(f"[Controller] WARNING: {msg}")
-        return msg
+        return _power_transition_result(
+            action="power_down",
+            accepted=False,
+            code="POWER_DOWN_FAILED",
+            message=msg,
+            extra={"waited_for_idle": bool(wait_for_idle)},
+        )
 
 
-def handle_safe_power_up() -> str:
+def handle_safe_power_up() -> dict[str, object]:
     """
     Best-effort transition the active actuator backend into an armed/energized state.
     """
@@ -2665,26 +2869,169 @@ def handle_safe_power_up() -> str:
     try:
         backend = backend_registry.get_active_backend()
     except Exception as e:
-        msg = f"NO_ACTIVE_BACKEND:{e}"
+        msg = f"No active backend: {e}"
         print(f"[Controller] WARNING: {msg}")
-        return msg
+        return _power_transition_result(
+            action="power_up",
+            accepted=False,
+            code="POWER_UP_UNAVAILABLE",
+            message=msg,
+        )
 
     safe_power_up = getattr(backend, "safe_power_up", None)
     if not callable(safe_power_up):
         print("[Controller] Active backend does not implement safe_power_up().")
-        return "BACKEND_NOOP"
+        return _power_transition_result(
+            action="power_up",
+            accepted=True,
+            code="BACKEND_NOOP",
+            message="Active backend does not implement safe_power_up().",
+            extra={"backend_handled": False},
+        )
+
+    motion_payload = get_motion_execution_status()
+    if not bool(motion_payload.get("safe_for_power_transition", False)):
+        return _power_transition_result(
+            action="power_up",
+            accepted=False,
+            code="POWER_UP_BLOCKED",
+            message="Drive power-up blocked until motion is neutral, fault-free, and synchronized.",
+            motion_payload=motion_payload,
+        )
+
+    synchronize_targets = getattr(backend, "synchronize_command_targets_to_feedback", None)
+    if callable(synchronize_targets):
+        try:
+            sync_payload = synchronize_targets()
+        except Exception as exc:
+            sync_payload = {
+                "synchronized": False,
+                "reason": f"sync_failed:{exc}",
+                "joint_positions_rad": [],
+            }
+        if not bool(sync_payload.get("synchronized", False)):
+            sync_message = (
+                "Drive power-up blocked because live feedback could not be synchronized to hold targets."
+            )
+            motion_payload = get_motion_execution_status()
+            blocker_details = list(motion_payload.get("power_transition_blocker_details", []))
+            blocker_details.append(
+                {
+                    "code": "not_synchronized",
+                    "message": sync_message,
+                    "reason": str(sync_payload.get("reason", "unknown")),
+                }
+            )
+            blocker_codes = list(motion_payload.get("power_transition_blockers", [])) + ["not_synchronized"]
+            motion_payload["safe_for_power_transition"] = False
+            motion_payload["power_transition_blockers"] = blocker_codes
+            motion_payload["power_transition_blocker_details"] = blocker_details
+            execution_payload = motion_payload.get("execution")
+            if isinstance(execution_payload, dict):
+                execution_payload["safe_for_power_transition"] = False
+                execution_payload["power_transition_blockers"] = blocker_codes
+                execution_payload["power_transition_blocker_details"] = blocker_details
+            return _power_transition_result(
+                action="power_up",
+                accepted=False,
+                code="POWER_UP_BLOCKED",
+                message=sync_message,
+                motion_payload=motion_payload,
+            )
 
     try:
         handled = bool(safe_power_up())
+        post_payload = get_motion_execution_status()
         if handled:
             print("[Controller] Backend safe power-up command sent.")
-            return "POWER_UP_SENT"
+            return _power_transition_result(
+                action="power_up",
+                accepted=True,
+                code="POWER_UP_SENT",
+                message="Drive power-up requested after neutral-state verification.",
+                motion_payload=post_payload,
+                extra={"backend_handled": True},
+            )
         print("[Controller] Backend reported no special power-up action.")
-        return "BACKEND_NOOP"
+        return _power_transition_result(
+            action="power_up",
+            accepted=True,
+            code="BACKEND_NOOP",
+            message="Backend reported no special power-up action.",
+            motion_payload=post_payload,
+            extra={"backend_handled": False},
+        )
     except Exception as e:
-        msg = f"POWER_UP_FAILED:{e}"
+        msg = f"Power-up failed: {e}"
         print(f"[Controller] WARNING: {msg}")
-        return msg
+        return _power_transition_result(
+            action="power_up",
+            accepted=False,
+            code="POWER_UP_FAILED",
+            message=msg,
+        )
+
+
+def handle_reset_faults(logical_joint_index: int | None = None) -> dict[str, object]:
+    print(
+        "[Controller] Received RESET_FAULTS command."
+        + (f" target_joint={logical_joint_index + 1}" if logical_joint_index is not None else "")
+    )
+    try:
+        backend = backend_registry.get_active_backend()
+    except Exception as exc:
+        msg = f"No active backend: {exc}"
+        print(f"[Controller] WARNING: {msg}")
+        return _power_transition_result(
+            action="reset_faults",
+            accepted=False,
+            code="RESET_FAULTS_UNAVAILABLE",
+            message=msg,
+            extra={"joint": None if logical_joint_index is None else logical_joint_index + 1},
+        )
+
+    try:
+        handle_stop_command()
+    except Exception as exc:
+        print(f"[Controller] WARNING: STOP during reset-faults failed: {exc}")
+
+    try:
+        handle_wait_for_idle(timeout_s=_POWER_TRANSITION_DEFAULT_TIMEOUT_S)
+    except Exception as exc:
+        print(f"[Controller] WARNING: WAIT_FOR_IDLE during reset-faults failed: {exc}")
+
+    try:
+        handled = bool(backend.reset_faults(logical_joint_index=logical_joint_index))
+    except Exception as exc:
+        msg = f"Fault reset failed: {exc}"
+        print(f"[Controller] WARNING: {msg}")
+        return _power_transition_result(
+            action="reset_faults",
+            accepted=False,
+            code="RESET_FAULTS_FAILED",
+            message=msg,
+            extra={"joint": None if logical_joint_index is None else logical_joint_index + 1},
+        )
+
+    if not handled:
+        return _power_transition_result(
+            action="reset_faults",
+            accepted=False,
+            code="RESET_FAULTS_FAILED",
+            message="Active backend rejected the drive fault reset request.",
+            extra={"joint": None if logical_joint_index is None else logical_joint_index + 1},
+        )
+
+    return _power_transition_result(
+        action="reset_faults",
+        accepted=True,
+        code="RESET_FAULTS_SENT",
+        message="Drive fault reset requested. Drives remain disarmed until an explicit safe power-up.",
+        extra={
+            "joint": None if logical_joint_index is None else logical_joint_index + 1,
+            "disarmed_after_reset": True,
+        },
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -3557,6 +3904,7 @@ def _plan_preview_points_payload(
     description: str,
     weld_metadata: dict | None = None,
     sections: list[dict] | None = None,
+    pose_waypoints: list[dict] | None = None,
 ) -> dict:
     if len(points) == 0:
         raise ValueError("At least one waypoint is required.")
@@ -3582,6 +3930,7 @@ def _plan_preview_points_payload(
     plan_acceleration = utils.DEFAULT_PROFILE_ACCELERATION
     if plan_acceleration is None or not np.isfinite(plan_acceleration) or float(plan_acceleration) <= 0:
         plan_acceleration = 0.2
+    standard_pose_waypoints = pose_waypoints if isinstance(pose_waypoints, list) and len(pose_waypoints) == len(points) else None
 
     def _append_cartesian_samples(joint_path: list[list[float]]) -> None:
         for joint_sample in joint_path:
@@ -3624,6 +3973,31 @@ def _plan_preview_points_payload(
         if not np.isfinite(value):
             return default_value
         return value
+
+    def _coerce_orientation_matrix(raw_waypoint) -> np.ndarray | None:
+        if not isinstance(raw_waypoint, dict):
+            return None
+        orientation_raw = raw_waypoint.get("orientation_euler_deg")
+        if isinstance(orientation_raw, dict):
+            roll_raw = orientation_raw.get("roll", orientation_raw.get("x"))
+            pitch_raw = orientation_raw.get("pitch", orientation_raw.get("y"))
+            yaw_raw = orientation_raw.get("yaw", orientation_raw.get("z"))
+        elif isinstance(orientation_raw, (list, tuple)) and len(orientation_raw) >= 3:
+            roll_raw, pitch_raw, yaw_raw = orientation_raw[:3]
+        else:
+            roll_raw = raw_waypoint.get("rollDeg", raw_waypoint.get("roll_deg"))
+            pitch_raw = raw_waypoint.get("pitchDeg", raw_waypoint.get("pitch_deg"))
+            yaw_raw = raw_waypoint.get("yawDeg", raw_waypoint.get("yaw_deg"))
+        if roll_raw is None or pitch_raw is None or yaw_raw is None:
+            return None
+        try:
+            return R.from_euler(
+                "xyz",
+                [float(roll_raw), float(pitch_raw), float(yaw_raw)],
+                degrees=True,
+            ).as_matrix()
+        except Exception:
+            return None
 
     def _normalize(vec: np.ndarray, fallback: np.ndarray) -> np.ndarray:
         norm = float(np.linalg.norm(vec))
@@ -4033,6 +4407,11 @@ def _plan_preview_points_payload(
         for idx, waypoint in enumerate(points, start=1):
             target_pos = np.array(waypoint, dtype=float)
             segment_start_fk = ik_solver.get_fk(current_q.tolist())
+            forced_orientation = (
+                _coerce_orientation_matrix(standard_pose_waypoints[idx - 1])
+                if standard_pose_waypoints is not None
+                else None
+            )
             t_start = time.monotonic()
             joint_path = trajectory_execution._plan_linear_move(
                 current_q,
@@ -4041,7 +4420,7 @@ def _plan_preview_points_payload(
                 float(plan_acceleration),
                 100,
                 True,
-                forced_orientation=None,
+                forced_orientation=forced_orientation,
             )
             if not joint_path:
                 print(f"[Pi Trajectory] ERROR: Failed to plan waypoint #{idx} -> {np.round(target_pos, 4)}.")
@@ -4148,7 +4527,28 @@ def _plan_preview_points_payload(
         "name": preview_name,
         "trajectory": traj_dict,
         "cartesian_path": cartesian_samples,
-        "waypoints": weld_points_for_payload if weld_points_for_payload else [item["position"] for item in waypoint_results],
+        "waypoints": (
+            weld_points_for_payload
+            if weld_points_for_payload
+            else [
+                {
+                    "x": round(float(item["position"][0]), 4),
+                    "y": round(float(item["position"][1]), 4),
+                    "z": round(float(item["position"][2]), 4),
+                    "orientation_euler_deg": (
+                        {
+                            "roll": round(float(item["orientation_euler_deg"][0]), 2),
+                            "pitch": round(float(item["orientation_euler_deg"][1]), 2),
+                            "yaw": round(float(item["orientation_euler_deg"][2]), 2),
+                        }
+                        if isinstance(item.get("orientation_euler_deg"), list)
+                        and len(item["orientation_euler_deg"]) >= 3
+                        else None
+                    ),
+                }
+                for item in waypoint_results
+            ]
+        ),
         "file_path": preview_path,
         "step_summaries": [
             {"type": step.get("type"), "freq": step.get("freq"), "points": len(step.get("path", []))}
@@ -4184,6 +4584,7 @@ def plan_preview_trajectory_points(
     preview_name: str = PLANNED_PREVIEW_NAME,
     weld_metadata: dict | None = None,
     sections: list[dict] | None = None,
+    pose_waypoints: list[dict] | None = None,
 ) -> dict:
     description = (
         f"Planned on {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} via "
@@ -4195,6 +4596,7 @@ def plan_preview_trajectory_points(
         description=description,
         weld_metadata=weld_metadata,
         sections=sections,
+        pose_waypoints=pose_waypoints,
     )
 
 

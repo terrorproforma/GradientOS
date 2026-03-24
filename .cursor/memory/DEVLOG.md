@@ -5379,3 +5379,239 @@
 - Follow-up notes / risks:
   - The newest session does not show a controller-side regression in IK, gating, or re-anchoring; the main issue visible in the logs is tracking/following lag under more aggressive user-commanded rates.
   - If the `66.388 deg/s` yaw command was not intentional, the next debugging step should be to inspect UI rate scaling / jog preset wiring before changing controller math.
+
+## 2026-03-24 06:40 +0000
+
+- Task summary:
+  - Added an offline pose-history parser to split multi-move captures into individual jog legs and round-trip summaries.
+- What changed:
+  - Added `src/gradient_os/diagnostics/pose_history_analysis.py` with reusable analysis helpers for:
+    - segmenting logs from contiguous `is_jogging` spans
+    - computing baseline vs commanded vs active-end vs settled-end deltas
+    - summarizing following error, gates, re-syncs, and gap contamination
+    - pairing simple opposite-direction round trips when no external motion command contaminates the gap
+  - Added `scripts/pose_history_report.py` as the CLI wrapper.
+  - Added focused coverage in `tests/test_pose_history_analysis.py`.
+- Validation / investigation performed:
+  - `python3 -m py_compile src/gradient_os/diagnostics/pose_history_analysis.py scripts/pose_history_report.py tests/test_pose_history_analysis.py`
+  - `PYTHONPATH=/home/pi/GradientOS/src python3 -m unittest discover -s /home/pi/GradientOS/tests -p test_pose_history_analysis.py`
+  - `PYTHONPATH=/home/pi/GradientOS/src python3 scripts/pose_history_report.py logs/diagnostics/20260324-062529-pose-history.json`
+  - `ReadLints` reported no issues on the new files.
+  - Real-file validation confirmed the parser surfaces the distinction between commanded and measured motion, e.g. the first `+Y` leg in `20260324-062529-pose-history.json` shows near-zero measured active displacement but about `+15.114 mm` commanded displacement with matching `15.114 mm` following error.
+- Follow-up notes / risks:
+  - Round-trip pairing is intentionally conservative: it only auto-pairs adjacent opposite-direction single-axis segments when the gap is free of other motion commands.
+  - The parser already flags contamination like `MOVE_LINE_RELATIVE` / `APPLY_JOINT_SETPOINT`; if we want richer attribution later, the next extension is to join pose-history segments with controller-log session IDs or explicit UI move labels.
+
+## 2026-03-24 18:32 +0000
+
+- Task summary:
+  - Investigated whether `litellm` is installed anywhere visible on this machine after the reported PyPI compromise concerns.
+- Changes:
+  - No product code changes.
+  - Appended durable notes to `.cursor/memory/AGENT_SCRATCHPAD.md`.
+- Validation:
+  - Enumerated discoverable interpreters and local virtualenvs with a Python script; found only `/usr/bin/python3` and `/usr/bin/python3.11`, and no `pyvenv.cfg` under `/home/pi` or `/opt`.
+  - Queried both interpreters via `importlib.metadata`; neither reported an installed `litellm`, and no installed distribution declared a dependency on `litellm`.
+  - Verified related packages were absent as well: `litellm`, `dspy`, `dspy-ai`, and `openai` all returned `PackageNotFound`.
+  - Checked common host package locations: `/usr/lib/python3/dist-packages` and `/usr/local/lib/python3.11/dist-packages` exist but contain no entries with `litellm` in the directory name.
+  - Checked user-local tooling: `python3 -m pip` reported no `pip` module, `uv tool list` reported no installed tools, and `pipx` was not installed.
+- Follow-up notes / risks:
+  - The currently discoverable host Python environments appear clean with respect to `litellm`.
+  - This investigation does not prove whether `litellm` was ever briefly installed and then removed before inspection; it only confirms absence at check time.
+
+## 2026-03-24 18:41 +0000
+
+- Task summary:
+  - Ran the new pose-history parser across the latest `20260324-062*.json` diagnostics saves and summarized the full session results.
+- Changes:
+  - No code changes.
+  - Appended durable notes to `.cursor/memory/AGENT_SCRATCHPAD.md`.
+- Validation:
+  - Aggregated `logs/diagnostics/20260324-062*.json` with `build_cli_report(...)`.
+  - Confirmed the `0622xx` files are cumulative prefixes of one growing session rather than 20 independent runs:
+    - segment count increases from `1` in `20260324-062236-pose-history.json` to `20` in `20260324-062529-pose-history.json`
+    - round-trip count increases from `0` to `5`
+  - Used `logs/diagnostics/20260324-062529-pose-history.json` as the authoritative full-session view.
+  - Full-session findings from the latest file:
+    - `20` jog segments, `5` conservative round-trip pairs
+    - worst position following error: about `15.114 mm` on the first `+Y` jog, where commanded displacement was about `+15.114 mm` but measured active displacement was effectively zero
+    - worst orientation following error: about `9.823 deg` on a later `+yaw` fast segment (`66.388 deg/s`)
+    - worst joint following error: about `14.921 deg` on another fast `+yaw` segment
+    - only one contaminated settle gap was flagged, after segment `1`, with `APPLY_JOINT_SETPOINT` and `MOVE_LINE_RELATIVE`
+- Follow-up notes / risks:
+  - The parser output makes clear that the late fast-yaw legs are the main repeatability / tracking concern in this session.
+  - Early files in the burst should not be counted as separate runs in future summaries unless their segment counts diverge from the monotonic prefix pattern seen here.
+
+## 2026-03-24 19:55 +0000
+
+- Task summary:
+  - Implemented the trajectory planner plan end-to-end: shared editable robot-program persistence, pose-aware waypoint planning, trajectory/weld SIM-vs-LIVE execution semantics, trajectory UI rebuild, program-tree pose editing, and docs/test updates.
+- Changes:
+  - Backend:
+    - Added shared `robot-program` save/list/detail endpoints in `src/gradient_os/api/main.py`.
+    - Kept weld compatibility routes but routed them through the shared persistence model.
+    - Updated `/trajectory/plan-points` to accept pose waypoints and plan locally through `controller_command_api.plan_preview_trajectory_points(...)`.
+    - Added `execution_mode` validation on `/trajectory/run` and returned `runtime_mode` / `execution_mode` in the response.
+    - Extended `src/gradient_os/arm_controller/command_api.py` so preview planning can carry waypoint orientation through to generated `move_absolute` steps.
+  - Frontend:
+    - Added pose-aware waypoint types and API encoding helpers in `web-ui/src/previewUtils.ts`.
+    - Reworked the trajectory panel in `web-ui/src/App.tsx` to support pose capture, shared saved-program load/save, and explicit `Simulate Trajectory` vs `Run Trajectory`.
+    - Updated weld save/load to use the same shared robot-program API and added matching SIM/LIVE runtime messaging plus split simulate/run actions.
+    - Expanded `web-ui/src/components/ProgramFeatureTree.tsx` to edit XYZ plus roll/pitch/yaw and support inserting/removing/reordering control points.
+    - Improved tree subtitles so control points and move endpoints show pose information rather than XYZ only.
+  - Tests/docs:
+    - Updated `tests/test_api_endpoints.py` coverage for shared robot-program APIs, pose-waypoint planning, and SIM/LIVE run gating.
+    - Rewrote `docs/trajectory_recorder.md` into a broader recorder + trajectory-authoring document covering shared saved programs and execution mode semantics.
+- Validation:
+  - `python3 -m py_compile src/gradient_os/api/main.py src/gradient_os/arm_controller/command_api.py tests/test_api_endpoints.py`
+  - `npm run build` in `web-ui/` completed successfully twice after the UI refactor.
+  - `ReadLints` reported no diagnostics on the edited backend/frontend files.
+  - `python3 -m pytest tests/test_api_endpoints.py -q` could not run here because `pytest` is not installed in the host interpreter.
+  - Started `npm run dev -- --host 127.0.0.1 --port 4173` and confirmed Vite served successfully; a true browser smoke pass was not completed because browser automation was not available through the accessible tool path in this session.
+- Follow-up notes / risks:
+  - The trajectory editor now uses the shared saved-program API as the authoring source of truth; any future program types should plug into that envelope instead of creating parallel persistence.
+  - The UI clearly distinguishes SIM vs LIVE, but controller runtime switching itself is still an operational/restart concern rather than an in-panel toggle.
+
+## 2026-03-24 20:08 +0000
+
+- Task summary:
+  - Fixed the immediate trajectory-authoring usability gap after the larger planner refactor by making the create-flow explicit in the drawer.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added a visible `Create Trajectory` section with step-by-step instructions
+    - added labeled `Start Editing`, `Add Waypoint`, and `Capture Pose` actions
+    - added a dedicated `handleAddTrajectoryWaypoint()` flow that auto-enters editing and refreshes the preview
+    - clarified the empty state text so users know the preview appears automatically after placing/capturing waypoints
+- Validation:
+  - `npm run build` in `web-ui/`
+  - `ReadLints` reported no diagnostics on the edited UI file
+- Follow-up notes / risks:
+  - This makes the entry path obvious in the panel, but the underlying scene interaction still uses Shift-click for free placement; if that remains awkward on touch devices, the next step is a dedicated on-canvas placement mode indicator or toolbar.
+
+## 2026-03-24 20:07 +0000
+
+- Task summary:
+  - Investigated the live drive fault shown in the commissioning UI: `J2 / axis1` reporting `fault_err=0x8611 [Er47.0]` / `Excessive position deviation`.
+- Changes:
+  - No product code changes.
+  - Appended durable notes to `.cursor/memory/AGENT_SCRATCHPAD.md`.
+- Validation:
+  - Read `logs/startups/20260324-195650/controller.log` and confirmed the same run accepted an `APPLY_JOINT_SETPOINT`/rest move, started an RTCore trajectory at `100 Hz (1433 steps)`, and then raised `TimeoutError: Timed out waiting for RTCore trajectory 1 to complete`.
+  - Read `logs/startups/20260324-195650/api.log` and confirmed `POST /control/rest` returned `200`, followed by a second `POST /control/rest` returning `503` while the first task was still active.
+  - Read `docs/resources/a6ec_manual_codes.md` and confirmed `0x8611` maps to `Following fault` and `Er47.0` maps to `Excessive position deviation`.
+  - Ran `./start-stack.sh probe` after the fault/reset and confirmed the current system is healthy again: EtherCAT `OP`, `operational=6/6`, `op_enabled_axes=6/6`, and all axes `err=0x0000`.
+  - Queried live endpoints:
+    - `/control/motion-status` now reports `state=completed`, `completion_scope=rtcore_execution`, `trajectory_id=8`, `underrun_count=0`
+    - `/info/joints-detailed` shows all six axes in `OperationEnabled` / CSP with zero error codes
+- Follow-up notes / risks:
+  - Most likely root cause is a transient drive-level following-position fault on `J2`, meaning actual motion lagged the commanded trajectory beyond the drive's configured following-error window; this is more consistent with axis/load/tuning/command aggressiveness than with a network underrun.
+  - If it recurs, capture `./start-stack.sh probe`, `/info/joints-detailed`, and `/control/motion-status` before pressing reset so the faulted state is preserved for comparison.
+
+## 2026-03-24 20:37 +0000
+
+- Task summary:
+  - Implemented the power-transition hardening plan so RTCore drive power-up, power-down, and fault reset all follow an explicit neutral/disarmed safety contract.
+- Changes:
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`
+    - Added RTCore-side power-transition snapshots, neutral waiting, feedback synchronization, and pre-reset/pre-power-down stop logic.
+    - Hardened `safe_power_down()`, `safe_power_up()`, and `reset_faults()` to stop motion intent, synchronize to live feedback, and disarm before reset.
+  - `src/gradient_os/arm_controller/command_api.py`
+    - Added a shared `safe_for_power_transition` guard derived from controller-thread state, RTCore execution state, jog activity, live faults, and feedback synchronization.
+    - Updated stop/power-up/power-down/reset handlers to use structured safety payloads and fail closed on unsafe power-up.
+  - `src/gradient_os/api/main.py`
+    - Added structured controller-call parsing for power-transition commands.
+    - Changed `/control/power-down` to default to wait-for-idle safe sequencing and exposed structured result/error payloads.
+  - `src/gradient_os/run_controller.py`
+    - Switched `SAFE_POWER_UP`, `SAFE_POWER_DOWN`, and `RESET_FAULTS` replies to encoded JSON payloads so the API/UI can surface exact blocker reasons.
+  - `src/gradient_rt_motion/main.cpp`
+    - Cleared pending/committed trajectory intent and active jog intent on disarm/full-disable/fault-reset command handling, and published an idle/aborted motion state.
+  - `web-ui/src/ControlPanel.tsx`
+    - Gated `Power Up Drives` on `safe_for_power_transition`, surfaced blocker reasons, and routed power-down through wait-for-idle semantics by default.
+    - Updated reset messaging to make the post-reset disarmed state explicit.
+  - Tests:
+    - Expanded `tests/test_api_endpoints.py`, `tests/test_command_api_direct_setpoint.py`, and `web-ui/src/ControlPanel.test.tsx` for the new safety contract and UI gating.
+  - Compatibility:
+    - Added `runtime_config.get_runtime_config_snapshot()` as a backward-compatible snapshot helper for older API tests.
+- Validation:
+  - `"/home/pi/GradientOS/.venv/bin/python" -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py -q`
+  - `npm exec vitest run src/ControlPanel.test.tsx`
+  - `ReadLints` reported no diagnostics on the edited Python/TS files.
+- Follow-up notes / risks:
+  - The new C++ RTCore motion-intent clearing path was covered indirectly through Python/UI contract tests in this pass; a live staged hardware validation is still needed to re-run the original surprise-move scenario safely.
+  - The power-transition guard currently treats missing live feedback synchronization as fail-closed for power-up, which is the intended safety default but may expose startup timing issues if RTCore status snapshots are delayed.
+
+## 2026-03-24 21:55 +0000
+
+- Task summary:
+  - Ran the requested live no-motion power-cycle validation on hardware: hard stop RTCore/EtherCAT, restart headless, power up drives, power down drives, then hard stop again.
+- Validation:
+  - Initial pre-test probe:
+    - `./start-stack.sh probe`
+    - result before restart: `physical_state=BUS_UP_DISARMED`, `driver_state=DISARMED`, `rtcore_state=UP`, `ethercat_master_state=OP`, controller/API down
+  - Hard shutdown:
+    - `./start-stack.sh stop --hard`
+    - `systemctl is-active ethercat.service gradient-rt-motion.service` -> both `inactive`
+    - post-stop `./start-stack.sh probe` -> `physical_state=INACTIVE`, `rtcore_state=DOWN`, `ethercat_master_state=DOWN`
+  - Headless restart:
+    - `./start-stack.sh --headless`
+    - startup reached `bus ready: responding=6/6 online=6/6 operational=6/6 wkc=18`
+    - post-start `./start-stack.sh probe` -> `physical_state=BUS_UP_DISARMED`, `driver_state=DISARMED`, all six axes `SwitchOnDisabled`, `err=0x0000`
+    - `GET /control/motion-status` -> `state=idle`, `active_traj_id=0`, `queue_depth=0`, `safe_for_power_transition=true`
+    - `GET /info/joints-detailed` -> live feedback with zero error codes and DS402 state code `2` on all six active axes
+  - Live power-up:
+    - `POST /control/power-up`
+    - response: `code=POWER_UP_SENT`
+    - post-enable `./start-stack.sh probe` -> `physical_state=ACTIVE`, `driver_state=ACTIVE`, `armed=1`, `enable_mask=0x3f`, `op_enabled_axes=6/6`, all axes `OperationEnabled`, all `err=0x0000`
+    - post-enable `GET /control/motion-status` remained `idle` with no queue/jog/fault blockers
+  - Live power-down:
+    - `POST /control/power-down` with `{"wait_for_idle": true}`
+    - response: `code=POWER_DOWN_SENT`
+    - post-power-down `./start-stack.sh probe` -> `physical_state=BUS_UP_DISARMED`, `driver_state=DISARMED`, `op_enabled_axes=0/6`, all axes back to `SwitchOnDisabled`, all `err=0x0000`
+    - post-power-down `GET /control/motion-status` unexpectedly reported `state=completed`, `active_traj_id=1`, and `safe_for_power_transition=false`
+  - Final hard shutdown:
+    - `./start-stack.sh stop --hard`
+    - `systemctl is-active ethercat.service gradient-rt-motion.service` -> both `inactive`
+    - final `./start-stack.sh probe` -> `physical_state=INACTIVE`, `rtcore_state=DOWN`, `ethercat_master_state=DOWN`
+  - Log sanity:
+    - `rg` over `logs/startups/20260324-215329` found no `APPLY_JOINT_SETPOINT`, `MOVE_*`, `ROTATE`, or `SET_ORIENTATION` markers during the run
+- Follow-up notes / risks:
+  - Hardware/startup/shutdown behavior was safe in this live test: no new drive faults, no motion commands were sent, and all requested transitions landed in the intended physical states.
+  - A remaining software bug is still present in the motion-status contract after safe power-down: the system physically disarms correctly, but `/control/motion-status` can retain a completed `active_traj_id` blocker (`trajectory_id=1`) and report `safe_for_power_transition=false` until the next full restart or status refresh path clears it.
+
+## 2026-03-24 22:01 +0000
+
+- Task summary:
+  - Fixed the stale post-power-down RTCore motion-status blocker, reran the live no-motion power-cycle validation, updated RTCore docs, and returned the stack to `INACTIVE`.
+- Root cause:
+  - `src/gradient_os/arm_controller/command_api.py`
+  - `handle_stop_command()` always issued a legacy `servo_driver.set_servo_positions(current_angles, 0, 100)` brake write after aborting RTCore motion.
+  - On the `ethercat_rtcore` backend, that legacy write is implemented as a one-point RTCore trajectory (`set_joint_positions()` -> `begin_trajectory()` / `commit_trajectory()`), so safe power-down could relatch `last_submitted_traj_id=1` / `active_traj_id=1` even with no user motion commands.
+- Implementation:
+  - `src/gradient_os/arm_controller/command_api.py`
+    - Added an RTCore-specific early return in `handle_stop_command()` after jog stop + trajectory abort:
+    - if the active backend exposes `get_execution_status()`, skip the legacy servo-driver brake write
+    - retain the old brake-write fallback for non-RTCore backends
+  - `tests/test_command_api_direct_setpoint.py`
+    - Added regression coverage to assert RTCore-backed stop skips the legacy `servo_driver.set_servo_positions(...)` write while still aborting RTCore motion and stopping jog.
+  - `docs/rtcore_owned_motion_contract.md`
+    - Added the explicit power-transition safety contract, STOP compatibility rule, and validated no-motion power-cycle sequence.
+  - `docs/ethercat/bringup.md`
+    - Added an operator-facing no-motion safe power-cycle validation checklist with expected probe and motion-status results.
+  - `docs/command_api.md`
+    - Documented RTCore-specific `STOP`, `GET_MOTION_STATUS`, `SAFE_POWER_UP`, `SAFE_POWER_DOWN`, and `RESET_FAULTS` semantics.
+- Validation:
+  - Focused tests:
+    - `"/home/pi/GradientOS/.venv/bin/python" -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py -q`
+    - result: `72 passed`
+  - Live rerun:
+    - `./start-stack.sh --headless`
+    - pre-enable `./start-stack.sh probe` -> `physical_state=BUS_UP_DISARMED`, all 6 axes `SwitchOnDisabled`, all errors `0x0000`
+    - pre-enable `GET /control/motion-status` -> `state=idle`, `active_traj_id=0`, `queue_depth=0`, `last_submitted_traj_id=0`, `safe_for_power_transition=true`
+    - `POST /control/power-up` -> `code=POWER_UP_SENT`
+    - `POST /control/power-down` with `{"wait_for_idle": true}` -> `code=POWER_DOWN_SENT`, `trajectory_id=0`, `active_traj_id=0`, `last_submitted_traj_id=0`
+    - post-power-down `./start-stack.sh probe` -> `physical_state=BUS_UP_DISARMED`, `driver_state=DISARMED`, `op_enabled_axes=0/6`, all errors `0x0000`
+    - post-power-down `GET /control/motion-status` -> `state=idle`, `active_traj_id=0`, `last_submitted_traj_id=0`, `safe_for_power_transition=true`
+    - final shutdown `./start-stack.sh stop --hard` -> `physical_state=INACTIVE`, `rtcore_state=DOWN`, `ethercat_master_state=DOWN`
+- Outcome / follow-up:
+  - The original safe power-transition hardening now behaves correctly in the no-motion restart/power-up/power-down scenario on hardware.
+  - The stack was left fully stopped after validation, so the machine is not left bus-up/disarmed at the end of the task.

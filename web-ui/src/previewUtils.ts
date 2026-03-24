@@ -1,5 +1,22 @@
 export type Point3 = { x: number; y: number; z: number };
 
+export type PoseWaypoint = Point3 & {
+  rollDeg: number | null;
+  pitchDeg: number | null;
+  yawDeg: number | null;
+};
+
+export type RobotProgramKind = "trajectory" | "weld";
+
+export type SavedRobotProgramRecord = {
+  name: string;
+  kind: RobotProgramKind;
+  saved_at?: string;
+  authoring: Record<string, unknown>;
+  planned_trajectory?: PreviewPlan | null;
+  metadata?: Record<string, unknown>;
+};
+
 export type TrajectoryMove = {
   command: string;
   vector?: number[] | null;
@@ -19,7 +36,7 @@ export type PreviewPlan = {
   name: string;
   trajectory: TrajectoryFile;
   pathPoints: Point3[];
-  waypoints: Point3[];
+  waypoints: PoseWaypoint[];
   planningWarnings?: string[];
 };
 
@@ -67,6 +84,18 @@ function toNodeId(value: string): string {
   return value.replace(/[^a-zA-Z0-9_-]+/g, "_");
 }
 
+function poseSubtitle(point: PoseWaypoint): string {
+  const xyz = `${point.x.toFixed(4)}, ${point.y.toFixed(4)}, ${point.z.toFixed(4)}`;
+  if (
+    point.rollDeg === null ||
+    point.pitchDeg === null ||
+    point.yawDeg === null
+  ) {
+    return `${xyz} | pose inherited`;
+  }
+  return `${xyz} | R ${point.rollDeg.toFixed(1)} P ${point.pitchDeg.toFixed(1)} Y ${point.yawDeg.toFixed(1)}`;
+}
+
 function toPoint3(value: unknown): Point3 | null {
   if (Array.isArray(value) && value.length >= 3) {
     const [x, y, z] = value;
@@ -103,6 +132,64 @@ function coercePointList(value: unknown): Point3[] {
     .filter((point): point is Point3 => point !== null);
 }
 
+function coerceOrientationDeg(value: unknown): {
+  rollDeg: number | null;
+  pitchDeg: number | null;
+  yawDeg: number | null;
+} {
+  let rollRaw: unknown = null;
+  let pitchRaw: unknown = null;
+  let yawRaw: unknown = null;
+  if (Array.isArray(value) && value.length >= 3) {
+    [rollRaw, pitchRaw, yawRaw] = value;
+  } else if (typeof value === "object" && value !== null) {
+    const orientation = value as Record<string, unknown>;
+    rollRaw = orientation.roll ?? orientation.x ?? null;
+    pitchRaw = orientation.pitch ?? orientation.y ?? null;
+    yawRaw = orientation.yaw ?? orientation.z ?? null;
+  }
+  const rollDeg = rollRaw == null ? null : Number(rollRaw);
+  const pitchDeg = pitchRaw == null ? null : Number(pitchRaw);
+  const yawDeg = yawRaw == null ? null : Number(yawRaw);
+  return {
+    rollDeg: Number.isFinite(rollDeg) ? rollDeg : null,
+    pitchDeg: Number.isFinite(pitchDeg) ? pitchDeg : null,
+    yawDeg: Number.isFinite(yawDeg) ? yawDeg : null,
+  };
+}
+
+function toPoseWaypoint(value: unknown): PoseWaypoint | null {
+  const point = toPoint3(value);
+  if (!point) {
+    return null;
+  }
+  const record = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+  const orientation = coerceOrientationDeg(
+    record?.orientation_euler_deg ??
+      record?.orientationEulerDeg ??
+      (record
+        ? {
+            roll: record.rollDeg ?? record.roll_deg ?? null,
+            pitch: record.pitchDeg ?? record.pitch_deg ?? null,
+            yaw: record.yawDeg ?? record.yaw_deg ?? null,
+          }
+        : null),
+  );
+  return {
+    ...point,
+    ...orientation,
+  };
+}
+
+export function coercePoseWaypointList(value: unknown): PoseWaypoint[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => toPoseWaypoint(entry))
+    .filter((point): point is PoseWaypoint => point !== null);
+}
+
 function coerceStringList(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -112,16 +199,17 @@ function coerceStringList(value: unknown): string[] {
     .filter((entry) => entry.length > 0);
 }
 
-function deriveWaypointsFromTrajectory(trajectory: TrajectoryFile): Point3[] {
+function deriveWaypointsFromTrajectory(trajectory: TrajectoryFile): PoseWaypoint[] {
   if (!trajectory?.moves || !Array.isArray(trajectory.moves)) {
     return [];
   }
-  const points: Point3[] = [];
+  const points: PoseWaypoint[] = [];
   trajectory.moves.forEach((move) => {
     if (move?.command === "move_absolute") {
       const point = toPoint3(move.vector ?? null);
       if (point) {
-        points.push(point);
+        const orientation = coerceOrientationDeg(move.orientation_euler_deg ?? null);
+        points.push({ ...point, ...orientation });
       }
     }
   });
@@ -136,7 +224,7 @@ function buildPreviewPlan(
   explicitWarnings?: unknown,
 ): PreviewPlan {
   const fallbackWaypoints = deriveWaypointsFromTrajectory(trajectory);
-  const explicitWaypointsList = coercePointList(explicitWaypoints);
+  const explicitWaypointsList = coercePoseWaypointList(explicitWaypoints);
   const waypoints =
     explicitWaypointsList.length > 0
       ? explicitWaypointsList
@@ -155,7 +243,12 @@ function buildPreviewPlan(
     trajectory,
     pathPoints: pathPoints.map(({ x, y, z }) => transformToScenePoint({ x, y, z })),
     waypoints: (waypoints.length > 0 ? waypoints : fallbackWaypoints).map(
-      ({ x, y, z }) => transformToScenePoint({ x, y, z }),
+      ({ x, y, z, rollDeg, pitchDeg, yawDeg }) => ({
+        ...transformToScenePoint({ x, y, z }),
+        rollDeg,
+        pitchDeg,
+        yawDeg,
+      }),
     ),
     planningWarnings,
   };
@@ -163,7 +256,7 @@ function buildPreviewPlan(
 
 export function previewFromPlannerPayload(payload: any): {
   plan: PreviewPlan;
-  waypoints: Point3[];
+  waypoints: PoseWaypoint[];
 } {
   const name =
     typeof payload?.name === "string" && payload.name.trim()
@@ -231,7 +324,7 @@ export function buildProgramTree({
     id: `control_point_${index}`,
     type: "waypoint",
     label: `Control Point ${index + 1}`,
-    subtitle: `${point.x.toFixed(4)}, ${point.y.toFixed(4)}, ${point.z.toFixed(4)}`,
+    subtitle: poseSubtitle(point),
     badge: `${index + 1}`,
     focus: {
       openPanel: defaultFocusPanel,
@@ -258,11 +351,12 @@ export function buildProgramTree({
     if (command === "move_absolute") {
       const movePoint = toPoint3(move.vector ?? null);
       if (movePoint) {
+        const moveOrientation = coerceOrientationDeg(move.orientation_euler_deg ?? null);
         commandNode.children.push({
           id: `move_${moveIndex}_endpoint`,
           type: "waypoint",
           label: "Move Endpoint",
-          subtitle: `${movePoint.x.toFixed(4)}, ${movePoint.y.toFixed(4)}, ${movePoint.z.toFixed(4)}`,
+          subtitle: poseSubtitle({ ...movePoint, ...moveOrientation }),
           focus: {
             openPanel: defaultFocusPanel,
             moveIndex,
@@ -401,6 +495,29 @@ export function encodePointsForApi(points: Point3[]): any[] {
       y: Number(world.y),
       z: Number(world.z),
     };
+  });
+}
+
+export function encodePoseWaypointsForApi(waypoints: PoseWaypoint[]): any[] {
+  return waypoints.map((waypoint) => {
+    const world = transformFromScenePoint(waypoint);
+    const payload: Record<string, unknown> = {
+      x: Number(world.x),
+      y: Number(world.y),
+      z: Number(world.z),
+    };
+    if (
+      waypoint.rollDeg !== null &&
+      waypoint.pitchDeg !== null &&
+      waypoint.yawDeg !== null
+    ) {
+      payload.orientation_euler_deg = {
+        roll: Number(waypoint.rollDeg),
+        pitch: Number(waypoint.pitchDeg),
+        yaw: Number(waypoint.yawDeg),
+      };
+    }
+    return payload;
   });
 }
 

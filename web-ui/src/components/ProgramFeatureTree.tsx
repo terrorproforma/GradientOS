@@ -1,22 +1,30 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
-import type { Point3, ProgramNode, ProgramTreeViewMode } from "../previewUtils";
+import type { PoseWaypoint, ProgramNode, ProgramTreeViewMode } from "../previewUtils";
 
 type ProgramFeatureTreeProps = {
   root: ProgramNode | null;
   expandedNodeIds: string[];
   selectedNodeId: string | null;
   viewMode: ProgramTreeViewMode;
-  editableControlPoint: { index: number; point: Point3 } | null;
+  editableControlPoint: { index: number; point: PoseWaypoint } | null;
   canEditWaypointValues: boolean;
   canAddWaypoint: boolean;
   canRemoveWaypoint: boolean;
+  canMoveWaypointUp: boolean;
+  canMoveWaypointDown: boolean;
   canApplyWaypointEdits: boolean;
   onToggleExpand: (id: string) => void;
   onSelectNode: (id: string) => void;
   onChangeViewMode: (value: ProgramTreeViewMode) => void;
-  onWaypointChange: (index: number, axis: "x" | "y" | "z", value: number) => void;
+  onWaypointChange: (
+    index: number,
+    axis: "x" | "y" | "z" | "rollDeg" | "pitchDeg" | "yawDeg",
+    value: number,
+  ) => void;
   onAddWaypoint: () => void;
   onRemoveWaypoint: (index: number) => void;
+  onMoveWaypointUp: () => void;
+  onMoveWaypointDown: () => void;
   onApplyWaypointEdits: () => void;
 };
 
@@ -109,6 +117,8 @@ export function ProgramFeatureTree({
   canEditWaypointValues,
   canAddWaypoint,
   canRemoveWaypoint,
+  canMoveWaypointUp,
+  canMoveWaypointDown,
   canApplyWaypointEdits,
   onToggleExpand,
   onSelectNode,
@@ -116,6 +126,8 @@ export function ProgramFeatureTree({
   onWaypointChange,
   onAddWaypoint,
   onRemoveWaypoint,
+  onMoveWaypointUp,
+  onMoveWaypointDown,
   onApplyWaypointEdits,
 }: ProgramFeatureTreeProps) {
   const expanded = new Set(expandedNodeIds);
@@ -204,6 +216,30 @@ export function ProgramFeatureTree({
               >
                 -
               </button>
+              <button
+                type="button"
+                onClick={onMoveWaypointUp}
+                disabled={!canMoveWaypointUp}
+                className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
+                  !canMoveWaypointUp ? "opacity-60" : ""
+                }`}
+                aria-label="Move control point up"
+                title="Move control point earlier"
+              >
+                ^
+              </button>
+              <button
+                type="button"
+                onClick={onMoveWaypointDown}
+                disabled={!canMoveWaypointDown}
+                className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
+                  !canMoveWaypointDown ? "opacity-60" : ""
+                }`}
+                aria-label="Move control point down"
+                title="Move control point later"
+              >
+                v
+              </button>
             </div>
           </div>
           <div className="grid grid-cols-3 gap-1">
@@ -222,6 +258,34 @@ export function ProgramFeatureTree({
                     editableControlPoint.index,
                     axis,
                     parseOrKeep(event.target.value, editableControlPoint.point[axis]),
+                  )
+                }
+              />
+            ))}
+          </div>
+          <div className="mt-1 grid grid-cols-3 gap-1">
+            {(
+              [
+                ["rollDeg", "Roll"],
+                ["pitchDeg", "Pitch"],
+                ["yawDeg", "Yaw"],
+              ] as const
+            ).map(([axis, label]) => (
+              <input
+                key={`tree-control-rot-${editableControlPoint.index}-${axis}`}
+                className={`rounded border border-slate-600/70 bg-slate-950/70 px-1.5 py-1 text-[12px] text-slate-100 ${
+                  !canEditWaypointValues ? "opacity-60" : ""
+                }`}
+                type="number"
+                step="0.1"
+                title={label}
+                value={editableControlPoint.point[axis] ?? 0}
+                disabled={!canEditWaypointValues}
+                onChange={(event) =>
+                  onWaypointChange(
+                    editableControlPoint.index,
+                    axis,
+                    parseOrKeep(event.target.value, editableControlPoint.point[axis] ?? 0),
                   )
                 }
               />

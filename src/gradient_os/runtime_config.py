@@ -184,6 +184,28 @@ def load_runtime_config() -> dict[str, Any]:
     return _normalize_runtime_config(payload)
 
 
+def get_runtime_config_snapshot() -> dict[str, Any]:
+    """Backward-compatible snapshot shape used by older API tests and callers."""
+    desired_config = load_runtime_config()
+    desired = desired_config.get("desired", {}) if isinstance(desired_config, dict) else {}
+    overrides = desired.get("overrides", {}) if isinstance(desired, dict) else {}
+    active_runtime = resolve_effective_runtime(
+        robot_name=_normalize_robot_name(desired.get("robot")),
+        sim_mode=False,
+        requested_ik_solver_backend=overrides.get("ik_solver_backend"),
+        requested_servo_backend=overrides.get("servo_backend"),
+        requested_drive_profile=overrides.get("drive_profile"),
+        requested_rt_max_rpm=overrides.get("rt_max_rpm"),
+        requested_active_tool_id=desired.get("active_tool_id"),
+        allow_unsafe_overrides=bool(desired.get("allow_unsafe_overrides", False)),
+    )
+    return {
+        "desired": desired_config,
+        "active": active_runtime,
+        "runtime_config_path": get_runtime_config_path(),
+    }
+
+
 def save_runtime_config(config: dict[str, Any], *, actor: str = "unknown") -> dict[str, Any]:
     normalized = _normalize_runtime_config(config)
     normalized["meta"] = {

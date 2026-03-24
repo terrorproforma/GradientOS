@@ -65,6 +65,22 @@ describe("ControlPanel jog session lifecycle", () => {
 				return mockJsonResponse({
 					status: "ok",
 					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						controller_thread_running: false,
+						rtcore_status_present: true,
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
 				});
 			}
 			if (parsed.pathname === "/control/jog/session/start") {
@@ -103,6 +119,7 @@ describe("ControlPanel jog session lifecycle", () => {
 
 	afterEach(() => {
 		cleanup();
+		vi.restoreAllMocks();
 		vi.unstubAllGlobals();
 	});
 
@@ -140,5 +157,98 @@ describe("ControlPanel jog session lifecycle", () => {
 		const jogPosts = fetchCalls.filter((call) => call.method === "POST" && call.pathname.startsWith("/control/jog/session/"));
 		expect(jogPosts[0]?.pathname).toBe("/control/jog/session/start");
 		expect(jogPosts[jogPosts.length - 1]?.pathname).toBe("/control/jog/session/stop");
+	});
+
+	it("blocks drive power-up when the runtime is unsafe", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [],
+				}}
+				motionStatus={{
+					status: "ok",
+					state: "accepted",
+					safe_for_power_transition: false,
+					power_transition_blocker_details: [
+						{
+							code: "active_trajectory",
+							message: "An RTCore trajectory is still latched or active.",
+							active_traj_id: 9,
+						},
+					],
+					execution: {
+						state_name: "queued",
+						active_mode_name: "trajectory_execute",
+						active_traj_id: 9,
+						queue_depth: 1,
+						queue_capacity: 4096,
+						motion_done: false,
+						stale_command: false,
+						safe_for_power_transition: false,
+						power_transition_blockers: ["active_trajectory"],
+						power_transition_blocker_details: [
+							{
+								code: "active_trajectory",
+								message: "An RTCore trajectory is still latched or active.",
+								active_traj_id: 9,
+							},
+						],
+					},
+				}}
+			/>,
+		);
+
+		const button = screen.getByRole("button", { name: "Power Up Drives" }) as HTMLButtonElement;
+		expect(button.disabled).toBe(true);
+		expect(button.title).toContain("Active trajectory 9");
+	});
+
+	it("uses wait-for-idle semantics for drive power-down", async () => {
+		vi.spyOn(window, "confirm").mockReturnValue(true);
+
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "ACTIVE",
+					axes: [],
+				}}
+				motionStatus={{
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Power Down Drives" }));
+
+		await waitFor(() => {
+			expect(
+				fetchCalls.some(
+					(call) =>
+						call.method === "POST"
+						&& call.pathname === "/control/power-down"
+						&& JSON.stringify(call.body) === JSON.stringify({ wait_for_idle: true }),
+				),
+			).toBe(true);
+		});
 	});
 });

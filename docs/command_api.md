@@ -117,6 +117,7 @@ SET_ORIENTATION,0,30,0,1.5,true
 #### `STOP`
 -   **Syntax:** `STOP`
 -   **Description:** Immediately and safely halts any running motion (`MOVE_LINE`, `RUN_TRAJECTORY`, etc.). This is the highest priority command.
+-   **RTCore note:** On EtherCAT RTCore, `STOP` aborts queued RTCore trajectory ownership and active jog ownership first. It intentionally does **not** send the legacy "hold current position" write through `servo_driver`, because that write becomes a one-point RTCore trajectory and can falsely relatch motion state during safe power-down.
 
 #### `WAIT_FOR_IDLE`
 -   **Syntax:** `WAIT_FOR_IDLE[,timeout_s]`
@@ -131,6 +132,29 @@ SET_ORIENTATION,0,30,0,1.5,true
 -   **Reply behavior:** The payload includes top-level motion fields such as `state`, `completion_scope`, `trajectory_id`, and `source_of_truth`, plus:
     -   `execution`: low-level RTCore/controller execution detail (`state_name`, `active_traj_id`, `queue_depth`, etc.)
     -   `program` and mirrored `program_*` fields: controller-program lifecycle detail (`program_state`, `program_terminal_reason`, `program_failing_step_index`, `program_completed_step_count`, `program_completed_loop_count`, active step/type, and loop iteration)
+-   **Power-transition fields:** The payload also carries:
+    -   `safe_for_power_transition`: derived neutral/disarmed-safe gate
+    -   `power_transition_blockers`: short blocker codes
+    -   `power_transition_blocker_details`: structured blocker metadata suitable for UI/operator display
+    -   mirrored copies of those fields under `execution`
+
+#### `SAFE_POWER_UP`
+-   **Syntax:** `SAFE_POWER_UP`
+-   **Description:** Explicitly arms/enables the active actuator backend only after verifying the runtime is neutral, fault-free, and synchronized to live feedback.
+-   **RTCore note:** On EtherCAT RTCore this is the required enable path. Startup is expected to land `BUS_UP_DISARMED`, not auto-armed.
+-   **Reply behavior:** Returns a structured ACK payload with fields such as `code`, `message`, `safe_for_power_transition`, and blocker details when the request is refused.
+
+#### `SAFE_POWER_DOWN`
+-   **Syntax:** `SAFE_POWER_DOWN[,wait]`
+-   **Description:** Explicitly de-energizes the active actuator backend using the safe stop/disarm flow.
+-   **RTCore note:** On EtherCAT RTCore this means stop jog -> abort trajectory ownership -> optionally wait for neutral -> disable axes -> disarm.
+-   **Reply behavior:** Returns a structured ACK payload including `waited_for_idle`, `code`, and the current power-transition safety fields.
+
+#### `RESET_FAULTS`
+-   **Syntax:** `RESET_FAULTS[,joint]`
+-   **Description:** Requests DS402/drive fault reset. On RTCore-backed EtherCAT this first neutralizes motion/disarm intent before pulsing fault reset.
+-   **RTCore note:** Fault reset must leave the system `BUS_UP_DISARMED`; a separate `SAFE_POWER_UP` is still required afterward.
+-   **Reply behavior:** Returns a structured ACK payload including `disarmed_after_reset=true` when the reset request is accepted.
 
 #### `GET_POSITION`
 -   **Syntax:** `GET_POSITION`

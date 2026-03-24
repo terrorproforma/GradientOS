@@ -3490,6 +3490,41 @@ int main(int argc, char** argv) {
         motion_last_update_ns.store(update_ns, std::memory_order_relaxed);
       };
 
+      auto clear_motion_intent = [&](uint64_t active_cmd_seq,
+                                     uint32_t last_event_code,
+                                     uint32_t exec_state) {
+        pending_upload = PendingTrajectoryUpload{};
+        trajectory_abort_request.store(
+            std::numeric_limits<uint64_t>::max(),
+            std::memory_order_release);
+        committed_trajectory.traj_id = 0;
+        committed_trajectory.cmd_seq = 0;
+        committed_trajectory.axis_mask = 0;
+        committed_trajectory.point_count = 0;
+        committed_trajectory.seq.store(0, std::memory_order_release);
+
+        latest_jog_command.axis_mask = 0;
+        latest_jog_command.flags = gradient::ipc::v1::JOG_FLAG_STOP;
+        latest_jog_command.timeout_ns = 0;
+        latest_jog_command.cmd_seq = active_cmd_seq;
+        for (uint32_t axis_i = 0; axis_i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++axis_i) {
+          latest_jog_command.velocity_counts_per_s[axis_i] = 0.0;
+        }
+        latest_jog_command.seq.store(active_cmd_seq, std::memory_order_release);
+
+        publish_motion_status(
+            gradient::ipc::v1::MOTION_MODE_IDLE,
+            exec_state,
+            0,
+            std::numeric_limits<uint32_t>::max(),
+            0,
+            last_event_code,
+            0,
+            1,
+            active_cmd_seq,
+            now_monotonic_ns());
+      };
+
       // Emit STATUS_HELLO once on connect.
       {
         gradient::ipc::v1::StatusHelloV1 sh{};
@@ -3561,6 +3596,12 @@ int main(int argc, char** argv) {
                     auto* cmd = reinterpret_cast<const gradient::ipc::v1::CmdArmV1*>(payload);
                     const bool arm = (cmd->arm != 0);
                     armed.store(arm, std::memory_order_relaxed);
+                    if (!arm) {
+                      clear_motion_intent(
+                          mh->seq,
+                          gradient::ipc::v1::EVT_DISARMED,
+                          gradient::ipc::v1::EXEC_STATE_ABORTED);
+                    }
                   }
                   break;
                 }
@@ -3575,7 +3616,14 @@ int main(int argc, char** argv) {
                   if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::CmdAxisMaskV1)) {
                     auto* cmd = reinterpret_cast<const gradient::ipc::v1::CmdAxisMaskV1*>(payload);
                     const uint32_t cur = axis_enable_mask.load(std::memory_order_relaxed);
-                    axis_enable_mask.store(cur & ~cmd->axis_mask, std::memory_order_relaxed);
+                    const uint32_t next = cur & ~cmd->axis_mask;
+                    axis_enable_mask.store(next, std::memory_order_relaxed);
+                    if (next == 0u) {
+                      clear_motion_intent(
+                          mh->seq,
+                          gradient::ipc::v1::EVT_DISARMED,
+                          gradient::ipc::v1::EXEC_STATE_ABORTED);
+                    }
                   }
                   break;
                 }
@@ -3599,6 +3647,10 @@ int main(int argc, char** argv) {
                     }
                     mask &= valid;
                     if (mask != 0) {
+                      clear_motion_intent(
+                          mh->seq,
+                          gradient::ipc::v1::EVT_DISARMED,
+                          gradient::ipc::v1::EXEC_STATE_ABORTED);
                       fault_reset_request.fetch_or(mask, std::memory_order_relaxed);
                     }
                   }

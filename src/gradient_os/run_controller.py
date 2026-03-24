@@ -96,6 +96,11 @@ def _update_rolling_metric(metric: dict[str, object], value_ms: float) -> None:
     metric["max_ms"] = max(float(metric.get("max_ms", 0.0)), float(value_ms))
 
 
+def _encode_controller_payload_b64(payload: dict[str, object]) -> str:
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return base64.urlsafe_b64encode(body).decode("ascii")
+
+
 def _record_controller_udp_reset(count: int) -> None:
     with _CONTROLLER_PERF_LOCK:
         udp = _CONTROLLER_PERF.setdefault("udp", {})
@@ -1848,23 +1853,36 @@ Examples:
                     wait_for_idle = False
                     if len(parts) > 1:
                         wait_for_idle = parts[1].strip().lower() in {"1", "true", "yes", "on", "wait"}
-                    detail = command_api.handle_safe_power_down(wait_for_idle=wait_for_idle)
+                    payload = command_api.handle_safe_power_down(wait_for_idle=wait_for_idle)
                     try:
-                        sock.sendto(f"ACK,SAFE_POWER_DOWN,{detail}".encode("utf-8"), addr)
+                        if isinstance(payload, dict):
+                            prefix = "ACK" if bool(payload.get("accepted", False)) else "ERROR"
+                            sock.sendto(
+                                f"{prefix},SAFE_POWER_DOWN,{_encode_controller_payload_b64(payload)}".encode("utf-8"),
+                                addr,
+                            )
+                        else:
+                            sock.sendto(f"ACK,SAFE_POWER_DOWN,{payload}".encode("utf-8"), addr)
                     except Exception:
                         pass
 
                 elif command == "SAFE_POWER_UP":
-                    detail = command_api.handle_safe_power_up()
+                    payload = command_api.handle_safe_power_up()
                     try:
-                        sock.sendto(f"ACK,SAFE_POWER_UP,{detail}".encode("utf-8"), addr)
+                        if isinstance(payload, dict):
+                            prefix = "ACK" if bool(payload.get("accepted", False)) else "ERROR"
+                            sock.sendto(
+                                f"{prefix},SAFE_POWER_UP,{_encode_controller_payload_b64(payload)}".encode("utf-8"),
+                                addr,
+                            )
+                        else:
+                            sock.sendto(f"ACK,SAFE_POWER_UP,{payload}".encode("utf-8"), addr)
                     except Exception:
                         pass
 
                 elif command == "RESET_FAULTS":
                     try:
                         logical_joint_index = None
-                        detail = "ALL"
                         if len(parts) > 1 and parts[1].strip():
                             joint_num = int(parts[1])
                             logical_joint_index = joint_num - 1
@@ -1874,13 +1892,16 @@ Examples:
                                     addr,
                                 )
                                 continue
-                            detail = f"JOINT,{joint_num}"
 
-                        backend = backend_registry.get_active_backend()
-                        if not backend.reset_faults(logical_joint_index=logical_joint_index):
-                            sock.sendto("ERROR,RESET_FAULTS,UNSUPPORTED_OR_FAILED".encode("utf-8"), addr)
-                            continue
-                        sock.sendto(f"ACK,RESET_FAULTS,{detail}".encode("utf-8"), addr)
+                        payload = command_api.handle_reset_faults(logical_joint_index=logical_joint_index)
+                        if isinstance(payload, dict):
+                            prefix = "ACK" if bool(payload.get("accepted", False)) else "ERROR"
+                            sock.sendto(
+                                f"{prefix},RESET_FAULTS,{_encode_controller_payload_b64(payload)}".encode("utf-8"),
+                                addr,
+                            )
+                        else:
+                            sock.sendto(f"ACK,RESET_FAULTS,{payload}".encode("utf-8"), addr)
                     except (ValueError, IndexError):
                         sock.sendto("ERROR,RESET_FAULTS,BAD_ARGS".encode("utf-8"), addr)
                     except Exception as e:

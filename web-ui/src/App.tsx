@@ -22,6 +22,7 @@ import {
   Moon,
   Octagon,
   Play,
+  Plus,
   Plug,
   RefreshCcw,
   Route,
@@ -45,12 +46,16 @@ import ControlPanel from "./ControlPanel";
 import {
   buildProgramTree,
   encodePointsForApi,
+  encodePoseWaypointsForApi,
+  coercePoseWaypointList,
   previewFromPlannerPayload,
   previewFromTrajectoryDetail,
   type ProgramNode,
   type ProgramTreeViewMode,
   type Point3,
+  type PoseWaypoint,
   type PreviewPlan,
+  type SavedRobotProgramRecord,
 } from "./previewUtils";
 import { SidebarRail, type SidebarItem } from "./components/SidebarRail";
 import { SidebarDrawer } from "./components/SidebarDrawer";
@@ -211,6 +216,8 @@ type MotionStatusResponse = {
   detail?: string;
   accepted?: boolean;
   command_acknowledged?: boolean;
+  execution_mode?: string;
+  runtime_mode?: string;
   state?: string;
   completion_scope?: string;
   trajectory_id?: number;
@@ -458,6 +465,16 @@ type WeldProgramRecord = {
   planned_trajectory?: PreviewPlan | null;
 };
 
+type TrajectoryProgramRecord = SavedRobotProgramRecord & {
+  kind: "trajectory";
+  authoring: {
+    waypoints?: unknown;
+    metadata?: Record<string, unknown>;
+  };
+};
+
+type RuntimeExecutionMode = "simulate" | "live";
+
 const WELD_TYPE_OPTIONS = ["fillet", "butt", "lap", "tack/spot", "custom"] as const;
 const DRAWER_LABEL_CLASS = "block text-[13px] font-normal text-slate-300";
 const DRAWER_INPUT_CLASS =
@@ -611,6 +628,12 @@ function MotionStatusCard({
           badge: "border-amber-300/40 bg-amber-400/15 text-amber-100",
         };
   const detailParts = [`source ${source}`, `scope ${scope}`];
+  if (motionStatus.runtime_mode) {
+    detailParts.push(`runtime ${motionStatus.runtime_mode}`);
+  }
+  if (motionStatus.execution_mode) {
+    detailParts.push(`request ${motionStatus.execution_mode}`);
+  }
   if (typeof queueDepth === "number" && Number.isFinite(queueDepth)) {
     detailParts.push(
       typeof queueCapacity === "number" && Number.isFinite(queueCapacity) && queueCapacity > 0
@@ -1267,6 +1290,60 @@ function normalizeWeldDraftRecord(
   };
 }
 
+function buildPoseWaypoint(
+  point: Point3,
+  orientation?: Partial<Pick<PoseWaypoint, "rollDeg" | "pitchDeg" | "yawDeg">> | null,
+): PoseWaypoint {
+  return {
+    x: Number(point.x),
+    y: Number(point.y),
+    z: Number(point.z),
+    rollDeg: Number.isFinite(Number(orientation?.rollDeg)) ? Number(orientation?.rollDeg) : null,
+    pitchDeg: Number.isFinite(Number(orientation?.pitchDeg)) ? Number(orientation?.pitchDeg) : null,
+    yawDeg: Number.isFinite(Number(orientation?.yawDeg)) ? Number(orientation?.yawDeg) : null,
+  };
+}
+
+function poseOrientationSummary(waypoint: PoseWaypoint): string {
+  const values = [waypoint.rollDeg, waypoint.pitchDeg, waypoint.yawDeg];
+  if (values.some((value) => value === null || !Number.isFinite(Number(value)))) {
+    return "orientation inherited";
+  }
+  return `R ${Number(waypoint.rollDeg).toFixed(1)} deg, P ${Number(waypoint.pitchDeg).toFixed(1)} deg, Y ${Number(waypoint.yawDeg).toFixed(1)} deg`;
+}
+
+function normalizeTrajectoryProgramRecord(raw: unknown): TrajectoryProgramRecord | null {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  if (record.kind !== "trajectory") {
+    return null;
+  }
+  const name = typeof record.name === "string" ? record.name.trim() : "";
+  const authoring =
+    record.authoring && typeof record.authoring === "object"
+      ? (record.authoring as TrajectoryProgramRecord["authoring"])
+      : null;
+  if (!name || !authoring) {
+    return null;
+  }
+  return {
+    name,
+    kind: "trajectory",
+    saved_at: typeof record.saved_at === "string" ? record.saved_at : undefined,
+    authoring,
+    planned_trajectory:
+      record.planned_trajectory && typeof record.planned_trajectory === "object"
+        ? (record.planned_trajectory as PreviewPlan)
+        : null,
+    metadata:
+      record.metadata && typeof record.metadata === "object"
+        ? (record.metadata as Record<string, unknown>)
+        : undefined,
+  };
+}
+
 type WeldPreviewSection = {
   kind: "weld" | "transition";
   weldType?: string;
@@ -1619,13 +1696,21 @@ type TrajectoryPanelProps = {
   isMotionActive: boolean;
   motionStatus: MotionStatusResponse | null;
   preview: PreviewPlan | null;
-  plannerPoints: Point3[];
+  plannerPoints: PoseWaypoint[];
   savedTrajectories: string[];
   selectedTrajectory: string;
   isTrajectoryListLoading: boolean;
   isLoadingSavedTrajectory: boolean;
+  trajectoryProgramName: string;
+  onTrajectoryProgramNameChange: (value: string) => void;
+  onSaveTrajectory: () => void;
+  isSavingTrajectory: boolean;
+  runtimeMode: RuntimeExecutionMode | null;
   onPlanToggle: () => void;
-  onRun: () => void;
+  onSimulate: () => void;
+  onRunLive: () => void;
+  onCapturePose: () => void;
+  onAddWaypoint: () => void;
   onClear: () => void;
   onRefreshTrajectories: () => void;
   onSelectTrajectory: (value: string) => void;
@@ -1645,8 +1730,16 @@ function TrajectoryPanel({
   selectedTrajectory,
   isTrajectoryListLoading,
   isLoadingSavedTrajectory,
+  trajectoryProgramName,
+  onTrajectoryProgramNameChange,
+  onSaveTrajectory,
+  isSavingTrajectory,
+  runtimeMode,
   onPlanToggle,
-  onRun,
+  onSimulate,
+  onRunLive,
+  onCapturePose,
+  onAddWaypoint,
   onClear,
   onRefreshTrajectories,
   onSelectTrajectory,
@@ -1658,6 +1751,9 @@ function TrajectoryPanel({
   const hasSavedTrajectories = savedTrajectories.length > 0;
   const lastPoint =
     waypointList.length > 0 ? waypointList[waypointList.length - 1] : null;
+  const canSimulate = runtimeMode === "simulate" && !!preview;
+  const canRunLive = runtimeMode === "live" && !!preview;
+  const hasDraftWaypoints = plannerPoints.length > 0;
 
   return (
     <div className="pointer-events-auto w-full">
@@ -1691,14 +1787,14 @@ function TrajectoryPanel({
           </button>
           <button
             type="button"
-            onClick={onRun}
-            disabled={!preview || isPlanLoading || isSubmittingRun || isMotionActive}
+            onClick={onCapturePose}
+            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
             className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
-              (!preview || isPlanLoading || isSubmittingRun || isMotionActive) ? "opacity-60" : ""
+              isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
             }`}
-            aria-label="Execute planned trajectory"
+            aria-label="Capture current robot pose"
           >
-            <Play size={18} strokeWidth={2} />
+            <Crosshair size={18} strokeWidth={2} />
           </button>
           <button
             type="button"
@@ -1719,15 +1815,80 @@ function TrajectoryPanel({
         isSubmitting={isSubmittingRun}
         submittingLabel="Submitting trajectory run..."
       />
+      <div className="mt-3 rounded border border-slate-700/60 bg-slate-950/40 px-3 py-3">
+        <div className="mb-1 flex items-center justify-between">
+          <span className={DRAWER_SECTION_TITLE_CLASS}>Create Trajectory</span>
+          <span className={DRAWER_META_TEXT_CLASS}>
+            {hasDraftWaypoints ? `${plannerPoints.length} draft waypoint(s)` : "start here"}
+          </span>
+        </div>
+        <div className="text-[12px] leading-5 text-slate-300/90">
+          <p>
+            1. Click <span className="font-semibold text-slate-100">{isPlanning ? "Stop Editing" : "Start Editing"}</span>.
+          </p>
+          <p>
+            2. While editing, <span className="font-semibold text-slate-100">Shift-click the 3D workspace</span> to place waypoints,
+            or use <span className="font-semibold text-slate-100">Capture Pose</span> to grab the robot TCP.
+          </p>
+          <p>
+            3. Fine-tune XYZ plus roll/pitch/yaw in the <span className="font-semibold text-slate-100">Program Tree</span>.
+          </p>
+        </div>
+        <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+          <button
+            type="button"
+            onClick={onPlanToggle}
+            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
+            className={`rounded-lg border px-3 py-2 text-left ${DRAWER_ACTION_TEXT_CLASS} transition ${
+              isPlanning
+                ? "border-cyan-400/60 bg-cyan-500/15 text-cyan-100"
+                : "border-slate-600/60 bg-slate-900/60 text-slate-100 hover:border-slate-400 hover:text-slate-50"
+            } ${isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""}`}
+          >
+            {isPlanning ? "Stop Editing" : "Start Editing"}
+          </button>
+          <button
+            type="button"
+            onClick={onAddWaypoint}
+            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
+            className={`rounded-lg border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left ${DRAWER_ACTION_TEXT_CLASS} text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+              isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
+            }`}
+          >
+            <span className="inline-flex items-center gap-2">
+              <Plus size={14} />
+              Add Waypoint
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={onCapturePose}
+            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
+            className={`rounded-lg border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left ${DRAWER_ACTION_TEXT_CLASS} text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+              isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
+            }`}
+          >
+            Capture Pose
+          </button>
+        </div>
+      </div>
       <div className="text-[13px] leading-[1.35] text-slate-100/90">
+        <div className="mb-2 flex items-center gap-2">
+          <span className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+            Runtime {runtimeMode === "simulate" ? "SIM" : runtimeMode === "live" ? "LIVE" : "UNKNOWN"}
+          </span>
+          <span className={DRAWER_META_TEXT_CLASS}>
+            Preview draws the path locally. Only `Simulate Trajectory` runs safely in SIM mode.
+          </span>
+        </div>
         {isPlanLoading ? (
           <p>Planning preview trajectory…</p>
         ) : isSubmittingRun ? (
           <p>Submitting trajectory run…</p>
         ) : isPlanning ? (
           <p>
-            Shift-click in the workspace to add waypoints. Use undo to remove
-            the last point.
+            Shift-click in the workspace to add waypoints. Use capture pose to
+            record the robot TCP directly, and undo to remove the last point.
           </p>
         ) : preview ? (
           <div className="flex flex-col gap-2">
@@ -1748,15 +1909,65 @@ function TrajectoryPanel({
                 </span>
               </div>
             )}
+            {lastPoint ? (
+              <div className={DRAWER_META_TEXT_CLASS}>
+                Last pose: <span className="font-semibold text-slate-100">{poseOrientationSummary(lastPoint)}</span>
+              </div>
+            ) : null}
           </div>
         ) : (
-          <p>No preview loaded yet.</p>
+          <p>No preview loaded yet. Start editing, place or capture waypoints, and the preview will appear automatically.</p>
         )}
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          onClick={onSimulate}
+          disabled={!canSimulate || isPlanLoading || isSubmittingRun || isMotionActive}
+          className={`rounded-lg border border-cyan-500/50 bg-cyan-500/10 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-cyan-100 transition hover:border-cyan-300 hover:text-cyan-50 ${
+            !canSimulate || isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
+          }`}
+        >
+          Simulate Trajectory
+        </button>
+        <button
+          type="button"
+          onClick={onRunLive}
+          disabled={!canRunLive || isPlanLoading || isSubmittingRun || isMotionActive}
+          className={`rounded-lg border border-rose-500/50 bg-rose-500/10 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-rose-100 transition hover:border-rose-300 hover:text-rose-50 ${
+            !canRunLive || isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
+          }`}
+        >
+          Run Trajectory
+        </button>
+      </div>
+      <div className="mt-4 border-t border-slate-700/50 pt-3">
+        <div className="mb-2 flex items-center justify-between">
+          <span className={DRAWER_SECTION_TITLE_CLASS}>Save Program</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            value={trajectoryProgramName}
+            onChange={(event) => onTrajectoryProgramNameChange(event.target.value)}
+            placeholder="trajectory_program"
+            className={`flex-1 ${DRAWER_INLINE_INPUT_CLASS} px-3 py-2`}
+          />
+          <button
+            type="button"
+            onClick={onSaveTrajectory}
+            disabled={isSavingTrajectory || !preview}
+            className={`rounded-lg border border-slate-600/60 bg-slate-900/60 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+              isSavingTrajectory || !preview ? "opacity-60" : ""
+            }`}
+          >
+            {isSavingTrajectory ? "Saving…" : "Save"}
+          </button>
+        </div>
       </div>
       <div className="mt-4 border-t border-slate-700/50 pt-3">
         <div className="mb-2 flex items-center justify-between">
           <span className={DRAWER_SECTION_TITLE_CLASS}>
-            Saved Trajectories
+            Saved Programs
           </span>
           <button
             type="button"
@@ -1775,7 +1986,7 @@ function TrajectoryPanel({
           </button>
         </div>
         {isTrajectoryListLoading ? (
-          <p className={DRAWER_META_TEXT_CLASS}>Loading trajectories…</p>
+          <p className={DRAWER_META_TEXT_CLASS}>Loading programs…</p>
         ) : hasSavedTrajectories ? (
           <div className="flex items-center gap-2">
             <select
@@ -1805,7 +2016,7 @@ function TrajectoryPanel({
           </div>
         ) : (
           <p className={DRAWER_META_TEXT_CLASS}>
-            No saved trajectories available.
+            No saved programs available.
           </p>
         )}
       </div>
@@ -1839,7 +2050,9 @@ type WeldPanelProps = {
   onSelectEdge: (edgeId: string) => void;
   onRemoveEdge: (edgeId: string) => void;
   onPlanFromEdge: () => void;
-  onRun: () => void;
+  runtimeMode: RuntimeExecutionMode | null;
+  onSimulate: () => void;
+  onRunLive: () => void;
   onSetWeldType: (value: string) => void;
   onSetWeldName: (value: string) => void;
   onSetWorkAngleDeg: (value: number) => void;
@@ -2139,7 +2352,9 @@ function WeldPanel({
   onSelectEdge,
   onRemoveEdge,
   onPlanFromEdge,
-  onRun,
+  runtimeMode,
+  onSimulate,
+  onRunLive,
   onSetWeldType,
   onSetWeldName,
   onSetWorkAngleDeg,
@@ -2175,6 +2390,8 @@ function WeldPanel({
       !isSubmittingRun &&
       !isMotionActive,
   );
+  const canSimulate = runtimeMode === "simulate" && canRunPreview;
+  const canRunLive = runtimeMode === "live" && canRunPreview;
 
   return (
     <div className="pointer-events-auto w-full">
@@ -2199,6 +2416,14 @@ function WeldPanel({
             </div>
           </div>
         ) : null}
+        <div className="rounded border border-slate-700/50 bg-slate-950/50 px-2 py-2 text-[12px] text-slate-300">
+          <div className="mb-1 flex items-center gap-2">
+            <span className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+              Runtime {runtimeMode === "simulate" ? "SIM" : runtimeMode === "live" ? "LIVE" : "UNKNOWN"}
+            </span>
+          </div>
+          <div>Preview draws the weld path locally. Simulated execution only runs safely when the controller is in SIM mode.</div>
+        </div>
         <div className="rounded border border-slate-700/50 bg-slate-950/50 px-2 py-2">
           <div className="mb-1 flex items-center justify-between">
             <span className="text-slate-300">Topology Model</span>
@@ -2495,16 +2720,28 @@ function WeldPanel({
           <div className={`mt-1 ${WELD_META_TEXT_CLASS}`}>No saved weld programs.</div>
         )}
       </div>
-      <button
-        type="button"
-        onClick={onRun}
-        disabled={!canRunPreview || isSubmittingRun || isPlanningWeld || isMotionActive}
-        className={`mt-3 inline-flex w-full items-center justify-center gap-2 rounded border border-orange-400/40 bg-orange-500/20 px-3 py-2 text-sm font-semibold text-orange-100 transition hover:bg-orange-500/30 ${
-          (!canRunPreview || isSubmittingRun || isPlanningWeld || isMotionActive) ? "opacity-60" : ""
-        }`}
-      >
-        <Play size={14} /> Run Weld Preview
-      </button>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <button
+          type="button"
+          onClick={onSimulate}
+          disabled={!canSimulate || isSubmittingRun || isPlanningWeld || isMotionActive}
+          className={`inline-flex w-full items-center justify-center gap-2 rounded border border-cyan-500/40 bg-cyan-500/20 px-3 py-2 text-sm font-semibold text-cyan-100 transition hover:bg-cyan-500/30 ${
+            (!canSimulate || isSubmittingRun || isPlanningWeld || isMotionActive) ? "opacity-60" : ""
+          }`}
+        >
+          <Play size={14} /> Simulate Weld
+        </button>
+        <button
+          type="button"
+          onClick={onRunLive}
+          disabled={!canRunLive || isSubmittingRun || isPlanningWeld || isMotionActive}
+          className={`inline-flex w-full items-center justify-center gap-2 rounded border border-orange-400/40 bg-orange-500/20 px-3 py-2 text-sm font-semibold text-orange-100 transition hover:bg-orange-500/30 ${
+            (!canRunLive || isSubmittingRun || isPlanningWeld || isMotionActive) ? "opacity-60" : ""
+          }`}
+        >
+          <Play size={14} /> Run Weld
+        </button>
+      </div>
     </div>
   );
 }
@@ -3050,7 +3287,7 @@ function SettingsDialog({
                   </div>
                   <div className="text-xs text-slate-400">
                     {activeRuntimeConfig
-                      ? `active ${activeRuntimeConfig.robot.display_name} · IK ${activeRuntimeConfig.ik_solver.effective_backend} · drive ${activeRuntimeConfig.drive_profile?.effective_profile ?? "none"} (${activeRuntimeConfig.drive_profile?.source ?? "unknown"})`
+                      ? `active ${activeRuntimeConfig.robot.display_name} · ${activeRuntimeConfig.mode?.sim ? "SIM" : "LIVE"} · servo ${activeRuntimeConfig.servo_backend.effective_backend} · IK ${activeRuntimeConfig.ik_solver.effective_backend} · drive ${activeRuntimeConfig.drive_profile?.effective_profile ?? "none"} (${activeRuntimeConfig.drive_profile?.source ?? "unknown"})`
                       : "Active controller runtime unavailable"}
                   </div>
                 </div>
@@ -3675,7 +3912,7 @@ export default function App() {
   const [isVisionActive, setIsVisionActive] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [previewPlan, setPreviewPlan] = useState<PreviewPlan | null>(null);
-  const [plannerPoints, setPlannerPoints] = useState<Point3[]>([]);
+  const [plannerPoints, setPlannerPoints] = useState<PoseWaypoint[]>([]);
   const [isPlanning, setIsPlanning] = useState(false);
   const [isPlanLoading, setIsPlanLoading] = useState(false);
   const [isRunningPreview, setIsRunningPreview] = useState(false);
@@ -3684,6 +3921,8 @@ export default function App() {
   const [isTrajectoryListLoading, setIsTrajectoryListLoading] = useState(false);
   const [selectedTrajectory, setSelectedTrajectory] = useState("");
   const [isLoadingSavedTrajectory, setIsLoadingSavedTrajectory] = useState(false);
+  const [trajectoryProgramName, setTrajectoryProgramName] = useState("trajectory_program");
+  const [isSavingTrajectoryProgram, setIsSavingTrajectoryProgram] = useState(false);
   const [isHoming, setIsHoming] = useState(false);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [isResting, setIsResting] = useState(false);
@@ -3700,7 +3939,7 @@ export default function App() {
   const [weldSelectionMode, setWeldSelectionMode] = useState(false);
   const [weldDraft, setWeldDraft] = useState<WeldDraft | null>(null);
   const [isPlanningWeld, setIsPlanningWeld] = useState(false);
-  const [weldEditableWaypoints, setWeldEditableWaypoints] = useState<Point3[]>([]);
+  const [weldEditableWaypoints, setWeldEditableWaypoints] = useState<PoseWaypoint[]>([]);
   const [weldPreviewGhostJoints, setWeldPreviewGhostJoints] = useState<number[] | null>(null);
   const [weldPreviewCacheReady, setWeldPreviewCacheReady] = useState(false);
   const [showEndEffectorFrame, setShowEndEffectorFrame] = useState(false);
@@ -3713,7 +3952,7 @@ export default function App() {
   const [liveClockMs, setLiveClockMs] = useState(() => Date.now());
   const [pendingWeldProgramRestore, setPendingWeldProgramRestore] = useState<{
     weldDraft: WeldDraft;
-    editableWaypoints: Point3[];
+    editableWaypoints: PoseWaypoint[];
     previewPlan: PreviewPlan | null;
   } | null>(null);
   const showBoundingBox = settings.showBoundingBox;
@@ -3742,6 +3981,16 @@ export default function App() {
 
   const activeRobotId = runtimeConfigSnapshot?.active?.robot?.robot_id ?? null;
   const activeToolId = runtimeConfigSnapshot?.active?.tool?.active_tool_id ?? null;
+  const runtimeMode: RuntimeExecutionMode | null = useMemo(() => {
+    const active = runtimeConfigSnapshot?.active;
+    if (!active) {
+      return null;
+    }
+    if (active.mode?.sim || active.servo_backend?.effective_backend === "simulation") {
+      return "simulate";
+    }
+    return "live";
+  }, [runtimeConfigSnapshot]);
   const desiredRobotId = useMemo(
     () => {
       const fromOptions = robotOptions.find((robot) => robot.name === selectedRobotName)?.robot_id;
@@ -4442,6 +4691,16 @@ export default function App() {
       treeEditableWaypoints.length > minRemainingWaypoints &&
       canTreeWaypointValueEdit,
   );
+  const canTreeWaypointMoveUp = Boolean(
+    selectedProgramControlPoint &&
+      selectedProgramControlPoint.index > 0 &&
+      canTreeWaypointValueEdit,
+  );
+  const canTreeWaypointMoveDown = Boolean(
+    selectedProgramControlPoint &&
+      selectedProgramControlPoint.index < treeEditableWaypoints.length - 1 &&
+      canTreeWaypointValueEdit,
+  );
   const canTreeWaypointApply =
     canTreeWaypointValueEdit &&
     (weldDraft ? weldEditableWaypoints.length > 1 : treeEditableWaypoints.length > 0);
@@ -4492,6 +4751,9 @@ export default function App() {
     setIsTrajectoryListLoading(false);
     setSelectedTrajectory("");
     setIsLoadingSavedTrajectory(false);
+    setTrajectoryProgramName("trajectory_program");
+    setIsSavingTrajectoryProgram(false);
+    setMotionStatus(null);
     setIsHoming(false);
     setTopologyModel(null);
     setIsTopologyLoading(false);
@@ -4952,8 +5214,8 @@ export default function App() {
   }, [stepFile, normalizedApiHost, pendingWeldProgramRestore]);
 
   const requestPlannerPreview = useCallback(
-    async (points: Point3[]) => {
-      if (points.length === 0) {
+    async (waypoints: PoseWaypoint[]) => {
+      if (waypoints.length === 0) {
         setPreviewPlan(null);
         setPlannerPoints([]);
         setWeldPreviewGhostJoints(null);
@@ -4966,7 +5228,7 @@ export default function App() {
         const response = await fetch(`${normalizedApiHost}/trajectory/plan-points`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ points: encodePointsForApi(points) }),
+          body: JSON.stringify({ waypoints: encodePoseWaypointsForApi(waypoints) }),
         });
         if (!response.ok) {
           const message = await response.text();
@@ -5006,16 +5268,58 @@ export default function App() {
     });
   }, [isPlanLoading, isRunningPreview, motionStatusActive, previewPlan]);
 
+  const handleAddTrajectoryWaypoint = useCallback(async () => {
+    if (isPlanLoading || isRunningPreview || motionStatusActive) {
+      return;
+    }
+    const basePoints =
+      plannerPoints.length > 0
+        ? plannerPoints
+        : (previewPlan?.waypoints ?? []);
+    let nextPoints: PoseWaypoint[];
+    if (basePoints.length === 0) {
+      nextPoints = [buildPoseWaypoint({ x: 0, y: 0, z: 0 })];
+    } else {
+      const insertFromIndex =
+        selectedProgramControlPointIndex !== null
+          ? Math.max(0, Math.min(basePoints.length - 1, selectedProgramControlPointIndex))
+          : basePoints.length - 1;
+      const source = basePoints[insertFromIndex] ?? basePoints[basePoints.length - 1];
+      nextPoints = [
+        ...basePoints.slice(0, insertFromIndex + 1),
+        { ...source },
+        ...basePoints.slice(insertFromIndex + 1),
+      ];
+      updateSettings({ selectedProgramNodeId: `control_point_${insertFromIndex + 1}` });
+    }
+    setIsPlanning(true);
+    setPlannerPoints(nextPoints);
+    await requestPlannerPreview(nextPoints);
+  }, [
+    isPlanLoading,
+    isRunningPreview,
+    motionStatusActive,
+    plannerPoints,
+    previewPlan,
+    requestPlannerPreview,
+    selectedProgramControlPointIndex,
+    updateSettings,
+  ]);
+
   const handlePointSelected = useCallback(
     async (point: Point3) => {
       if (!isPlanning || isPlanLoading) {
         return;
       }
-      const nextPoints = [...plannerPoints, point];
+      const lastOrientationSource = plannerPoints[plannerPoints.length - 1] ?? previewPlan?.waypoints?.[previewPlan.waypoints.length - 1] ?? null;
+      const nextPoints = [
+        ...plannerPoints,
+        buildPoseWaypoint(point, lastOrientationSource),
+      ];
       setPlannerPoints(nextPoints);
       await requestPlannerPreview(nextPoints);
     },
-    [isPlanning, isPlanLoading, plannerPoints, requestPlannerPreview],
+    [isPlanning, isPlanLoading, plannerPoints, previewPlan, requestPlannerPreview],
   );
 
   const handleUndoPoint = useCallback(async () => {
@@ -5180,7 +5484,7 @@ export default function App() {
     }
   }, [weldDraft]);
 
-  const handleRunPreview = useCallback(async () => {
+  const handleRunPreview = useCallback(async (executionMode: RuntimeExecutionMode) => {
     if (!previewPlan || isPlanLoading || isRunningPreview || motionStatusActive) {
       return;
     }
@@ -5214,7 +5518,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         // Weld previews need cached high-fidelity paths; endpoint-only re-planning
         // flattens the weld arc into sparse straight segments.
-        body: JSON.stringify({ name: runName, use_cache: useCache }),
+        body: JSON.stringify({ name: runName, use_cache: useCache, execution_mode: executionMode }),
       });
       if (!response.ok) {
         const message = await response.text();
@@ -5223,7 +5527,7 @@ export default function App() {
       const payload = (await response.json()) as MotionStatusResponse;
       setMotionStatus(payload);
     } catch (err) {
-      setError(`Failed to execute trajectory: ${(err as Error).message}`);
+      setError(`Failed to ${executionMode === "simulate" ? "simulate" : "run"} trajectory: ${(err as Error).message}`);
     } finally {
       setIsRunningPreview(false);
     }
@@ -5236,6 +5540,12 @@ export default function App() {
     weldDraft,
     requestWeldPreview,
   ]);
+  const handleSimulatePreview = useCallback(() => {
+    void handleRunPreview("simulate");
+  }, [handleRunPreview]);
+  const handleRunPreviewLive = useCallback(() => {
+    void handleRunPreview("live");
+  }, [handleRunPreview]);
 
   const handleTopologyEdgeSelected = useCallback(
     (edgeId: string) => {
@@ -5283,7 +5593,11 @@ export default function App() {
   }, [requestWeldPreview, weldDraft, weldEditableWaypoints]);
 
   const handleTreeWaypointChange = useCallback(
-    (index: number, axis: "x" | "y" | "z", value: number) => {
+    (
+      index: number,
+      axis: "x" | "y" | "z" | "rollDeg" | "pitchDeg" | "yawDeg",
+      value: number,
+    ) => {
       if (weldDraft) {
         setWeldEditableWaypoints((current) =>
           current.map((point, pointIndex) =>
@@ -5316,22 +5630,41 @@ export default function App() {
     if (weldDraft) {
       setWeldEditableWaypoints((current) => {
         if (current.length === 0) {
-          return [{ x: 0, y: 0, z: 0 }, { x: 0.02, y: 0, z: 0 }];
+          return [
+            buildPoseWaypoint({ x: 0, y: 0, z: 0 }),
+            buildPoseWaypoint({ x: 0.02, y: 0, z: 0 }),
+          ];
         }
-        const last = current[current.length - 1];
-        return [...current, { ...last }];
+        const insertFromIndex =
+          selectedProgramControlPointIndex !== null
+            ? Math.max(0, Math.min(current.length - 1, selectedProgramControlPointIndex))
+            : current.length - 1;
+        const source = current[insertFromIndex] ?? current[current.length - 1];
+        return [
+          ...current.slice(0, insertFromIndex + 1),
+          { ...source },
+          ...current.slice(insertFromIndex + 1),
+        ];
       });
       setWeldPreviewCacheReady(false);
       return;
     }
     setPlannerPoints((current) => {
       if (current.length === 0) {
-        return [{ x: 0, y: 0, z: 0 }];
+        return [buildPoseWaypoint({ x: 0, y: 0, z: 0 })];
       }
-      const last = current[current.length - 1];
-      return [...current, { ...last }];
+      const insertFromIndex =
+        selectedProgramControlPointIndex !== null
+          ? Math.max(0, Math.min(current.length - 1, selectedProgramControlPointIndex))
+          : current.length - 1;
+      const source = current[insertFromIndex] ?? current[current.length - 1];
+      return [
+        ...current.slice(0, insertFromIndex + 1),
+        { ...source },
+        ...current.slice(insertFromIndex + 1),
+      ];
     });
-  }, [weldDraft]);
+  }, [selectedProgramControlPointIndex, weldDraft]);
 
   const handleTreeRemoveWaypoint = useCallback((index: number) => {
     if (weldDraft) {
@@ -5350,6 +5683,37 @@ export default function App() {
     );
   }, [weldDraft]);
 
+  const handleTreeMoveWaypoint = useCallback(
+    (direction: -1 | 1) => {
+      if (selectedProgramControlPointIndex === null) {
+        return;
+      }
+      const nextIndex = selectedProgramControlPointIndex + direction;
+      if (nextIndex < 0 || nextIndex >= treeEditableWaypoints.length) {
+        return;
+      }
+      if (weldDraft) {
+        setWeldEditableWaypoints((current) => {
+          const next = [...current];
+          const [moved] = next.splice(selectedProgramControlPointIndex, 1);
+          next.splice(nextIndex, 0, moved);
+          return next;
+        });
+        setWeldPreviewCacheReady(false);
+        updateSettings({ selectedProgramNodeId: `control_point_${nextIndex}` });
+        return;
+      }
+      setPlannerPoints((current) => {
+        const next = [...current];
+        const [moved] = next.splice(selectedProgramControlPointIndex, 1);
+        next.splice(nextIndex, 0, moved);
+        return next;
+      });
+      updateSettings({ selectedProgramNodeId: `control_point_${nextIndex}` });
+    },
+    [selectedProgramControlPointIndex, treeEditableWaypoints.length, updateSettings, weldDraft],
+  );
+
   const handleApplyTreeWaypointEdits = useCallback(async () => {
     if (weldDraft) {
       await handleApplyWeldWaypointEdits();
@@ -5366,10 +5730,46 @@ export default function App() {
     treeEditableWaypoints,
   ]);
 
+  const handleCaptureTrajectoryPose = useCallback(async () => {
+    if (isPlanLoading || isRunningPreview || motionStatusActive) {
+      return;
+    }
+    setError(null);
+    try {
+      const response = await fetch(`${normalizedApiHost}/info/pose`);
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || `Pose request failed (${response.status})`);
+      }
+      const pose = (await response.json()) as {
+        position_m?: { x?: number; y?: number; z?: number };
+        orientation_euler_deg?: { roll?: number; pitch?: number; yaw?: number };
+      };
+      const nextWaypoint = buildPoseWaypoint(
+        {
+          x: Number(pose.position_m?.x ?? 0),
+          y: Number(pose.position_m?.y ?? 0),
+          z: Number(pose.position_m?.z ?? 0),
+        },
+        {
+          rollDeg: Number(pose.orientation_euler_deg?.roll ?? null),
+          pitchDeg: Number(pose.orientation_euler_deg?.pitch ?? null),
+          yawDeg: Number(pose.orientation_euler_deg?.yaw ?? null),
+        },
+      );
+      const nextWaypoints = [...plannerPoints, nextWaypoint];
+      setPlannerPoints(nextWaypoints);
+      await requestPlannerPreview(nextWaypoints);
+    } catch (err) {
+      setError(`Failed to capture current pose: ${(err as Error).message}`);
+    }
+  }, [isPlanLoading, isRunningPreview, motionStatusActive, normalizedApiHost, plannerPoints, requestPlannerPreview]);
+
+
   const refreshWeldProgramList = useCallback(async () => {
     setIsWeldProgramListLoading(true);
     try {
-      const response = await fetch(`${normalizedApiHost}/weld-program/list`);
+      const response = await fetch(`${normalizedApiHost}/robot-program/list?kind=weld`);
       if (!response.ok) {
         const message = await response.text();
         throw new Error(message || `Weld program list failed (${response.status})`);
@@ -5407,34 +5807,37 @@ export default function App() {
     setError(null);
     try {
       const stepBase64 = await fileToBase64(stepFile);
-      const response = await fetch(`${normalizedApiHost}/weld-program/save`, {
+      const response = await fetch(`${normalizedApiHost}/robot-program/save`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          kind: "weld",
           name: programName,
-          step: {
-            filename: stepFile.name,
-            step_base64: stepBase64,
-            transform: stepTransform,
+          authoring: {
+            step: {
+              filename: stepFile.name,
+              step_base64: stepBase64,
+              transform: stepTransform,
+            },
+            weld_draft: {
+              modelId: weldDraft.modelId,
+              weldType: weldDraft.weldType,
+              weldName: weldDraft.weldName,
+              workAngleDeg: weldDraft.workAngleDeg,
+              travelAngleDeg: weldDraft.travelAngleDeg,
+              spinAngleDeg: weldDraft.spinAngleDeg,
+              transitionClearanceMm: weldDraft.transitionClearanceMm,
+              postAction: weldDraft.postAction,
+              segments: weldDraft.segments.map((segment) => ({
+                edgeId: segment.edgeId,
+                startS: clamp01(segment.startS),
+                endS: clamp01(segment.endS),
+                weldType: segment.weldType,
+              })),
+              activeSegmentEdgeId: weldDraft.activeSegmentEdgeId,
+            },
+            editable_waypoints: weldEditableWaypoints,
           },
-          weld_draft: {
-            modelId: weldDraft.modelId,
-            weldType: weldDraft.weldType,
-            weldName: weldDraft.weldName,
-            workAngleDeg: weldDraft.workAngleDeg,
-            travelAngleDeg: weldDraft.travelAngleDeg,
-            spinAngleDeg: weldDraft.spinAngleDeg,
-            transitionClearanceMm: weldDraft.transitionClearanceMm,
-            postAction: weldDraft.postAction,
-            segments: weldDraft.segments.map((segment) => ({
-              edgeId: segment.edgeId,
-              startS: clamp01(segment.startS),
-              endS: clamp01(segment.endS),
-              weldType: segment.weldType,
-            })),
-            activeSegmentEdgeId: weldDraft.activeSegmentEdgeId,
-          },
-          editable_waypoints: weldEditableWaypoints,
           planned_trajectory: previewPlan,
         }),
       });
@@ -5468,13 +5871,27 @@ export default function App() {
     setError(null);
     try {
       const response = await fetch(
-        `${normalizedApiHost}/weld-program/${encodeURIComponent(selectedWeldProgram.trim())}`,
+        `${normalizedApiHost}/robot-program/${encodeURIComponent(selectedWeldProgram.trim())}?kind=weld`,
       );
       if (!response.ok) {
         const message = await response.text();
         throw new Error(message || `Load weld program failed (${response.status})`);
       }
-      const program = (await response.json()) as WeldProgramRecord;
+      const record = (await response.json()) as SavedRobotProgramRecord;
+      const authoring =
+        record.authoring && typeof record.authoring === "object"
+          ? (record.authoring as Record<string, unknown>)
+          : null;
+      const program = authoring
+        ? ({
+            name: record.name,
+            saved_at: record.saved_at,
+            step: authoring.step,
+            weld_draft: authoring.weld_draft,
+            editable_waypoints: authoring.editable_waypoints,
+            planned_trajectory: record.planned_trajectory ?? null,
+          } as WeldProgramRecord)
+        : null;
       if (!program?.step?.step_base64 || !program?.step?.filename) {
         throw new Error("Saved program is missing STEP payload.");
       }
@@ -5498,9 +5915,7 @@ export default function App() {
       }
       setPendingWeldProgramRestore({
         weldDraft: restoredDraft,
-        editableWaypoints: Array.isArray(program.editable_waypoints)
-          ? program.editable_waypoints
-          : [],
+        editableWaypoints: coercePoseWaypointList(program.editable_waypoints),
         previewPlan: program.planned_trajectory ?? null,
       });
       setStepFile(stepFileFromProgram);
@@ -5521,14 +5936,14 @@ export default function App() {
     setError(null);
     setIsTrajectoryListLoading(true);
     try {
-      const response = await fetch(`${normalizedApiHost}/trajectory/list`);
+      const response = await fetch(`${normalizedApiHost}/robot-program/list?kind=trajectory`);
       if (!response.ok) {
         const message = await response.text();
         throw new Error(message || `List request failed (${response.status})`);
       }
-      const data = (await response.json()) as { trajectories?: unknown };
-      const names = Array.isArray(data.trajectories)
-        ? data.trajectories
+      const data = (await response.json()) as { programs?: unknown };
+      const names = Array.isArray(data.programs)
+        ? data.programs
             .map((value) =>
               typeof value === "string" ? value.trim() : "",
             )
@@ -5539,7 +5954,7 @@ export default function App() {
         current && names.includes(current) ? current : names[0] ?? "",
       );
     } catch (err) {
-      setError(`Failed to load trajectories: ${(err as Error).message}`);
+      setError(`Failed to load trajectory programs: ${(err as Error).message}`);
       setSavedTrajectories([]);
       setSelectedTrajectory("");
     } finally {
@@ -5547,6 +5962,47 @@ export default function App() {
       trajectoryRefreshInFlight.current = false;
     }
   }, [normalizedApiHost]);
+
+  const handleSaveTrajectoryProgram = useCallback(async () => {
+    if (!previewPlan || plannerPoints.length === 0) {
+      setError("Plan a trajectory before saving it.");
+      return;
+    }
+    const programName = trajectoryProgramName.trim();
+    if (!programName) {
+      setError("Program name is required.");
+      return;
+    }
+    setIsSavingTrajectoryProgram(true);
+    setError(null);
+    try {
+      const response = await fetch(`${normalizedApiHost}/robot-program/save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: "trajectory",
+          name: programName,
+          authoring: {
+            waypoints: plannerPoints,
+            metadata: {
+              source: "trajectory_editor",
+            },
+          },
+          planned_trajectory: previewPlan,
+        }),
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || `Save trajectory program failed (${response.status})`);
+      }
+      await refreshTrajectoryList();
+      setSelectedTrajectory(programName);
+    } catch (err) {
+      setError(`Failed to save trajectory program: ${(err as Error).message}`);
+    } finally {
+      setIsSavingTrajectoryProgram(false);
+    }
+  }, [normalizedApiHost, plannerPoints, previewPlan, refreshTrajectoryList, trajectoryProgramName]);
 
   const handleSelectTrajectory = useCallback((value: string) => {
     setSelectedTrajectory(value);
@@ -5560,81 +6016,30 @@ export default function App() {
     setIsLoadingSavedTrajectory(true);
     try {
       const response = await fetch(
-        `${normalizedApiHost}/trajectory/detail/${encodeURIComponent(selectedTrajectory)}`,
+        `${normalizedApiHost}/robot-program/${encodeURIComponent(selectedTrajectory)}?kind=trajectory`,
       );
       if (!response.ok) {
         const message = await response.text();
         throw new Error(message || `Load request failed (${response.status})`);
       }
-      const data = await response.json();
-      const plan = previewFromTrajectoryDetail(
-        typeof data?.name === "string" ? data.name : selectedTrajectory,
-        data?.trajectory ?? { moves: [] },
-      );
-      setPreviewPlan(plan);
-      setPlannerPoints(plan.waypoints);
-      setWeldEditableWaypoints(plan.waypoints);
+      const record = normalizeTrajectoryProgramRecord(await response.json());
+      if (!record) {
+        throw new Error("Saved trajectory program is invalid.");
+      }
+      const waypoints = coercePoseWaypointList(record.authoring.waypoints);
+      if (waypoints.length === 0) {
+        throw new Error("Saved trajectory program has no waypoints.");
+      }
+      const savedPlan = record.planned_trajectory ?? null;
+      setPlannerPoints(waypoints);
+      setPreviewPlan(savedPlan);
+      setTrajectoryProgramName(record.name);
+      setWeldDraft(null);
+      setWeldEditableWaypoints([]);
       setWeldPreviewGhostJoints(null);
       setWeldPreviewCacheReady(false);
-      if (data?.trajectory?.weld && typeof data.trajectory.weld === "object") {
-        const weld = data.trajectory.weld as Record<string, unknown>;
-        const weldType =
-          typeof weld.type === "string" && weld.type.trim() ? weld.type.trim() : "fillet";
-        const modelId =
-          typeof weld.model_id === "string" && weld.model_id.trim() ? weld.model_id.trim() : "";
-        const edgeId =
-          typeof weld.edge_id === "string" && weld.edge_id.trim() ? weld.edge_id.trim() : "";
-        const options =
-          weld.options && typeof weld.options === "object"
-            ? (weld.options as Record<string, unknown>)
-            : {};
-        const workAngleDeg = Number(options.work_angle_deg ?? 45);
-        const travelAngleDeg = Number(options.travel_angle_deg ?? 0);
-        const spinAngleDeg = Number(
-          options.spin_angle_deg ?? options.spinAngleDeg ?? 0,
-        );
-        const transitionClearanceMm = Number(options.transition_clearance_mm ?? 35);
-        const postActionRaw =
-          typeof options.post_action === "string" ? options.post_action.trim() : "return_to_start";
-        const postAction: "none" | "return_to_start" | "lift" =
-          postActionRaw === "none"
-            ? "none"
-            : postActionRaw === "lift"
-              ? "lift"
-              : "return_to_start";
-        const segments =
-          edgeId.length > 0
-            ? [
-                {
-                  edgeId,
-                  startS: typeof weld.start_s === "number" ? clamp01(weld.start_s) : 0,
-                  endS: typeof weld.end_s === "number" ? clamp01(weld.end_s) : 1,
-                  weldType,
-                },
-              ]
-            : [];
-        setWeldDraft(
-          segments.length > 0
-            ? {
-                modelId,
-                weldType,
-                weldName:
-                  typeof weld.name === "string" && weld.name.trim()
-                    ? weld.name.trim()
-                    : `${weldType} weld`,
-                segments,
-                activeSegmentEdgeId: segments[0].edgeId,
-                workAngleDeg: Number.isFinite(workAngleDeg) ? workAngleDeg : 45,
-                travelAngleDeg: Number.isFinite(travelAngleDeg) ? travelAngleDeg : 0,
-                spinAngleDeg: Number.isFinite(spinAngleDeg) ? spinAngleDeg : 0,
-                transitionClearanceMm:
-                  Number.isFinite(transitionClearanceMm) && transitionClearanceMm > 0
-                    ? transitionClearanceMm
-                    : 35,
-                postAction,
-              }
-            : null,
-        );
+      if (!savedPlan) {
+        await requestPlannerPreview(waypoints);
       }
       setIsPlanning(false);
     } catch (err) {
@@ -5643,7 +6048,7 @@ export default function App() {
     } finally {
       setIsLoadingSavedTrajectory(false);
     }
-  }, [selectedTrajectory, isLoadingSavedTrajectory, normalizedApiHost]);
+  }, [selectedTrajectory, isLoadingSavedTrajectory, normalizedApiHost, requestPlannerPreview]);
 
   const issueStop = useCallback(async () => {
     if (isStopping) {
@@ -6064,17 +6469,25 @@ export default function App() {
           <TrajectoryPanel
             isPlanning={isPlanning}
             isPlanLoading={isPlanLoading}
-          isSubmittingRun={isRunningPreview}
-          isMotionActive={motionStatusActive}
-          motionStatus={motionStatus}
+            isSubmittingRun={isRunningPreview}
+            isMotionActive={motionStatusActive}
+            motionStatus={motionStatus}
             preview={previewPlan}
             plannerPoints={plannerPoints}
             savedTrajectories={savedTrajectories}
             selectedTrajectory={selectedTrajectory}
             isTrajectoryListLoading={isTrajectoryListLoading}
             isLoadingSavedTrajectory={isLoadingSavedTrajectory}
+            trajectoryProgramName={trajectoryProgramName}
+            onTrajectoryProgramNameChange={setTrajectoryProgramName}
+            onSaveTrajectory={handleSaveTrajectoryProgram}
+            isSavingTrajectory={isSavingTrajectoryProgram}
+            runtimeMode={runtimeMode}
             onPlanToggle={handlePlanToggle}
-            onRun={handleRunPreview}
+            onSimulate={handleSimulatePreview}
+            onRunLive={handleRunPreviewLive}
+            onCapturePose={handleCaptureTrajectoryPose}
+            onAddWaypoint={handleAddTrajectoryWaypoint}
             onClear={handleClearPreview}
             onRefreshTrajectories={refreshTrajectoryList}
             onSelectTrajectory={handleSelectTrajectory}
@@ -6181,7 +6594,9 @@ export default function App() {
                 })
               }
               onPlanFromEdge={handlePlanWeldFromEdge}
-              onRun={handleRunPreview}
+              runtimeMode={runtimeMode}
+              onSimulate={handleSimulatePreview}
+              onRunLive={handleRunPreviewLive}
               onSetWeldType={(value) =>
                 setWeldDraft((current) =>
                   current
@@ -6588,6 +7003,8 @@ export default function App() {
             canEditWaypointValues={canTreeWaypointValueEdit}
             canAddWaypoint={canTreeWaypointAdd}
             canRemoveWaypoint={canTreeWaypointRemove}
+            canMoveWaypointUp={canTreeWaypointMoveUp}
+            canMoveWaypointDown={canTreeWaypointMoveDown}
             canApplyWaypointEdits={canTreeWaypointApply}
             onToggleExpand={handleToggleProgramTreeNode}
             onSelectNode={handleSelectProgramTreeNode}
@@ -6595,6 +7012,8 @@ export default function App() {
             onWaypointChange={handleTreeWaypointChange}
             onAddWaypoint={handleTreeAddWaypoint}
             onRemoveWaypoint={handleTreeRemoveWaypoint}
+            onMoveWaypointUp={() => handleTreeMoveWaypoint(-1)}
+            onMoveWaypointDown={() => handleTreeMoveWaypoint(1)}
             onApplyWaypointEdits={handleApplyTreeWaypointEdits}
           />
         ) : null}

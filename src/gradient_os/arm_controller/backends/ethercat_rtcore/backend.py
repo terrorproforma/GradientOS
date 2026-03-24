@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from ...actuator_interface import ActuatorBackend
 from .runtime import (
@@ -73,6 +73,9 @@ _TRAJ_POINTF_LAST_POINT = 1 << 1
 _JOG_FLAG_ACTIVE = 1 << 0
 _JOG_FLAG_STOP = 1 << 1
 _JOG_FLAG_QUICK_STOP = 1 << 2
+
+_POWER_TRANSITION_WAIT_POLL_INTERVAL_S = 0.01
+_POWER_TRANSITION_DEFAULT_TIMEOUT_S = 1.0
 
 _HELLO_STRUCT = struct.Struct("<IHHIIQ4Q")  # 56 bytes
 _WELCOME_STRUCT = struct.Struct("<IHHI II 4x QQ IIII Q 4Q")  # 96 bytes (includes padding after reserved0)
@@ -467,8 +470,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 output_target_velocity_counts_per_s=[0] * _GRADIENT_MAX_AXES,
             )
 
-    def safe_power_down(self) -> bool:
-        self._best_effort_safe_power_down()
+    def safe_power_down(self, *, wait_for_idle: bool = False, timeout_s: float | None = None) -> bool:
+        self._best_effort_safe_power_down(wait_for_idle=wait_for_idle, timeout_s=timeout_s)
         return True
 
     def safe_power_up(self) -> bool:
@@ -494,6 +497,145 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def get_last_trajectory_timing(self) -> dict[str, int]:
         with self._status_lock:
             return dict(self._last_trajectory_timing)
+
+    def _all_axis_mask(self) -> int:
+        return (1 << self._rt_num_axes) - 1 if self._rt_num_axes > 0 else 0
+
+    def get_power_transition_snapshot(self) -> dict[str, Any]:
+        with self._status_lock:
+            execution_status = self._execution_status
+            jog_status = self._jog_debug_status
+            axis_error_code = list(self._axis_error_code[: self._rt_num_axes])
+            axis_fault_flags = list(self._axis_fault_flags[: self._rt_num_axes])
+            axis_counts = list(self._axis_counts[: self._rt_num_axes])
+            axis_config = self._axis_config
+            feedback_ready = self._status_snapshot_event.is_set()
+
+        terminal_states = {"idle", "completed", "aborted", "faulted", "underrun"}
+        active_mode_name = str(getattr(execution_status, "active_mode_name", "idle") or "idle").strip().lower() or "idle"
+        state_name = str(getattr(execution_status, "state_name", "idle") or "idle").strip().lower() or "idle"
+        active_traj_id = int(getattr(execution_status, "active_traj_id", 0) or 0)
+        queue_depth = int(getattr(execution_status, "queue_depth", 0) or 0)
+        stale_command = bool(getattr(execution_status, "stale_command", False))
+        motion_done = bool(getattr(execution_status, "motion_done", False))
+        active_jog = bool(getattr(jog_status, "active_jog", False))
+        faulted_axis_indices = [
+            axis_i
+            for axis_i, (error_code, fault_flag) in enumerate(zip(axis_error_code, axis_fault_flags, strict=False))
+            if int(error_code) != 0 or int(fault_flag) != 0
+        ]
+
+        live_feedback_joint_positions: list[float] = []
+        if axis_config is not None and self._connected and self._rt_num_axes > 0:
+            try:
+                live_feedback_joint_positions = self.raw_to_joint_positions(
+                    {axis_i: axis_counts[axis_i] for axis_i in range(min(len(axis_counts), self._rt_num_axes))}
+                )
+            except Exception:
+                live_feedback_joint_positions = []
+
+        motion_active = False
+        if active_traj_id > 0 or queue_depth > 0 or active_jog:
+            motion_active = True
+        elif state_name in {"accepted", "queued", "executing"}:
+            motion_active = True
+        elif active_mode_name != "idle" and not motion_done and state_name not in terminal_states:
+            motion_active = True
+
+        feedback_synchronized = (
+            feedback_ready
+            and len(live_feedback_joint_positions) == self._num_joints
+        )
+
+        return {
+            "connected": bool(self._connected),
+            "feedback_ready": bool(feedback_ready),
+            "feedback_synchronized": bool(feedback_synchronized),
+            "live_feedback_joint_positions_rad": list(live_feedback_joint_positions),
+            "active_mode_name": active_mode_name,
+            "state_name": state_name,
+            "active_traj_id": active_traj_id,
+            "queue_depth": queue_depth,
+            "stale_command": bool(stale_command),
+            "motion_done": bool(motion_done),
+            "active_jog": bool(active_jog),
+            "active_jog_axis_mask": int(getattr(jog_status, "active_jog_axis_mask", 0) or 0),
+            "faulted_axis_count": len(faulted_axis_indices),
+            "faulted_axis_indices": faulted_axis_indices,
+            "motion_active": bool(motion_active),
+            "motion_intent_cleared": not motion_active,
+            "power_up_ready": bool(not motion_active and not stale_command and not faulted_axis_indices and feedback_synchronized),
+        }
+
+    def wait_for_power_transition_neutral(self, *, timeout_s: float | None = None) -> dict[str, Any]:
+        latest = self.get_power_transition_snapshot()
+        resolved_timeout_s = (
+            _POWER_TRANSITION_DEFAULT_TIMEOUT_S
+            if timeout_s is None
+            else max(0.0, float(timeout_s))
+        )
+        if resolved_timeout_s <= 0.0 or bool(latest.get("motion_intent_cleared", False)):
+            latest["wait_timed_out"] = False
+            return latest
+
+        deadline = time.monotonic() + resolved_timeout_s
+        while time.monotonic() <= deadline:
+            time.sleep(_POWER_TRANSITION_WAIT_POLL_INTERVAL_S)
+            latest = self.get_power_transition_snapshot()
+            if bool(latest.get("motion_intent_cleared", False)):
+                latest["wait_timed_out"] = False
+                return latest
+
+        latest["wait_timed_out"] = True
+        return latest
+
+    def prepare_for_power_transition(
+        self,
+        *,
+        wait_for_idle: bool = False,
+        timeout_s: float | None = None,
+        quick_stop: bool = True,
+    ) -> dict[str, Any]:
+        if not self._connected:
+            snapshot = self.get_power_transition_snapshot()
+            snapshot["waited_for_idle"] = bool(wait_for_idle)
+            snapshot["wait_timed_out"] = False
+            return snapshot
+
+        try:
+            self.abort_trajectory()
+        except Exception as exc:
+            print(f"[EtherCAT RTCore] WARNING: trajectory abort before power transition failed: {exc}")
+        try:
+            self.stop_joint_velocity_lease_jog(quick_stop=quick_stop)
+        except Exception as exc:
+            print(f"[EtherCAT RTCore] WARNING: jog stop before power transition failed: {exc}")
+
+        if wait_for_idle:
+            snapshot = self.wait_for_power_transition_neutral(timeout_s=timeout_s)
+        else:
+            time.sleep(0.02)
+            snapshot = self.get_power_transition_snapshot()
+            snapshot["wait_timed_out"] = False
+        snapshot["waited_for_idle"] = bool(wait_for_idle)
+        return snapshot
+
+    def synchronize_command_targets_to_feedback(self) -> dict[str, Any]:
+        snapshot = self.get_power_transition_snapshot()
+        joint_positions = snapshot.get("live_feedback_joint_positions_rad")
+        if not isinstance(joint_positions, list) or len(joint_positions) != self._num_joints:
+            return {
+                "synchronized": False,
+                "reason": "feedback_unavailable",
+                "joint_positions_rad": [],
+            }
+        with self._status_lock:
+            self._last_joint_setpoint_rad = [float(value) for value in joint_positions]
+        return {
+            "synchronized": True,
+            "reason": "ok",
+            "joint_positions_rad": [float(value) for value in joint_positions],
+        }
 
     def get_rtcore_cycle_ns(self) -> int:
         hdr = self._cmd_hdr or self._status_hdr
@@ -707,6 +849,16 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 return False
             label = f"joint {joint_i + 1}"
 
+        try:
+            self.prepare_for_power_transition(wait_for_idle=True, timeout_s=_POWER_TRANSITION_DEFAULT_TIMEOUT_S)
+            axis_mask_all = self._all_axis_mask()
+            if axis_mask_all:
+                self._send_cmd_axis_disable(axis_mask=axis_mask_all)
+            self._send_cmd_arm(False)
+            time.sleep(0.05)
+        except Exception as exc:
+            print(f"[EtherCAT RTCore] WARNING: pre-reset neutralization failed: {exc}")
+
         self._send_cmd_fault_reset(axis_mask=axis_mask)
         print(
             "[EtherCAT RTCore] Fault reset requested:"
@@ -714,12 +866,18 @@ class EthercatRTCoreBackend(ActuatorBackend):
         )
         return True
 
-    def _best_effort_safe_power_down(self) -> None:
+    def _best_effort_safe_power_down(
+        self,
+        *,
+        wait_for_idle: bool = False,
+        timeout_s: float | None = None,
+    ) -> None:
         if not self._connected:
             return
 
         try:
-            axis_mask = (1 << self._rt_num_axes) - 1 if self._rt_num_axes > 0 else 0
+            self.prepare_for_power_transition(wait_for_idle=wait_for_idle, timeout_s=timeout_s)
+            axis_mask = self._all_axis_mask()
             if axis_mask:
                 self._send_cmd_axis_disable(axis_mask=axis_mask)
             self._send_cmd_arm(False)
@@ -733,7 +891,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if not self._connected:
             return
         try:
-            axis_mask_all = (1 << self._rt_num_axes) - 1 if self._rt_num_axes > 0 else 0
+            sync_result = self.synchronize_command_targets_to_feedback()
+            if not bool(sync_result.get("synchronized", False)):
+                print(
+                    "[EtherCAT RTCore] WARNING: power-up target synchronization failed:"
+                    f" {sync_result.get('reason', 'unknown')}"
+                )
+            axis_mask_all = self._all_axis_mask()
             axis_mask = axis_mask_all
             if self._auto_arm_mask is not None:
                 axis_mask = int(self._auto_arm_mask) & int(axis_mask_all)

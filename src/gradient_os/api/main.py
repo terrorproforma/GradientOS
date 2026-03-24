@@ -45,7 +45,9 @@ except ImportError:
 _REST_POSE_RAD = [0.0, -1.4, 1.5, 0.0, 0.0, 0.0]
 _REST_POSE_COMMAND = ",".join(str(value) for value in _REST_POSE_RAD)
 _ALLOWED_WELD_TYPES = {"fillet", "butt", "lap", "tack/spot", "custom"}
+_ALLOWED_PROGRAM_KINDS = {"trajectory", "weld"}
 _PROJECT_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+_ROBOT_PROGRAM_DIR = os.path.join(_PROJECT_ROOT_DIR, "recorded_programs")
 _WELD_PROGRAM_DIR = os.path.join(_PROJECT_ROOT_DIR, "recorded_trajectories", "weld_programs")
 _DIAGNOSTICS_LOG_DIR = os.path.join(_PROJECT_ROOT_DIR, "logs", "diagnostics")
 _CONTROLLER_REPLY_MAX_BYTES = 65535
@@ -293,16 +295,7 @@ def _ensure_weld_program_dir() -> None:
 
 
 def _sanitize_weld_program_name(raw: Any) -> str:
-    if not isinstance(raw, str):
-        raise HTTPException(status_code=400, detail="Field 'name' must be a string.")
-    trimmed = raw.strip()
-    if not trimmed:
-        raise HTTPException(status_code=400, detail="Field 'name' is required.")
-    safe = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in trimmed)
-    safe = safe.strip("_")
-    if not safe:
-        raise HTTPException(status_code=400, detail="Field 'name' must contain letters or numbers.")
-    return safe[:128]
+    return _sanitize_program_name(raw)
 
 
 def _coerce_step_transform(raw: Any) -> dict[str, Any]:
@@ -334,6 +327,374 @@ def _coerce_step_transform(raw: Any) -> dict[str, Any]:
         "position": _axis_triplet(raw.get("position")),
         "rotationDeg": _axis_triplet(raw.get("rotationDeg")),
         "scale": scale,
+    }
+
+
+def _ensure_robot_program_dir() -> None:
+    os.makedirs(_ROBOT_PROGRAM_DIR, exist_ok=True)
+
+
+def _sanitize_program_name(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise HTTPException(status_code=400, detail="Field 'name' must be a string.")
+    trimmed = raw.strip()
+    if not trimmed:
+        raise HTTPException(status_code=400, detail="Field 'name' is required.")
+    safe = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in trimmed)
+    safe = safe.strip("_")
+    if not safe:
+        raise HTTPException(status_code=400, detail="Field 'name' must contain letters or numbers.")
+    return safe[:128]
+
+
+def _normalize_program_kind(raw: Any) -> str:
+    value = str(raw or "").strip().lower()
+    if value not in _ALLOWED_PROGRAM_KINDS:
+        allowed = ", ".join(sorted(_ALLOWED_PROGRAM_KINDS))
+        raise HTTPException(status_code=400, detail=f"Invalid program kind '{value}'. Allowed: {allowed}")
+    return value
+
+
+def _robot_program_path(name: str) -> str:
+    return os.path.join(_ROBOT_PROGRAM_DIR, f"{name}.json")
+
+
+def _normalize_robot_program_record(raw: dict[str, Any]) -> dict[str, Any]:
+    kind = _normalize_program_kind(raw.get("kind"))
+    authoring = raw.get("authoring")
+    if not isinstance(authoring, dict):
+        raise HTTPException(status_code=500, detail="Saved program record is missing 'authoring'.")
+    record: dict[str, Any] = {
+        "name": _sanitize_program_name(raw.get("name")),
+        "kind": kind,
+        "saved_at": (
+            str(raw.get("saved_at")).strip()
+            if isinstance(raw.get("saved_at"), str) and str(raw.get("saved_at")).strip()
+            else datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        ),
+        "authoring": json.loads(json.dumps(authoring)),
+        "planned_trajectory": (
+            json.loads(json.dumps(raw.get("planned_trajectory")))
+            if isinstance(raw.get("planned_trajectory"), dict)
+            else None
+        ),
+    }
+    metadata = raw.get("metadata")
+    if isinstance(metadata, dict):
+        record["metadata"] = json.loads(json.dumps(metadata))
+    return record
+
+
+def _normalize_legacy_weld_program_record(raw: dict[str, Any], fallback_name: str) -> dict[str, Any]:
+    safe_name = _sanitize_program_name(raw.get("name", fallback_name))
+    step_payload = raw.get("step")
+    if not isinstance(step_payload, dict):
+        raise HTTPException(status_code=500, detail="Legacy weld program is missing STEP payload.")
+    record: dict[str, Any] = {
+        "name": safe_name,
+        "kind": "weld",
+        "saved_at": (
+            str(raw.get("saved_at")).strip()
+            if isinstance(raw.get("saved_at"), str) and str(raw.get("saved_at")).strip()
+            else datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        ),
+        "authoring": {
+            "step": {
+                "filename": str(step_payload.get("filename", "uploaded.step")).strip() or "uploaded.step",
+                "step_base64": str(step_payload.get("step_base64", "")).strip(),
+                "transform": _coerce_step_transform(step_payload.get("transform")),
+            },
+            "weld_draft": json.loads(json.dumps(raw.get("weld_draft", {}))),
+            "editable_waypoints": [
+                {"x": x, "y": y, "z": z}
+                for (x, y, z) in _coerce_waypoint_list(raw.get("editable_waypoints"))
+            ],
+        },
+        "planned_trajectory": (
+            json.loads(json.dumps(raw.get("planned_trajectory")))
+            if isinstance(raw.get("planned_trajectory"), dict)
+            else None
+        ),
+    }
+    return record
+
+
+def _load_robot_program_record(name: str, *, expected_kind: str | None = None) -> dict[str, Any]:
+    safe_name = _sanitize_program_name(name)
+    if expected_kind is not None:
+        expected_kind = _normalize_program_kind(expected_kind)
+
+    path = _robot_program_path(safe_name)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                record = _normalize_robot_program_record(json.load(f))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to load saved program: {exc}") from exc
+        if expected_kind and record["kind"] != expected_kind:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Saved program '{safe_name}' is of kind '{record['kind']}', not '{expected_kind}'.",
+            )
+        return record
+
+    if expected_kind in {None, "weld"}:
+        legacy_path = os.path.join(_WELD_PROGRAM_DIR, f"{safe_name}.json")
+        if os.path.exists(legacy_path):
+            try:
+                with open(legacy_path, "r", encoding="utf-8") as f:
+                    return _normalize_legacy_weld_program_record(json.load(f), safe_name)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Failed to load weld program: {exc}") from exc
+
+    raise HTTPException(status_code=404, detail=f"Saved program '{safe_name}' not found.")
+
+
+def _save_robot_program_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_robot_program_record(record)
+    _ensure_robot_program_dir()
+    path = _robot_program_path(normalized["name"])
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(normalized, f, indent=2)
+    return normalized
+
+
+def _list_robot_program_names(kind: str | None = None) -> list[str]:
+    expected_kind = _normalize_program_kind(kind) if kind is not None else None
+    names: list[str] = []
+    seen: set[str] = set()
+
+    _ensure_robot_program_dir()
+    for filename in os.listdir(_ROBOT_PROGRAM_DIR):
+        if not filename.lower().endswith(".json"):
+            continue
+        name = filename[:-5]
+        path = os.path.join(_ROBOT_PROGRAM_DIR, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                record = _normalize_robot_program_record(json.load(f))
+        except Exception:
+            continue
+        if expected_kind and record["kind"] != expected_kind:
+            continue
+        if name not in seen:
+            names.append(name)
+            seen.add(name)
+
+    if expected_kind in {None, "weld"} and os.path.isdir(_WELD_PROGRAM_DIR):
+        for filename in os.listdir(_WELD_PROGRAM_DIR):
+            if not filename.lower().endswith(".json"):
+                continue
+            name = filename[:-5]
+            if name in seen:
+                continue
+            names.append(name)
+            seen.add(name)
+
+    names.sort()
+    return names
+
+
+def _serialize_weld_program_record(record: dict[str, Any]) -> dict[str, Any]:
+    authoring = record.get("authoring")
+    if not isinstance(authoring, dict):
+        raise HTTPException(status_code=500, detail="Saved weld program is missing authoring payload.")
+    step_payload = authoring.get("step")
+    if not isinstance(step_payload, dict):
+        raise HTTPException(status_code=500, detail="Saved weld program is missing STEP payload.")
+    payload: dict[str, Any] = {
+        "name": record["name"],
+        "saved_at": record.get("saved_at"),
+        "step": json.loads(json.dumps(step_payload)),
+        "weld_draft": json.loads(json.dumps(authoring.get("weld_draft", {}))),
+        "editable_waypoints": json.loads(json.dumps(authoring.get("editable_waypoints", []))),
+        "planned_trajectory": json.loads(json.dumps(record.get("planned_trajectory"))),
+    }
+    return payload
+
+
+def _build_weld_program_record_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    safe_name = _sanitize_program_name(payload.get("name"))
+    authoring_payload = payload.get("authoring")
+    if isinstance(authoring_payload, dict):
+        step_payload = authoring_payload.get("step")
+        weld_draft_raw = authoring_payload.get("weld_draft")
+        editable_waypoints_raw = authoring_payload.get("editable_waypoints")
+    else:
+        step_payload = payload.get("step")
+        weld_draft_raw = payload.get("weld_draft")
+        editable_waypoints_raw = payload.get("editable_waypoints")
+
+    if not isinstance(step_payload, dict):
+        raise HTTPException(status_code=400, detail="Field 'step' is required and must be an object.")
+    step_filename, step_bytes = _decode_base64_step_payload(step_payload)
+    step_base64 = base64.b64encode(step_bytes).decode("ascii")
+    step_transform = _coerce_step_transform(step_payload.get("transform"))
+
+    if not isinstance(weld_draft_raw, dict):
+        raise HTTPException(status_code=400, detail="Field 'weld_draft' is required and must be an object.")
+
+    default_weld_type = _normalize_weld_type(
+        weld_draft_raw.get("weldType", weld_draft_raw.get("weld_type", "fillet"))
+    )
+    segments: list[dict[str, Any]] = []
+    raw_segments = weld_draft_raw.get("segments")
+    if isinstance(raw_segments, list):
+        seen_edge_ids: set[str] = set()
+        for raw_segment in raw_segments:
+            if not isinstance(raw_segment, dict):
+                continue
+            edge_id = str(raw_segment.get("edgeId", raw_segment.get("edge_id", ""))).strip()
+            if not edge_id or edge_id in seen_edge_ids:
+                continue
+            try:
+                start_s = float(raw_segment.get("startS", raw_segment.get("start_s", 0.0)))
+            except (TypeError, ValueError):
+                start_s = 0.0
+            try:
+                end_s = float(raw_segment.get("endS", raw_segment.get("end_s", 1.0)))
+            except (TypeError, ValueError):
+                end_s = 1.0
+            start_s = max(0.0, min(1.0, start_s))
+            end_s = max(0.0, min(1.0, end_s))
+            weld_type = _normalize_weld_type(
+                raw_segment.get("weldType", raw_segment.get("weld_type", default_weld_type))
+            )
+            segments.append(
+                {
+                    "edgeId": edge_id,
+                    "startS": start_s,
+                    "endS": end_s,
+                    "weldType": weld_type,
+                }
+            )
+            seen_edge_ids.add(edge_id)
+
+    legacy_edge_id = str(weld_draft_raw.get("edgeId", weld_draft_raw.get("edge_id", ""))).strip()
+    try:
+        legacy_start_s = float(weld_draft_raw.get("startS", weld_draft_raw.get("start_s", 0.0)))
+    except (TypeError, ValueError):
+        legacy_start_s = 0.0
+    try:
+        legacy_end_s = float(weld_draft_raw.get("endS", weld_draft_raw.get("end_s", 1.0)))
+    except (TypeError, ValueError):
+        legacy_end_s = 1.0
+    legacy_start_s = max(0.0, min(1.0, legacy_start_s))
+    legacy_end_s = max(0.0, min(1.0, legacy_end_s))
+    if not segments and legacy_edge_id:
+        segments.append(
+            {
+                "edgeId": legacy_edge_id,
+                "startS": legacy_start_s,
+                "endS": legacy_end_s,
+                "weldType": default_weld_type,
+            }
+        )
+
+    requested_active_edge_id = str(
+        weld_draft_raw.get(
+            "activeSegmentEdgeId",
+            weld_draft_raw.get("active_segment_edge_id", legacy_edge_id),
+        )
+    ).strip()
+    active_segment_edge_id = (
+        requested_active_edge_id
+        if requested_active_edge_id and any(seg["edgeId"] == requested_active_edge_id for seg in segments)
+        else (segments[0]["edgeId"] if segments else "")
+    )
+    active_segment = next(
+        (seg for seg in segments if seg["edgeId"] == active_segment_edge_id),
+        segments[0] if segments else None,
+    )
+    active_weld_type = (
+        _normalize_weld_type(active_segment.get("weldType", default_weld_type))
+        if isinstance(active_segment, dict)
+        else default_weld_type
+    )
+    post_action_raw = str(
+        weld_draft_raw.get("postAction", weld_draft_raw.get("post_action", "return_to_start"))
+    ).strip()
+    post_action = (
+        "none" if post_action_raw == "none" else ("lift" if post_action_raw == "lift" else "return_to_start")
+    )
+
+    weld_draft = {
+        "modelId": str(weld_draft_raw.get("modelId", weld_draft_raw.get("model_id", ""))).strip(),
+        "edgeId": active_segment["edgeId"] if active_segment else legacy_edge_id,
+        "weldType": active_weld_type,
+        "weldName": (
+            str(weld_draft_raw.get("weldName", weld_draft_raw.get("weld_name", f"{active_weld_type} weld"))).strip()
+            or f"{active_weld_type} weld"
+        ),
+        "workAngleDeg": float(weld_draft_raw.get("workAngleDeg", weld_draft_raw.get("work_angle_deg", 45.0))),
+        "travelAngleDeg": float(weld_draft_raw.get("travelAngleDeg", weld_draft_raw.get("travel_angle_deg", 0.0))),
+        "spinAngleDeg": float(
+            weld_draft_raw.get("spinAngleDeg", weld_draft_raw.get("spin_angle_deg", 0.0))
+        ),
+        "transitionClearanceMm": float(
+            weld_draft_raw.get("transitionClearanceMm", weld_draft_raw.get("transition_clearance_mm", 35.0))
+        ),
+        "postAction": post_action,
+        "startS": active_segment["startS"] if active_segment else legacy_start_s,
+        "endS": active_segment["endS"] if active_segment else legacy_end_s,
+        "segments": segments,
+        "activeSegmentEdgeId": active_segment_edge_id or None,
+    }
+
+    editable_waypoints = [
+        {"x": x, "y": y, "z": z}
+        for (x, y, z) in _coerce_waypoint_list(editable_waypoints_raw)
+    ]
+    planned_trajectory = payload.get("planned_trajectory")
+    if planned_trajectory is not None and not isinstance(planned_trajectory, dict):
+        raise HTTPException(status_code=400, detail="planned_trajectory must be an object or null.")
+
+    return {
+        "name": safe_name,
+        "kind": "weld",
+        "saved_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "authoring": {
+            "step": {
+                "filename": step_filename,
+                "step_base64": step_base64,
+                "transform": step_transform,
+            },
+            "weld_draft": weld_draft,
+            "editable_waypoints": editable_waypoints,
+        },
+        "planned_trajectory": planned_trajectory if isinstance(planned_trajectory, dict) else None,
+    }
+
+
+def _build_trajectory_program_record_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    safe_name = _sanitize_program_name(payload.get("name"))
+    authoring_payload = payload.get("authoring")
+    waypoints_raw = (
+        authoring_payload.get("waypoints")
+        if isinstance(authoring_payload, dict)
+        else payload.get("waypoints", payload.get("pose_waypoints"))
+    )
+    metadata_raw = authoring_payload.get("metadata") if isinstance(authoring_payload, dict) else payload.get("metadata")
+    waypoints = _coerce_pose_waypoint_list(waypoints_raw)
+    if len(waypoints) == 0:
+        raise HTTPException(status_code=400, detail="Trajectory programs require at least one waypoint.")
+    planned_trajectory = payload.get("planned_trajectory")
+    if planned_trajectory is not None and not isinstance(planned_trajectory, dict):
+        raise HTTPException(status_code=400, detail="planned_trajectory must be an object or null.")
+    metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
+    return {
+        "name": safe_name,
+        "kind": "trajectory",
+        "saved_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "authoring": {
+            "waypoints": waypoints,
+            "metadata": json.loads(json.dumps(metadata)),
+        },
+        "planned_trajectory": planned_trajectory if isinstance(planned_trajectory, dict) else None,
     }
 
 
@@ -609,6 +970,24 @@ def create_app() -> FastAPI:
             return 404
         return 503
 
+    def _status_code_for_power_transition_error(code: str) -> int:
+        normalized = str(code or "").strip().upper()
+        if normalized in {"POWER_UP_BLOCKED", "RESET_FAULTS_BLOCKED"}:
+            return 409
+        return 503
+
+    def _controller_structured_call(command: str, response_command: str, *, timeout: float) -> tuple[str, dict[str, Any]]:
+        ok, detail = _send_controller_command(command, timeout=timeout, expect_response=True)
+        if ok:
+            return detail, _parse_controller_ack_payload(detail, response_command, allow_plain_suffix=True)
+        error_payload = _parse_controller_error_payload(detail, response_command)
+        if error_payload is not None:
+            raise HTTPException(
+                status_code=_status_code_for_power_transition_error(str(error_payload.get("code", ""))),
+                detail=error_payload,
+            )
+        raise HTTPException(status_code=503, detail=detail)
+
     def _controller_jog_session_call(command: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         message = command
         if payload is not None:
@@ -729,6 +1108,20 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail="Runtime-config payload must be a JSON object.")
         return payload
 
+    def _runtime_is_sim_mode(runtime_snapshot: dict[str, Any]) -> bool:
+        active = runtime_snapshot.get("active")
+        if not isinstance(active, dict):
+            return False
+        mode = active.get("mode")
+        if isinstance(mode, dict) and bool(mode.get("sim")):
+            return True
+        servo_backend = active.get("servo_backend")
+        if isinstance(servo_backend, dict):
+            backend_name = str(servo_backend.get("effective_backend", "")).strip().lower()
+            if backend_name == "simulation":
+                return True
+        return False
+
     def _controller_set_active_tool_call(tool_id: str | None, timeout: float = 2.0) -> str:
         tool_token = str(tool_id).strip() if tool_id is not None else ""
         ok, detail = _send_controller_command(
@@ -838,21 +1231,26 @@ def create_app() -> FastAPI:
 
     @api.post("/control/power-down", summary="Best-effort actuator power-down / de-energize")
     async def control_power_down(payload: dict[str, Any] | None = None):
-        wait_for_idle = False
+        wait_for_idle = True
         if isinstance(payload, dict):
-            wait_for_idle = bool(payload.get("wait_for_idle", False))
+            wait_for_idle = bool(payload.get("wait_for_idle", True))
         command = "SAFE_POWER_DOWN,wait" if wait_for_idle else "SAFE_POWER_DOWN"
-        detail = await run_in_threadpool(
-            _controller_call_or_503, command, timeout=5.0, expect_response=True
+        detail, structured = await run_in_threadpool(
+            _controller_structured_call, command, "SAFE_POWER_DOWN", timeout=5.0
         )
-        return {"status": "ok", "detail": detail, "waited_for_idle": wait_for_idle}
+        return {
+            "status": "ok",
+            "detail": detail,
+            "waited_for_idle": bool(structured.get("waited_for_idle", wait_for_idle)),
+            **structured,
+        }
 
     @api.post("/control/power-up", summary="Best-effort actuator power-up / arm")
     async def control_power_up():
-        detail = await run_in_threadpool(
-            _controller_call_or_503, "SAFE_POWER_UP", timeout=5.0, expect_response=True
+        detail, structured = await run_in_threadpool(
+            _controller_structured_call, "SAFE_POWER_UP", "SAFE_POWER_UP", timeout=5.0
         )
-        return {"status": "ok", "detail": detail}
+        return {"status": "ok", "detail": detail, **structured}
 
     @api.post(
         "/control/restart-controller",
@@ -922,10 +1320,10 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=400, detail="joint must be >= 1")
 
         command = f"RESET_FAULTS,{joint}" if joint is not None else "RESET_FAULTS"
-        detail = await run_in_threadpool(
-            _controller_call_or_503, command, timeout=5.0, expect_response=True
+        detail, structured = await run_in_threadpool(
+            _controller_structured_call, command, "RESET_FAULTS", timeout=5.0
         )
-        return {"status": "ok", "detail": detail, "joint": joint}
+        return {"status": "ok", "detail": detail, "joint": joint, **structured}
 
     @api.post("/control/home", summary="Move all joints to zero position")
     async def control_home():
@@ -1735,182 +2133,45 @@ def create_app() -> FastAPI:
         except TopologyModelNotFoundError:
             raise HTTPException(status_code=404, detail=f"Unknown topology model '{model_id}'.")
 
+    @api.post("/robot-program/save", summary="Save an editable robot program record")
+    async def robot_program_save(payload: dict[str, Any]):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body required.")
+        kind = _normalize_program_kind(payload.get("kind"))
+        record = (
+            _build_weld_program_record_from_payload(payload)
+            if kind == "weld"
+            else _build_trajectory_program_record_from_payload(payload)
+        )
+        saved = _save_robot_program_record(record)
+        return {"status": "ok", "name": saved["name"], "kind": saved["kind"]}
+
+    @api.get("/robot-program/list", summary="List saved editable robot programs")
+    async def robot_program_list(kind: str | None = None):
+        names = _list_robot_program_names(kind)
+        return {"programs": names, "kind": _normalize_program_kind(kind) if kind is not None else None}
+
+    @api.get("/robot-program/{name}", summary="Load a saved editable robot program")
+    async def robot_program_detail(name: str, kind: str | None = None):
+        record = _load_robot_program_record(name, expected_kind=kind)
+        return record
+
     @api.post("/weld-program/save", summary="Save weld program with embedded STEP payload")
     async def weld_program_save(payload: dict[str, Any]):
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="JSON body required.")
-
-        safe_name = _sanitize_weld_program_name(payload.get("name"))
-        step_payload = payload.get("step")
-        if not isinstance(step_payload, dict):
-            raise HTTPException(status_code=400, detail="Field 'step' is required and must be an object.")
-        step_filename, step_bytes = _decode_base64_step_payload(step_payload)
-        step_base64 = base64.b64encode(step_bytes).decode("ascii")
-        step_transform = _coerce_step_transform(step_payload.get("transform"))
-
-        weld_draft_raw = payload.get("weld_draft")
-        if not isinstance(weld_draft_raw, dict):
-            raise HTTPException(status_code=400, detail="Field 'weld_draft' is required and must be an object.")
-
-        default_weld_type = _normalize_weld_type(
-            weld_draft_raw.get("weldType", weld_draft_raw.get("weld_type", "fillet"))
-        )
-        segments: list[dict[str, Any]] = []
-        raw_segments = weld_draft_raw.get("segments")
-        if isinstance(raw_segments, list):
-            seen_edge_ids: set[str] = set()
-            for raw_segment in raw_segments:
-                if not isinstance(raw_segment, dict):
-                    continue
-                edge_id = str(
-                    raw_segment.get("edgeId", raw_segment.get("edge_id", ""))
-                ).strip()
-                if not edge_id or edge_id in seen_edge_ids:
-                    continue
-                try:
-                    start_s = float(raw_segment.get("startS", raw_segment.get("start_s", 0.0)))
-                except (TypeError, ValueError):
-                    start_s = 0.0
-                try:
-                    end_s = float(raw_segment.get("endS", raw_segment.get("end_s", 1.0)))
-                except (TypeError, ValueError):
-                    end_s = 1.0
-                start_s = max(0.0, min(1.0, start_s))
-                end_s = max(0.0, min(1.0, end_s))
-                weld_type = _normalize_weld_type(
-                    raw_segment.get("weldType", raw_segment.get("weld_type", default_weld_type))
-                )
-                segments.append(
-                    {
-                        "edgeId": edge_id,
-                        "startS": start_s,
-                        "endS": end_s,
-                        "weldType": weld_type,
-                    }
-                )
-                seen_edge_ids.add(edge_id)
-
-        legacy_edge_id = str(weld_draft_raw.get("edgeId", weld_draft_raw.get("edge_id", ""))).strip()
-        try:
-            legacy_start_s = float(weld_draft_raw.get("startS", weld_draft_raw.get("start_s", 0.0)))
-        except (TypeError, ValueError):
-            legacy_start_s = 0.0
-        try:
-            legacy_end_s = float(weld_draft_raw.get("endS", weld_draft_raw.get("end_s", 1.0)))
-        except (TypeError, ValueError):
-            legacy_end_s = 1.0
-        legacy_start_s = max(0.0, min(1.0, legacy_start_s))
-        legacy_end_s = max(0.0, min(1.0, legacy_end_s))
-        if not segments and legacy_edge_id:
-            segments.append(
-                {
-                    "edgeId": legacy_edge_id,
-                    "startS": legacy_start_s,
-                    "endS": legacy_end_s,
-                    "weldType": default_weld_type,
-                }
-            )
-
-        requested_active_edge_id = str(
-            weld_draft_raw.get(
-                "activeSegmentEdgeId",
-                weld_draft_raw.get("active_segment_edge_id", legacy_edge_id),
-            )
-        ).strip()
-        active_segment_edge_id = (
-            requested_active_edge_id
-            if requested_active_edge_id and any(seg["edgeId"] == requested_active_edge_id for seg in segments)
-            else (segments[0]["edgeId"] if segments else "")
-        )
-        active_segment = next(
-            (seg for seg in segments if seg["edgeId"] == active_segment_edge_id),
-            segments[0] if segments else None,
-        )
-        active_weld_type = (
-            _normalize_weld_type(active_segment.get("weldType", default_weld_type))
-            if isinstance(active_segment, dict)
-            else default_weld_type
-        )
-        post_action_raw = str(
-            weld_draft_raw.get("postAction", weld_draft_raw.get("post_action", "return_to_start"))
-        ).strip()
-        post_action = (
-            "none"
-            if post_action_raw == "none"
-            else ("lift" if post_action_raw == "lift" else "return_to_start")
-        )
-
-        weld_draft = {
-            "modelId": str(weld_draft_raw.get("modelId", weld_draft_raw.get("model_id", ""))).strip(),
-            "edgeId": active_segment["edgeId"] if active_segment else legacy_edge_id,
-            "weldType": active_weld_type,
-            "weldName": str(weld_draft_raw.get("weldName", weld_draft_raw.get("weld_name", f"{active_weld_type} weld"))).strip() or f"{active_weld_type} weld",
-            "workAngleDeg": float(weld_draft_raw.get("workAngleDeg", weld_draft_raw.get("work_angle_deg", 45.0))),
-            "travelAngleDeg": float(weld_draft_raw.get("travelAngleDeg", weld_draft_raw.get("travel_angle_deg", 0.0))),
-            "spinAngleDeg": float(
-                weld_draft_raw.get("spinAngleDeg", weld_draft_raw.get("spin_angle_deg", 0.0))
-            ),
-            "transitionClearanceMm": float(
-                weld_draft_raw.get("transitionClearanceMm", weld_draft_raw.get("transition_clearance_mm", 35.0))
-            ),
-            "postAction": post_action,
-            "startS": active_segment["startS"] if active_segment else legacy_start_s,
-            "endS": active_segment["endS"] if active_segment else legacy_end_s,
-            "segments": segments,
-            "activeSegmentEdgeId": active_segment_edge_id or None,
-        }
-
-        editable_waypoints = [
-            {"x": x, "y": y, "z": z}
-            for (x, y, z) in _coerce_waypoint_list(payload.get("editable_waypoints"))
-        ]
-
-        planned_trajectory = payload.get("planned_trajectory")
-        if planned_trajectory is not None and not isinstance(planned_trajectory, dict):
-            raise HTTPException(status_code=400, detail="planned_trajectory must be an object or null.")
-
-        record: dict[str, Any] = {
-            "name": safe_name,
-            "saved_at": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "step": {
-                "filename": step_filename,
-                "step_base64": step_base64,
-                "transform": step_transform,
-            },
-            "weld_draft": weld_draft,
-            "editable_waypoints": editable_waypoints,
-            "planned_trajectory": planned_trajectory,
-        }
-
-        _ensure_weld_program_dir()
-        path = os.path.join(_WELD_PROGRAM_DIR, f"{safe_name}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(record, f, indent=2)
-        return {"status": "ok", "name": safe_name}
+        enriched_payload = dict(payload)
+        enriched_payload["kind"] = "weld"
+        record = _save_robot_program_record(_build_weld_program_record_from_payload(enriched_payload))
+        return {"status": "ok", "name": record["name"]}
 
     @api.get("/weld-program/list", summary="List saved weld programs")
     async def weld_program_list():
-        _ensure_weld_program_dir()
-        names: list[str] = []
-        for filename in os.listdir(_WELD_PROGRAM_DIR):
-            if not filename.lower().endswith(".json"):
-                continue
-            names.append(filename[:-5])
-        names.sort()
-        return {"programs": names}
+        return {"programs": _list_robot_program_names("weld")}
 
     @api.get("/weld-program/{name}", summary="Load a saved weld program")
     async def weld_program_detail(name: str):
-        safe_name = _sanitize_weld_program_name(name)
-        path = os.path.join(_WELD_PROGRAM_DIR, f"{safe_name}.json")
-        if not os.path.exists(path):
-            raise HTTPException(status_code=404, detail=f"Weld program '{safe_name}' not found.")
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to load weld program: {exc}") from exc
-        return payload
+        return _serialize_weld_program_record(_load_robot_program_record(name, expected_kind="weld"))
 
     @api.post("/trajectory/plan", summary="Begin recording a new trajectory")
     async def trajectory_plan():
@@ -1944,22 +2205,52 @@ def create_app() -> FastAPI:
     async def trajectory_plan_points(payload: dict):
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="JSON body required.")
-        points = _coerce_waypoint_list(payload.get("points"))
-        if not points:
-            raise HTTPException(status_code=400, detail="Field 'points' must contain at least one waypoint.")
+        if controller_command_api is None:
+            raise HTTPException(status_code=500, detail="Arm controller command API unavailable")
 
-        coord_tokens = ",".join(str(value) for point in points for value in point)
-        command = "PLAN_TRAJECTORY_POINTS," + coord_tokens
-        detail = await run_in_threadpool(
-            _controller_call_or_503, command, timeout=2.0, expect_response=True
+        pose_waypoints = _coerce_pose_waypoint_list(payload.get("waypoints"))
+        if not pose_waypoints:
+            points = _coerce_waypoint_list(payload.get("points"))
+            pose_waypoints = [{"x": x, "y": y, "z": z} for (x, y, z) in points]
+        if not pose_waypoints:
+            raise HTTPException(
+                status_code=400,
+                detail="Field 'waypoints' or 'points' must contain at least one waypoint.",
+            )
+
+        preview_name_raw = payload.get("preview_name")
+        preview_name = (
+            str(preview_name_raw).strip()
+            if isinstance(preview_name_raw, str) and preview_name_raw.strip()
+            else getattr(controller_command_api, "PLANNED_PREVIEW_NAME", "__planner_preview__")
         )
-        prefix = "PLANNED_TRAJECTORY_POINTS,"
-        if not detail.startswith(prefix):
-            raise HTTPException(status_code=502, detail=f"Malformed planner reply: {detail}")
+
+        def _plan():
+            _sync_local_planner_runtime(timeout=1.0)
+            live_joints = _get_live_joint_angles_from_controller(timeout=1.0)
+            if controller_utils is not None:
+                controller_utils.current_logical_joint_angles_rad = list(live_joints)
+            if hasattr(controller_command_api, "utils"):
+                controller_command_api.utils.current_logical_joint_angles_rad = list(live_joints)
+            return controller_command_api.plan_preview_trajectory_points(
+                [[float(item["x"]), float(item["y"]), float(item["z"])] for item in pose_waypoints],
+                preview_name=preview_name,
+                pose_waypoints=pose_waypoints,
+            )
+
         try:
-            payload_dict = json.loads(detail[len(prefix) :])
-        except json.JSONDecodeError as exc:
-            raise HTTPException(status_code=502, detail=f"Planner payload decode failure: {exc}") from exc
+            payload_dict = await run_in_threadpool(_plan)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=f"Trajectory planning failed: {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Trajectory planning failed unexpectedly: {exc}") from exc
+
+        payload_dict["source"] = {
+            "mode": "pose_waypoints" if payload.get("waypoints") is not None else "points",
+            "waypoint_count": len(pose_waypoints),
+        }
         return payload_dict
 
     @api.post("/trajectory/plan-weld", summary="Plan a weld trajectory from selected CAD edge segment")
@@ -2127,6 +2418,27 @@ def create_app() -> FastAPI:
         name = payload.get("name")
         if not isinstance(name, str) or not name.strip():
             raise HTTPException(status_code=400, detail="Field 'name' is required.")
+        execution_mode_raw = payload.get("execution_mode")
+        execution_mode = (
+            str(execution_mode_raw).strip().lower()
+            if isinstance(execution_mode_raw, str) and str(execution_mode_raw).strip()
+            else None
+        )
+        if execution_mode not in {None, "simulate", "live"}:
+            raise HTTPException(status_code=400, detail="execution_mode must be 'simulate' or 'live'.")
+        runtime_snapshot = await run_in_threadpool(_controller_runtime_config_call, 1.5)
+        runtime_is_sim = _runtime_is_sim_mode(runtime_snapshot)
+        runtime_mode = "simulate" if runtime_is_sim else "live"
+        if execution_mode == "simulate" and not runtime_is_sim:
+            raise HTTPException(
+                status_code=409,
+                detail="Simulated execution requires the controller to be running in SIM mode.",
+            )
+        if execution_mode == "live" and runtime_is_sim:
+            raise HTTPException(
+                status_code=409,
+                detail="Live execution is unavailable while the controller is running in SIM mode.",
+            )
         use_cache = payload.get("use_cache", False)
         loop_override = payload.get("loop_override")
         parts = [name.strip()]
@@ -2143,7 +2455,13 @@ def create_app() -> FastAPI:
             _controller_call_or_503, command, timeout=2.0, expect_response=True
         )
         payload = _parse_controller_ack_payload(detail, "RUN_TRAJECTORY")
-        return {"status": "ok", "detail": detail, **payload}
+        return {
+            "status": "ok",
+            "detail": detail,
+            "execution_mode": execution_mode or runtime_mode,
+            "runtime_mode": runtime_mode,
+            **payload,
+        }
 
     @api.post("/trajectory/preview", summary="Plan a trajectory to a target point")
     async def trajectory_preview(payload: dict):
@@ -2249,6 +2567,47 @@ def _coerce_waypoint_list(raw_points: Any) -> list[tuple[float, float, float]]:
             ) from exc
         points.append((x, y, z))
     return points
+
+
+def _coerce_pose_waypoint_list(raw_waypoints: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_waypoints, list):
+        return []
+    waypoints: list[dict[str, Any]] = []
+    for idx, entry in enumerate(raw_waypoints):
+        try:
+            if not isinstance(entry, dict):
+                raise ValueError("Waypoint must be an object.")
+            x = float(entry["x"])
+            y = float(entry["y"])
+            z = float(entry["z"])
+            orientation = entry.get("orientation_euler_deg", entry.get("orientationEulerDeg"))
+            roll_raw = entry.get("rollDeg", entry.get("roll_deg"))
+            pitch_raw = entry.get("pitchDeg", entry.get("pitch_deg"))
+            yaw_raw = entry.get("yawDeg", entry.get("yaw_deg"))
+            if isinstance(orientation, dict):
+                roll_raw = orientation.get("roll", orientation.get("x", roll_raw))
+                pitch_raw = orientation.get("pitch", orientation.get("y", pitch_raw))
+                yaw_raw = orientation.get("yaw", orientation.get("z", yaw_raw))
+            elif isinstance(orientation, (list, tuple)) and len(orientation) >= 3:
+                roll_raw, pitch_raw, yaw_raw = orientation[:3]
+
+            roll = float(roll_raw) if roll_raw is not None else None
+            pitch = float(pitch_raw) if pitch_raw is not None else None
+            yaw = float(yaw_raw) if yaw_raw is not None else None
+        except (TypeError, ValueError, KeyError) as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid pose waypoint at index {idx}: {exc}"
+            ) from exc
+
+        waypoint: dict[str, Any] = {"x": x, "y": y, "z": z}
+        if roll is not None and pitch is not None and yaw is not None:
+            waypoint["orientation_euler_deg"] = {
+                "roll": roll,
+                "pitch": pitch,
+                "yaw": yaw,
+            }
+        waypoints.append(waypoint)
+    return waypoints
 
 
 def _coerce_plan_sections(raw_sections: Any) -> list[dict[str, Any]]:

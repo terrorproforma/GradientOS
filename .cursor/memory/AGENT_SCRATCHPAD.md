@@ -1275,3 +1275,94 @@ Use this file as persistent, repo-local execution memory.
 - [tool] In `logs/diagnostics/20260324-062529-pose-history.json`, every active sample still showed `gate_result="accepted"`, `gate_reason="OK"`, `solve_failed=false`, `clamped=false`, and `target_vs_applied ~= 0`.
 - [self] Interpretation rule: when `target_vs_applied` stays essentially zero but `following_error` grows large, the controller-owned planning/IK path is behaving consistently and the remaining problem is execution/following lag or commanded-rate scaling, not solver drift.
 - [tool] This session reached much larger commanded rates than the earlier validation sweep, including `vy=0.05 m/s` and `v_yaw=66.388 deg/s`; the worst observed following envelopes were about `15.11 mm` position, `9.82 deg` orientation, and `14.92 deg` max joint error.
+
+### 2026-03-24 - Pose-history parsers must key segmentation off `is_jogging`, not stale `ik_debug`
+- [tool] Idle/stopped samples in saved pose-history files keep the last `ik_debug` snapshot around, including old velocities and sequence numbers.
+- [self] Corrective rule: segment multi-move logs from contiguous `is_jogging=true` spans, then use the surrounding idle samples only for baseline and settle measurements.
+- [self] Reporting rule: print `commanded_end`, `active_end`, and `settled_end` deltas separately; with large following error, measured `active_end` alone can look nearly stationary even when the commanded leg was large.
+- [tool] Implemented reusable parser logic in `src/gradient_os/diagnostics/pose_history_analysis.py` plus CLI entrypoint `scripts/pose_history_report.py` and coverage in `tests/test_pose_history_analysis.py`.
+
+### 2026-03-24 - Recent `auto-stop` pose-history files can be cumulative prefixes of one session
+- [tool] The `logs/diagnostics/20260324-062236..062529-pose-history.json` sequence grows monotonically from `1` to `20` parsed segments and from `0` to `5` round-trip pairs.
+- [self] Corrective rule: when reviewing a burst of nearby `auto-stop` files, first check whether later files simply supersede earlier ones before aggregating across all of them.
+- [self] Reporting rule: summarize the file progression briefly, but treat the newest file as the authoritative full-session view when the counts monotonically accumulate.
+
+### 2026-03-24 18:32 +0000 - Safe host triage for suspected Python supply-chain packages
+
+#### Task Summary
+
+- Investigated whether this machine currently has any installed `litellm` package or local Python environments that would expose it after the reported compromise window.
+
+#### Mistakes And Fixes
+
+- Source: `[tool]`
+- Mistake: initially assumed `pip`/`pipx`/`uv`-managed environments might exist locally by default.
+- Detection: `python3 -m pip --version` reported no `pip` module, `uv tool list` reported no tools, and `pipx` was not installed.
+- Fix: switched to interpreter metadata checks plus direct filesystem inspection of standard package directories.
+- Preventive rule: for package-compromise triage on this host, verify actual interpreter visibility and package directories first instead of assuming common Python tooling is present.
+
+#### User Preferences
+
+- New or reinforced preference: explain the work, but actually perform the investigation instead of only discussing risk in the abstract.
+- How it changed execution: used concrete host checks (`importlib.metadata`, package-directory inspection, local env discovery) and will report exact evidence.
+
+#### What Worked
+
+- Pattern/check that worked: checking `importlib.metadata.distribution()` from the real interpreters and scanning `/usr/lib/python3/dist-packages` plus `/usr/local/lib/python3.11/dist-packages` confirmed package absence without importing untrusted code.
+
+#### What Did Not Work
+
+- Failed attempt and why: shell-side `rg` was unavailable in this terminal environment, so filesystem verification was done with Python instead.
+
+#### Guardrails For Next Session
+
+- Preflight rule: for suspected malicious Python packages, do not import the package; prefer metadata queries, dist-info inspection, and interpreter/env enumeration.
+
+#### Follow-Ups / Risks
+
+- Remaining risk or pending check: this confirms absence in the currently discoverable host interpreters and package directories, but cannot prove whether the package was previously installed and removed before this check.
+
+### 2026-03-24 - Shared robot-program persistence should replace one-off weld/trajectory save flows
+- [user] Explicit requirement: trajectory and weld save/load should converge on one shared editable-program system rather than duplicating the old weld-only persistence pattern.
+- [tool] Implemented shared `robot-program` save/list/detail endpoints in `src/gradient_os/api/main.py`, with weld compatibility wrappers still available for legacy callers.
+- [self] Corrective rule: when a new authoring workflow wants save/load, first look for a reusable program envelope (`kind`, `authoring`, `planned_trajectory`) before adding more top-level per-feature endpoints.
+
+### 2026-03-24 - Trajectory planning must preserve pose data end-to-end, not just XYZ
+- [user] Explicit preference reinforced again: implement the industrial-style waypoint editor for real, including saved pose/orientation, rather than stopping at discussion.
+- [tool] Upgraded `trajectory/plan-points` and `command_api.plan_preview_trajectory_points(...)` to accept pose waypoints and carry orientation through preview generation, saved program records, and the UI tree/editor.
+- [self] Corrective rule: if the planner returns richer waypoint data, keep it rich in frontend types (`PoseWaypoint`) instead of immediately collapsing back to `Point3` and losing orientation again.
+
+### 2026-03-24 - SIM vs LIVE execution needs explicit UX and backend gating
+- [tool] Added `execution_mode` / `runtime_mode` handling to `/trajectory/run`, with server-side rejection for simulate-in-live and live-in-sim mismatches.
+- [tool] Updated the web UI to surface runtime mode in both trajectory and weld panels and split actions into `Simulate ...` vs `Run ...`.
+- [self] Corrective rule: for safety-sensitive robot features, do not rely on color or text alone; pair visible mode labeling with backend-enforced execution checks.
+
+### 2026-03-24 - Trajectory creation must have an obvious "start here" path in the panel
+- [user] Immediate usability feedback after the full planner landed: the panel still did not make it obvious how to create a trajectory at all.
+- [tool] Added a visible `Create Trajectory` section to `web-ui/src/App.tsx` with explicit `Start Editing`, `Add Waypoint`, and `Capture Pose` actions plus step-by-step instructions.
+- [self] Corrective rule: if a workflow depends on a canvas gesture like Shift-click, never hide that behind icon-only chrome; surface the gesture in a labeled first-run panel and provide at least one button-driven alternative.
+
+### 2026-03-24 - For A6-EC `ER47.0`, distinguish drive following faults from RT/bus faults before blaming the stack
+- [tool] Live commissioning panel showed `J2 / axis1: fault_err=0x8611 [Er47.0]` while the app decoded `0x603F=0xEF47` as `Excessive position deviation`; the codebook in `docs/resources/a6ec_manual_codes.md` maps `0x8611` to `Following fault` and `Er47.0` to `Excessive position deviation`.
+- [tool] The same startup run's controller log (`logs/startups/20260324-195650/controller.log`) shows a large `POST /control/rest` move being offloaded as RTCore trajectory `1`, then `TimeoutError: Timed out waiting for RTCore trajectory 1 to complete`.
+- [self] Interpretation rule: if the drive reports `Er47.0` with `underruns=0` and the bus stays `OP`, the primary hypothesis is that the motor/encoder on that axis lagged the commanded position beyond the drive's following-error window, not that EtherCAT comms dropped out.
+- [self] Diagnostic rule: for future repeats, capture `/info/joints-detailed`, `/control/motion-status`, and `./start-stack.sh probe` before resetting so we preserve the faulted axis, DS402 state, and execution status together.
+
+### 2026-03-24 - Power-transition hardening should reuse one neutral-state contract across backend, API, and UI
+- [user] Explicit requirement reinforced again: explain the safety reasoning, but also implement the hardening end-to-end instead of stopping at a plan.
+- [self] Corrective rule: when adding a safety gate like `safe_for_power_transition`, compute it once from controller thread state, RTCore execution state, jog state, live fault presence, and feedback synchronization, then expose that same contract through `/control/motion-status`, power endpoints, and the commissioning UI.
+- [tool] Focused validation worked reliably from the repo venv: `"/home/pi/GradientOS/.venv/bin/python" -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py -q` and `npm exec vitest run src/ControlPanel.test.tsx`.
+- [self] Corrective rule: when older tests assume stale helper names or response shapes, prefer small compatibility shims (`runtime_config.get_runtime_config_snapshot()`) or targeted test updates over backing out intentional safety metadata.
+- [tool] The UI test harness needed explicit `safe_for_power_transition` mock fields; otherwise the new fail-closed power-up gating correctly leaves `Power Up Drives` disabled by default.
+
+### 2026-03-24 - Live power-cycle validation must check probe state and motion-status independently
+- [tool] Live headless restart validation (`./start-stack.sh stop --hard` -> `./start-stack.sh --headless` -> `POST /control/power-up` -> `POST /control/power-down` -> `./start-stack.sh stop --hard`) showed the hardware behaved safely: startup landed in `BUS_UP_DISARMED`, power-up reached `OperationEnabled` on all 6 axes with `err=0x0000`, power-down returned to `BUS_UP_DISARMED`, and final hard stop returned to `INACTIVE`.
+- [tool] During that same run, `/control/motion-status` stayed clean before power-up (`safe_for_power_transition=true`, `active_traj_id=0`, `queue_depth=0`) but after power-down it reported `state=completed`, `active_traj_id=1`, and `safe_for_power_transition=false` even though `./start-stack.sh probe` simultaneously showed `driver_state=DISARMED`, `physical_state=BUS_UP_DISARMED`, and `op_enabled_axes=0/6`.
+- [self] Corrective rule: do not treat a safe hardware probe as proof that the motion-status contract is fixed; after every live power-down, verify both `./start-stack.sh probe` and `/control/motion-status` and look specifically for latched `active_traj_id` / completed trajectory blockers.
+- [tool] Fresh startup logs for `logs/startups/20260324-215329` contained no `APPLY_JOINT_SETPOINT`, `MOVE_*`, `ROTATE`, or `SET_ORIENTATION` markers during the validation run, matching the intended "no motion commands" test.
+
+### 2026-03-24 - RTCore-backed STOP must not inject a hold trajectory during power-down
+- [tool] Root cause of the stale post-power-down blocker was `handle_stop_command()` calling `servo_driver.set_servo_positions(current_angles, 0, 100)` even on the EtherCAT RTCore backend; that backend maps the write to a one-point RTCore trajectory via `set_joint_positions()`.
+- [self] Corrective rule: when the active backend exposes RTCore execution status, `STOP` should abort RTCore ownership and stop jog, then skip the legacy servo-driver brake write entirely.
+- [tool] After that fix, the live rerun (`logs/startups/20260324-215735`) passed end to end: pre-enable `safe_for_power_transition=true`, post-power-down `./start-stack.sh probe` returned `BUS_UP_DISARMED`, and `/control/motion-status` also returned `idle` with `active_traj_id=0`, `last_submitted_traj_id=0`, and `safe_for_power_transition=true`.
+- [tool] Updated docs in `docs/rtcore_owned_motion_contract.md`, `docs/ethercat/bringup.md`, and `docs/command_api.md` to record the final RTCore power-transition contract and the validated no-motion power-cycle procedure.

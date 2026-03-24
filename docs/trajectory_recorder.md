@@ -1,24 +1,40 @@
-# Interactive Trajectory Recorder
+# Trajectory Authoring And Recorder
 
-> **Status:** Added in PR x.x (November 2023)
+> **Status:** Current workflow supports both the legacy recorder op-codes and the newer waypoint-program editor used by the web UI.
 >
-> This feature lets you “teach” the Mini-Arm by jogging it manually and dropping way-points on the fly.  The recorder stores these poses in exactly the same JSON format that `RUN_TRAJECTORY` already understands, so you can play them back immediately without post-processing.
+> The system now has two complementary ways to create robot motion:
+>
+> 1. **Recorder flow** for quick teach-by-demonstration capture.
+> 2. **Waypoint authoring flow** for editable pose waypoints, IK-planned interpolation, saved program records, and explicit SIM-vs-LIVE execution.
 
 ---
 
-## Why a Recorder?
-Teaching by demonstration is often quicker than scripting a complex move by hand.  With the new *Recorder* op-codes you can:
+## Two Authoring Modes
+### 1. Recorder flow
+Teaching by demonstration is still useful when you want to jog the robot manually and snapshot poses in sequence. With the recorder op-codes you can:
 
 1. **Start** a recording session (`PLAN_TRAJECTORY`).
 2. **Move** the robot with any normal command (`MOVE_LINE`, `SET_ORIENTATION`, …).
 3. **Drop** poses at interesting points (`REC_POS`).
 4. **Finish** and save to disk (`END_TRAJECTORY,<name>`).
 
-The result is a human-readable JSON file in `recorded_trajectories/` that you can replay with a single `RUN_TRAJECTORY` command.
+The result is a human-readable runnable JSON file in `recorded_trajectories/` that you can replay with a single `RUN_TRAJECTORY` command.
+
+### 2. Waypoint program flow
+The web trajectory editor is the main production authoring path. It lets you:
+
+1. Create pose waypoints from workspace clicks, numeric edits, or `Capture Pose`.
+2. Store both **position** and **orientation** per waypoint.
+3. Re-plan the whole sequence through the existing IK / trajectory planner.
+4. Save the editable source program separately from the runnable trajectory artifact.
+5. Load the editable program later and keep the program tree plus 3D preview in sync.
+6. Execute with an explicit intent:
+   - `Simulate Trajectory` when the controller runtime is in `SIM`
+   - `Run Trajectory` when the controller runtime is in `LIVE`
 
 ---
 
-## New UDP Commands
+## Legacy Recorder Commands
 
 | Command | Syntax | Blocking? | Description |
 |---------|--------|-----------|-------------|
@@ -47,8 +63,67 @@ RUN_TRAJECTORY,my_pick_place,true  # Use cache for faster start-up
 
 ---
 
-## File Format
-Each recorded file matches the structure of an entry in `trajectories.json`:
+## Waypoint Planning And Saved Programs
+### Editable saved program APIs
+
+The editable source-of-truth records live behind the shared robot-program API:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /robot-program/save` | Save an editable robot program (`kind: "trajectory"` or `kind: "weld"`). |
+| `GET /robot-program/list?kind=trajectory` | List saved editable trajectory programs. |
+| `GET /robot-program/list?kind=weld` | List saved editable weld programs. |
+| `GET /robot-program/{name}?kind=trajectory` | Load an editable trajectory program. |
+| `GET /robot-program/{name}?kind=weld` | Load an editable weld program. |
+
+Trajectory program records store:
+
+- program metadata (`name`, `kind`, `saved_at`)
+- `authoring.waypoints` with XYZ plus roll/pitch/yaw
+- the latest `planned_trajectory` preview payload used by the UI
+
+Weld program records use the same outer envelope but store weld-specific authoring data under `authoring`.
+
+### Trajectory planning API
+
+`POST /trajectory/plan-points` now accepts pose-aware waypoint payloads from the UI:
+
+```json
+{
+  "waypoints": [
+    {
+      "x": 0.20,
+      "y": 0.10,
+      "z": 0.30,
+      "orientation_euler_deg": {
+        "roll": 0.0,
+        "pitch": 90.0,
+        "yaw": 0.0
+      }
+    }
+  ]
+}
+```
+
+The planner:
+
+- interpolates waypoint-to-waypoint motion with the existing IK stack
+- preserves the ordinary runnable `move_absolute` trajectory format
+- returns dense preview path samples for the visualizer and program tree
+
+### Execution mode contract
+
+`POST /trajectory/run` accepts an optional `execution_mode`:
+
+- `simulate` requires the controller runtime to be in `SIM`
+- `live` requires the controller runtime to be in `LIVE`
+
+The response echoes both `execution_mode` and `runtime_mode` so the UI can show exactly what happened.
+
+---
+
+## Runnable Trajectory File Format
+Each runnable recorded file still matches the structure of an entry in `trajectories.json`:
 ```json
 {
   "description": "Recorded on 2023-11-05 14:37:01",
@@ -63,18 +138,27 @@ Each recorded file matches the structure of an entry in `trajectories.json`:
 }
 ```
 Details:
-* **move list** – The recorder stores each way-point as a `move_absolute` command.  A default 1-second `pause` is inserted *between* way-points so you can see the arm settle.  Edit times or vectors afterwards if desired.
-* **orientation lock** – Currently `null`.  In future updates we may let you freeze tool orientation while replaying.
+* **move list** – Recorder-generated files store each way-point as a `move_absolute` command.  A default 1-second `pause` is inserted *between* way-points so you can see the arm settle.
+* **pose-aware planning** – Planner-generated trajectories may also include `orientation_euler_deg` per `move_absolute` step.
+* **editable vs runnable** – The editable source program is no longer the same thing as the runnable trajectory JSON. Editable programs live in `recorded_programs/`; runnable controller trajectories stay in `recorded_trajectories/`.
 
 ---
 
 ## Internals (Developers)
-* **Implementation:** see `command_api._recording_state` and the three handlers:
+### Recorder internals
+See `command_api._recording_state` and the three handlers:
   * `handle_plan_trajectory_start()`
   * `handle_record_position()`
   * `handle_end_trajectory(name)`
-* **Storage path:** `recorded_trajectories/` (auto-created).
-* **Playback:** `handle_run_trajectory()` now searches the recorded folder *before* falling back to `trajectories.json`.
+
+### Waypoint-planner internals
+
+- Shared saved-program persistence lives behind the robot-program API in `src/gradient_os/api/main.py`.
+- Trajectory planning flows through `command_api.plan_preview_trajectory_points(...)`.
+- Cartesian interpolation / IK solving stays in `src/gradient_os/arm_controller/trajectory_execution.py`.
+- Runnable preview files are still emitted under `recorded_trajectories/`.
+- Editable source program records are stored under `recorded_programs/`.
+- Playback still runs through `handle_run_trajectory()`.
 
 ### Telemetry recorder (episodes)
 - Start/stop from UI Real Control page under "Telemetry Recorder" (leave camera URLs blank to auto-start the built-in MJPEG server on port 8080 and use both cameras, if available; server starts with `--vflip --hflip` by default).
@@ -89,6 +173,6 @@ Details:
 ---
 
 ## Roadmap
-* Configurable pause duration / speed multiplier per way-point.
-* Option to capture orientation Euler angles and enforce them during playback.
-* GUI “teach pendant” that sends recorder op-codes automatically. 
+* Runtime switching workflow that can deliberately relaunch the controller between SIM and LIVE from the UI.
+* Richer waypoint operations such as multi-select edits and bulk retiming.
+* GUI teach-pendant shortcuts for the legacy recorder path. 

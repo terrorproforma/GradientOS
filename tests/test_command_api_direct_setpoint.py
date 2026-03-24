@@ -24,11 +24,20 @@ def test_handle_apply_joint_setpoint_uses_fallbacks_when_servo_defaults_missing(
         "trajectory_id": 0,
         "source_of_truth": "controller",
         "state": "accepted",
+        "safe_for_power_transition": True,
+        "power_transition_blockers": [],
+        "power_transition_blocker_details": [],
         "execution": {
             "controller_motion_state": "idle",
             "controller_thread_running": False,
             "last_correlation_id": None,
             "rtcore_status_present": False,
+            "safe_for_power_transition": True,
+            "power_transition_blockers": [],
+            "power_transition_blocker_details": [],
+            "power_transition_feedback_synchronized": False,
+            "power_transition_faulted_axis_count": 0,
+            "power_transition_active_jog": False,
         },
         "speed": 500,
         "acceleration": 500.0,
@@ -1079,3 +1088,162 @@ def test_handle_set_orientation_preserves_closed_loop_on_non_rtcore_backend(monk
     assert result["execution_policy"] == "controller_closed_loop"
     assert result["frequency_hz"] == 50
     assert executor_calls == [("closed", 50)]
+
+
+def test_handle_safe_power_up_rejects_when_runtime_is_not_safe(monkeypatch):
+    backend_calls: list[str] = []
+
+    class _Backend:
+        def safe_power_up(self):
+            backend_calls.append("safe_power_up")
+            return True
+
+    motion_payload = {
+        "accepted": True,
+        "state": "accepted",
+        "completion_scope": "rtcore_execution",
+        "trajectory_id": 11,
+        "source_of_truth": "rtcore",
+        "safe_for_power_transition": False,
+        "power_transition_blockers": ["active_trajectory", "queued_motion"],
+        "power_transition_blocker_details": [
+            {"code": "active_trajectory", "message": "An RTCore trajectory is still latched or active.", "active_traj_id": 11},
+            {"code": "queued_motion", "message": "Queued RTCore motion points are still pending.", "queue_depth": 3},
+        ],
+        "execution": {
+            "controller_thread_running": False,
+            "rtcore_status_present": True,
+            "safe_for_power_transition": False,
+            "power_transition_blockers": ["active_trajectory", "queued_motion"],
+            "power_transition_blocker_details": [
+                {"code": "active_trajectory", "message": "An RTCore trajectory is still latched or active.", "active_traj_id": 11},
+                {"code": "queued_motion", "message": "Queued RTCore motion points are still pending.", "queue_depth": 3},
+            ],
+        },
+    }
+
+    monkeypatch.setattr(command_api.backend_registry, "get_active_backend", lambda: _Backend())
+    monkeypatch.setattr(command_api, "get_motion_execution_status", lambda: dict(motion_payload))
+
+    result = command_api.handle_safe_power_up()
+
+    assert result["accepted"] is False
+    assert result["code"] == "POWER_UP_BLOCKED"
+    assert result["power_transition_blockers"] == ["active_trajectory", "queued_motion"]
+    assert backend_calls == []
+
+
+def test_handle_safe_power_down_waits_for_idle_and_calls_backend(monkeypatch):
+    backend_calls: list[tuple[bool, float | None]] = []
+    stop_calls: list[str] = []
+    wait_calls: list[float] = []
+
+    class _Backend:
+        def safe_power_down(self, *, wait_for_idle: bool = False, timeout_s: float | None = None):
+            backend_calls.append((bool(wait_for_idle), timeout_s))
+            return True
+
+    completed_motion = {
+        "accepted": True,
+        "state": "completed",
+        "completion_scope": "rtcore_execution",
+        "trajectory_id": 0,
+        "source_of_truth": "rtcore",
+        "safe_for_power_transition": True,
+        "power_transition_blockers": [],
+        "power_transition_blocker_details": [],
+        "execution": {
+            "controller_thread_running": False,
+            "rtcore_status_present": True,
+            "safe_for_power_transition": True,
+            "power_transition_blockers": [],
+            "power_transition_blocker_details": [],
+        },
+    }
+
+    monkeypatch.setattr(command_api, "handle_stop_command", lambda: stop_calls.append("stop"))
+    monkeypatch.setattr(command_api, "handle_wait_for_idle", lambda timeout_s=30.0: wait_calls.append(float(timeout_s)) or dict(completed_motion))
+    monkeypatch.setattr(command_api.backend_registry, "get_active_backend", lambda: _Backend())
+    monkeypatch.setattr(command_api, "get_motion_execution_status", lambda: dict(completed_motion))
+
+    result = command_api.handle_safe_power_down(wait_for_idle=True)
+
+    assert result["accepted"] is True
+    assert result["code"] == "POWER_DOWN_SENT"
+    assert result["waited_for_idle"] is True
+    assert stop_calls == ["stop"]
+    assert wait_calls == [30.0]
+    assert backend_calls == [(True, 1.0)]
+
+
+def test_handle_reset_faults_leaves_system_disarmed(monkeypatch):
+    reset_calls: list[int | None] = []
+
+    class _Backend:
+        def reset_faults(self, *, logical_joint_index: int | None = None):
+            reset_calls.append(logical_joint_index)
+            return True
+
+    completed_motion = {
+        "accepted": True,
+        "state": "completed",
+        "completion_scope": "rtcore_execution",
+        "trajectory_id": 0,
+        "source_of_truth": "rtcore",
+        "safe_for_power_transition": True,
+        "power_transition_blockers": [],
+        "power_transition_blocker_details": [],
+        "execution": {
+            "controller_thread_running": False,
+            "rtcore_status_present": True,
+            "safe_for_power_transition": True,
+            "power_transition_blockers": [],
+            "power_transition_blocker_details": [],
+        },
+    }
+
+    monkeypatch.setattr(command_api, "handle_stop_command", lambda: None)
+    monkeypatch.setattr(command_api, "handle_wait_for_idle", lambda timeout_s=30.0: dict(completed_motion))
+    monkeypatch.setattr(command_api.backend_registry, "get_active_backend", lambda: _Backend())
+    monkeypatch.setattr(command_api, "get_motion_execution_status", lambda: dict(completed_motion))
+
+    result = command_api.handle_reset_faults(logical_joint_index=1)
+
+    assert result["accepted"] is True
+    assert result["code"] == "RESET_FAULTS_SENT"
+    assert result["disarmed_after_reset"] is True
+    assert result["joint"] == 2
+    assert reset_calls == [1]
+
+
+def test_handle_stop_command_skips_legacy_brake_write_for_rtcore_backend(monkeypatch):
+    servo_writes: list[list[float]] = []
+    aborted: list[str] = []
+    jog_stops: list[str] = []
+
+    class _Backend:
+        def abort_trajectory(self):
+            aborted.append("abort")
+
+        def get_execution_status(self):
+            return object()
+
+    monkeypatch.setattr(command_api.utils, "trajectory_state_update", lambda **kwargs: None)
+    monkeypatch.setattr(command_api.utils, "trajectory_state_set", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(command_api.utils, "trajectory_state_snapshot", lambda: {})
+    monkeypatch.setattr(command_api.utils, "set_motion_state", lambda _state: None)
+    monkeypatch.setattr(command_api, "_program_status_from_snapshot", lambda _snapshot: None)
+    monkeypatch.setattr(command_api, "stop_active_jog_session", lambda reason="controller-stop": jog_stops.append(str(reason)) or {})
+    monkeypatch.setattr(command_api.backend_registry, "get_active_backend", lambda: _Backend())
+    monkeypatch.setattr(command_api.servo_driver, "get_current_arm_state_rad", lambda verbose=False: [0.1] * 6)
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "set_servo_positions",
+        lambda logical_joint_angles_rad, speed_value, acceleration_value_deg_s2: servo_writes.append(list(logical_joint_angles_rad)),
+    )
+
+    command_api.handle_stop_command()
+
+    assert jog_stops == ["controller-stop"]
+    assert aborted == ["abort"]
+    assert servo_writes == []
