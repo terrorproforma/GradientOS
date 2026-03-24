@@ -63,3 +63,36 @@ def test_attach_drive_faults_to_telemetry_message_uses_servo_backend(monkeypatch
         }
     ]
     assert msg["drive_faults"] == {"driver_state": "ACTIVE"}
+
+
+def test_build_monitor_motion_status_payload_returns_controller_snapshot(monkeypatch):
+    payload = {
+        "accepted": True,
+        "state": "executing",
+        "trajectory_id": 9,
+        "execution": {"state_name": "queued"},
+    }
+    monkeypatch.setattr(
+        run_controller.command_api,
+        "get_motion_execution_status",
+        lambda: payload,
+    )
+
+    result = run_controller._build_monitor_motion_status_payload()
+
+    assert result == payload
+
+
+def test_build_monitor_motion_status_payload_fails_closed(monkeypatch):
+    monkeypatch.setattr(
+        run_controller.command_api,
+        "get_motion_execution_status",
+        lambda: "not-a-dict",
+    )
+    assert run_controller._build_monitor_motion_status_payload() is None
+
+    def _boom():
+        raise RuntimeError("monitor unavailable")
+
+    monkeypatch.setattr(run_controller.command_api, "get_motion_execution_status", _boom)
+    assert run_controller._build_monitor_motion_status_payload() is None

@@ -1,4 +1,6 @@
 import {
+  Suspense,
+  lazy,
   useCallback,
   useEffect,
   useMemo,
@@ -8,7 +10,6 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import * as THREE from "three";
 import {
   Camera,
   CameraOff,
@@ -34,7 +35,6 @@ import {
 } from "lucide-react";
 import { resolveDefaultApiHost, resolveDefaultVisionHost } from "./useEndpoint";
 import {
-  ArmVisualizer,
   type ArmVisualizerHandle,
   type StepLoadStatus,
   type TopologyEdgeOverlay,
@@ -55,6 +55,7 @@ import {
 import { SidebarRail, type SidebarItem } from "./components/SidebarRail";
 import { SidebarDrawer } from "./components/SidebarDrawer";
 import { ProgramFeatureTree } from "./components/ProgramFeatureTree";
+import { LiveStateProvider, LIVE_MONITOR_STALE_MS } from "./liveState";
 
 type Alert = {
   level: "error" | "warning" | "info";
@@ -166,6 +167,8 @@ type TelemetryEvent = {
   drive_faults?: DriveFaultSnapshot | null;
   weld_active?: boolean;
   weld_type?: string;
+  comms?: Record<string, unknown>;
+  motion_status?: MotionStatusResponse | null;
 };
 
 type MotionExecutionPayload = {
@@ -216,7 +219,7 @@ type MotionStatusResponse = {
   program?: ProgramStatusPayload;
 };
 
-const LIVE_JOINT_FALLBACK_MAX_AGE_S = 1 / 50;
+const LIVE_JOINT_FALLBACK_MAX_AGE_S = LIVE_MONITOR_STALE_MS / 1000;
 const TERMINAL_MOTION_STATES = new Set(["idle", "completed", "aborted", "faulted", "underrun", "timeout"]);
 
 function areJointArraysClose(a: number[] | undefined, b: number[]): boolean {
@@ -700,6 +703,10 @@ function angleFromPointer(
 const SETTINGS_STORAGE_KEY = "gradient-ui:settings";
 // Keep initial visualizer identity stable before runtime snapshot hydration completes.
 const DEFAULT_VISUALIZER_ROBOT_ID = "gradient-05";
+const LazyArmVisualizer = lazy(async () => {
+  const module = await import("./ArmVisualizer");
+  return { default: module.ArmVisualizer };
+});
 const DEFAULT_STEP_TRANSFORM: StepTransform = {
   position: { x: 0, y: 0, z: 0 },
   rotationDeg: { x: 0, y: 0, z: 0 },
@@ -960,34 +967,76 @@ function computeTopologyOffset(edges: TopologyEdgeOverlay[]): Point3 | null {
   };
 }
 
-function buildStepTransformMatrix(transform: StepTransform): THREE.Matrix4 {
+type StepTransformMatrix = {
+  position: Point3;
+  scale: number;
+  quaternion: { x: number; y: number; z: number; w: number };
+};
+
+function degToRad(value: number): number {
+  return (value * Math.PI) / 180;
+}
+
+function buildStepTransformMatrix(transform: StepTransform): StepTransformMatrix {
   const safeScale = Number.isFinite(transform.scale) ? Math.max(1e-4, transform.scale) : 1;
-  const position = new THREE.Vector3(
-    transform.position.x,
-    transform.position.y,
-    transform.position.z,
-  );
-  const rotation = new THREE.Euler(
-    THREE.MathUtils.degToRad(transform.rotationDeg.x),
-    THREE.MathUtils.degToRad(transform.rotationDeg.y),
-    THREE.MathUtils.degToRad(transform.rotationDeg.z),
-    "XYZ",
-  );
-  const quaternion = new THREE.Quaternion().setFromEuler(rotation);
-  const scale = new THREE.Vector3(safeScale, safeScale, safeScale);
-  return new THREE.Matrix4().compose(position, quaternion, scale);
+  const x = degToRad(transform.rotationDeg.x) * 0.5;
+  const y = degToRad(transform.rotationDeg.y) * 0.5;
+  const z = degToRad(transform.rotationDeg.z) * 0.5;
+  const c1 = Math.cos(x);
+  const c2 = Math.cos(y);
+  const c3 = Math.cos(z);
+  const s1 = Math.sin(x);
+  const s2 = Math.sin(y);
+  const s3 = Math.sin(z);
+  return {
+    position: {
+      x: transform.position.x,
+      y: transform.position.y,
+      z: transform.position.z,
+    },
+    scale: safeScale,
+    quaternion: {
+      x: s1 * c2 * c3 + c1 * s2 * s3,
+      y: c1 * s2 * c3 - s1 * c2 * s3,
+      z: c1 * c2 * s3 + s1 * s2 * c3,
+      w: c1 * c2 * c3 - s1 * s2 * s3,
+    },
+  };
+}
+
+function rotatePointByQuaternion(
+  point: Point3,
+  quaternion: StepTransformMatrix["quaternion"],
+): Point3 {
+  const { x, y, z, w } = quaternion;
+  const ix = w * point.x + y * point.z - z * point.y;
+  const iy = w * point.y + z * point.x - x * point.z;
+  const iz = w * point.z + x * point.y - y * point.x;
+  const iw = -x * point.x - y * point.y - z * point.z;
+
+  return {
+    x: ix * w + iw * -x + iy * -z - iz * -y,
+    y: iy * w + iw * -y + iz * -x - ix * -z,
+    z: iz * w + iw * -z + ix * -y - iy * -x,
+  };
 }
 
 function transformTopologyPointToScene(
   point: Point3,
   topologyOffset: Point3 | null,
-  stepMatrix: THREE.Matrix4,
+  stepMatrix: StepTransformMatrix,
 ): Point3 {
-  const localX = topologyOffset ? point.x - topologyOffset.x : point.x;
-  const localY = topologyOffset ? point.y - topologyOffset.y : point.y;
-  const localZ = topologyOffset ? point.z - topologyOffset.z : point.z;
-  const scenePoint = new THREE.Vector3(localX, localY, localZ).applyMatrix4(stepMatrix);
-  return { x: scenePoint.x, y: scenePoint.y, z: scenePoint.z };
+  const localPoint = {
+    x: (topologyOffset ? point.x - topologyOffset.x : point.x) * stepMatrix.scale,
+    y: (topologyOffset ? point.y - topologyOffset.y : point.y) * stepMatrix.scale,
+    z: (topologyOffset ? point.z - topologyOffset.z : point.z) * stepMatrix.scale,
+  };
+  const rotated = rotatePointByQuaternion(localPoint, stepMatrix.quaternion);
+  return {
+    x: rotated.x + stepMatrix.position.x,
+    y: rotated.y + stepMatrix.position.y,
+    z: rotated.z + stepMatrix.position.z,
+  };
 }
 
 async function fileToBase64(file: File): Promise<string> {
@@ -3544,6 +3593,8 @@ function AlertsPanel({
       : lvl === "warning"
       ? "border-amber-500/50 bg-amber-500/10 text-amber-100"
       : "border-cyan-500/40 bg-cyan-500/10 text-cyan-100";
+  const emphasisFor = (alert: Alert) =>
+    alert.kind === "JOINT_LIMIT" ? "ring-1 ring-amber-300/40 shadow-lg shadow-amber-900/20" : "";
   const iconFor = (lvl: Alert["level"]) =>
     lvl === "error" ? <Octagon size={16} /> : lvl === "warning" ? <Octagon size={16} /> : <Octagon size={16} />;
   return (
@@ -3551,11 +3602,22 @@ function AlertsPanel({
       {alerts.slice(-4).map((a, idx) => (
         <div
           key={`${a.kind}:${a.ts ?? idx}:${idx}`}
-          className={`flex items-start gap-2 rounded-lg border px-3 py-2 text-sm shadow-md ${colorFor(a.level)}`}
+          className={`flex items-start gap-2 rounded-lg border px-3 py-2 text-sm shadow-md ${colorFor(a.level)} ${emphasisFor(a)}`}
         >
           <div className="mt-0.5 shrink-0">{iconFor(a.level)}</div>
           <div className="flex-1">
+            {a.kind === "JOINT_LIMIT" ? (
+              <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-current/80">
+                Joint Limit Warning
+              </div>
+            ) : null}
             <div className="font-medium">{a.message}</div>
+            {Array.isArray((a.details as { joint_labels?: unknown } | undefined)?.joint_labels) &&
+            ((a.details as { joint_labels?: unknown[] }).joint_labels?.length ?? 0) > 0 ? (
+              <div className="text-xs opacity-90">
+                Joints: {((a.details as { joint_labels?: unknown[] }).joint_labels ?? []).map((value) => String(value)).join(", ")}
+              </div>
+            ) : null}
             {a.servo_ids && a.servo_ids.length > 0 && (
               <div className="text-xs opacity-75">Servos: {a.servo_ids.join(", ")}</div>
             )}
@@ -3574,33 +3636,14 @@ function AlertsPanel({
   );
 }
 
-function normalizeHealthProbeMessage(raw: string, fallback: string): string {
-  const text = raw.trim();
-  if (!text) {
-    return fallback;
-  }
-  try {
-    const payload = JSON.parse(text) as { detail?: unknown; message?: unknown };
-    if (typeof payload.detail === "string" && payload.detail.trim()) {
-      return payload.detail.trim();
-    }
-    if (typeof payload.message === "string" && payload.message.trim()) {
-      return payload.message.trim();
-    }
-  } catch {
-    // Ignore JSON parsing failures and use the raw body.
-  }
-  return text;
-}
-
 export default function App() {
   const [apiHost, setApiHost] = useState(() => resolveDefaultApiHost());
   const [visionHost, setVisionHost] = useState(() => resolveDefaultVisionHost());
   const [settings, setSettings] = useState<PersistedSettings>(() => loadPersistedSettings());
+  const [isVisualizerEnabled, setIsVisualizerEnabled] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [latest, setLatest] = useState<TelemetryEvent | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [apiHealthError, setApiHealthError] = useState<string | null>(null);
   const [visionError, setVisionError] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsDialogTab>("general");
@@ -3667,6 +3710,7 @@ export default function App() {
   const [isWeldProgramListLoading, setIsWeldProgramListLoading] = useState(false);
   const [isSavingWeldProgram, setIsSavingWeldProgram] = useState(false);
   const [isLoadingWeldProgram, setIsLoadingWeldProgram] = useState(false);
+  const [liveClockMs, setLiveClockMs] = useState(() => Date.now());
   const [pendingWeldProgramRestore, setPendingWeldProgramRestore] = useState<{
     weldDraft: WeldDraft;
     editableWaypoints: Point3[];
@@ -4471,11 +4515,13 @@ export default function App() {
     let joints: number[] | undefined;
     let gripper: number | undefined;
     let servos: Record<string, ServoSample> | undefined;
-      let parsedAlerts: Alert[] | undefined;
-      let driveFaultsValue: DriveFaultSnapshot | null = null;
+    let parsedAlerts: Alert[] | undefined;
+    let driveFaultsValue: DriveFaultSnapshot | null = null;
     let weldActiveValue: boolean | undefined;
     let weldTypeValue: string | undefined;
     let sourceTimeSec: number | undefined;
+    let commsValue: Record<string, unknown> | undefined;
+    let motionStatusValue: MotionStatusResponse | null = null;
 
     try {
       const parsed = JSON.parse(payload);
@@ -4550,6 +4596,12 @@ export default function App() {
         if (typeof maybeObj.weld_type === "string" && maybeObj.weld_type.trim()) {
           weldTypeValue = maybeObj.weld_type.trim();
         }
+        if (maybeObj.comms && typeof maybeObj.comms === "object") {
+          commsValue = maybeObj.comms as Record<string, unknown>;
+        }
+        if (maybeObj.motion_status && typeof maybeObj.motion_status === "object") {
+          motionStatusValue = maybeObj.motion_status as MotionStatusResponse;
+        }
       }
     } catch {
       // fall back to raw payload only
@@ -4565,6 +4617,8 @@ export default function App() {
       drive_faults: driveFaultsValue,
       weld_active: weldActiveValue,
       weld_type: weldTypeValue,
+      comms: commsValue,
+      motion_status: motionStatusValue,
     };
 
     const candidateTimeSec = sourceTimeSec ?? next.timestamp / 1000;
@@ -4605,6 +4659,9 @@ export default function App() {
       // power controls do not flicker back to an indeterminate/disarmed UI.
       drive_faults: next.drive_faults ?? prev?.drive_faults ?? null,
     }));
+    if (motionStatusValue) {
+      setMotionStatus(motionStatusValue);
+    }
     // Merge alerts into state (keep last 20)
     if (Array.isArray(next.alerts) && next.alerts.length > 0) {
       setAlerts((prev) => {
@@ -4652,7 +4709,7 @@ export default function App() {
       const nextJoints = anglesDeg
         .map((value) => Number(value))
         .filter((value) => Number.isFinite(value))
-        .map((value) => THREE.MathUtils.degToRad(value));
+        .map((value) => degToRad(value));
       if (nextJoints.length === 0) {
         return;
       }
@@ -4667,7 +4724,7 @@ export default function App() {
 
       const nextGripper =
         typeof gripperDeg === "number" && Number.isFinite(gripperDeg)
-          ? THREE.MathUtils.degToRad(gripperDeg)
+          ? degToRad(gripperDeg)
           : undefined;
 
       lastAcceptedJointsRef.current = nextJoints.slice();
@@ -4703,41 +4760,13 @@ export default function App() {
   }, [connect, disconnect, isConnected]);
 
   useEffect(() => {
-    let disposed = false;
-    let inFlight = false;
-    const tick = async () => {
-      if (disposed || inFlight) {
-        return;
-      }
-      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
-        return;
-      }
-      inFlight = true;
-      try {
-        const response = await fetch(`${normalizedApiHost}/control/motion-status`);
-        if (!response.ok) {
-          return;
-        }
-        const payload = (await response.json()) as MotionStatusResponse;
-        if (!disposed) {
-          setMotionStatus(payload);
-        }
-      } catch {
-        // Keep the last known status when the poll misses; other UI health
-        // paths already surface broader connectivity problems.
-      } finally {
-        inFlight = false;
-      }
-    };
-    void tick();
     const timer = window.setInterval(() => {
-      void tick();
-    }, 200);
+      setLiveClockMs(Date.now());
+    }, 250);
     return () => {
-      disposed = true;
       window.clearInterval(timer);
     };
-  }, [normalizedApiHost]);
+  }, []);
 
   const toggleVision = useCallback(() => {
     if (isVisionActive) {
@@ -5791,47 +5820,6 @@ export default function App() {
       });
   }, [fetchToolLibrarySnapshot, isSettingsOpen]);
 
-  // Lightweight API health probe to surface clearer 5xx reasons
-  useEffect(() => {
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const r = await fetch(`${normalizedApiHost}/health`, { method: "GET" });
-        if (!r.ok) {
-          const detail = normalizeHealthProbeMessage(await r.text(), r.statusText);
-          if (!cancelled) {
-            setApiHealthError(
-              r.status === 503
-                ? `Controller unavailable: ${detail}`
-                : `API health check failed: ${detail}`,
-            );
-          }
-          return;
-        }
-        if (!cancelled) {
-          setApiHealthError(null);
-        }
-      } catch (e) {
-        if (!cancelled) {
-          setApiHealthError("API unreachable. Check that gradient-api is running.");
-        }
-      }
-    };
-    const id = window.setInterval(tick, 5000);
-    tick(); // immediate first probe
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [normalizedApiHost]);
-  useEffect(() => {
-    if (
-      error === "API unreachable. Check that gradient-api is running." ||
-      error?.startsWith("API /health ")
-    ) {
-      setError(null);
-    }
-  }, [error]);
   useEffect(() => {
     persistSettings(settings);
   }, [settings]);
@@ -5992,6 +5980,20 @@ export default function App() {
     () => (isConnected ? "Streaming" : "Disconnected"),
     [isConnected],
   );
+  const monitorLastMessageAtMs = latest?.timestamp ?? null;
+  const monitorFreshnessMs = monitorLastMessageAtMs === null
+    ? null
+    : Math.max(0, liveClockMs - monitorLastMessageAtMs);
+  const isMonitorFresh = monitorFreshnessMs !== null && monitorFreshnessMs <= LIVE_MONITOR_STALE_MS;
+  const apiHealthError = !isConnected
+    ? (
+        error === "Connection lost. Ensure the API is reachable and CORS allows this origin."
+          ? "API unreachable. Check that gradient-api is running."
+          : null
+      )
+    : (monitorLastMessageAtMs !== null && !isMonitorFresh
+        ? `Controller telemetry stale (${Math.round(monitorFreshnessMs ?? 0)} ms).`
+        : null);
   const headerAlert = [error, visionError].filter(Boolean).join(" • ");
   const hasHeaderAlert = headerAlert.length > 0;
   const alertTone = error ? "rose" : "amber";
@@ -6308,11 +6310,37 @@ export default function App() {
             />
           )
         : activePanel === "telemetry"
-          ? <TelemetryWorkspace latest={latest} apiHost={normalizedApiHost} />
+          ? <TelemetryWorkspace />
         : null;
+  const liveStateValue = useMemo(
+    () => ({
+      apiHost: normalizedApiHost,
+      latest,
+      motionStatus,
+      setMotionStatus,
+      isConnected,
+      monitorLastMessageAtMs,
+      monitorFreshnessMs,
+      isMonitorFresh,
+      monitorError: error,
+      apiHealthError,
+    }),
+    [
+      apiHealthError,
+      error,
+      isConnected,
+      isMonitorFresh,
+      latest,
+      monitorFreshnessMs,
+      monitorLastMessageAtMs,
+      motionStatus,
+      normalizedApiHost,
+    ],
+  );
 
   return (
-    <div className="flex min-h-screen flex-col bg-gradient-to-b from-slate-900/80 via-slate-950 to-black text-slate-100">
+    <LiveStateProvider value={liveStateValue}>
+      <div className="flex min-h-screen flex-col bg-gradient-to-b from-slate-900/80 via-slate-950 to-black text-slate-100">
       <header className="relative flex flex-col gap-2 border-b border-slate-800/40 bg-slate-950/60 px-6 py-2.5 shadow-inner shadow-slate-900/40 backdrop-blur">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-col shrink-0">
@@ -6465,35 +6493,76 @@ export default function App() {
         </div>
       </header>
       <main className="relative flex-1 overflow-hidden">
-        <ArmVisualizer
-          robotId={visualizerRobotId}
-          activeTool={visualizerTool}
-          ref={visualizerRef}
-          joints={latest?.joints}
-          showBoundingBox={showBoundingBox}
-          selectionMode={isPlanning && !isPlanLoading}
-          onPointSelected={handlePointSelected}
-          weldSelectionMode={weldSelectionMode}
-          topologyEdges={topologyOverlays}
-          selectedTopologyEdgeId={activeWeldSegment?.edgeId ?? null}
-          selectedTopologyEdgeIds={selectedTopologyEdgeIds}
-          onTopologyEdgeSelected={handleTopologyEdgeSelected}
-          weldActive={weldActive}
-          weldIndicatorPoint={weldIndicatorPoint}
-          weldStartPoint={weldStartPoint}
-          weldStopPoint={weldStopPoint}
-          weldSegmentPoints={weldSegmentPoints}
-          showEndEffectorFrame={showEndEffectorFrame}
-          weldAnglePreview={weldAnglePreview}
-          weldGhostJoints={weldPreviewGhostJoints}
-          pathPoints={visualPathPoints}
-          waypoints={visualWaypoints}
-          highlightPathRange={selectedProgramPathRange}
-          highlightWaypointIndices={selectedProgramWaypointIndices}
-          stepFile={stepFile}
-          stepTransform={stepTransform}
-          onStepStatusChange={setStepLoadStatus}
-        />
+        {isVisualizerEnabled ? (
+          <Suspense
+            fallback={
+              <div className="absolute inset-0 flex items-center justify-center bg-slate-950/80">
+                <div className="rounded-2xl border border-cyan-500/20 bg-slate-950/85 px-5 py-4 text-sm text-slate-200 shadow-2xl shadow-black/40">
+                  Loading 3D workspace...
+                </div>
+              </div>
+            }
+          >
+            <LazyArmVisualizer
+              robotId={visualizerRobotId}
+              activeTool={visualizerTool}
+              ref={visualizerRef}
+              joints={latest?.joints}
+              showBoundingBox={showBoundingBox}
+              selectionMode={isPlanning && !isPlanLoading}
+              onPointSelected={handlePointSelected}
+              weldSelectionMode={weldSelectionMode}
+              topologyEdges={topologyOverlays}
+              selectedTopologyEdgeId={activeWeldSegment?.edgeId ?? null}
+              selectedTopologyEdgeIds={selectedTopologyEdgeIds}
+              onTopologyEdgeSelected={handleTopologyEdgeSelected}
+              weldActive={weldActive}
+              weldIndicatorPoint={weldIndicatorPoint}
+              weldStartPoint={weldStartPoint}
+              weldStopPoint={weldStopPoint}
+              weldSegmentPoints={weldSegmentPoints}
+              showEndEffectorFrame={showEndEffectorFrame}
+              weldAnglePreview={weldAnglePreview}
+              weldGhostJoints={weldPreviewGhostJoints}
+              pathPoints={visualPathPoints}
+              waypoints={visualWaypoints}
+              highlightPathRange={selectedProgramPathRange}
+              highlightWaypointIndices={selectedProgramWaypointIndices}
+              stepFile={stepFile}
+              stepTransform={stepTransform}
+              onStepStatusChange={setStepLoadStatus}
+            />
+          </Suspense>
+        ) : (
+          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.12),transparent_32%),linear-gradient(180deg,rgba(2,6,23,0.88),rgba(2,6,23,1))]">
+            <div className="pointer-events-none flex h-full items-center justify-center px-6">
+              <div className="pointer-events-auto max-w-xl rounded-2xl border border-slate-700/70 bg-slate-950/88 p-6 shadow-2xl shadow-black/40 backdrop-blur">
+                <div className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-300/80">
+                  Lightweight startup
+                </div>
+                <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-50">
+                  Control UI loaded with 3D paused
+                </h2>
+                <p className="mt-3 max-w-lg text-sm leading-6 text-slate-300">
+                  The robot visualizer is the heaviest part of the page on this device. It now
+                  stays paused until you ask for it, so the rest of the UI can open reliably.
+                </p>
+                <div className="mt-5 flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => setIsVisualizerEnabled(true)}
+                    className="rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-sm font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-400/20"
+                  >
+                    Load 3D Workspace
+                  </button>
+                  <span className="text-xs text-slate-400">
+                    Jog, telemetry, settings, and the control panel stay available without it.
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
         <SidebarRail
           items={sidebarItems}
           activeItemId={activePanel}
@@ -6658,6 +6727,7 @@ export default function App() {
         onResetOffsets={handleResetRuntimeOffsets}
         onClose={() => setIsSettingsOpen(false)}
       />
-    </div>
+      </div>
+    </LiveStateProvider>
   );
 }

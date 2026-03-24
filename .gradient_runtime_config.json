@@ -2,17 +2,17 @@
   "version": 1,
   "desired": {
     "robot": "gradient05",
-    "active_tool_id": "tool-1774055759338",
+    "active_tool_id": "tool-1774284997294",
     "allow_unsafe_overrides": false,
     "overrides": {
       "ik_solver_backend": null,
       "servo_backend": null,
       "drive_profile": null,
-      "rt_max_rpm": 6000
+      "rt_max_rpm": 6000.0
     }
   },
   "meta": {
-    "updated_at": "2026-03-21T02:30:00+00:00",
-    "updated_by": "assistant"
+    "updated_at": "2026-03-23T16:59:22+00:00",
+    "updated_by": "web-ui"
   }
 }

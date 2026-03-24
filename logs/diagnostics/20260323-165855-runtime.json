@@ -1,0 +1,475 @@
+{
+  "collected_at": "2026-03-23T16:58:54.956373+00:00",
+  "disk": {
+    "project_root": {
+      "free_bytes": 17159782400,
+      "path": "/home/pi/GradientOS",
+      "total_bytes": 30423937024,
+      "used_bytes": 11967234048
+    },
+    "tmp": {
+      "free_bytes": 17159782400,
+      "path": "/tmp",
+      "total_bytes": 30423937024,
+      "used_bytes": 11967234048
+    }
+  },
+  "host": {
+    "boot_id": "76163a01-a511-4174-aa13-78ecbafb9053",
+    "cwd": "/home/pi/GradientOS",
+    "hostname": "RevPi158236",
+    "loadavg": {
+      "15m": 2.49560546875,
+      "1m": 3.31005859375,
+      "5m": 3.14892578125
+    },
+    "pid": 41866,
+    "platform": "Linux-6.12.56-revpi1-rpi-v8-aarch64-with-glibc2.36",
+    "project_root": "/home/pi/GradientOS",
+    "python": "3.11.2",
+    "uptime_s": 4941.84
+  },
+  "kernel_hints": {
+    "matches": [
+      "2026-03-23T16:27:51+0000 RevPi158236 kernel: EtherCAT 0: Link state of ecm0 changed to UP.",
+      "2026-03-23T16:28:01+0000 RevPi158236 kernel: EtherCAT 0: Domain 0: Working counter changed to 2/18.",
+      "2026-03-23T16:28:02+0000 RevPi158236 kernel: EtherCAT 0: Domain 0: 3 working counter changes - now 6/18.",
+      "2026-03-23T16:28:03+0000 RevPi158236 kernel: EtherCAT 0: Domain 0: 2 working counter changes - now 12/18.",
+      "2026-03-23T16:28:04+0000 RevPi158236 kernel: EtherCAT 0: Domain 0: 3 working counter changes - now 18/18."
+    ],
+    "source": "journalctl -k"
+  },
+  "latest_startup_logs": {
+    "latest_path": "/home/pi/GradientOS/logs/startups/20260323-164931",
+    "logs": {
+      "api.log": [
+        "INFO:     127.0.0.1:41588 - \"GET /control/motion-status HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:37152 - \"GET /control/motion-status HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:41588 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:41588 - \"GET /control/motion-status HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:37152 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:37152 - \"GET /control/motion-status HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:41588 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:37152 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:41588 - \"GET /control/motion-status HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:37152 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:41588 - \"GET /control/motion-status HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:41588 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:37152 - \"GET /control/motion-status HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:45748 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:37152 - \"GET /control/motion-status HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:45748 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:45748 - \"GET /control/motion-status HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:37152 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:37152 - \"GET /info/joints HTTP/1.1\" 200 OK",
+        "INFO:     127.0.0.1:45748 - \"GET /control/motion-status HTTP/1.1\" 200 OK"
+      ],
+      "controller.log": [
+        "[Controller] Received: 'GET_JOINT_ANGLES' from ('127.0.0.1', 33610)",
+        "[Controller] Received: 'GET_STATUS' from ('127.0.0.1', 42541)",
+        "[Controller] Received: 'GET_MOTION_STATUS' from ('127.0.0.1', 53741)",
+        "[Controller] Received: 'GET_MOTION_STATUS' from ('127.0.0.1', 48556)",
+        "[Controller] Received: 'GET_JOINT_ANGLES' from ('127.0.0.1', 39876)",
+        "[Controller] Received: 'GET_JOINT_ANGLES' from ('127.0.0.1', 53805)",
+        "[Controller] Received: 'GET_MOTION_STATUS' from ('127.0.0.1', 54213)",
+        "[Controller] Received: 'GET_MOTION_STATUS' from ('127.0.0.1', 53004)",
+        "[Controller] Received: 'GET_JOINT_ANGLES' from ('127.0.0.1', 41276)",
+        "[Controller] Received: 'GET_MOTION_STATUS' from ('127.0.0.1', 36493)",
+        "[Controller] Received: 'GET_JOINT_ANGLES' from ('127.0.0.1', 39280)",
+        "[Controller] Received: 'GET_STATUS' from ('127.0.0.1', 38433)",
+        "[Controller] Received: 'GET_JOINT_ANGLES' from ('127.0.0.1', 46589)",
+        "[Controller] Received: 'GET_MOTION_STATUS' from ('127.0.0.1', 45865)",
+        "[Controller] Received: 'GET_MOTION_STATUS' from ('127.0.0.1', 54479)",
+        "[Controller] Received: 'GET_JOINT_ANGLES' from ('127.0.0.1', 50212)",
+        "[Controller] Received: 'GET_MOTION_STATUS' from ('127.0.0.1', 44783)",
+        "[Controller] Received: 'GET_JOINT_ANGLES' from ('127.0.0.1', 59353)",
+        "[Controller] Received: 'GET_MOTION_STATUS' from ('127.0.0.1', 43226)",
+        "[Controller] Received: 'GET_JOINT_ANGLES' from ('127.0.0.1', 53055)"
+      ],
+      "launcher.log": [
+        "[web] > node ./scripts/sync-robot-assets.mjs",
+        "[web]",
+        "[web] [sync-robot-assets] Synced 2 robot asset bundle(s).",
+        "[web] [sync-robot-assets] Default robot: gradient-05",
+        "[web]",
+        "[web] > gradient-web-ui@0.1.0 sync:tool-assets",
+        "[web] > node ./scripts/sync-tool-assets.mjs",
+        "[web]",
+        "[web] [sync-tool-assets] Synced 3 tool definition(s).",
+        "[web]",
+        "[web] > gradient-web-ui@0.1.0 dev",
+        "[web] > vite",
+        "[web]",
+        "[web]",
+        "[web]   VITE v5.4.21  ready in 707 ms",
+        "[web]",
+        "[web]   \u279c  Local:   http://localhost:8000/",
+        "[web]   \u279c  Network: http://192.168.137.89:8000/",
+        "[2026-03-23 16:49:48+0000] [start-stack] Startup complete. Interactive console attached to this terminal.",
+        "[2026-03-23 16:49:48+0000] [start-stack] Type stop, stop --hard, probe, status, help, or press Ctrl-C."
+      ],
+      "web.log": [
+        "> gradient-web-ui@0.1.0 dev",
+        "> vite",
+        "  VITE v5.4.21  ready in 707 ms",
+        "  \u279c  Local:   http://localhost:8000/",
+        "  \u279c  Network: http://192.168.137.89:8000/",
+        "[baseline-browser-mapping] The data in this module is over two months old.  To ensure accurate Baseline data, please update: `npm i baseline-browser-mapping@latest -D`",
+        "4:50:33 PM [vite] hmr update /src/App.tsx, /src/index.css",
+        "4:50:45 PM [vite] page reload public/assets/robots/gradient-05/gradient-05.urdf",
+        "4:50:45 PM [vite] page reload public/assets/robots/gradient-05/stl-files/.gitkeep",
+        "4:50:45 PM [vite] page reload public/assets/robots/gradient-05/robot.urdf",
+        "4:50:45 PM [vite] page reload public/assets/robots/index.json",
+        "4:50:45 PM [vite] page reload public/assets/robots/mini-6dof-arm/mini-6dof-arm.urdf",
+        "4:50:45 PM [vite] page reload public/assets/robots/mini-6dof-arm/mini-6dof-arm.usd",
+        "4:50:45 PM [vite] page reload public/assets/robots/mini-6dof-arm/robot.urdf",
+        "4:50:45 PM [vite] page reload public/assets/robots/gradient-05/robot.urdf",
+        "4:50:46 PM [vite] page reload public/assets/tools/index.json",
+        "Files in the public directory are served at the root path.",
+        "Instead of /public/assets/robots/index.json, use /assets/robots/index.json.",
+        "Files in the public directory are served at the root path.",
+        "Instead of /public/assets/robots/index.json, use /assets/robots/index.json."
+      ]
+    }
+  },
+  "processes": {
+    "current_process": {
+      "command": "/home/pi/GradientOS/.venv/bin/python -m gradient_os.diagnostics.runtime_snapshot --skip-probes",
+      "group": null,
+      "name": "python",
+      "oom_score": 668,
+      "pid": 41866,
+      "ppid": 41852,
+      "state": "R (running)",
+      "threads": 1,
+      "vm_rss_bytes": 20127744,
+      "vm_size_bytes": 29753344
+    },
+    "interesting": {
+      "api": [
+        {
+          "command": "/home/pi/GradientOS/.venv/bin/python -m gradient_os.api.main",
+          "group": "api",
+          "name": "python",
+          "oom_score": 677,
+          "pid": 33208,
+          "ppid": 32891,
+          "state": "R (running)",
+          "threads": 11,
+          "vm_rss_bytes": 137494528,
+          "vm_size_bytes": 1137147904
+        }
+      ],
+      "browser": [
+        {
+          "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node --dns-result-order=ipv4first /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/out/bootstrap-fork --type=extensionHost --transformURIs --useHostProxy=false",
+          "group": "browser",
+          "name": "node",
+          "oom_score": 700,
+          "pid": 6092,
+          "ppid": 6042,
+          "state": "S (sleeping)",
+          "threads": 17,
+          "vm_rss_bytes": 416530432,
+          "vm_size_bytes": 36767350784
+        },
+        {
+          "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/out/server-main.js --start-server --host=127.0.0.1 --port 0 --connection-token-file /run/user/1000/cursor-remote-code.token.77b20c32f2812cd4cdf3092bdf5622e7 --telemetry-level off --enable-remote-auto-shutdown --accept-server-license-terms",
+          "group": "browser",
+          "name": "node",
+          "oom_score": 681,
+          "pid": 6042,
+          "ppid": 6034,
+          "state": "S (sleeping)",
+          "threads": 11,
+          "vm_rss_bytes": 188669952,
+          "vm_size_bytes": 5472030720
+        },
+        {
+          "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/extensions/node_modules/typescript/lib/typingsInstaller.js --globalTypingsCacheLocation /home/pi/.cache/typescript/5.9 --enableTelemetry --typesMapLocation /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/extensions/node_modules/typescript/lib/typesMap.json --validateDefaultNpmLocation",
+          "group": "browser",
+          "name": "node",
+          "oom_score": 672,
+          "pid": 34287,
+          "ppid": 34269,
+          "state": "S (sleeping)",
+          "threads": 7,
+          "vm_rss_bytes": 81289216,
+          "vm_size_bytes": 779882496
+        },
+        {
+          "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/out/bootstrap-fork --type=ptyHost --logsPath /home/pi/.cursor-server/data/logs/20260323T154452",
+          "group": "browser",
+          "name": "node",
+          "oom_score": 672,
+          "pid": 6148,
+          "ppid": 6042,
+          "state": "S (sleeping)",
+          "threads": 12,
+          "vm_rss_bytes": 69218304,
+          "vm_size_bytes": 5171146752
+        },
+        {
+          "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/out/bootstrap-fork --type=fileWatcher",
+          "group": "browser",
+          "name": "node",
+          "oom_score": 671,
+          "pid": 6103,
+          "ppid": 6042,
+          "state": "S (sleeping)",
+          "threads": 13,
+          "vm_rss_bytes": 64782336,
+          "vm_size_bytes": 5361651712
+        },
+        {
+          "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/extensions/markdown-language-features/dist/serverWorkerMain --node-ipc --clientProcessId=6092",
+          "group": "browser",
+          "name": "node",
+          "oom_score": 670,
+          "pid": 6230,
+          "ppid": 6092,
+          "state": "S (sleeping)",
+          "threads": 7,
+          "vm_rss_bytes": 55619584,
+          "vm_size_bytes": 751067136
+        },
+        {
+          "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node /home/pi/.cursor-server/bin/multiplex-server/3ce73d09cffc8f33c6d911e972bd0f6dabbe3e26e810844be8060e6b10987db8.js 0f92ce45-c038-4902-be7c-02bcbfc66426 0",
+          "group": "browser",
+          "name": "node",
+          "oom_score": 670,
+          "pid": 6003,
+          "ppid": 5863,
+          "state": "S (sleeping)",
+          "threads": 7,
+          "vm_rss_bytes": 46342144,
+          "vm_size_bytes": 743407616
+        },
+        {
+          "command": "/bin/bash -O extglob -c snap=$(command cat <&3) && builtin shopt -s extglob && builtin eval -- \"$snap\" && { builtin set +u 2>/dev/null || true; builtin eval \"${__CURSOR_SANDBOX_ENV_RESTORE:-}\" 2>/dev/null; builtin export PWD=\"$(builtin pwd)\"; builtin shopt -s expand_aliases 2>/dev/null; builtin eval \"$1\"; }; COMMAND_EXIT_CODE=$?; dump_bash_state >&4; builtin exit $COMMAND_EXIT_CODE -- PYTHONPATH=src \"/home/pi/GradientOS/.venv/bin/python\" -m gradient_os.diagnostics.runtime_snapshot --skip-probes",
+          "group": "browser",
+          "name": "bash",
+          "oom_score": 666,
+          "pid": 41852,
+          "ppid": 6092,
+          "state": "S (sleeping)",
+          "threads": 1,
+          "vm_rss_bytes": 5066752,
+          "vm_size_bytes": 8859648
+        }
+      ],
+      "controller": [
+        {
+          "command": "/home/pi/GradientOS/.venv/bin/python -m gradient_os.run_controller",
+          "group": "controller",
+          "name": "python",
+          "oom_score": 676,
+          "pid": 33133,
+          "ppid": 32891,
+          "state": "S (sleeping)",
+          "threads": 5,
+          "vm_rss_bytes": 117448704,
+          "vm_size_bytes": 617562112
+        }
+      ],
+      "stack": [
+        {
+          "command": "/bin/bash ./start-stack.sh",
+          "group": "stack",
+          "name": "start-stack.sh",
+          "oom_score": 666,
+          "pid": 32891,
+          "ppid": 6395,
+          "state": "S (sleeping)",
+          "threads": 1,
+          "vm_rss_bytes": 4055040,
+          "vm_size_bytes": 7892992
+        }
+      ],
+      "web": [
+        {
+          "command": "node /home/pi/GradientOS/web-ui/node_modules/.bin/vite",
+          "group": "web",
+          "name": "node",
+          "oom_score": 679,
+          "pid": 33523,
+          "ppid": 33522,
+          "state": "S (sleeping)",
+          "threads": 14,
+          "vm_rss_bytes": 161234944,
+          "vm_size_bytes": 11047526400
+        },
+        {
+          "command": "/home/pi/GradientOS/web-ui/node_modules/@esbuild/linux-arm64/bin/esbuild --service=0.21.5 --ping",
+          "group": "web",
+          "name": "esbuild",
+          "oom_score": 667,
+          "pid": 33550,
+          "ppid": 33523,
+          "state": "S (sleeping)",
+          "threads": 6,
+          "vm_rss_bytes": 13447168,
+          "vm_size_bytes": 738426880
+        },
+        {
+          "command": "sh -c vite",
+          "group": "web",
+          "name": "sh",
+          "oom_score": 666,
+          "pid": 33522,
+          "ppid": 33304,
+          "state": "S (sleeping)",
+          "threads": 1,
+          "vm_rss_bytes": 1531904,
+          "vm_size_bytes": 2527232
+        }
+      ]
+    },
+    "top_rss": [
+      {
+        "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node --dns-result-order=ipv4first /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/out/bootstrap-fork --type=extensionHost --transformURIs --useHostProxy=false",
+        "group": "browser",
+        "name": "node",
+        "oom_score": 700,
+        "pid": 6092,
+        "ppid": 6042,
+        "state": "S (sleeping)",
+        "threads": 17,
+        "vm_rss_bytes": 416530432,
+        "vm_size_bytes": 36767350784
+      },
+      {
+        "command": "tsserver[5.9.2]: semantic",
+        "group": null,
+        "name": "tsserver[5.9.2]",
+        "oom_score": 687,
+        "pid": 34269,
+        "ppid": 6092,
+        "state": "S (sleeping)",
+        "threads": 7,
+        "vm_rss_bytes": 262795264,
+        "vm_size_bytes": 942301184
+      },
+      {
+        "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/out/server-main.js --start-server --host=127.0.0.1 --port 0 --connection-token-file /run/user/1000/cursor-remote-code.token.77b20c32f2812cd4cdf3092bdf5622e7 --telemetry-level off --enable-remote-auto-shutdown --accept-server-license-terms",
+        "group": "browser",
+        "name": "node",
+        "oom_score": 681,
+        "pid": 6042,
+        "ppid": 6034,
+        "state": "S (sleeping)",
+        "threads": 11,
+        "vm_rss_bytes": 188669952,
+        "vm_size_bytes": 5472030720
+      },
+      {
+        "command": "node /home/pi/GradientOS/web-ui/node_modules/.bin/vite",
+        "group": "web",
+        "name": "node",
+        "oom_score": 679,
+        "pid": 33523,
+        "ppid": 33522,
+        "state": "S (sleeping)",
+        "threads": 14,
+        "vm_rss_bytes": 161234944,
+        "vm_size_bytes": 11047526400
+      },
+      {
+        "command": "tsserver[5.9.2]: syntax",
+        "group": null,
+        "name": "tsserver[5.9.2]",
+        "oom_score": 678,
+        "pid": 34268,
+        "ppid": 6092,
+        "state": "S (sleeping)",
+        "threads": 7,
+        "vm_rss_bytes": 148824064,
+        "vm_size_bytes": 832286720
+      },
+      {
+        "command": "/home/pi/GradientOS/.venv/bin/python -m gradient_os.api.main",
+        "group": "api",
+        "name": "python",
+        "oom_score": 677,
+        "pid": 33208,
+        "ppid": 32891,
+        "state": "R (running)",
+        "threads": 11,
+        "vm_rss_bytes": 137494528,
+        "vm_size_bytes": 1137147904
+      },
+      {
+        "command": "/home/pi/GradientOS/.venv/bin/python -m gradient_os.run_controller",
+        "group": "controller",
+        "name": "python",
+        "oom_score": 676,
+        "pid": 33133,
+        "ppid": 32891,
+        "state": "S (sleeping)",
+        "threads": 5,
+        "vm_rss_bytes": 117448704,
+        "vm_size_bytes": 617562112
+      },
+      {
+        "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/extensions/node_modules/typescript/lib/typingsInstaller.js --globalTypingsCacheLocation /home/pi/.cache/typescript/5.9 --enableTelemetry --typesMapLocation /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/extensions/node_modules/typescript/lib/typesMap.json --validateDefaultNpmLocation",
+        "group": "browser",
+        "name": "node",
+        "oom_score": 672,
+        "pid": 34287,
+        "ppid": 34269,
+        "state": "S (sleeping)",
+        "threads": 7,
+        "vm_rss_bytes": 81289216,
+        "vm_size_bytes": 779882496
+      },
+      {
+        "command": "npm run dev",
+        "group": null,
+        "name": "npm run dev",
+        "oom_score": 672,
+        "pid": 33304,
+        "ppid": 32891,
+        "state": "S (sleeping)",
+        "threads": 11,
+        "vm_rss_bytes": 71790592,
+        "vm_size_bytes": 745451520
+      },
+      {
+        "command": "/home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/node /home/pi/.cursor-server/bin/linux-arm64/b29eb4ee5f9f6d1cb2afbc09070198d3ea6ad760/out/bootstrap-fork --type=ptyHost --logsPath /home/pi/.cursor-server/data/logs/20260323T154452",
+        "group": "browser",
+        "name": "node",
+        "oom_score": 672,
+        "pid": 6148,
+        "ppid": 6042,
+        "state": "S (sleeping)",
+        "threads": 12,
+        "vm_rss_bytes": 69218304,
+        "vm_size_bytes": 5171146752
+      }
+    ]
+  },
+  "raspberry_pi": {
+    "thermal_zone0_c": 69.4,
+    "throttled": {
+      "flags": [],
+      "parsed": 0,
+      "raw": "throttled=0x0"
+    },
+    "vcgencmd_available": true,
+    "vcgencmd_temp": "temp=70.8'C"
+  },
+  "resources": {
+    "memory": {
+      "available_bytes": 6636191744,
+      "total_bytes": 8341823488,
+      "used_bytes": 1705631744,
+      "used_percent": 20.45
+    },
+    "swap": {
+      "free_bytes": 0,
+      "total_bytes": 0,
+      "used_bytes": 0,
+      "used_percent": null
+    }
+  }
+}

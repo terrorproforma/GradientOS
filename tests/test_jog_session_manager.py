@@ -47,6 +47,30 @@ def test_wrong_owner_rejected():
         )
 
 
+def test_same_owner_duplicate_start_is_not_counted_as_owner_conflict():
+    manager = JogSessionManager()
+    snapshot = manager.start_session(
+        owner_id="ui-a",
+        seq=0,
+        lease_timeout_s=0.4,
+        deadman=True,
+        velocity_vector=_vector(0.05),
+    )
+
+    with pytest.raises(JogSessionError, match="already active"):
+        manager.start_session(
+            owner_id="ui-a",
+            seq=1,
+            lease_timeout_s=0.4,
+            deadman=True,
+            velocity_vector=_vector(0.05),
+        )
+
+    after = manager.get_snapshot()
+    assert after["session_id"] == snapshot["session_id"]
+    assert after["owner_conflict_rejects"] == 0
+
+
 def test_stale_sequence_rejected():
     manager = JogSessionManager()
     snapshot = manager.start_session(
@@ -137,3 +161,63 @@ def test_pause_for_motion_resumes_only_with_valid_lease():
     resumed = manager.resume_after_motion()
     assert resumed["session_id"] == snapshot["session_id"]
     assert resumed["state"] == "expired"
+
+
+def test_resync_command_state_records_controller_owned_pose_and_joints():
+    manager = JogSessionManager()
+    manager.start_session(
+        owner_id="ui-a",
+        seq=0,
+        lease_timeout_s=0.4,
+        deadman=True,
+        velocity_vector=_vector(0.05),
+    )
+
+    snapshot = manager.resync_command_state(
+        position_m=[0.1, 0.2, 0.3],
+        orientation_matrix=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        joint_vector=[0.01, 0.02, 0.03, 0.04, 0.05, 0.06],
+        reason="jog-start",
+    )
+    control = manager.get_control_state()
+
+    assert snapshot["command_state_valid"] is True
+    assert snapshot["last_resync_reason"] == "jog-start"
+    assert snapshot["commanded_position_m"] == [0.1, 0.2, 0.3]
+    assert control["commanded_joint_vector"] == (0.01, 0.02, 0.03, 0.04, 0.05, 0.06)
+
+
+def test_accept_command_step_and_gate_failure_are_visible_in_snapshot():
+    manager = JogSessionManager()
+    manager.start_session(
+        owner_id="ui-a",
+        seq=0,
+        lease_timeout_s=0.4,
+        deadman=True,
+        velocity_vector=_vector(0.05),
+    )
+    manager.resync_command_state(
+        position_m=[0.0, 0.0, 0.0],
+        orientation_matrix=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        joint_vector=[0.0] * 6,
+        reason="jog-start",
+    )
+
+    manager.record_gate_failure(
+        reason="IK_JUMP_REJECTED",
+        details={"max_joint_step_rad": 1.2},
+    )
+    after_reject = manager.get_snapshot()
+    manager.accept_command_step(
+        position_m=[0.02, 0.0, 0.0],
+        orientation_matrix=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        joint_vector=[0.02, 0.0, 0.0, 0.0, 0.0, 0.0],
+    )
+    manager.update_following_error({"pose": {"position_error_mm": 0.5}, "joint": {"max_abs_joint_error_deg": 0.2}})
+    final_snapshot = manager.get_snapshot()
+
+    assert after_reject["last_gate_failure_reason"] == "IK_JUMP_REJECTED"
+    assert after_reject["last_gate_failure_details"]["max_joint_step_rad"] == 1.2
+    assert final_snapshot["last_gate_failure_reason"] is None
+    assert final_snapshot["commanded_position_m"] == [0.02, 0.0, 0.0]
+    assert final_snapshot["following_error_snapshot"]["pose"]["position_error_mm"] == 0.5

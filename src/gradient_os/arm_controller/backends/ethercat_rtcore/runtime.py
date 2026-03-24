@@ -25,6 +25,11 @@ RTCORE_MOTION_CAP_LEGACY_SETPOINT = 1 << 0
 RTCORE_MOTION_CAP_TRAJECTORY_UPLOAD = 1 << 1
 RTCORE_MOTION_CAP_JOG_COMMAND = 1 << 2
 
+RTCORE_JOG_STOP_REASON_NONE = 0
+RTCORE_JOG_STOP_REASON_CMD_STOP = 1
+RTCORE_JOG_STOP_REASON_TIMEOUT = 2
+RTCORE_JOG_STOP_REASON_TRAJECTORY_PREEMPT = 3
+
 RTCORE_DRIVE_PROFILE_NAME_TO_ID: dict[str, int] = {
     "a6ec_ds402": RTCORE_DRIVE_PROFILE_A6EC_DS402,
     "cia402": RTCORE_DRIVE_PROFILE_CIA402,
@@ -50,6 +55,13 @@ RTCORE_EXEC_STATE_ID_TO_NAME: dict[int, str] = {
     RTCORE_EXEC_STATE_ABORTED: "aborted",
     RTCORE_EXEC_STATE_FAULTED: "faulted",
     RTCORE_EXEC_STATE_UNDERRUN: "underrun",
+}
+
+RTCORE_JOG_STOP_REASON_ID_TO_NAME: dict[int, str] = {
+    RTCORE_JOG_STOP_REASON_NONE: "none",
+    RTCORE_JOG_STOP_REASON_CMD_STOP: "cmd_stop",
+    RTCORE_JOG_STOP_REASON_TIMEOUT: "timeout",
+    RTCORE_JOG_STOP_REASON_TRAJECTORY_PREEMPT: "trajectory_preempt",
 }
 
 
@@ -91,6 +103,14 @@ def rtcore_execution_state_id_to_name(state_code: object | None) -> str | None:
     except Exception:
         return None
     return RTCORE_EXEC_STATE_ID_TO_NAME.get(code)
+
+
+def rtcore_jog_stop_reason_id_to_name(reason_code: object | None) -> str | None:
+    try:
+        code = int(reason_code)
+    except Exception:
+        return None
+    return RTCORE_JOG_STOP_REASON_ID_TO_NAME.get(code)
 
 
 def build_rtcore_axis_scaling(robot_config: dict[str, Any]) -> dict[str, Any]:

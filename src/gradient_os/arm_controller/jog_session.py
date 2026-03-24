@@ -24,10 +24,61 @@ class JogSessionState(str, Enum):
 
 
 _TERMINAL_STATES = {JogSessionState.STOPPED, JogSessionState.EXPIRED}
+_MATRIX3_SIZE = 3
 
 
 def _zero_vector() -> tuple[float, float, float, float, float, float]:
     return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+def _normalize_position_vector(position: list[float] | tuple[float, ...]) -> tuple[float, float, float]:
+    if len(position) != 3:
+        raise JogSessionError("INVALID_POSITION", "Jog commanded position must contain 3 values.")
+    try:
+        return (
+            float(position[0]),
+            float(position[1]),
+            float(position[2]),
+        )
+    except Exception as exc:
+        raise JogSessionError("INVALID_POSITION", "Jog commanded position must be numeric.") from exc
+
+
+def _normalize_joint_vector(joint_vector: list[float] | tuple[float, ...]) -> tuple[float, ...]:
+    if len(joint_vector) == 0:
+        raise JogSessionError("INVALID_JOINT_VECTOR", "Jog commanded joints must not be empty.")
+    try:
+        return tuple(float(value) for value in joint_vector)
+    except Exception as exc:
+        raise JogSessionError("INVALID_JOINT_VECTOR", "Jog commanded joints must be numeric.") from exc
+
+
+def _normalize_orientation_matrix(
+    orientation_matrix: list[list[float]] | tuple[tuple[float, ...], ...],
+) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    if len(orientation_matrix) != _MATRIX3_SIZE:
+        raise JogSessionError("INVALID_ORIENTATION", "Jog commanded orientation must be a 3x3 matrix.")
+    rows: list[tuple[float, float, float]] = []
+    try:
+        for row in orientation_matrix:
+            if len(row) != _MATRIX3_SIZE:
+                raise JogSessionError("INVALID_ORIENTATION", "Jog commanded orientation must be a 3x3 matrix.")
+            rows.append((float(row[0]), float(row[1]), float(row[2])))
+    except JogSessionError:
+        raise
+    except Exception as exc:
+        raise JogSessionError("INVALID_ORIENTATION", "Jog commanded orientation must be numeric.") from exc
+    return (rows[0], rows[1], rows[2])
+
+
+def _json_safe_copy(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe_copy(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_safe_copy(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe_copy(item) for item in value]
+    return value
 
 
 @dataclass
@@ -51,6 +102,20 @@ class JogSessionRecord:
     last_stop_reason: str | None = None
     backend_mode: str = "controller_cartesian_loop"
     backend_timeout_s: float | None = None
+    commanded_position_m: tuple[float, float, float] | None = None
+    commanded_orientation_matrix: (
+        tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None
+    ) = None
+    commanded_joint_vector: tuple[float, ...] | None = None
+    last_accepted_target_position_m: tuple[float, float, float] | None = None
+    last_accepted_target_orientation_matrix: (
+        tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] | None
+    ) = None
+    last_resync_reason: str | None = None
+    last_resync_monotonic: float | None = None
+    following_error_snapshot: dict[str, Any] | None = None
+    last_gate_failure_reason: str | None = None
+    last_gate_failure_details: dict[str, Any] | None = None
 
     def is_live(self) -> bool:
         return self.state not in _TERMINAL_STATES
@@ -82,8 +147,8 @@ class JogSessionManager:
         with self._lock:
             current = self._record
             if current is not None and current.is_live():
-                current.owner_conflict_rejects += 1
                 if current.owner_id != owner:
+                    current.owner_conflict_rejects += 1
                     raise JogSessionError(
                         "OWNER_CONFLICT",
                         "Another jog session owner is already active.",
@@ -237,6 +302,17 @@ class JogSessionManager:
                     "gripper_velocity_deg_s": 0.0,
                     "backend_timeout_s": None,
                     "last_seq_received": -1,
+                    "command_state_valid": False,
+                    "commanded_position_m": None,
+                    "commanded_orientation_matrix": None,
+                    "commanded_joint_vector": None,
+                    "last_accepted_target_position_m": None,
+                    "last_accepted_target_orientation_matrix": None,
+                    "last_resync_reason": None,
+                    "last_resync_monotonic": None,
+                    "following_error_snapshot": None,
+                    "last_gate_failure_reason": None,
+                    "last_gate_failure_details": None,
                 }
             lease_valid = bool(record.is_live() and record.lease_deadline_monotonic > now)
             paused = record.state == JogSessionState.PAUSED_FOR_MOTION
@@ -249,7 +325,81 @@ class JogSessionManager:
                 "gripper_velocity_deg_s": float(record.gripper_velocity_deg_s) if lease_valid and not paused else 0.0,
                 "backend_timeout_s": record.backend_timeout_s,
                 "last_seq_received": int(record.last_seq_received),
+                "command_state_valid": self._command_state_valid(record),
+                "commanded_position_m": record.commanded_position_m,
+                "commanded_orientation_matrix": record.commanded_orientation_matrix,
+                "commanded_joint_vector": record.commanded_joint_vector,
+                "last_accepted_target_position_m": record.last_accepted_target_position_m,
+                "last_accepted_target_orientation_matrix": record.last_accepted_target_orientation_matrix,
+                "last_resync_reason": record.last_resync_reason,
+                "last_resync_monotonic": record.last_resync_monotonic,
+                "following_error_snapshot": _json_safe_copy(record.following_error_snapshot),
+                "last_gate_failure_reason": record.last_gate_failure_reason,
+                "last_gate_failure_details": _json_safe_copy(record.last_gate_failure_details),
             }
+
+    def resync_command_state(
+        self,
+        *,
+        position_m: tuple[float, float, float] | list[float],
+        orientation_matrix: list[list[float]] | tuple[tuple[float, ...], ...],
+        joint_vector: tuple[float, ...] | list[float],
+        reason: str,
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._lock:
+            record = self._require_live_record_locked()
+            self._set_command_state_locked(
+                record,
+                position_m=position_m,
+                orientation_matrix=orientation_matrix,
+                joint_vector=joint_vector,
+            )
+            record.last_resync_reason = str(reason or "unspecified")
+            record.last_resync_monotonic = now
+            record.last_gate_failure_reason = None
+            record.last_gate_failure_details = None
+            return self._snapshot_locked(now)
+
+    def accept_command_step(
+        self,
+        *,
+        position_m: tuple[float, float, float] | list[float],
+        orientation_matrix: list[list[float]] | tuple[tuple[float, ...], ...],
+        joint_vector: tuple[float, ...] | list[float],
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._lock:
+            record = self._require_live_record_locked()
+            self._set_command_state_locked(
+                record,
+                position_m=position_m,
+                orientation_matrix=orientation_matrix,
+                joint_vector=joint_vector,
+            )
+            record.last_gate_failure_reason = None
+            record.last_gate_failure_details = None
+            return self._snapshot_locked(now)
+
+    def update_following_error(self, following_error_snapshot: dict[str, Any] | None) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._lock:
+            record = self._require_live_record_locked()
+            record.following_error_snapshot = _json_safe_copy(following_error_snapshot)
+            return self._snapshot_locked(now)
+
+    def record_gate_failure(
+        self,
+        *,
+        reason: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._lock:
+            record = self._require_live_record_locked()
+            record.last_gate_failure_reason = str(reason or "unspecified")
+            record.last_gate_failure_details = _json_safe_copy(details or {})
+            return self._snapshot_locked(now)
 
     def _normalize_owner(self, owner_id: str) -> str:
         owner = str(owner_id or "").strip()
@@ -301,6 +451,40 @@ class JogSessionManager:
             raise JogSessionError("SESSION_INACTIVE", "Jog session is no longer active.", payload={"state": record.state.value})
         return record
 
+    def _require_live_record_locked(self) -> JogSessionRecord:
+        record = self._record
+        if record is None:
+            raise JogSessionError("SESSION_NOT_FOUND", "Jog session not found.")
+        if not record.is_live():
+            raise JogSessionError("SESSION_INACTIVE", "Jog session is no longer active.", payload={"state": record.state.value})
+        return record
+
+    def _command_state_valid(self, record: JogSessionRecord) -> bool:
+        return (
+            record.commanded_position_m is not None
+            and record.commanded_orientation_matrix is not None
+            and record.commanded_joint_vector is not None
+            and record.last_accepted_target_position_m is not None
+            and record.last_accepted_target_orientation_matrix is not None
+        )
+
+    def _set_command_state_locked(
+        self,
+        record: JogSessionRecord,
+        *,
+        position_m: tuple[float, float, float] | list[float],
+        orientation_matrix: list[list[float]] | tuple[tuple[float, ...], ...],
+        joint_vector: tuple[float, ...] | list[float],
+    ) -> None:
+        normalized_position = _normalize_position_vector(position_m)
+        normalized_orientation = _normalize_orientation_matrix(orientation_matrix)
+        normalized_joints = _normalize_joint_vector(joint_vector)
+        record.commanded_position_m = normalized_position
+        record.commanded_orientation_matrix = normalized_orientation
+        record.commanded_joint_vector = normalized_joints
+        record.last_accepted_target_position_m = normalized_position
+        record.last_accepted_target_orientation_matrix = normalized_orientation
+
     def _stop_locked(self, record: JogSessionRecord, *, reason: str) -> None:
         record.state = JogSessionState.STOPPED
         record.deadman = False
@@ -341,6 +525,17 @@ class JogSessionManager:
                 "last_stop_reason": None,
                 "stale_packet_rejects": 0,
                 "owner_conflict_rejects": 0,
+                "command_state_valid": False,
+                "commanded_position_m": None,
+                "commanded_orientation_matrix": None,
+                "commanded_joint_vector": None,
+                "last_accepted_target_position_m": None,
+                "last_accepted_target_orientation_matrix": None,
+                "last_resync_reason": None,
+                "last_resync_age_s": None,
+                "following_error_snapshot": None,
+                "last_gate_failure_reason": None,
+                "last_gate_failure_details": None,
             }
         lease_remaining_s = (
             max(0.0, float(record.lease_deadline_monotonic) - now)
@@ -348,6 +543,11 @@ class JogSessionManager:
             else 0.0
         )
         last_update_age_s = max(0.0, now - float(record.updated_monotonic))
+        last_resync_age_s = (
+            max(0.0, now - float(record.last_resync_monotonic))
+            if isinstance(record.last_resync_monotonic, (int, float))
+            else None
+        )
         return {
             "session_present": True,
             "session_active": bool(record.is_live()),
@@ -368,4 +568,15 @@ class JogSessionManager:
             "last_stop_reason": record.last_stop_reason,
             "stale_packet_rejects": int(record.stale_packet_rejects),
             "owner_conflict_rejects": int(record.owner_conflict_rejects),
+            "command_state_valid": self._command_state_valid(record),
+            "commanded_position_m": _json_safe_copy(record.commanded_position_m),
+            "commanded_orientation_matrix": _json_safe_copy(record.commanded_orientation_matrix),
+            "commanded_joint_vector": _json_safe_copy(record.commanded_joint_vector),
+            "last_accepted_target_position_m": _json_safe_copy(record.last_accepted_target_position_m),
+            "last_accepted_target_orientation_matrix": _json_safe_copy(record.last_accepted_target_orientation_matrix),
+            "last_resync_reason": record.last_resync_reason,
+            "last_resync_age_s": last_resync_age_s,
+            "following_error_snapshot": _json_safe_copy(record.following_error_snapshot),
+            "last_gate_failure_reason": record.last_gate_failure_reason,
+            "last_gate_failure_details": _json_safe_copy(record.last_gate_failure_details),
         }

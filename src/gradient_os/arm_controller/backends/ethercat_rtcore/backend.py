@@ -17,11 +17,13 @@ from .runtime import (
     RTCORE_EXEC_STATE_COMPLETED,
     RTCORE_EXEC_STATE_FAULTED,
     RTCORE_EXEC_STATE_IDLE,
+    RTCORE_JOG_STOP_REASON_NONE,
     RTCORE_MOTION_CAP_JOG_COMMAND,
     RTCORE_EXEC_STATE_UNDERRUN,
     RTCORE_MOTION_MODE_IDLE,
     rtcore_drive_profile_id_to_name,
     rtcore_execution_state_id_to_name,
+    rtcore_jog_stop_reason_id_to_name,
     rtcore_motion_mode_id_to_name,
 )
 from ....joint_zero_offsets import load_joint_zero_offsets, save_joint_zero_offsets
@@ -51,6 +53,7 @@ _MSG_STATUS_HELLO = 0x0201
 _MSG_STATUS_SNAPSHOT = 0x0202
 _MSG_STATUS_AXIS_CONFIG = 0x0203
 _MSG_STATUS_MOTION_STATE = 0x0204
+_MSG_STATUS_JOG_DEBUG = 0x0205
 
 # Command ring message types (v1)
 _MSG_CMD_ARM = 0x0101
@@ -69,6 +72,7 @@ _TRAJ_POINTF_HAS_VELOCITY = 1 << 0
 _TRAJ_POINTF_LAST_POINT = 1 << 1
 _JOG_FLAG_ACTIVE = 1 << 0
 _JOG_FLAG_STOP = 1 << 1
+_JOG_FLAG_QUICK_STOP = 1 << 2
 
 _HELLO_STRUCT = struct.Struct("<IHHIIQ4Q")  # 56 bytes
 _WELCOME_STRUCT = struct.Struct("<IHHI II 4x QQ IIII Q 4Q")  # 96 bytes (includes padding after reserved0)
@@ -88,6 +92,7 @@ _STATUS_HELLO_STRUCT = struct.Struct("<QQQIIII")
 _AXIS_CONFIG_STRUCT = struct.Struct("<II16I16d16i16B16x16d")  # 424 bytes
 _STATUS_SNAPSHOT_HEADER_STRUCT = struct.Struct("<IIIIqqQ")
 _STATUS_MOTION_STATE_STRUCT = struct.Struct("<IIQIIIIIIIIQQ")  # 64 bytes
+_STATUS_JOG_DEBUG_STRUCT = struct.Struct("<12I7Q16i16i16i16i")  # 360 bytes
 
 _TRAJECTORY_WAIT_SETTLE_MARGIN_S = 5.0
 _CMD_RING_WRITE_WAIT_S = 0.5
@@ -182,6 +187,34 @@ class RTCoreExecutionStatus:
     capability_flags: int
     active_command_seq: int
     last_update_ns: int
+
+
+@dataclass(frozen=True)
+class RTCoreJogDebugStatus:
+    num_axes: int
+    active_jog: bool
+    active_jog_axis_mask: int
+    command_sp_mask: int
+    have_hold_mask: int
+    have_jog_target_mask: int
+    snap_hold_mask: int
+    stop_arrest_mask: int
+    latest_cmd_axis_mask: int
+    latest_cmd_flags: int
+    latest_cmd_timeout_ns: int
+    sample_time_ns: int
+    active_jog_cmd_seq: int
+    latest_jog_seq_seen: int
+    active_jog_deadline_ns: int
+    last_stop_reason: int
+    last_stop_reason_name: str
+    last_stop_axis_mask: int
+    last_stop_time_ns: int
+    last_stop_cmd_seq: int
+    feedback_pos_counts: list[int]
+    hold_target_counts: list[int]
+    output_target_counts: list[int]
+    output_target_velocity_counts_per_s: list[int]
 
 
 class EthercatRTCoreBackend(ActuatorBackend):
@@ -295,6 +328,32 @@ class EthercatRTCoreBackend(ActuatorBackend):
             active_command_seq=0,
             last_update_ns=0,
         )
+        self._jog_debug_status = RTCoreJogDebugStatus(
+            num_axes=0,
+            active_jog=False,
+            active_jog_axis_mask=0,
+            command_sp_mask=0,
+            have_hold_mask=0,
+            have_jog_target_mask=0,
+            snap_hold_mask=0,
+            stop_arrest_mask=0,
+            latest_cmd_axis_mask=0,
+            latest_cmd_flags=0,
+            latest_cmd_timeout_ns=0,
+            sample_time_ns=0,
+            active_jog_cmd_seq=0,
+            latest_jog_seq_seen=0,
+            active_jog_deadline_ns=0,
+            last_stop_reason=RTCORE_JOG_STOP_REASON_NONE,
+            last_stop_reason_name=rtcore_jog_stop_reason_id_to_name(RTCORE_JOG_STOP_REASON_NONE) or "none",
+            last_stop_axis_mask=0,
+            last_stop_time_ns=0,
+            last_stop_cmd_seq=0,
+            feedback_pos_counts=[0] * _GRADIENT_MAX_AXES,
+            hold_target_counts=[0] * _GRADIENT_MAX_AXES,
+            output_target_counts=[0] * _GRADIENT_MAX_AXES,
+            output_target_velocity_counts_per_s=[0] * _GRADIENT_MAX_AXES,
+        )
 
         # Latest commanded joint positions (radians) as a safe fallback for getters.
         self._last_joint_setpoint_rad: list[float] = [0.0] * self._num_joints
@@ -381,6 +440,32 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 active_command_seq=0,
                 last_update_ns=0,
             )
+            self._jog_debug_status = RTCoreJogDebugStatus(
+                num_axes=0,
+                active_jog=False,
+                active_jog_axis_mask=0,
+                command_sp_mask=0,
+                have_hold_mask=0,
+                have_jog_target_mask=0,
+                snap_hold_mask=0,
+                stop_arrest_mask=0,
+                latest_cmd_axis_mask=0,
+                latest_cmd_flags=0,
+                latest_cmd_timeout_ns=0,
+                sample_time_ns=0,
+                active_jog_cmd_seq=0,
+                latest_jog_seq_seen=0,
+                active_jog_deadline_ns=0,
+                last_stop_reason=RTCORE_JOG_STOP_REASON_NONE,
+                last_stop_reason_name=rtcore_jog_stop_reason_id_to_name(RTCORE_JOG_STOP_REASON_NONE) or "none",
+                last_stop_axis_mask=0,
+                last_stop_time_ns=0,
+                last_stop_cmd_seq=0,
+                feedback_pos_counts=[0] * _GRADIENT_MAX_AXES,
+                hold_target_counts=[0] * _GRADIENT_MAX_AXES,
+                output_target_counts=[0] * _GRADIENT_MAX_AXES,
+                output_target_velocity_counts_per_s=[0] * _GRADIENT_MAX_AXES,
+            )
 
     def safe_power_down(self) -> bool:
         self._best_effort_safe_power_down()
@@ -397,6 +482,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def get_execution_status(self) -> RTCoreExecutionStatus:
         with self._status_lock:
             return self._execution_status
+
+    def get_jog_debug_status(self) -> RTCoreJogDebugStatus:
+        with self._status_lock:
+            return self._jog_debug_status
 
     def get_last_submitted_trajectory_id(self) -> int:
         with self._status_lock:
@@ -1256,6 +1345,65 @@ class EthercatRTCoreBackend(ActuatorBackend):
             last_update_ns=int(last_update_ns),
         )
 
+    def _parse_jog_debug_state(self, payload: bytes) -> RTCoreJogDebugStatus:
+        unpacked = _STATUS_JOG_DEBUG_STRUCT.unpack_from(payload, 0)
+        num_axes = max(0, min(int(unpacked[0]), _GRADIENT_MAX_AXES))
+        active_jog = bool(unpacked[1])
+        active_jog_axis_mask = int(unpacked[2])
+        command_sp_mask = int(unpacked[3])
+        have_hold_mask = int(unpacked[4])
+        have_jog_target_mask = int(unpacked[5])
+        snap_hold_mask = int(unpacked[6])
+        latest_cmd_axis_mask = int(unpacked[7])
+        latest_cmd_flags = int(unpacked[8])
+        last_stop_reason = int(unpacked[9])
+        last_stop_axis_mask = int(unpacked[10])
+        stop_arrest_mask = int(unpacked[11])
+        sample_time_ns = int(unpacked[12])
+        active_jog_cmd_seq = int(unpacked[13])
+        latest_jog_seq_seen = int(unpacked[14])
+        active_jog_deadline_ns = int(unpacked[15])
+        latest_cmd_timeout_ns = int(unpacked[16])
+        last_stop_time_ns = int(unpacked[17])
+        last_stop_cmd_seq = int(unpacked[18])
+        axis_start = 19
+        feedback_pos_counts = [int(value) for value in unpacked[axis_start : axis_start + _GRADIENT_MAX_AXES]]
+        hold_target_counts = [
+            int(value) for value in unpacked[axis_start + _GRADIENT_MAX_AXES : axis_start + (_GRADIENT_MAX_AXES * 2)]
+        ]
+        output_target_counts = [
+            int(value) for value in unpacked[axis_start + (_GRADIENT_MAX_AXES * 2) : axis_start + (_GRADIENT_MAX_AXES * 3)]
+        ]
+        output_target_velocity_counts_per_s = [
+            int(value) for value in unpacked[axis_start + (_GRADIENT_MAX_AXES * 3) : axis_start + (_GRADIENT_MAX_AXES * 4)]
+        ]
+        return RTCoreJogDebugStatus(
+            num_axes=num_axes,
+            active_jog=active_jog,
+            active_jog_axis_mask=active_jog_axis_mask,
+            command_sp_mask=command_sp_mask,
+            have_hold_mask=have_hold_mask,
+            have_jog_target_mask=have_jog_target_mask,
+            snap_hold_mask=snap_hold_mask,
+            stop_arrest_mask=stop_arrest_mask,
+            latest_cmd_axis_mask=latest_cmd_axis_mask,
+            latest_cmd_flags=latest_cmd_flags,
+            latest_cmd_timeout_ns=latest_cmd_timeout_ns,
+            sample_time_ns=sample_time_ns,
+            active_jog_cmd_seq=active_jog_cmd_seq,
+            latest_jog_seq_seen=latest_jog_seq_seen,
+            active_jog_deadline_ns=active_jog_deadline_ns,
+            last_stop_reason=last_stop_reason,
+            last_stop_reason_name=rtcore_jog_stop_reason_id_to_name(last_stop_reason) or f"unknown:{last_stop_reason}",
+            last_stop_axis_mask=last_stop_axis_mask,
+            last_stop_time_ns=last_stop_time_ns,
+            last_stop_cmd_seq=last_stop_cmd_seq,
+            feedback_pos_counts=feedback_pos_counts,
+            hold_target_counts=hold_target_counts,
+            output_target_counts=output_target_counts,
+            output_target_velocity_counts_per_s=output_target_velocity_counts_per_s,
+        )
+
     def _build_axis_config_from_robot_config(self, robot_config: dict) -> Optional[_AxisConfig]:
         counts_per_radian = list(robot_config.get("actuator_counts_per_radian", []))
         if not counts_per_radian:
@@ -1489,6 +1637,14 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 except Exception:
                     pass
 
+            if mtype == _MSG_STATUS_JOG_DEBUG and len(payload) >= _STATUS_JOG_DEBUG_STRUCT.size:
+                try:
+                    parsed_state = self._parse_jog_debug_state(payload)
+                    with self._status_lock:
+                        self._jog_debug_status = parsed_state
+                except Exception:
+                    pass
+
             read_idx += 1
 
         # Publish new read_idx (consumer-owned).
@@ -1526,12 +1682,12 @@ class EthercatRTCoreBackend(ActuatorBackend):
             timeout_s=timeout_s,
         )
 
-    def stop_joint_velocity_lease_jog(self) -> None:
+    def stop_joint_velocity_lease_jog(self, *, quick_stop: bool = False) -> None:
         if not self._connected:
             return
         self._send_cmd_jog(
             axis_mask=0,
-            flags=_JOG_FLAG_STOP,
+            flags=_JOG_FLAG_STOP | (_JOG_FLAG_QUICK_STOP if quick_stop else 0),
             timeout_ns=0,
             axis_qd=[0.0] * self._rt_num_axes,
         )

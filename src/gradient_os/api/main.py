@@ -17,7 +17,7 @@ import argparse
 import subprocess
 import sys
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
@@ -32,6 +32,7 @@ from ..kinematics import runtime as kinematics_runtime
 from .. import robot_assets
 from .. import runtime_config
 from .. import tool_library
+from ..diagnostics.runtime_snapshot import get_runtime_diagnostics_snapshot
 from ..arm_controller.robots import get_robot_name_by_id, list_robot_metadata
 
 try:
@@ -46,6 +47,7 @@ _REST_POSE_COMMAND = ",".join(str(value) for value in _REST_POSE_RAD)
 _ALLOWED_WELD_TYPES = {"fillet", "butt", "lap", "tack/spot", "custom"}
 _PROJECT_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _WELD_PROGRAM_DIR = os.path.join(_PROJECT_ROOT_DIR, "recorded_trajectories", "weld_programs")
+_DIAGNOSTICS_LOG_DIR = os.path.join(_PROJECT_ROOT_DIR, "logs", "diagnostics")
 _CONTROLLER_REPLY_MAX_BYTES = 65535
 _DEFAULT_MONITOR_TELEMETRY_HZ = 50
 _DEFAULT_MOVE_LINE_CLOSED_LOOP = False
@@ -128,6 +130,18 @@ def _load_rtcore_metrics_summary() -> dict[str, Any] | None:
         "motion_last_update_age_ms": raw.get("motion_last_update_age_ms"),
         "feedback_cycle_jitter_ns": raw.get("feedback_cycle_jitter_ns"),
     }
+
+
+def _pose_history_filename(exported_at: str | None = None) -> str:
+    if isinstance(exported_at, str) and exported_at.strip():
+        raw = exported_at.strip()
+        try:
+            parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            return f"{parsed.astimezone(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S')}-pose-history.json"
+    return f"{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S')}-pose-history.json"
 
 
 def _default_controller_port() -> int:
@@ -1431,18 +1445,55 @@ def create_app() -> FastAPI:
     async def info_pose():
         detail = await run_in_threadpool(_controller_call_or_503, "GET_POSITION", timeout=1.0)
         parts = detail.split(",")
-        if len(parts) < 1 or parts[0] != "CURRENT_POSE" or len(parts) < 1 + 3 + 3:
-            raise HTTPException(status_code=502, detail=f"Malformed pose reply: {detail}")
         try:
-            pos = list(map(float, parts[1:4]))
-            orient = list(map(float, parts[4:7]))
-            joint_vals = list(map(float, parts[7:]))
+            return _parse_pose_snapshot_response(detail)
         except ValueError as exc:
-            raise HTTPException(status_code=502, detail=f"Invalid pose data: {exc}") from exc
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @api.get("/debug/performance", summary="Controller/API/RTCore performance snapshot")
+    async def debug_performance():
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_PERFORMANCE_STATE", timeout=1.0)
+        try:
+            controller_payload = _parse_performance_state_response(detail)
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        try:
+            pose_detail = await run_in_threadpool(_controller_call_or_503, "GET_POSITION", timeout=1.0)
+            controller_payload["pose"] = _parse_pose_snapshot_response(pose_detail)
+        except (HTTPException, ValueError):
+            # Keep timing diagnostics available even if a pose sample misses.
+            pass
+
         return {
-            "position_m": {"x": pos[0], "y": pos[1], "z": pos[2]},
-            "orientation_euler_deg": {"roll": orient[0], "pitch": orient[1], "yaw": orient[2]},
-            "joints_deg": joint_vals,
+            "collected_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "api_udp": _get_api_command_metrics_snapshot(),
+            "controller": controller_payload,
+            "rtcore": _load_rtcore_metrics_summary(),
+        }
+
+    @api.post("/debug/pose-history", summary="Persist captured pose history locally")
+    async def debug_pose_history_save(payload: dict[str, Any] = Body(...)):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Pose history payload must be a JSON object.")
+        pose_history = payload.get("pose_history")
+        if not isinstance(pose_history, list) or len(pose_history) == 0:
+            raise HTTPException(status_code=400, detail="Pose history payload must include a non-empty 'pose_history' list.")
+
+        os.makedirs(_DIAGNOSTICS_LOG_DIR, exist_ok=True)
+        filename = _pose_history_filename(payload.get("exported_at") if isinstance(payload.get("exported_at"), str) else None)
+        output_path = os.path.join(_DIAGNOSTICS_LOG_DIR, filename)
+        stored_payload = dict(payload)
+        stored_payload["saved_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        stored_payload["sample_count"] = len(pose_history)
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(stored_payload, fh, indent=2, ensure_ascii=True)
+            fh.write("\n")
+
+        return {
+            "status": "ok",
+            "path": output_path,
+            "sample_count": len(pose_history),
         }
 
     @api.get("/info/orientation", summary="Current end-effector orientation matrix")
@@ -1492,19 +1543,13 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail=f"Malformed detailed joint reply: {detail}")
         return payload
 
-    @api.get("/debug/performance", summary="Controller/API/RTCore performance snapshot")
-    async def debug_performance():
-        detail = await run_in_threadpool(_controller_call_or_503, "GET_PERFORMANCE_STATE", timeout=1.0)
-        try:
-            controller_payload = _parse_performance_state_response(detail)
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {
-            "collected_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "api_udp": _get_api_command_metrics_snapshot(),
-            "controller": controller_payload,
-            "rtcore": _load_rtcore_metrics_summary(),
-        }
+    @api.get("/debug/runtime", summary="Host/runtime diagnostics snapshot")
+    async def debug_runtime():
+        return await run_in_threadpool(
+            get_runtime_diagnostics_snapshot,
+            _PROJECT_ROOT_DIR,
+            include_local_probes=True,
+        )
 
     @api.get("/info/gripper", summary="Gripper angle snapshot")
     async def info_gripper():
@@ -2159,15 +2204,29 @@ def create_app() -> FastAPI:
     return api
 
 
-def _parse_pose_response(detail: str) -> list[float]:
+def _parse_pose_snapshot_response(detail: str) -> dict[str, Any]:
     parts = detail.split(",")
     if len(parts) < 7 or parts[0] != "CURRENT_POSE":
         raise ValueError(f"Malformed pose reply: {detail}")
     try:
+        pos = [float(value) for value in parts[1:4]]
+        orient = [float(value) for value in parts[4:7]]
         joints = [float(value) for value in parts[7:]]
     except ValueError as exc:
-        raise ValueError("Invalid joint data from controller") from exc
-    return joints
+        raise ValueError("Invalid pose data from controller") from exc
+    return {
+        "position_m": {"x": pos[0], "y": pos[1], "z": pos[2]},
+        "orientation_euler_deg": {"roll": orient[0], "pitch": orient[1], "yaw": orient[2]},
+        "joints_deg": joints,
+    }
+
+
+def _parse_pose_response(detail: str) -> list[float]:
+    payload = _parse_pose_snapshot_response(detail)
+    joints = payload.get("joints_deg")
+    if not isinstance(joints, list):
+        raise ValueError("Pose reply did not include joint angles.")
+    return [float(value) for value in joints]
 
 
 def _coerce_waypoint_list(raw_points: Any) -> list[tuple[float, float, float]]:

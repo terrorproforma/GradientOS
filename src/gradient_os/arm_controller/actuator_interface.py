@@ -308,11 +308,16 @@ class ActuatorBackend(ABC):
             f"{self.__class__.__name__} does not support leased joint-velocity jog."
         )
 
-    def stop_joint_velocity_lease_jog(self) -> None:
+    def stop_joint_velocity_lease_jog(self, *, quick_stop: bool = False) -> None:
         """
         Exit backend-native leased joint-velocity jog mode and stop motion.
 
         Callers must check `supports_joint_velocity_lease_jog()` first.
+
+        Args:
+            quick_stop: Request a stronger fail-closed stop semantic when the
+                backend supports it. Ordinary operator-release stops should
+                normally leave this disabled.
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support leased joint-velocity jog."

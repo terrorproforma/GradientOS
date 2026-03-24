@@ -1244,6 +1244,33 @@ int main(int argc, char** argv) {
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_operational{};
   };
 
+  struct LatestJogDebug {
+    std::atomic<uint64_t> seq{0};
+    uint32_t num_axes = 0;
+    uint32_t active_jog = 0;
+    uint32_t active_jog_axis_mask = 0;
+    uint32_t command_sp_mask = 0;
+    uint32_t have_hold_mask = 0;
+    uint32_t have_jog_target_mask = 0;
+    uint32_t snap_hold_mask = 0;
+    uint32_t stop_arrest_mask = 0;
+    uint32_t latest_cmd_axis_mask = 0;
+    uint32_t latest_cmd_flags = 0;
+    uint32_t last_stop_reason = gradient::ipc::v1::JOG_STOP_REASON_NONE;
+    uint32_t last_stop_axis_mask = 0;
+    uint64_t sample_time_ns = 0;
+    uint64_t active_jog_cmd_seq = 0;
+    uint64_t latest_jog_seq_seen = 0;
+    uint64_t active_jog_deadline_ns = 0;
+    uint64_t latest_cmd_timeout_ns = 0;
+    uint64_t last_stop_time_ns = 0;
+    uint64_t last_stop_cmd_seq = 0;
+    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> feedback_pos_counts{};
+    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> hold_target_counts{};
+    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> output_target_counts{};
+    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> output_target_velocity_counts_per_s{};
+  };
+
   std::atomic<bool> armed{false};
   std::atomic<uint32_t> axis_enable_mask{0};
   std::atomic<int32_t> mode_of_operation{0}; // e.g. 8=CSP
@@ -1252,6 +1279,7 @@ int main(int argc, char** argv) {
   CommittedTrajectory committed_trajectory{};
   JogCommandRuntime latest_jog_command{};
   LatestFeedback latest_feedback{};
+  LatestJogDebug latest_jog_debug{};
   std::atomic<uint32_t> motion_active_mode{gradient::ipc::v1::MOTION_MODE_IDLE};
   std::atomic<uint32_t> motion_exec_state{gradient::ipc::v1::EXEC_STATE_IDLE};
   std::atomic<uint64_t> motion_active_traj_id{0};
@@ -1304,12 +1332,19 @@ int main(int argc, char** argv) {
     uint64_t active_jog_seq_seen = 0;
     uint64_t active_jog_cmd_seq = 0;
     uint64_t active_jog_deadline_ns = 0;
+    uint64_t latest_jog_timeout_ns = 0;
     uint64_t active_traj_start_ns = 0;
     uint64_t active_traj_cmd_seq = 0;
+    uint64_t last_jog_stop_time_ns = 0;
+    uint64_t last_jog_stop_cmd_seq = 0;
     uint32_t active_traj_axis_mask = 0;
     uint32_t active_traj_point_count = 0;
     uint32_t active_traj_segment_index = 0;
     uint32_t active_jog_axis_mask = 0;
+    uint32_t latest_jog_axis_mask = 0;
+    uint32_t latest_jog_flags = 0;
+    uint32_t last_jog_stop_reason = gradient::ipc::v1::JOG_STOP_REASON_NONE;
+    uint32_t last_jog_stop_axis_mask = 0;
     std::array<TrajectoryPointRuntime, kMaxTrajectoryPoints> active_traj_points{};
     std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> active_jog_velocity_counts_per_s{};
     std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> jog_target_counts_float{};
@@ -1359,6 +1394,8 @@ int main(int argc, char** argv) {
     std::array<AxisOffsets, gradient::ipc::v1::GRADIENT_MAX_AXES> off{};
     std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> hold_target_counts{};
     std::array<bool, gradient::ipc::v1::GRADIENT_MAX_AXES> have_hold{};
+    std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> jog_stop_quick_stop_cycles_left{};
+    std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> jog_stop_arrest_cycles_left{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> fault_reset_left{};
     struct SlaveDiagSnapshot {
       bool valid = false;
@@ -1379,6 +1416,8 @@ int main(int argc, char** argv) {
     std::array<SlaveDiagSnapshot, gradient::ipc::v1::GRADIENT_MAX_AXES> prev_slave_diag{};
     MasterDiagSnapshot prev_master_diag{};
     constexpr uint8_t kFaultResetPulseCycles = 20; // ~20ms at 1kHz
+    constexpr uint16_t kJogQuickStopCycles = 300;  // ~300ms at 1kHz
+    constexpr uint16_t kJogStopArrestCycles = 200; // ~200ms at 1kHz
     constexpr uint64_t kStartupLogIntervalNs = 1000000000ULL; // 1s
     constexpr uint64_t kStartupResetDelayNs = 1000000000ULL;  // 1s
     constexpr uint64_t kStartupDetailedDiagBaseNs = 1500000000ULL;       // 1.5s
@@ -2113,7 +2152,10 @@ int main(int argc, char** argv) {
 
         std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> target_counts{};
         std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> target_velocity_counts_per_s{};
+        std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> output_target_counts{};
+        std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> output_target_velocity_counts_per_s{};
         uint32_t sp_mask = 0;
+        uint32_t snap_jog_hold_to_feedback_mask = 0;
         const uint64_t abort_req =
             trajectory_abort_request.exchange(0, std::memory_order_acq_rel);
         if (active_trajectory &&
@@ -2136,11 +2178,19 @@ int main(int argc, char** argv) {
         const uint64_t committed_seq = committed_trajectory.seq.load(std::memory_order_acquire);
         if (committed_seq != 0 && committed_seq != active_commit_seq_seen) {
           active_commit_seq_seen = committed_seq;
+          if (active_jog) {
+            last_jog_stop_reason = gradient::ipc::v1::JOG_STOP_REASON_TRAJECTORY_PREEMPT;
+            last_jog_stop_time_ns = diag_now_ns;
+            last_jog_stop_cmd_seq = active_jog_cmd_seq;
+            last_jog_stop_axis_mask = active_jog_axis_mask;
+          }
           active_trajectory = true;
           active_jog = false;
           active_jog_axis_mask = 0;
           active_jog_deadline_ns = 0;
           have_jog_target.fill(false);
+          jog_stop_quick_stop_cycles_left.fill(0);
+          jog_stop_arrest_cycles_left.fill(0);
           active_traj_id_rt = committed_trajectory.traj_id;
           active_traj_cmd_seq = committed_trajectory.cmd_seq;
           active_traj_axis_mask = committed_trajectory.axis_mask;
@@ -2169,10 +2219,34 @@ int main(int argc, char** argv) {
         if (jog_seq != 0 && jog_seq != active_jog_seq_seen) {
           active_jog_seq_seen = jog_seq;
           active_jog_cmd_seq = latest_jog_command.cmd_seq;
+          latest_jog_axis_mask = latest_jog_command.axis_mask;
+          latest_jog_flags = latest_jog_command.flags;
+          latest_jog_timeout_ns = latest_jog_command.timeout_ns;
           const uint32_t jog_flags = latest_jog_command.flags;
           const bool stop_requested =
               (jog_flags & gradient::ipc::v1::JOG_FLAG_STOP) != 0u;
+          const bool quick_stop_requested =
+              (jog_flags & gradient::ipc::v1::JOG_FLAG_QUICK_STOP) != 0u;
           if (stop_requested) {
+            const uint32_t stop_axis_mask =
+                active_jog_axis_mask != 0 ? active_jog_axis_mask : latest_jog_command.axis_mask;
+            for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+              if ((stop_axis_mask & (1u << i)) != 0u) {
+                if (quick_stop_requested) {
+                  jog_stop_quick_stop_cycles_left[i] = std::max<uint16_t>(
+                      jog_stop_quick_stop_cycles_left[i],
+                      kJogQuickStopCycles);
+                }
+                jog_stop_arrest_cycles_left[i] = std::max<uint16_t>(
+                    jog_stop_arrest_cycles_left[i],
+                    kJogStopArrestCycles);
+              }
+            }
+            snap_jog_hold_to_feedback_mask |= stop_axis_mask;
+            last_jog_stop_reason = gradient::ipc::v1::JOG_STOP_REASON_CMD_STOP;
+            last_jog_stop_time_ns = diag_now_ns;
+            last_jog_stop_cmd_seq = active_jog_cmd_seq;
+            last_jog_stop_axis_mask = stop_axis_mask;
             active_jog = false;
             active_jog_axis_mask = 0;
             active_jog_deadline_ns = 0;
@@ -2196,6 +2270,10 @@ int main(int argc, char** argv) {
             active_jog_deadline_ns =
                 diag_now_ns + std::max<uint64_t>(latest_jog_command.timeout_ns, period);
             for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+              if ((active_jog_axis_mask & (1u << i)) != 0u) {
+                jog_stop_quick_stop_cycles_left[i] = 0;
+                jog_stop_arrest_cycles_left[i] = 0;
+              }
               active_jog_velocity_counts_per_s[i] = latest_jog_command.velocity_counts_per_s[i];
               if ((active_jog_axis_mask & (1u << i)) == 0u) {
                 have_jog_target[i] = false;
@@ -2335,6 +2413,21 @@ int main(int argc, char** argv) {
           }
 
           if (active_jog_deadline_ns != 0 && diag_now_ns > active_jog_deadline_ns) {
+            for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+              if ((active_jog_axis_mask & (1u << i)) != 0u) {
+                jog_stop_quick_stop_cycles_left[i] = std::max<uint16_t>(
+                    jog_stop_quick_stop_cycles_left[i],
+                    kJogQuickStopCycles);
+                jog_stop_arrest_cycles_left[i] = std::max<uint16_t>(
+                    jog_stop_arrest_cycles_left[i],
+                    kJogStopArrestCycles);
+              }
+            }
+            snap_jog_hold_to_feedback_mask |= active_jog_axis_mask;
+            last_jog_stop_reason = gradient::ipc::v1::JOG_STOP_REASON_TIMEOUT;
+            last_jog_stop_time_ns = diag_now_ns;
+            last_jog_stop_cmd_seq = active_jog_cmd_seq;
+            last_jog_stop_axis_mask = active_jog_axis_mask;
             active_jog = false;
             active_jog_axis_mask = 0;
             active_jog_deadline_ns = 0;
@@ -2398,6 +2491,14 @@ int main(int argc, char** argv) {
         }
 
         // Per-axis DS402 sequencing + CSP targets.
+        uint32_t have_hold_mask = 0;
+        uint32_t have_jog_target_mask = 0;
+        uint32_t stop_arrest_mask = 0;
+        for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+          if (jog_stop_arrest_cycles_left[i] > 0) {
+            stop_arrest_mask |= (1u << i);
+          }
+        }
         for (uint32_t i = 0; i < opt.num_axes; ++i) {
           uint8_t* axis_pd = opt.split_domains_per_axis ? axis_domain_pd[i] : domain_pd;
           const uint16_t sw = EC_READ_U16(axis_pd + off[i].sw);
@@ -2425,6 +2526,9 @@ int main(int argc, char** argv) {
           if (!startup_passive_active) {
             const bool want_enable = is_armed && ((en_mask & (1u << i)) != 0u);
             bool want_fault_reset = (fault_reset_left[i] > 0);
+            const bool want_jog_quick_stop =
+                want_enable && (jog_stop_quick_stop_cycles_left[i] > 0) &&
+                !active_jog && !active_trajectory;
             if (want_fault_reset && st != gradient::ds402::State::Fault) {
               // Stop pulsing once the drive leaves FAULT (or if it never was in FAULT).
               fault_reset_left[i] = 0;
@@ -2435,6 +2539,18 @@ int main(int argc, char** argv) {
             // - While not operation-enabled (or not wanting enable), keep the target aligned to feedback
             //   so we don't present a "big step" when DS402 transitions to OperationEnabled (manual: Er87.*).
             // - Once operation-enabled, latch once, then track commanded targets with optional per-cycle clamp.
+            if ((snap_jog_hold_to_feedback_mask & (1u << i)) != 0u) {
+              // When jog stops or expires we must immediately collapse the CSP hold target
+              // onto live feedback, otherwise the axis can keep chasing the last jog target.
+              hold_target_counts[i] = pos;
+              have_hold[i] = true;
+            }
+            if (jog_stop_arrest_cycles_left[i] > 0) {
+              // Briefly keep re-latching hold to live feedback after a jog stop/timeout so
+              // the drive does not keep chasing a stale frozen CSP target.
+              hold_target_counts[i] = pos;
+              have_hold[i] = true;
+            }
             if (want_enable && st == gradient::ds402::State::OperationEnabled) {
               if (!have_hold[i]) {
                 hold_target_counts[i] = pos;
@@ -2477,6 +2593,11 @@ int main(int argc, char** argv) {
             }
 
             cw = gradient::ds402::controlword_for_enable(st, want_enable, want_fault_reset);
+            if (want_jog_quick_stop &&
+                (st == gradient::ds402::State::OperationEnabled ||
+                 st == gradient::ds402::State::QuickStopActive)) {
+              cw = gradient::ds402::CW_QUICK_STOP;
+            }
             if (want_fault_reset && st == gradient::ds402::State::Fault && fault_reset_left[i] > 0) {
               fault_reset_left[i]--;
             }
@@ -2510,6 +2631,21 @@ int main(int argc, char** argv) {
             EC_WRITE_U32(axis_pd + off[i].max_profile_vel, max_profile_vel_out);
           }
 
+          output_target_counts[i] = target_pos_out;
+          output_target_velocity_counts_per_s[i] = target_vel_out;
+          if (have_hold[i]) {
+            have_hold_mask |= (1u << i);
+          }
+          if (have_jog_target[i]) {
+            have_jog_target_mask |= (1u << i);
+          }
+          if (jog_stop_quick_stop_cycles_left[i] > 0) {
+            jog_stop_quick_stop_cycles_left[i]--;
+          }
+          if (jog_stop_arrest_cycles_left[i] > 0) {
+            jog_stop_arrest_cycles_left[i]--;
+          }
+
           // Publish raw feedback (counts + status) for STATUS_SNAPSHOT.
           latest_feedback.pos_counts[i] = pos;
           latest_feedback.torque_raw[i] = torque;
@@ -2519,6 +2655,31 @@ int main(int argc, char** argv) {
           latest_feedback.ds402_state[i] = static_cast<uint8_t>(st);
           latest_feedback.di_bits[i] = di;
         }
+
+        latest_jog_debug.num_axes = opt.num_axes;
+        latest_jog_debug.active_jog = active_jog ? 1u : 0u;
+        latest_jog_debug.active_jog_axis_mask = active_jog_axis_mask;
+        latest_jog_debug.command_sp_mask = sp_mask;
+        latest_jog_debug.have_hold_mask = have_hold_mask;
+        latest_jog_debug.have_jog_target_mask = have_jog_target_mask;
+        latest_jog_debug.snap_hold_mask = snap_jog_hold_to_feedback_mask;
+        latest_jog_debug.stop_arrest_mask = stop_arrest_mask;
+        latest_jog_debug.latest_cmd_axis_mask = latest_jog_axis_mask;
+        latest_jog_debug.latest_cmd_flags = latest_jog_flags;
+        latest_jog_debug.last_stop_reason = last_jog_stop_reason;
+        latest_jog_debug.last_stop_axis_mask = last_jog_stop_axis_mask;
+        latest_jog_debug.sample_time_ns = diag_now_ns;
+        latest_jog_debug.active_jog_cmd_seq = active_jog_cmd_seq;
+        latest_jog_debug.latest_jog_seq_seen = active_jog_seq_seen;
+        latest_jog_debug.active_jog_deadline_ns = active_jog_deadline_ns;
+        latest_jog_debug.latest_cmd_timeout_ns = latest_jog_timeout_ns;
+        latest_jog_debug.last_stop_time_ns = last_jog_stop_time_ns;
+        latest_jog_debug.last_stop_cmd_seq = last_jog_stop_cmd_seq;
+        latest_jog_debug.feedback_pos_counts = latest_feedback.pos_counts;
+        latest_jog_debug.hold_target_counts = hold_target_counts;
+        latest_jog_debug.output_target_counts = output_target_counts;
+        latest_jog_debug.output_target_velocity_counts_per_s = output_target_velocity_counts_per_s;
+        latest_jog_debug.seq.store(diag_now_ns, std::memory_order_release);
 
         if (active_trajectory && active_traj_point_count > 0) {
           motion_active_mode.store(gradient::ipc::v1::MOTION_MODE_TRAJECTORY, std::memory_order_relaxed);
@@ -3368,6 +3529,7 @@ int main(int argc, char** argv) {
       }
 
       uint64_t next_snapshot_ns = now_monotonic_ns();
+      uint64_t next_jog_debug_ns = now_monotonic_ns();
 
       while (helper_running.load(std::memory_order_relaxed) &&
              !g_stop.load(std::memory_order_relaxed)) {
@@ -3375,8 +3537,8 @@ int main(int argc, char** argv) {
         pfds[0].fd = cmd_eventfd;
         pfds[0].events = POLLIN;
 
-        // Wake periodically for status snapshots even if no commands arrive.
-        int timeout_ms = 50;
+        // Wake periodically for status publishing even if no commands arrive.
+        int timeout_ms = 20;
         int pr2 = poll(pfds, 1, timeout_ms);
         if (pr2 > 0 && (pfds[0].revents & POLLIN)) {
           eventfd_drain(cmd_eventfd);
@@ -3734,6 +3896,53 @@ int main(int argc, char** argv) {
                      &status_seq,
                      now);
           eventfd_write_one(status_eventfd);
+        }
+
+        if (now >= next_jog_debug_ns) {
+          next_jog_debug_ns = now + 20000000; // 20ms (50Hz) for jog stop instrumentation
+          const uint64_t dbg_seq = latest_jog_debug.seq.load(std::memory_order_acquire);
+          if (dbg_seq != 0) {
+            gradient::ipc::v1::StatusJogDebugV1 jog_debug{};
+            jog_debug.num_axes = latest_jog_debug.num_axes;
+            jog_debug.active_jog = latest_jog_debug.active_jog;
+            jog_debug.active_jog_axis_mask = latest_jog_debug.active_jog_axis_mask;
+            jog_debug.command_sp_mask = latest_jog_debug.command_sp_mask;
+            jog_debug.have_hold_mask = latest_jog_debug.have_hold_mask;
+            jog_debug.have_jog_target_mask = latest_jog_debug.have_jog_target_mask;
+            jog_debug.snap_hold_mask = latest_jog_debug.snap_hold_mask;
+            jog_debug.stop_arrest_mask = latest_jog_debug.stop_arrest_mask;
+            jog_debug.latest_cmd_axis_mask = latest_jog_debug.latest_cmd_axis_mask;
+            jog_debug.latest_cmd_flags = latest_jog_debug.latest_cmd_flags;
+            jog_debug.last_stop_reason = latest_jog_debug.last_stop_reason;
+            jog_debug.last_stop_axis_mask = latest_jog_debug.last_stop_axis_mask;
+            jog_debug.sample_time_ns = latest_jog_debug.sample_time_ns;
+            jog_debug.active_jog_cmd_seq = latest_jog_debug.active_jog_cmd_seq;
+            jog_debug.latest_jog_seq_seen = latest_jog_debug.latest_jog_seq_seen;
+            jog_debug.active_jog_deadline_ns = latest_jog_debug.active_jog_deadline_ns;
+            jog_debug.latest_cmd_timeout_ns = latest_jog_debug.latest_cmd_timeout_ns;
+            jog_debug.last_stop_time_ns = latest_jog_debug.last_stop_time_ns;
+            jog_debug.last_stop_cmd_seq = latest_jog_debug.last_stop_cmd_seq;
+            std::copy(latest_jog_debug.feedback_pos_counts.begin(),
+                      latest_jog_debug.feedback_pos_counts.end(),
+                      jog_debug.feedback_pos_counts);
+            std::copy(latest_jog_debug.hold_target_counts.begin(),
+                      latest_jog_debug.hold_target_counts.end(),
+                      jog_debug.hold_target_counts);
+            std::copy(latest_jog_debug.output_target_counts.begin(),
+                      latest_jog_debug.output_target_counts.end(),
+                      jog_debug.output_target_counts);
+            std::copy(latest_jog_debug.output_target_velocity_counts_per_s.begin(),
+                      latest_jog_debug.output_target_velocity_counts_per_s.end(),
+                      jog_debug.output_target_velocity_counts_per_s);
+
+            ring_write(status_ring,
+                       gradient::ipc::v1::MSG_STATUS_JOG_DEBUG,
+                       &jog_debug,
+                       sizeof(jog_debug),
+                       &status_seq,
+                       now);
+            eventfd_write_one(status_eventfd);
+          }
         }
       }
     });

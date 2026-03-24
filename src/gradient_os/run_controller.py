@@ -636,6 +636,16 @@ def _attach_drive_faults_to_telemetry_message(
         msg["drive_faults"] = drive_faults
 
 
+def _build_monitor_motion_status_payload() -> dict[str, object] | None:
+    try:
+        payload = command_api.get_motion_execution_status()
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def _rtcore_metrics_ready(metrics: dict[str, object] | None, *, expected_axes: int) -> tuple[bool, str]:
     if not metrics:
         return False, "metrics unavailable"
@@ -1136,6 +1146,8 @@ Examples:
             period = 1.0 / max(1, int(telemetry_hz))
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             last_extra_ts = 0.0  # throttle extended servo telemetry to ~2 Hz
+            last_motion_status_ts = 0.0
+            cached_motion_status: dict[str, object] | None = None
             
             # Get telemetry block configuration from the active backend
             telemetry_blocks = backend_registry.get_telemetry_blocks()
@@ -1190,6 +1202,11 @@ Examples:
                         backend = backend_registry.get_active_backend()
                     except Exception:
                         backend = None
+                    if cached_motion_status is None or now - last_motion_status_ts >= 0.1:
+                        cached_motion_status = _build_monitor_motion_status_payload()
+                        last_motion_status_ts = now
+                    if cached_motion_status is not None:
+                        msg["motion_status"] = cached_motion_status
                     if now - last_extra_ts >= 0.5:
                         last_extra_ts = now
                         try:

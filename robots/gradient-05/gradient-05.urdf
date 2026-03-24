@@ -111,6 +111,6 @@
     <child link="tool0"/>
     <origin xyz="0.0933 0.0478830 0" rpy="0 0 0"/>
     <axis xyz="1 0 0"/>
-    <limit lower="-6.3" upper="6.3" effort="100" velocity="2.0"/>
+    <limit lower="-10.0" upper="10.0" effort="100" velocity="2.0"/>
   </joint>
 </robot>

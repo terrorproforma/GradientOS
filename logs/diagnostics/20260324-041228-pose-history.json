@@ -1,0 +1,909 @@
+{
+  "exported_at": "2026-03-24T04:12:28.558Z",
+  "source": "auto-stop",
+  "sample_count": 20,
+  "pose_history": [
+    {
+      "collected_at": "2026-03-24T04:12:14.557745+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_JOINT_ANGLES",
+      "controller_last_command": "GET_JOINT_ANGLES",
+      "pose": {
+        "position_m": {
+          "x": 0.80676382,
+          "y": -2.208e-05,
+          "z": 0.68966249
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99603076,
+          "pitch": 0.00740099,
+          "yaw": -179.98492052
+        },
+        "joints_deg": [
+          -2.747e-05,
+          0.00164795,
+          0.00167542,
+          -0.00396729,
+          -0.0107254,
+          -0.0151062
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:15.669589+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_TRAJECTORIES",
+      "pose": {
+        "position_m": {
+          "x": 0.80676271,
+          "y": -2.214e-05,
+          "z": 0.68966249
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99587828,
+          "pitch": 0.00724993,
+          "yaw": -179.98541489
+        },
+        "joints_deg": [
+          2.747e-05,
+          0.00162048,
+          0.00170288,
+          -0.00411987,
+          -0.01057434,
+          -0.01455688
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:16.698189+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.80676401,
+          "y": -2.291e-05,
+          "z": 0.68966218
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99587822,
+          "pitch": 0.00737351,
+          "yaw": -179.98519515
+        },
+        "joints_deg": [
+          -2.747e-05,
+          0.00167542,
+          0.00167542,
+          -0.00411987,
+          -0.0107254,
+          -0.01483154
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:17.726620+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.80676475,
+          "y": -2.131e-05,
+          "z": 0.6896628
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99603075,
+          "pitch": 0.00757954,
+          "yaw": -179.98514024
+        },
+        "joints_deg": [
+          2.747e-05,
+          0.00164795,
+          0.00164795,
+          -0.00396729,
+          -0.01087646,
+          -0.01483154
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:19.786900+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "SAFE_POWER_UP",
+      "pose": {
+        "position_m": {
+          "x": 0.80676437,
+          "y": -2.381e-05,
+          "z": 0.68966342
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99557297,
+          "pitch": 0.00763435,
+          "yaw": -179.98514015
+        },
+        "joints_deg": [
+          2.747e-05,
+          0.00159302,
+          0.00164795,
+          -0.00442505,
+          -0.01087646,
+          -0.01483154
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:20.868405+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_JOINT_ANGLES",
+      "pose": {
+        "position_m": {
+          "x": 0.80687744,
+          "y": -2.822e-05,
+          "z": 0.68901299
+        },
+        "orientation_euler_deg": {
+          "roll": -179.9942038,
+          "pitch": -0.04968592,
+          "yaw": -179.99727975
+        },
+        "joints_deg": [
+          0.00024719,
+          0.03227234,
+          0.02859192,
+          -0.00579834,
+          -0.01117859,
+          -0.00247192
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:21.907016+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.80687108,
+          "y": -2.739e-05,
+          "z": 0.68903035
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99435611,
+          "pitch": -0.04860099,
+          "yaw": -179.99755448
+        },
+        "joints_deg": [
+          0.00024719,
+          0.03136597,
+          0.02796021,
+          -0.00564575,
+          -0.0107254,
+          -0.00219727
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:22.935082+00:00",
+      "motion_state": "executing",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "MOVE_LINE_RELATIVE",
+      "pose": {
+        "position_m": {
+          "x": 0.80689082,
+          "y": -2.578e-05,
+          "z": 0.68904057
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99450867,
+          "pitch": -0.04784567,
+          "yaw": -179.9974996
+        },
+        "joints_deg": [
+          0.00030212,
+          0.03301392,
+          0.02540588,
+          -0.00549316,
+          -0.01057434,
+          -0.00219727
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:23.219646+00:00",
+      "motion_state": "executing",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.80871234,
+          "y": -2.783e-05,
+          "z": 0.6890591
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99420364,
+          "pitch": -0.04586817,
+          "yaw": -179.99725235
+        },
+        "joints_deg": [
+          0.00027466,
+          0.20626831,
+          -0.14982605,
+          -0.00579834,
+          -0.01057434,
+          -0.00247192
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:23.481829+00:00",
+      "motion_state": "executing",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.81510503,
+          "y": -2.736e-05,
+          "z": 0.68904678
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99435631,
+          "pitch": -0.04297055,
+          "yaw": -179.99700529
+        },
+        "joints_deg": [
+          0.00024719,
+          0.81592712,
+          -0.76343994,
+          -0.00564575,
+          -0.00951691,
+          -0.00274658
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:23.748919+00:00",
+      "motion_state": "executing",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.82613091,
+          "y": -2.524e-05,
+          "z": 0.68906302
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99466063,
+          "pitch": -0.02796044,
+          "yaw": -179.99725339
+        },
+        "joints_deg": [
+          0.00027466,
+          1.86550598,
+          -1.83724365,
+          -0.00534058,
+          -0.00030212,
+          -0.00247192
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:24.017260+00:00",
+      "motion_state": "executing",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.83549571,
+          "y": -2.476e-05,
+          "z": 0.68903483
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99481362,
+          "pitch": -0.04790056,
+          "yaw": -179.99783485
+        },
+        "joints_deg": [
+          0.00024719,
+          2.77649231,
+          -2.779953,
+          -0.00518799,
+          0.05136108,
+          -0.00192261
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:24.314702+00:00",
+      "motion_state": "executing",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.84712905,
+          "y": -2.638e-05,
+          "z": 0.6890288
+        },
+        "orientation_euler_deg": {
+          "roll": -179.994509,
+          "pitch": -0.05005669,
+          "yaw": -179.99729179
+        },
+        "joints_deg": [
+          0.00024719,
+          3.90102539,
+          -3.96471863,
+          -0.00549316,
+          0.11374969,
+          -0.00247192
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:24.581836+00:00",
+      "motion_state": "executing",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.85429736,
+          "y": -2.635e-05,
+          "z": 0.68901986
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99450909,
+          "pitch": -0.0521029,
+          "yaw": -179.9972965
+        },
+        "joints_deg": [
+          0.00024719,
+          4.59684448,
+          -4.70758667,
+          -0.00549316,
+          0.16284485,
+          -0.00247192
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:24.855827+00:00",
+      "motion_state": "executing",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.85685002,
+          "y": -2.551e-05,
+          "z": 0.68899155
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99466174,
+          "pitch": -0.05347618,
+          "yaw": -179.99729772
+        },
+        "joints_deg": [
+          0.00024719,
+          4.84508057,
+          -4.97227478,
+          -0.00534058,
+          0.18067017,
+          -0.00247192
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:25.181092+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.85686992,
+          "y": -2.385e-05,
+          "z": 0.68904163
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99481441,
+          "pitch": -0.04987818,
+          "yaw": -179.99696773
+        },
+        "joints_deg": [
+          0.00030212,
+          4.84590454,
+          -4.97760315,
+          -0.00518799,
+          0.18157654,
+          -0.00274658
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:26.194189+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "idle",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "GET_POSITION",
+      "pose": {
+        "position_m": {
+          "x": 0.85687135,
+          "y": -2.551e-05,
+          "z": 0.68903241
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99466155,
+          "pitch": -0.04906792,
+          "yaw": -179.99729765
+        },
+        "joints_deg": [
+          0.00024719,
+          4.84546509,
+          -4.97631226,
+          -0.00534058,
+          0.17991486,
+          -0.00247192
+        ]
+      },
+      "ik_debug": null
+    },
+    {
+      "collected_at": "2026-03-24T04:12:27.209372+00:00",
+      "motion_state": "idle",
+      "is_jogging": true,
+      "session_state": "active",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "JOG_SESSION_UPDATE",
+      "pose": {
+        "position_m": {
+          "x": 0.88772376,
+          "y": -2.495e-05,
+          "z": 0.6887881
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99466207,
+          "pitch": -0.05236384,
+          "yaw": -179.99702273
+        },
+        "joints_deg": [
+          0.00027466,
+          7.86426086,
+          -8.28366394,
+          -0.00534058,
+          0.47176666,
+          -0.00274658
+        ]
+      },
+      "ik_debug": {
+        "captured_at": "2026-03-24T04:12:27.203389+00:00",
+        "seq": 5,
+        "dt_s": 0.02009909099433571,
+        "linear_velocity_m_s": [
+          0.05,
+          0,
+          0
+        ],
+        "angular_velocity_deg_s": [
+          0,
+          0,
+          0
+        ],
+        "current_pose": {
+          "position_m": {
+            "x": 0.8877237590970054,
+            "y": -2.4946430492272924e-05,
+            "z": 0.6887881002096048
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99466207483098,
+            "pitch": -0.05236384032047454,
+            "yaw": -179.99702273182362
+          }
+        },
+        "target_pose": {
+          "position_m": {
+            "x": 0.8887287136467222,
+            "y": -2.4946430492272924e-05,
+            "z": 0.6887881002096048
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99466207483098,
+            "pitch": -0.05236384032047454,
+            "yaw": -179.99702273182362
+          }
+        },
+        "solved_pose": {
+          "position_m": {
+            "x": 0.8887287136467223,
+            "y": -2.494643049227292e-05,
+            "z": 0.6887881002096048
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99466207483098,
+            "pitch": -0.052363840320487264,
+            "yaw": -179.99702273182362
+          }
+        },
+        "applied_pose": {
+          "position_m": {
+            "x": 0.8887287136467223,
+            "y": -2.494643049227292e-05,
+            "z": 0.6887881002096048
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99466207483098,
+            "pitch": -0.052363840320487264,
+            "yaw": -179.99702273182362
+          }
+        },
+        "target_vs_solved": {
+          "delta_position_m": {
+            "x": 1.1102230246251565e-16,
+            "y": 3.3881317890172014e-21,
+            "z": 0
+          },
+          "position_error_mm": 1.1102230251421444e-13,
+          "orientation_error_deg": 5.534910604125592e-15
+        },
+        "target_vs_applied": {
+          "delta_position_m": {
+            "x": 1.1102230246251565e-16,
+            "y": 3.3881317890172014e-21,
+            "z": 0
+          },
+          "position_error_mm": 1.1102230251421444e-13,
+          "orientation_error_deg": 5.534910604125592e-15
+        },
+        "current_joints_deg": [
+          0.000274658203125,
+          7.864260864257813,
+          -8.283663940429687,
+          -0.005340576171875,
+          0.47176666259812816,
+          -0.00274658203125
+        ],
+        "ik_solution_joints_deg": [
+          0.00027434772580202496,
+          7.963494742235474,
+          -8.39558980179656,
+          -0.005340586327815597,
+          0.48445864590327564,
+          -0.002748075580991806
+        ],
+        "applied_joints_deg": [
+          0.00027434772580202496,
+          7.963494742235474,
+          -8.39558980179656,
+          -0.005340586327815597,
+          0.48445864590327564,
+          -0.002748075580991806
+        ],
+        "clamped_joint_indices": [],
+        "clamped": false,
+        "solve_failed": false
+      }
+    },
+    {
+      "collected_at": "2026-03-24T04:12:27.498570+00:00",
+      "motion_state": "idle",
+      "is_jogging": true,
+      "session_state": "active",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "JOG_SESSION_UPDATE",
+      "pose": {
+        "position_m": {
+          "x": 0.90290765,
+          "y": -2.45e-05,
+          "z": 0.68872539
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99496699,
+          "pitch": -0.04373956,
+          "yaw": -179.99711972
+        },
+        "joints_deg": [
+          0.00019226,
+          9.36422424,
+          -9.98681946,
+          -0.0050354,
+          0.66633453,
+          -0.00274658
+        ]
+      },
+      "ik_debug": {
+        "captured_at": "2026-03-24T04:12:27.487637+00:00",
+        "seq": 7,
+        "dt_s": 0.020073424995644018,
+        "linear_velocity_m_s": [
+          0.05,
+          0,
+          0
+        ],
+        "angular_velocity_deg_s": [
+          0,
+          0,
+          0
+        ],
+        "current_pose": {
+          "position_m": {
+            "x": 0.9029076516863923,
+            "y": -2.4502512630894894e-05,
+            "z": 0.6887253854372114
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99496699215587,
+            "pitch": -0.04373955759211046,
+            "yaw": -179.9971197154885
+          }
+        },
+        "target_pose": {
+          "position_m": {
+            "x": 0.9039113229361745,
+            "y": -2.4502512630894894e-05,
+            "z": 0.6887253854372114
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99496699215587,
+            "pitch": -0.04373955759211046,
+            "yaw": -179.9971197154885
+          }
+        },
+        "solved_pose": {
+          "position_m": {
+            "x": 0.9039113229361746,
+            "y": -2.450251263089489e-05,
+            "z": 0.6887253854372116
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99496699215587,
+            "pitch": -0.04373955759208502,
+            "yaw": -179.9971197154885
+          }
+        },
+        "applied_pose": {
+          "position_m": {
+            "x": 0.9039113229361746,
+            "y": -2.450251263089489e-05,
+            "z": 0.6887253854372116
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99496699215587,
+            "pitch": -0.04373955759208502,
+            "yaw": -179.9971197154885
+          }
+        },
+        "target_vs_solved": {
+          "delta_position_m": {
+            "x": 1.1102230246251565e-16,
+            "y": 3.3881317890172014e-21,
+            "z": 2.220446049250313e-16
+          },
+          "position_error_mm": 2.4825341534784767e-13,
+          "orientation_error_deg": 1.3964622914945273e-14
+        },
+        "target_vs_applied": {
+          "delta_position_m": {
+            "x": 1.1102230246251565e-16,
+            "y": 3.3881317890172014e-21,
+            "z": 2.220446049250313e-16
+          },
+          "position_error_mm": 2.4825341534784767e-13,
+          "orientation_error_deg": 1.3964622914945273e-14
+        },
+        "current_joints_deg": [
+          0.00019226074218750002,
+          9.364224243164063,
+          -9.986819458007814,
+          -0.005035400390625,
+          0.6663345336920726,
+          -0.00274658203125
+        ],
+        "ik_solution_joints_deg": [
+          0.00019204731911184823,
+          9.464256789040512,
+          -10.102060944909498,
+          -0.005035416276331203,
+          0.6815434746398029,
+          -0.002748132178130805
+        ],
+        "applied_joints_deg": [
+          0.00019204731911184823,
+          9.464256789040512,
+          -10.102060944909498,
+          -0.005035416276331203,
+          0.6815434746398029,
+          -0.002748132178130805
+        ],
+        "clamped_joint_indices": [],
+        "clamped": false,
+        "solve_failed": false
+      }
+    },
+    {
+      "collected_at": "2026-03-24T04:12:27.763581+00:00",
+      "motion_state": "idle",
+      "is_jogging": false,
+      "session_state": "stopped",
+      "api_last_command": "GET_POSITION",
+      "controller_last_command": "JOG_SESSION_STOP",
+      "pose": {
+        "position_m": {
+          "x": 0.90919427,
+          "y": -2.27e-05,
+          "z": 0.68832881
+        },
+        "orientation_euler_deg": {
+          "roll": -179.99481653,
+          "pitch": -0.09611686,
+          "yaw": -179.9972421
+        },
+        "joints_deg": [
+          0.00035706,
+          10.01359863,
+          -10.70255127,
+          -0.00518799,
+          0.78506927,
+          -0.00247192
+        ]
+      },
+      "ik_debug": {
+        "captured_at": "2026-03-24T04:12:27.571856+00:00",
+        "seq": 8,
+        "dt_s": 0.020623576994694304,
+        "linear_velocity_m_s": [
+          0.05,
+          0,
+          0
+        ],
+        "angular_velocity_deg_s": [
+          0,
+          0,
+          0
+        ],
+        "current_pose": {
+          "position_m": {
+            "x": 0.9029076516863923,
+            "y": -2.4502512630894894e-05,
+            "z": 0.6887253854372114
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99496699215587,
+            "pitch": -0.04373955759211046,
+            "yaw": -179.9971197154885
+          }
+        },
+        "target_pose": {
+          "position_m": {
+            "x": 0.903938830536127,
+            "y": -2.4502512630894894e-05,
+            "z": 0.6887253854372114
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99496699215587,
+            "pitch": -0.04373955759211046,
+            "yaw": -179.9971197154885
+          }
+        },
+        "solved_pose": {
+          "position_m": {
+            "x": 0.9039388305361269,
+            "y": -2.450251263089489e-05,
+            "z": 0.6887253854372112
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99496699215587,
+            "pitch": -0.04373955759211046,
+            "yaw": -179.9971197154885
+          }
+        },
+        "applied_pose": {
+          "position_m": {
+            "x": 0.9039388305361269,
+            "y": -2.450251263089489e-05,
+            "z": 0.6887253854372112
+          },
+          "orientation_euler_deg": {
+            "roll": -179.99496699215587,
+            "pitch": -0.04373955759211046,
+            "yaw": -179.9971197154885
+          }
+        },
+        "target_vs_solved": {
+          "delta_position_m": {
+            "x": -1.1102230246251565e-16,
+            "y": 3.3881317890172014e-21,
+            "z": -2.220446049250313e-16
+          },
+          "position_error_mm": 2.4825341534784767e-13,
+          "orientation_error_deg": 6.292777214290846e-15
+        },
+        "target_vs_applied": {
+          "delta_position_m": {
+            "x": -1.1102230246251565e-16,
+            "y": 3.3881317890172014e-21,
+            "z": -2.220446049250313e-16
+          },
+          "position_error_mm": 2.4825341534784767e-13,
+          "orientation_error_deg": 6.292777214290846e-15
+        },
+        "current_joints_deg": [
+          0.00019226074218750002,
+          9.364224243164063,
+          -9.986819458007814,
+          -0.005035400390625,
+          0.6663345336920726,
+          -0.00274658203125
+        ],
+        "ik_solution_joints_deg": [
+          0.00019204147650031197,
+          9.466999305897946,
+          -10.105222699167033,
+          -0.005035416719219218,
+          0.6819627120377838,
+          -0.002748174867912058
+        ],
+        "applied_joints_deg": [
+          0.00019204147650031197,
+          9.466999305897946,
+          -10.105222699167033,
+          -0.005035416719219218,
+          0.6819627120377838,
+          -0.002748174867912058
+        ],
+        "clamped_joint_indices": [],
+        "clamped": false,
+        "solve_failed": false
+      }
+    }
+  ],
+  "saved_at": "2026-03-24T04:12:27.787033+00:00"
+}

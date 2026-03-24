@@ -1,11 +1,70 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { TelemetryEvent } from "./TelemetryCharts";
 import { TelemetryCharts } from "./TelemetryCharts";
 import { PerformanceDiagnosticsPanel } from "./PerformanceDiagnosticsPanel";
-import type { PerformanceResponse } from "./PerformanceDiagnosticsPanel";
+import type { DiagnosticsPoseHistorySample, PerformanceResponse } from "./PerformanceDiagnosticsPanel";
+import { useOptionalLiveState } from "./liveState";
 
 type TelemetryTab = "charts" | "diagnostics";
-const PERFORMANCE_POLL_MS = 500;
+const ACTIVE_PERFORMANCE_POLL_MS = 250;
+const IDLE_PERFORMANCE_POLL_MS = 1000;
+
+function isMotionActive(snapshot: PerformanceResponse | null): boolean {
+  if (!snapshot) {
+    return false;
+  }
+  const controller = snapshot.controller;
+  if (!controller) {
+    return false;
+  }
+  if (controller.is_jogging) {
+    return true;
+  }
+  const state = String(controller.motion_state ?? "").toLowerCase();
+  if (state && !["idle", "ready", "complete", "completed", "stopped"].includes(state)) {
+    return true;
+  }
+  return false;
+}
+
+function buildPoseHistorySample(snapshot: PerformanceResponse): DiagnosticsPoseHistorySample | null {
+  const pose = snapshot.controller?.pose;
+  if (!pose) {
+    return null;
+  }
+  return {
+    collected_at: snapshot.collected_at,
+    motion_state: snapshot.controller?.motion_state ?? undefined,
+    is_jogging: snapshot.controller?.is_jogging ?? false,
+    session_state: snapshot.controller?.jog_session?.state ?? undefined,
+    api_last_command: snapshot.api_udp?.last_command ?? null,
+    controller_last_command: snapshot.controller?.udp?.last_command ?? null,
+    pose,
+    ik_debug: snapshot.controller?.jog?.ik_debug ?? null,
+  };
+}
+
+function appendPoseHistorySample(
+  history: DiagnosticsPoseHistorySample[],
+  sample: DiagnosticsPoseHistorySample | null,
+): DiagnosticsPoseHistorySample[] {
+  if (!sample) {
+    return history;
+  }
+  const last = history.length > 0 ? history[history.length - 1] : null;
+  if (
+    last &&
+    last.collected_at === sample.collected_at &&
+    JSON.stringify(last.pose) === JSON.stringify(sample.pose) &&
+    JSON.stringify(last.ik_debug) === JSON.stringify(sample.ik_debug) &&
+    last.motion_state === sample.motion_state &&
+    last.is_jogging === sample.is_jogging &&
+    last.session_state === sample.session_state
+  ) {
+    return history;
+  }
+  return [...history, sample];
+}
 
 async function readErrorMessage(res: Response): Promise<string> {
   const contentType = res.headers.get("content-type") ?? "";
@@ -47,13 +106,20 @@ export function TelemetryWorkspace({
   latest,
   apiHost,
 }: {
-  latest: TelemetryEvent | null;
-  apiHost: string;
+  latest?: TelemetryEvent | null;
+  apiHost?: string;
 }) {
+  const liveState = useOptionalLiveState();
+  const resolvedLatest = latest ?? liveState?.latest ?? null;
+  const resolvedApiHost = apiHost ?? liveState?.apiHost ?? "";
   const [activeTab, setActiveTab] = useState<TelemetryTab>("charts");
   const [diagnosticsVisible, setDiagnosticsVisible] = useState<boolean>(true);
   const [diagnosticsSnapshot, setDiagnosticsSnapshot] = useState<PerformanceResponse | null>(null);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [poseHistory, setPoseHistory] = useState<DiagnosticsPoseHistorySample[]>([]);
+  const [poseHistorySaveStatus, setPoseHistorySaveStatus] = useState<string | null>(null);
+  const lastAutoSavedStopAtRef = useRef<string | null>(null);
+  const diagnosticsPollingEnabled = diagnosticsVisible;
 
   useEffect(() => {
     if (!diagnosticsVisible && activeTab === "diagnostics") {
@@ -62,15 +128,33 @@ export function TelemetryWorkspace({
   }, [activeTab, diagnosticsVisible]);
 
   useEffect(() => {
+    if (!diagnosticsPollingEnabled) {
+      return;
+    }
+    if (!resolvedApiHost) {
+      setDiagnosticsError("Live API host unavailable.");
+      return;
+    }
     let disposed = false;
     let inFlight = false;
+    let timer: number | null = null;
+
+    const scheduleNext = (delayMs: number) => {
+      if (disposed) {
+        return;
+      }
+      timer = window.setTimeout(() => {
+        void tick();
+      }, delayMs);
+    };
+
     const tick = async () => {
       if (disposed || inFlight) {
         return;
       }
       inFlight = true;
       try {
-        const res = await fetch(`${apiHost}/debug/performance`, {
+        const res = await fetch(`${resolvedApiHost}/debug/performance`, {
           method: "GET",
           headers: { Accept: "application/json" },
         });
@@ -81,24 +165,78 @@ export function TelemetryWorkspace({
         if (!disposed) {
           setDiagnosticsSnapshot(payload);
           setDiagnosticsError(null);
+          setPoseHistory((current) => appendPoseHistorySample(current, buildPoseHistorySample(payload)));
         }
+        scheduleNext(isMotionActive(payload) ? ACTIVE_PERFORMANCE_POLL_MS : IDLE_PERFORMANCE_POLL_MS);
       } catch (err) {
         if (!disposed) {
           setDiagnosticsError((err as Error)?.message || "Failed to load timing diagnostics.");
         }
+        scheduleNext(IDLE_PERFORMANCE_POLL_MS);
       } finally {
         inFlight = false;
       }
     };
     void tick();
-    const timer = window.setInterval(() => {
-      void tick();
-    }, PERFORMANCE_POLL_MS);
     return () => {
       disposed = true;
-      window.clearInterval(timer);
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
     };
-  }, [apiHost]);
+  }, [diagnosticsPollingEnabled, resolvedApiHost]);
+
+  const persistPoseHistory = useCallback(
+    async (history: DiagnosticsPoseHistorySample[], source: "manual" | "auto-stop") => {
+      if (history.length === 0) {
+        return;
+      }
+      if (!resolvedApiHost) {
+        setPoseHistorySaveStatus("Local save unavailable: API host missing.");
+        return;
+      }
+      try {
+        const res = await fetch(`${resolvedApiHost}/debug/pose-history`, {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            exported_at: new Date().toISOString(),
+            source,
+            sample_count: history.length,
+            pose_history: history,
+          }),
+        });
+        if (!res.ok) {
+          throw new Error(await readErrorMessage(res));
+        }
+        const payload = (await res.json()) as { path?: unknown; sample_count?: unknown };
+        setPoseHistorySaveStatus(
+          `Saved locally: ${String(payload.path ?? "--")} (${String(payload.sample_count ?? history.length)} samples)`,
+        );
+      } catch (err) {
+        setPoseHistorySaveStatus((err as Error)?.message ? `Local save failed: ${(err as Error).message}` : "Local save failed.");
+      }
+    },
+    [resolvedApiHost],
+  );
+
+  useEffect(() => {
+    const last = poseHistory.length > 0 ? poseHistory[poseHistory.length - 1] : null;
+    const previous = poseHistory.length > 1 ? poseHistory[poseHistory.length - 2] : null;
+    const runJustStopped =
+      last?.session_state === "stopped" && Boolean(previous?.is_jogging || previous?.session_state === "active");
+    if (!runJustStopped || !last) {
+      return;
+    }
+    if (lastAutoSavedStopAtRef.current === last.collected_at) {
+      return;
+    }
+    lastAutoSavedStopAtRef.current = last.collected_at;
+    void persistPoseHistory(poseHistory, "auto-stop");
+  }, [persistPoseHistory, poseHistory]);
 
   const tabs: Array<{ id: TelemetryTab; label: string }> = diagnosticsVisible
     ? [
@@ -141,9 +279,22 @@ export function TelemetryWorkspace({
       </div>
 
       {activeTab === "charts" ? (
-        <TelemetryCharts latest={latest} />
+        <TelemetryCharts latest={resolvedLatest} />
       ) : (
-        <PerformanceDiagnosticsPanel snapshot={diagnosticsSnapshot} error={diagnosticsError} />
+        <PerformanceDiagnosticsPanel
+          snapshot={diagnosticsSnapshot}
+          error={diagnosticsError}
+          poseHistory={poseHistory}
+          onClearPoseHistory={() => {
+            setPoseHistory([]);
+            setPoseHistorySaveStatus(null);
+            lastAutoSavedStopAtRef.current = null;
+          }}
+          onSavePoseHistory={() => {
+            void persistPoseHistory(poseHistory, "manual");
+          }}
+          poseHistorySaveStatus={poseHistorySaveStatus}
+        />
       )}
     </div>
   );

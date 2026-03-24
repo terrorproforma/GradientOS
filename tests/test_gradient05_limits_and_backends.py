@@ -12,6 +12,7 @@ from gradient_os.arm_controller.backends import registry as backend_registry
 from gradient_os.arm_controller.backends.ethercat_rtcore.backend import (
     EthercatRTCoreBackend,
     RTCoreExecutionStatus,
+    RTCoreJogDebugStatus,
     _MAGIC_RING,
     _MSG_HEADER_STRUCT,
     _RING_HEADER_STRUCT,
@@ -511,6 +512,55 @@ def test_ethercat_backend_parses_motion_state_status(monkeypatch, tmp_path):
     assert status.active_command_seq == 42
 
 
+def test_ethercat_backend_parses_jog_debug_status(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+
+    payload = struct.pack(
+        "<12I7Q16i16i16i16i",
+        3,   # num_axes
+        1,   # active_jog
+        0x7,  # active_jog_axis_mask
+        0x3,  # command_sp_mask
+        0x7,  # have_hold_mask
+        0x3,  # have_jog_target_mask
+        0x1,  # snap_hold_mask
+        0x7,  # latest_cmd_axis_mask
+        0x1,  # latest_cmd_flags
+        2,   # timeout
+        0x3,  # last_stop_axis_mask
+        0x2,  # stop_arrest_mask
+        111,  # sample_time_ns
+        222,  # active_jog_cmd_seq
+        333,  # latest_jog_seq_seen
+        444,  # active_jog_deadline_ns
+        555,  # latest_cmd_timeout_ns
+        666,  # last_stop_time_ns
+        777,  # last_stop_cmd_seq
+        *([10, 20, 30] + [0] * 13),
+        *([11, 21, 31] + [0] * 13),
+        *([12, 22, 32] + [0] * 13),
+        *([13, 23, 33] + [0] * 13),
+    )
+
+    status = backend._parse_jog_debug_state(payload)
+
+    assert isinstance(status, RTCoreJogDebugStatus)
+    assert status.num_axes == 3
+    assert status.active_jog is True
+    assert status.active_jog_axis_mask == 0x7
+    assert status.command_sp_mask == 0x3
+    assert status.snap_hold_mask == 0x1
+    assert status.stop_arrest_mask == 0x2
+    assert status.last_stop_reason == 2
+    assert status.last_stop_reason_name == "timeout"
+    assert status.last_stop_cmd_seq == 777
+    assert status.feedback_pos_counts[:3] == [10, 20, 30]
+    assert status.hold_target_counts[:3] == [11, 21, 31]
+    assert status.output_target_counts[:3] == [12, 22, 32]
+    assert status.output_target_velocity_counts_per_s[:3] == [13, 23, 33]
+
+
 def test_ethercat_backend_wait_for_trajectory_complete_ignores_stale_previous_completion(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
@@ -623,6 +673,27 @@ def test_ethercat_backend_stop_realtime_jog_sends_stop_flag(monkeypatch, tmp_pat
     axis_mask, flags, timeout_ns, *qd = struct.unpack("<IIQ16d", payload)
     assert axis_mask == 0
     assert flags == 0x2
+    assert timeout_ns == 0
+    assert qd[:2] == pytest.approx([0.0, 0.0])
+
+
+def test_ethercat_backend_stop_joint_velocity_lease_jog_can_request_quick_stop(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 2
+
+    captured: list[tuple[int, bytes]] = []
+    monkeypatch.setattr(backend, "_cmd_ring_write", lambda msg_type, payload: captured.append((msg_type, payload)))
+
+    backend.stop_joint_velocity_lease_jog(quick_stop=True)
+
+    assert len(captured) == 1
+    msg_type, payload = captured[0]
+    assert msg_type == 0x0130
+    axis_mask, flags, timeout_ns, *qd = struct.unpack("<IIQ16d", payload)
+    assert axis_mask == 0
+    assert flags == 0x6
     assert timeout_ns == 0
     assert qd[:2] == pytest.approx([0.0, 0.0])
 

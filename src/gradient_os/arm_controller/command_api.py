@@ -26,6 +26,7 @@ from . import pid_tuner
 from .jog_session import JogSessionError, JogSessionManager
 from .backends import registry as backend_registry
 from ..kinematics import runtime as kinematics_runtime
+from ..telemetry import alerts as telemetry_alerts
 
 _DIRECT_SETPOINT_FALLBACK_SPEED = 500
 _DIRECT_SETPOINT_FALLBACK_ACCELERATION_DEG_S2 = 500.0
@@ -71,6 +72,18 @@ def _new_jog_perf_state() -> dict[str, object]:
             "ik_solve_ms": {"count": 0, "avg_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0},
             "command_send_ms": {"count": 0, "avg_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0},
         },
+        "command_state_valid": False,
+        "commanded_pose": None,
+        "commanded_joints_deg": None,
+        "last_accepted_target_pose": None,
+        "measured_pose": None,
+        "measured_joints_deg": None,
+        "following_error": None,
+        "last_resync_reason": None,
+        "last_resync_age_s": None,
+        "last_gate_failure_reason": None,
+        "last_gate_failure_details": None,
+        "ik_debug": None,
     }
 
 
@@ -84,6 +97,314 @@ def _update_perf_metric(metric: dict[str, object], value_ms: float) -> None:
     metric["last_ms"] = float(value_ms)
     metric["avg_ms"] = avg_ms + ((float(value_ms) - avg_ms) / float(count))
     metric["max_ms"] = max(float(metric.get("max_ms", 0.0)), float(value_ms))
+
+
+def _vector_to_float_list(values: np.ndarray | list[float] | tuple[float, ...]) -> list[float]:
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    return [float(item) for item in arr.tolist()]
+
+
+def _joint_angles_deg_list(values: np.ndarray | list[float] | tuple[float, ...]) -> list[float]:
+    return [float(np.rad2deg(item)) for item in np.asarray(values, dtype=float).reshape(-1).tolist()]
+
+
+def _pose_snapshot_from_components(
+    position: np.ndarray | list[float] | tuple[float, ...],
+    orientation_matrix: np.ndarray,
+) -> dict[str, object] | None:
+    try:
+        pos = np.asarray(position, dtype=float).reshape(3)
+        orient = np.asarray(orientation_matrix, dtype=float).reshape(3, 3)
+        euler_deg = R.from_matrix(orient).as_euler("xyz", degrees=True)
+    except Exception:
+        return None
+    return {
+        "position_m": {
+            "x": float(pos[0]),
+            "y": float(pos[1]),
+            "z": float(pos[2]),
+        },
+        "orientation_euler_deg": {
+            "roll": float(euler_deg[0]),
+            "pitch": float(euler_deg[1]),
+            "yaw": float(euler_deg[2]),
+        },
+    }
+
+
+def _pose_snapshot_from_matrix(matrix: np.ndarray | None) -> dict[str, object] | None:
+    if matrix is None:
+        return None
+    try:
+        pose_mx = np.asarray(matrix, dtype=float).reshape(4, 4)
+    except Exception:
+        return None
+    return _pose_snapshot_from_components(pose_mx[:3, 3], pose_mx[:3, :3])
+
+
+def _pose_error_snapshot(
+    target_position: np.ndarray,
+    target_orientation_matrix: np.ndarray,
+    actual_pose_matrix: np.ndarray | None,
+) -> dict[str, object] | None:
+    if actual_pose_matrix is None:
+        return None
+    try:
+        actual_pose = np.asarray(actual_pose_matrix, dtype=float).reshape(4, 4)
+        actual_position = actual_pose[:3, 3]
+        actual_orientation = actual_pose[:3, :3]
+        delta_position = actual_position - np.asarray(target_position, dtype=float).reshape(3)
+        orientation_delta = (
+            R.from_matrix(np.asarray(target_orientation_matrix, dtype=float).reshape(3, 3)).inv()
+            * R.from_matrix(actual_orientation)
+        )
+        orientation_error_deg = float(np.rad2deg(orientation_delta.magnitude()))
+    except Exception:
+        return None
+    return {
+        "delta_position_m": {
+            "x": float(delta_position[0]),
+            "y": float(delta_position[1]),
+            "z": float(delta_position[2]),
+        },
+        "position_error_mm": float(np.linalg.norm(delta_position) * 1000.0),
+        "orientation_error_deg": orientation_error_deg,
+    }
+
+
+def _joint_error_snapshot(
+    commanded_joints: np.ndarray | list[float] | tuple[float, ...],
+    measured_joints: np.ndarray | list[float] | tuple[float, ...],
+) -> dict[str, object] | None:
+    try:
+        commanded = np.asarray(commanded_joints, dtype=float).reshape(-1)
+        measured = np.asarray(measured_joints, dtype=float).reshape(-1)
+        delta_deg = np.rad2deg(measured - commanded)
+    except Exception:
+        return None
+    return {
+        "delta_deg": [float(value) for value in delta_deg.tolist()],
+        "max_abs_joint_error_deg": float(np.max(np.abs(delta_deg))) if delta_deg.size else 0.0,
+    }
+
+
+def _following_error_snapshot(
+    *,
+    commanded_position: np.ndarray,
+    commanded_orientation_matrix: np.ndarray,
+    commanded_joints: np.ndarray,
+    measured_pose_matrix: np.ndarray | None,
+    measured_joints: np.ndarray,
+) -> dict[str, object] | None:
+    pose_error = _pose_error_snapshot(commanded_position, commanded_orientation_matrix, measured_pose_matrix)
+    joint_error = _joint_error_snapshot(commanded_joints, measured_joints)
+    if pose_error is None and joint_error is None:
+        return None
+    return {
+        "pose": pose_error,
+        "joint": joint_error,
+    }
+
+
+def _commanded_pose_snapshot_from_control(control: dict[str, object], *, key_prefix: str = "commanded") -> dict[str, object] | None:
+    position_key = f"{key_prefix}_position_m"
+    orientation_key = f"{key_prefix}_orientation_matrix"
+    position = control.get(position_key)
+    orientation = control.get(orientation_key)
+    if position is None or orientation is None:
+        return None
+    try:
+        return _pose_snapshot_from_components(
+            np.asarray(position, dtype=float).reshape(3),
+            np.asarray(orientation, dtype=float).reshape(3, 3),
+        )
+    except Exception:
+        return None
+
+
+def _commanded_joint_vector_from_control(control: dict[str, object]) -> np.ndarray | None:
+    joints = control.get("commanded_joint_vector")
+    if joints is None:
+        return None
+    try:
+        return np.asarray(joints, dtype=float).reshape(-1)
+    except Exception:
+        return None
+
+
+def _build_jog_command_state_perf_fields(control: dict[str, object]) -> dict[str, object]:
+    last_resync_monotonic = control.get("last_resync_monotonic")
+    if isinstance(last_resync_monotonic, (int, float)):
+        last_resync_age_s: float | None = max(0.0, time.monotonic() - float(last_resync_monotonic))
+    else:
+        last_resync_age_s = None
+
+    commanded_joints = _commanded_joint_vector_from_control(control)
+    last_target_position = control.get("last_accepted_target_position_m")
+    last_target_orientation = control.get("last_accepted_target_orientation_matrix")
+    last_accepted_target_pose = None
+    if last_target_position is not None and last_target_orientation is not None:
+        try:
+            last_accepted_target_pose = _pose_snapshot_from_components(
+                np.asarray(last_target_position, dtype=float).reshape(3),
+                np.asarray(last_target_orientation, dtype=float).reshape(3, 3),
+            )
+        except Exception:
+            last_accepted_target_pose = None
+
+    return {
+        "command_state_valid": bool(control.get("command_state_valid", False)),
+        "commanded_pose": _commanded_pose_snapshot_from_control(control),
+        "commanded_joints_deg": _joint_angles_deg_list(commanded_joints) if commanded_joints is not None else None,
+        "last_accepted_target_pose": last_accepted_target_pose,
+        "following_error": control.get("following_error_snapshot"),
+        "last_resync_reason": control.get("last_resync_reason"),
+        "last_resync_age_s": last_resync_age_s,
+        "last_gate_failure_reason": control.get("last_gate_failure_reason"),
+        "last_gate_failure_details": control.get("last_gate_failure_details"),
+    }
+
+
+def _emit_jog_gate_alert(reason_code: str, details: dict[str, object] | None = None) -> None:
+    normalized_reason = str(reason_code or "JOG_GATE_REJECTED").strip().upper() or "JOG_GATE_REJECTED"
+    message = f"Jog step rejected: {normalized_reason}."
+    telemetry_alerts.push_alert(
+        level="warning",
+        kind="JOG_GATE_REJECTED",
+        message=message,
+        details={
+            "reason_code": normalized_reason,
+            **(details or {}),
+        },
+        key=f"JOG_GATE_REJECTED:{normalized_reason}",
+    )
+
+
+def _unwrap_jog_joint_target(
+    seed_joint_angles: np.ndarray,
+    candidate_joint_angles: np.ndarray | list[float] | tuple[float, ...],
+) -> np.ndarray:
+    candidate = np.asarray(candidate_joint_angles, dtype=float).reshape(-1)
+    try:
+        unwrapped = trajectory_execution._unwrap_joint_trajectory(
+            [seed_joint_angles.tolist(), candidate.tolist()]
+        )
+        if len(unwrapped) >= 2:
+            return np.asarray(unwrapped[-1], dtype=float)
+    except Exception:
+        pass
+    return candidate
+
+
+def _validate_jog_step_candidate(
+    *,
+    seed_joint_angles: np.ndarray,
+    candidate_joint_angles: np.ndarray,
+    target_position: np.ndarray,
+    target_orientation: np.ndarray,
+) -> tuple[bool, str, dict[str, object], np.ndarray | None]:
+    candidate = np.asarray(candidate_joint_angles, dtype=float).reshape(-1)
+    seed = np.asarray(seed_joint_angles, dtype=float).reshape(-1)
+    max_joint_step = float(np.max(np.abs(candidate - seed))) if candidate.size else 0.0
+
+    limits = utils.LOGICAL_JOINT_LIMITS_RAD or [(-float("inf"), float("inf"))] * len(candidate)
+    min_limit_margin = float("inf")
+    violating_joint_indices: list[int] = []
+    for idx, (joint_value, joint_limits) in enumerate(zip(candidate.tolist(), limits)):
+        lo, hi = joint_limits
+        margin = min(float(joint_value - lo), float(hi - joint_value))
+        min_limit_margin = min(min_limit_margin, margin)
+        if margin < trajectory_execution.JOINT_LIMIT_MARGIN_RAD:
+            violating_joint_indices.append(int(idx))
+
+    solved_pose_matrix = ik_solver.get_fk_matrix(candidate)
+    pose_error = _pose_error_snapshot(target_position, target_orientation, solved_pose_matrix)
+    cartesian_residual_m = None
+    orientation_residual_deg = None
+    if pose_error is not None:
+        cartesian_residual_m = float(pose_error.get("position_error_mm", 0.0)) / 1000.0
+        orientation_residual_deg = float(pose_error.get("orientation_error_deg", 0.0))
+
+    details: dict[str, object] = {
+        "max_joint_step_rad": trajectory_execution._json_safe_float(max_joint_step),
+        "joint_limit_margin_rad": trajectory_execution._json_safe_float(min_limit_margin),
+        "cartesian_residual_m": trajectory_execution._json_safe_float(
+            cartesian_residual_m if cartesian_residual_m is not None else float("inf")
+        ),
+        "orientation_residual_deg": trajectory_execution._json_safe_float(
+            orientation_residual_deg if orientation_residual_deg is not None else float("inf")
+        ),
+        "violating_joint_indices": [int(idx) for idx in violating_joint_indices],
+        "candidate_joints_deg": _joint_angles_deg_list(candidate),
+    }
+
+    if max_joint_step > trajectory_execution.MAX_JOINT_STEP_RAD:
+        return False, "IK_JUMP_REJECTED", details, solved_pose_matrix
+    if violating_joint_indices:
+        return False, "LIMIT_VIOLATION", details, solved_pose_matrix
+    if solved_pose_matrix is None:
+        return False, "FK_VALIDATION_FAILED", details, None
+    if cartesian_residual_m is None or cartesian_residual_m > trajectory_execution.MAX_CART_RESIDUAL_M:
+        return False, "CARTESIAN_RESIDUAL_EXCEEDED", details, solved_pose_matrix
+    if orientation_residual_deg is None or orientation_residual_deg > trajectory_execution.MAX_ORIENT_RESIDUAL_DEG:
+        return False, "ORIENTATION_RESIDUAL_EXCEEDED", details, solved_pose_matrix
+    return True, "OK", details, solved_pose_matrix
+
+
+def _emit_joint_limit_alert(
+    clamped_idx: list[int],
+    q_requested: np.ndarray,
+    q_applied: np.ndarray,
+    mins: np.ndarray,
+    maxs: np.ndarray,
+    *,
+    source: str,
+) -> None:
+    if not clamped_idx:
+        return
+    joint_labels: list[str] = []
+    limit_sides: list[str] = []
+    requested_deg: list[float] = []
+    applied_deg: list[float] = []
+    limit_min_deg: list[float] = []
+    limit_max_deg: list[float] = []
+
+    for idx in clamped_idx:
+        requested = float(q_requested[idx])
+        applied = float(q_applied[idx])
+        lower = float(mins[idx])
+        upper = float(maxs[idx])
+        if requested > upper + 1e-6:
+            side = "upper"
+        elif requested < lower - 1e-6:
+            side = "lower"
+        else:
+            side = "clamped"
+        joint_num = int(idx) + 1
+        joint_labels.append(f"J{joint_num} {side}")
+        limit_sides.append(side)
+        requested_deg.append(float(np.rad2deg(requested)))
+        applied_deg.append(float(np.rad2deg(applied)))
+        limit_min_deg.append(float(np.rad2deg(lower)))
+        limit_max_deg.append(float(np.rad2deg(upper)))
+
+    message = f"Joint limit reached during {source}: {', '.join(joint_labels)}."
+    telemetry_alerts.push_alert(
+        level="warning",
+        kind="JOINT_LIMIT",
+        message=message,
+        details={
+            "source": source,
+            "logical_joints": [int(idx) + 1 for idx in clamped_idx],
+            "joint_labels": joint_labels,
+            "limit_sides": limit_sides,
+            "requested_deg": requested_deg,
+            "applied_deg": applied_deg,
+            "limit_min_deg": limit_min_deg,
+            "limit_max_deg": limit_max_deg,
+        },
+        key=f"JOINT_LIMIT:{source}:{'|'.join(joint_labels)}",
+    )
 
 
 def _jog_perf_update(**kwargs: object) -> None:
@@ -142,10 +463,15 @@ def get_jog_performance_snapshot() -> dict[str, object]:
     with _JOG_PERF_LOCK:
         snapshot = json.loads(json.dumps(_JOG_PERF))
     session_snapshot = {}
+    control_state = {}
     try:
         session_snapshot = _JOG_SESSION_MANAGER.get_snapshot()
     except Exception:
         session_snapshot = {}
+    try:
+        control_state = _JOG_SESSION_MANAGER.get_control_state()
+    except Exception:
+        control_state = {}
     last_update_age_s = session_snapshot.get("last_update_age_s")
     if isinstance(last_update_age_s, (int, float)):
         snapshot["last_velocity_command_age_s"] = max(0.0, float(last_update_age_s))
@@ -158,8 +484,12 @@ def get_jog_performance_snapshot() -> dict[str, object]:
         or utils.trajectory_state.get("jog_execution_policy", "")
         or ""
     )
+    snapshot.update(_build_jog_command_state_perf_fields(control_state))
     snapshot["rtcore_owned"] = bool(_get_rtcore_jog_backend() is not None)
     snapshot["control_frequency_hz"] = int(JOG_CONTROL_FREQUENCY_HZ) if "JOG_CONTROL_FREQUENCY_HZ" in globals() else 0
+    rtcore_jog_debug = _build_rtcore_jog_debug_snapshot()
+    if rtcore_jog_debug is not None:
+        snapshot["rtcore_jog_debug"] = rtcore_jog_debug
     return snapshot
 
 
@@ -356,6 +686,67 @@ def _get_rtcore_execution_backend_and_status():
         return backend, getter()
     except Exception:
         return backend, None
+
+
+def _get_rtcore_jog_debug_status():
+    backend = _get_rtcore_jog_backend()
+    if backend is None:
+        return None
+    getter = getattr(backend, "get_jog_debug_status", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+def _build_rtcore_jog_debug_snapshot() -> dict[str, object] | None:
+    status = _get_rtcore_jog_debug_status()
+    if status is None:
+        return None
+    num_axes = max(0, min(int(getattr(status, "num_axes", 0) or 0), 16))
+    feedback = [int(value) for value in list(getattr(status, "feedback_pos_counts", []))[:num_axes]]
+    hold = [int(value) for value in list(getattr(status, "hold_target_counts", []))[:num_axes]]
+    output = [int(value) for value in list(getattr(status, "output_target_counts", []))[:num_axes]]
+    output_velocity = [
+        int(value)
+        for value in list(getattr(status, "output_target_velocity_counts_per_s", []))[:num_axes]
+    ]
+    sample_time_ns = int(getattr(status, "sample_time_ns", 0) or 0)
+    last_stop_time_ns = int(getattr(status, "last_stop_time_ns", 0) or 0)
+    now_ns = time.monotonic_ns()
+    snapshot: dict[str, object] = {
+        "num_axes": num_axes,
+        "active_jog": bool(getattr(status, "active_jog", False)),
+        "active_jog_axis_mask": int(getattr(status, "active_jog_axis_mask", 0) or 0),
+        "command_sp_mask": int(getattr(status, "command_sp_mask", 0) or 0),
+        "have_hold_mask": int(getattr(status, "have_hold_mask", 0) or 0),
+        "have_jog_target_mask": int(getattr(status, "have_jog_target_mask", 0) or 0),
+        "snap_hold_mask": int(getattr(status, "snap_hold_mask", 0) or 0),
+        "stop_arrest_mask": int(getattr(status, "stop_arrest_mask", 0) or 0),
+        "latest_cmd_axis_mask": int(getattr(status, "latest_cmd_axis_mask", 0) or 0),
+        "latest_cmd_flags": int(getattr(status, "latest_cmd_flags", 0) or 0),
+        "latest_cmd_timeout_ns": int(getattr(status, "latest_cmd_timeout_ns", 0) or 0),
+        "sample_time_ns": sample_time_ns,
+        "sample_age_s": max(0.0, (now_ns - sample_time_ns) / 1e9) if sample_time_ns > 0 else None,
+        "active_jog_cmd_seq": int(getattr(status, "active_jog_cmd_seq", 0) or 0),
+        "latest_jog_seq_seen": int(getattr(status, "latest_jog_seq_seen", 0) or 0),
+        "active_jog_deadline_ns": int(getattr(status, "active_jog_deadline_ns", 0) or 0),
+        "last_stop_reason": int(getattr(status, "last_stop_reason", 0) or 0),
+        "last_stop_reason_name": str(getattr(status, "last_stop_reason_name", "none") or "none"),
+        "last_stop_axis_mask": int(getattr(status, "last_stop_axis_mask", 0) or 0),
+        "last_stop_time_ns": last_stop_time_ns,
+        "last_stop_age_s": max(0.0, (now_ns - last_stop_time_ns) / 1e9) if last_stop_time_ns > 0 else None,
+        "last_stop_cmd_seq": int(getattr(status, "last_stop_cmd_seq", 0) or 0),
+        "feedback_pos_counts": feedback,
+        "hold_target_counts": hold,
+        "output_target_counts": output,
+        "output_target_velocity_counts_per_s": output_velocity,
+        "hold_minus_feedback_counts": [h - f for h, f in zip(hold, feedback)],
+        "output_minus_feedback_counts": [o - f for o, f in zip(output, feedback)],
+    }
+    return snapshot
 
 
 def _get_backend_last_submitted_trajectory_id(backend) -> int:
@@ -2506,6 +2897,29 @@ def _wait_for_jog_thread_stop(timeout_s: float = 0.5) -> None:
         utils.trajectory_state["jog_thread"] = None
 
 
+def _stop_rtcore_jog_backend_best_effort(reason: str) -> None:
+    jog_backend = _get_rtcore_jog_backend()
+    if jog_backend is None:
+        return
+    reason_text = str(reason or "")
+    reason_lower = reason_text.strip().lower()
+    quick_stop = any(
+        marker in reason_lower
+        for marker in (
+            "lease-expired",
+            "fk-failed",
+            "controller-stop",
+            "controller-shutdown",
+        )
+    )
+    try:
+        stop_joint_velocity_lease_jog = getattr(jog_backend, "stop_joint_velocity_lease_jog", None)
+        if callable(stop_joint_velocity_lease_jog):
+            stop_joint_velocity_lease_jog(quick_stop=quick_stop)
+    except Exception as exc:
+        print(f"[Jog] WARNING: Failed to stop RTCore jog backend cleanly ({reason}): {exc}")
+
+
 def handle_get_jog_session_state() -> dict[str, object]:
     return _JOG_SESSION_MANAGER.get_snapshot()
 
@@ -2564,6 +2978,7 @@ def handle_jog_session_stop(payload: dict[str, object]) -> dict[str, object]:
     )
     print(f"[Jog] Stopping jog session {snapshot.get('session_id')} ({reason})")
     _sync_jog_trajectory_state()
+    _stop_rtcore_jog_backend_best_effort(f"session-stop:{reason}")
     _wait_for_jog_thread_stop()
     return snapshot
 
@@ -2578,14 +2993,53 @@ def _jog_controller_thread():
     jog_backend_timeout_s = _jog_backend_timeout_s(jog_backend)
     jog_backend_active = False
     q_current = servo_driver.get_current_arm_state_rad(verbose=False)
+    if q_current is None:
+        q_current = np.zeros(utils.NUM_LOGICAL_JOINTS, dtype=float)
+    else:
+        q_current = np.asarray(q_current, dtype=float)
     last_loop_time = time.monotonic()
     last_status_log_time = time.monotonic()
     was_paused_for_motion = False
+    was_motion_command_active = False
+    pending_resync_reason: str | None = "jog-start"
     target_period_ms = 1000.0 / float(JOG_CONTROL_FREQUENCY_HZ)
+
+    def _stop_backend_jog_now(reason: str) -> None:
+        nonlocal jog_backend_active
+        if jog_backend is None or not jog_backend_active:
+            return
+        reason_text = str(reason or "")
+        reason_lower = reason_text.strip().lower()
+        quick_stop = any(
+            marker in reason_lower
+            for marker in (
+                "lease-expired",
+                "fk-failed",
+                "controller-stop",
+                "controller-shutdown",
+            )
+        )
+        try:
+            stop_joint_velocity_lease_jog = getattr(jog_backend, "stop_joint_velocity_lease_jog", None)
+            if callable(stop_joint_velocity_lease_jog):
+                stop_joint_velocity_lease_jog(quick_stop=quick_stop)
+        except Exception as exc:
+            print(f"[Jog] WARNING: Failed to stop backend jog cleanly ({reason}): {exc}")
+        finally:
+            jog_backend_active = False
 
     while True:
         session_snapshot = _JOG_SESSION_MANAGER.expire_if_needed()
         if not bool(session_snapshot.get("session_active", False)):
+            stop_reason = str(
+                session_snapshot.get("last_stop_reason")
+                or session_snapshot.get("state")
+                or "session-inactive-before-loop"
+            ).strip().lower()
+            if stop_reason in {"lease-expired", "expired"}:
+                _stop_backend_jog_now("lease-expired-before-loop")
+            else:
+                _stop_backend_jog_now("session-inactive-before-loop")
             break
 
         loop_start_time = time.monotonic()
@@ -2595,15 +3049,9 @@ def _jog_controller_thread():
         if bool(utils.trajectory_state_get("is_running", False)):
             _JOG_SESSION_MANAGER.pause_for_motion()
             _sync_jog_trajectory_state()
-            if jog_backend_active and jog_backend is not None:
-                try:
-                    stop_joint_velocity_lease_jog = getattr(jog_backend, "stop_joint_velocity_lease_jog", None)
-                    if callable(stop_joint_velocity_lease_jog):
-                        stop_joint_velocity_lease_jog()
-                except Exception as exc:
-                    print(f"[Jog] WARNING: Failed to pause backend jog cleanly: {exc}")
-                jog_backend_active = False
+            _stop_backend_jog_now("pause-for-motion")
             was_paused_for_motion = True
+            was_motion_command_active = False
             loop_duration = time.monotonic() - loop_start_time
             sleep_time = (1.0 / JOG_CONTROL_FREQUENCY_HZ) - loop_duration
             if sleep_time > 0:
@@ -2613,11 +3061,12 @@ def _jog_controller_thread():
         if was_paused_for_motion:
             fresh_q = servo_driver.get_current_arm_state_rad(verbose=False)
             if fresh_q is not None:
-                q_current = fresh_q
+                q_current = np.asarray(fresh_q, dtype=float)
             _JOG_SESSION_MANAGER.resume_after_motion()
             _sync_jog_trajectory_state()
             last_loop_time = time.monotonic()
             was_paused_for_motion = False
+            pending_resync_reason = "resume-after-motion"
             continue
 
         control = _JOG_SESSION_MANAGER.get_control_state()
@@ -2633,13 +3082,16 @@ def _jog_controller_thread():
         if fresh_q is not None:
             q_current = np.asarray(fresh_q, dtype=float)
 
-        current_pose_matrix = ik_solver.get_fk_matrix(q_current)
-        if current_pose_matrix is None:
+        measured_pose_matrix = ik_solver.get_fk_matrix(q_current)
+        if measured_pose_matrix is None:
             print("[Jog] ERROR: FK failed during jog loop. Stopping.")
+            _stop_backend_jog_now("fk-failed")
             break
 
-        current_position = current_pose_matrix[:3, 3]
-        current_orientation = current_pose_matrix[:3, :3]
+        current_position = np.asarray(measured_pose_matrix[:3, 3], dtype=float)
+        current_orientation = np.asarray(measured_pose_matrix[:3, :3], dtype=float)
+        current_pose_snapshot = _pose_snapshot_from_components(current_position, current_orientation)
+        measured_joints_deg = _joint_angles_deg_list(q_current)
         if utils.trajectory_state.get("jog_debug", False):
             try:
                 curr_eul_deg = R.from_matrix(current_orientation).as_euler("xyz", degrees=True)
@@ -2650,9 +3102,49 @@ def _jog_controller_thread():
         velocities = np.asarray(control.get("velocity_vector", _coerce_jog_vector(0, 0, 0, 0, 0, 0)), dtype=float)
         linear_vel = np.clip(velocities[:3], -MAX_JOG_LINEAR_M_S, MAX_JOG_LINEAR_M_S)
         angular_deg_s = np.clip(velocities[3:], -MAX_JOG_ANGULAR_DEG_S, MAX_JOG_ANGULAR_DEG_S)
-        target_position = current_position + linear_vel * dt
+        motion_command_active = bool(
+            np.any(np.abs(linear_vel) > 1e-9) or np.any(np.abs(angular_deg_s) > 1e-9)
+        )
+        if motion_command_active and not was_motion_command_active and pending_resync_reason is None:
+            pending_resync_reason = "idle-resume"
+
+        if pending_resync_reason is not None or not bool(control.get("command_state_valid", False)):
+            _JOG_SESSION_MANAGER.resync_command_state(
+                position_m=current_position.tolist(),
+                orientation_matrix=current_orientation.tolist(),
+                joint_vector=q_current.tolist(),
+                reason=pending_resync_reason or "boundary-resync",
+            )
+            control = _JOG_SESSION_MANAGER.get_control_state()
+            pending_resync_reason = None
+
+        commanded_position = np.asarray(control.get("commanded_position_m"), dtype=float).reshape(3)
+        commanded_orientation = np.asarray(control.get("commanded_orientation_matrix"), dtype=float).reshape(3, 3)
+        commanded_joints = np.asarray(control.get("commanded_joint_vector"), dtype=float).reshape(-1)
+        current_commanded_pose_snapshot = _pose_snapshot_from_components(commanded_position, commanded_orientation)
+        current_commanded_pose_matrix = np.eye(4, dtype=float)
+        current_commanded_pose_matrix[:3, :3] = commanded_orientation
+        current_commanded_pose_matrix[:3, 3] = commanded_position
+        following_error = _following_error_snapshot(
+            commanded_position=commanded_position,
+            commanded_orientation_matrix=commanded_orientation,
+            commanded_joints=commanded_joints,
+            measured_pose_matrix=measured_pose_matrix,
+            measured_joints=q_current,
+        )
+        _JOG_SESSION_MANAGER.update_following_error(following_error)
+        control = _JOG_SESSION_MANAGER.get_control_state()
+        perf_fields = _build_jog_command_state_perf_fields(control)
+        _jog_perf_update(
+            measured_pose=current_pose_snapshot,
+            measured_joints_deg=measured_joints_deg,
+            **perf_fields,
+        )
+
+        target_position = commanded_position + linear_vel * dt
         delta_rotation = R.from_euler("xyz", angular_deg_s * dt, degrees=True).as_matrix()
-        target_orientation = delta_rotation @ current_orientation
+        target_orientation = delta_rotation @ commanded_orientation
+        target_pose_snapshot = _pose_snapshot_from_components(target_position, target_orientation)
         if utils.trajectory_state.get("jog_debug", False):
             try:
                 targ_eul_deg = R.from_matrix(target_orientation).as_euler("xyz", degrees=True)
@@ -2664,7 +3156,7 @@ def _jog_controller_thread():
         q_target = ik_solver.solve_ik(
             target_position=target_position,
             target_orientation_matrix=target_orientation,
-            initial_joint_angles=q_current,
+            initial_joint_angles=commanded_joints,
         )
         _record_jog_stage_metric(
             "ik_solve_ms",
@@ -2673,18 +3165,118 @@ def _jog_controller_thread():
 
         if q_target is not None:
             try:
-                q_arr = np.array(q_target, dtype=float)
-                limits = np.array(utils.LOGICAL_JOINT_LIMITS_RAD, dtype=float)
-                mins = limits[:, 0]
-                maxs = limits[:, 1]
-                q_clamped = np.clip(q_arr, mins, maxs)
-                if not np.allclose(q_arr, q_clamped, atol=1e-6):
-                    clamped_idx = np.where(np.abs(q_arr - q_clamped) > 1e-6)[0].tolist()
-                    print(f"[Jog] NOTE: IK target clamped at joints: {clamped_idx}")
+                q_arr = _unwrap_jog_joint_target(commanded_joints, q_target)
+                gate_ok, gate_reason, gate_details, solved_pose_matrix = _validate_jog_step_candidate(
+                    seed_joint_angles=commanded_joints,
+                    candidate_joint_angles=q_arr,
+                    target_position=target_position,
+                    target_orientation=target_orientation,
+                )
+                applied_pose_matrix = solved_pose_matrix if gate_ok else current_commanded_pose_matrix
+                applied_joint_vector = q_arr if gate_ok else commanded_joints
+                if not gate_ok:
+                    if gate_reason == "LIMIT_VIOLATION":
+                        limits = np.array(utils.LOGICAL_JOINT_LIMITS_RAD, dtype=float)
+                        mins = limits[:, 0]
+                        maxs = limits[:, 1]
+                        violating_idx = [
+                            int(idx)
+                            for idx in gate_details.get("violating_joint_indices", [])
+                            if isinstance(idx, (int, float))
+                        ]
+                        if violating_idx:
+                            _emit_joint_limit_alert(
+                                violating_idx,
+                                q_arr,
+                                np.clip(q_arr, mins, maxs),
+                                mins,
+                                maxs,
+                                source="jog",
+                            )
+                    _JOG_SESSION_MANAGER.record_gate_failure(reason=gate_reason, details=gate_details)
+                    _emit_jog_gate_alert(gate_reason, gate_details)
+                    if jog_backend is not None and jog_backend_active:
+                        try:
+                            update_joint_velocity_lease_jog = getattr(jog_backend, "update_joint_velocity_lease_jog", None)
+                            if callable(update_joint_velocity_lease_jog):
+                                update_joint_velocity_lease_jog(
+                                    [0.0] * len(commanded_joints),
+                                    timeout_s=jog_backend_timeout_s or JOG_BACKEND_LEASE_TIMEOUT_S,
+                                )
+                        except Exception as exc:
+                            print(f"[Jog] WARNING: Failed to hold backend jog command after gate rejection: {exc}")
+
+                perf_fields_after_gate = _build_jog_command_state_perf_fields(_JOG_SESSION_MANAGER.get_control_state())
+                _jog_perf_update(
+                    measured_pose=current_pose_snapshot,
+                    measured_joints_deg=measured_joints_deg,
+                    **perf_fields_after_gate,
+                )
+                _jog_perf_update(
+                    ik_debug={
+                        "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "seq": int(control.get("last_seq_received", -1)),
+                        "dt_s": float(dt),
+                        "linear_velocity_m_s": _vector_to_float_list(linear_vel),
+                        "angular_velocity_deg_s": _vector_to_float_list(angular_deg_s),
+                        "current_pose": current_pose_snapshot,
+                        "measured_pose": current_pose_snapshot,
+                        "commanded_pose": current_commanded_pose_snapshot,
+                        "target_pose": target_pose_snapshot,
+                        "solved_pose": _pose_snapshot_from_matrix(solved_pose_matrix),
+                        "applied_pose": _pose_snapshot_from_matrix(applied_pose_matrix),
+                        "accepted_commanded_pose": (
+                            target_pose_snapshot if gate_ok else current_commanded_pose_snapshot
+                        ),
+                        "target_vs_solved": _pose_error_snapshot(
+                            target_position,
+                            target_orientation,
+                            solved_pose_matrix,
+                        ),
+                        "target_vs_applied": _pose_error_snapshot(
+                            target_position,
+                            target_orientation,
+                            applied_pose_matrix,
+                        ),
+                        "current_joints_deg": measured_joints_deg,
+                        "measured_joints_deg": measured_joints_deg,
+                        "commanded_joints_deg": _joint_angles_deg_list(commanded_joints),
+                        "ik_seed_joints_deg": _joint_angles_deg_list(commanded_joints),
+                        "ik_solution_joints_deg": _joint_angles_deg_list(q_arr),
+                        "applied_joints_deg": _joint_angles_deg_list(applied_joint_vector),
+                        "accepted_commanded_joints_deg": _joint_angles_deg_list(applied_joint_vector),
+                        "clamped_joint_indices": [],
+                        "clamped": False,
+                        "solve_failed": False,
+                        "following_error": following_error,
+                        "last_resync_reason": perf_fields_after_gate.get("last_resync_reason"),
+                        "last_resync_age_s": perf_fields_after_gate.get("last_resync_age_s"),
+                        "gate_result": "accepted" if gate_ok else "rejected",
+                        "gate_reason": gate_reason,
+                        "gate_details": gate_details,
+                    }
+                )
                 if utils.trajectory_state.get("jog_debug", False):
-                    dq = q_clamped - q_current
+                    dq = q_arr - commanded_joints
                     print(f"[Jog] q_delta(rad)={np.round(dq, 5)} | lin={np.round(linear_vel,4)} m/s, ang={np.round(angular_deg_s,1)} deg/s, dt={dt:.4f}s")
+                if not gate_ok:
+                    was_motion_command_active = motion_command_active
+                    loop_duration = time.monotonic() - loop_start_time
+                    sleep_time = (1.0 / JOG_CONTROL_FREQUENCY_HZ) - loop_duration
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    continue
+
                 command_send_started = time.monotonic()
+                control_before_send = _JOG_SESSION_MANAGER.get_control_state()
+                if not bool(control_before_send.get("session_active", False)):
+                    _stop_backend_jog_now("session-stopped-before-send")
+                    break
+                if not bool(control_before_send.get("lease_valid", False)):
+                    _JOG_SESSION_MANAGER.expire_if_needed()
+                    _sync_jog_trajectory_state()
+                    _stop_backend_jog_now("lease-expired-before-send")
+                    break
                 if jog_backend is not None:
                     if not jog_backend_active:
                         start_joint_velocity_lease_jog = getattr(jog_backend, "start_joint_velocity_lease_jog", None)
@@ -2696,29 +3288,91 @@ def _jog_controller_thread():
                     if not callable(update_joint_velocity_lease_jog):
                         raise RuntimeError("Jog backend does not expose update_joint_velocity_lease_jog()")
                     dt_safe = max(dt, 1.0 / float(JOG_CONTROL_FREQUENCY_HZ))
-                    joint_velocity_cmd = ((q_clamped - q_current) / dt_safe).tolist()
+                    joint_velocity_cmd = ((q_arr - commanded_joints) / dt_safe).tolist()
                     update_joint_velocity_lease_jog(
                         joint_velocity_cmd,
                         timeout_s=jog_backend_timeout_s or JOG_BACKEND_LEASE_TIMEOUT_S,
                     )
                 else:
-                    servo_driver.set_servo_positions(q_clamped, 800, 0)
+                    servo_driver.set_servo_positions(q_arr, 800, 0)
                 _record_jog_stage_metric(
                     "command_send_ms",
                     max(0.0, (time.monotonic() - command_send_started) * 1000.0),
                 )
-                q_current = q_clamped
+                _JOG_SESSION_MANAGER.accept_command_step(
+                    position_m=target_position.tolist(),
+                    orientation_matrix=target_orientation.tolist(),
+                    joint_vector=q_arr.tolist(),
+                )
+                accepted_perf_fields = _build_jog_command_state_perf_fields(_JOG_SESSION_MANAGER.get_control_state())
+                _jog_perf_update(
+                    measured_pose=current_pose_snapshot,
+                    measured_joints_deg=measured_joints_deg,
+                    **accepted_perf_fields,
+                )
                 _JOG_SESSION_MANAGER.mark_seq_applied(int(control.get("last_seq_received", -1)))
             except Exception as exc:
-                print(f"[Jog] WARNING: Failed to clamp/apply joint limits: {exc}")
+                print(f"[Jog] WARNING: Failed to validate/apply jog step: {exc}")
         else:
+            gate_reason = "IK_NO_SOLUTION"
+            gate_details = {
+                "max_joint_step_rad": None,
+                "joint_limit_margin_rad": None,
+                "cartesian_residual_m": None,
+                "orientation_residual_deg": None,
+                "violating_joint_indices": [],
+            }
+            _JOG_SESSION_MANAGER.record_gate_failure(reason=gate_reason, details=gate_details)
+            perf_fields_after_gate = _build_jog_command_state_perf_fields(_JOG_SESSION_MANAGER.get_control_state())
+            _jog_perf_update(
+                measured_pose=current_pose_snapshot,
+                measured_joints_deg=measured_joints_deg,
+                **perf_fields_after_gate,
+            )
+            _jog_perf_update(
+                ik_debug={
+                    "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "seq": int(control.get("last_seq_received", -1)),
+                    "dt_s": float(dt),
+                    "linear_velocity_m_s": _vector_to_float_list(linear_vel),
+                    "angular_velocity_deg_s": _vector_to_float_list(angular_deg_s),
+                    "current_pose": current_pose_snapshot,
+                    "measured_pose": current_pose_snapshot,
+                    "commanded_pose": current_commanded_pose_snapshot,
+                    "target_pose": target_pose_snapshot,
+                    "current_joints_deg": measured_joints_deg,
+                    "measured_joints_deg": measured_joints_deg,
+                    "commanded_joints_deg": _joint_angles_deg_list(commanded_joints),
+                    "ik_seed_joints_deg": _joint_angles_deg_list(commanded_joints),
+                    "ik_solution_joints_deg": None,
+                    "applied_joints_deg": _joint_angles_deg_list(commanded_joints),
+                    "solved_pose": None,
+                    "applied_pose": current_commanded_pose_snapshot,
+                    "target_vs_solved": None,
+                    "target_vs_applied": _pose_error_snapshot(
+                        target_position,
+                        target_orientation,
+                        current_commanded_pose_matrix,
+                    ),
+                    "clamped_joint_indices": [],
+                    "clamped": False,
+                    "solve_failed": True,
+                    "following_error": following_error,
+                    "last_resync_reason": perf_fields_after_gate.get("last_resync_reason"),
+                    "last_resync_age_s": perf_fields_after_gate.get("last_resync_age_s"),
+                    "gate_result": "rejected",
+                    "gate_reason": gate_reason,
+                    "gate_details": gate_details,
+                }
+            )
             print("[Jog] WARNING: IK solution not found for step.")
+            _emit_jog_gate_alert(gate_reason, gate_details)
             if jog_backend is not None and jog_backend_active:
                 try:
                     update_joint_velocity_lease_jog = getattr(jog_backend, "update_joint_velocity_lease_jog", None)
                     if callable(update_joint_velocity_lease_jog):
                         update_joint_velocity_lease_jog(
-                            [0.0] * len(q_current),
+                            [0.0] * len(commanded_joints),
                             timeout_s=jog_backend_timeout_s or JOG_BACKEND_LEASE_TIMEOUT_S,
                         )
                 except Exception as exc:
@@ -2757,19 +3411,14 @@ def _jog_controller_thread():
             if utils.trajectory_state.get("jog_debug", False):
                 print(f"[Jog] dt={dt*1000:.1f}ms, v_lin={np.round(linear_vel,3)}, v_ang(deg/s)={np.round(angular_deg_s,1)}")
             last_status_log_time = now
+        was_motion_command_active = motion_command_active
         _record_jog_loop_metric(
             max(0.0, (time.monotonic() - loop_start_time) * 1000.0),
             target_period_ms=target_period_ms,
         )
 
     print("[Jog] Jog controller thread stopped.")
-    if jog_backend is not None and jog_backend_active:
-        try:
-            stop_joint_velocity_lease_jog = getattr(jog_backend, "stop_joint_velocity_lease_jog", None)
-            if callable(stop_joint_velocity_lease_jog):
-                stop_joint_velocity_lease_jog()
-        except Exception as exc:
-            print(f"[Jog] WARNING: Failed to stop backend jog on thread exit: {exc}")
+    _stop_backend_jog_now("thread-exit")
     if jog_backend is None:
         current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
         if current_angles:

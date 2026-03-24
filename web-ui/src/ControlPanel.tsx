@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_SPEED_SLIDER } from "./uiConstants";
+import {
+	FALLBACK_JOINT_FEEDBACK_POLL_MS,
+	useOptionalLiveState,
+} from "./liveState";
 
 type Props = {
 	apiHost: string;
@@ -7,6 +11,8 @@ type Props = {
 	activeServoBackend?: string | null;
 	onJointFeedback?: (anglesDeg: number[], gripperDeg?: number) => void;
 	onError?: (message: string) => void;
+	motionStatus?: MotionStatusResponse | null;
+	onMotionStatus?: (status: MotionStatusResponse | null) => void;
 };
 
 type JointInfoResponse = {
@@ -50,6 +56,7 @@ type JogStatePayload = {
 	v_roll: number;
 	v_pitch: number;
 	v_yaw: number;
+	stop_reason?: string;
 };
 
 type JogSessionSnapshot = {
@@ -65,8 +72,6 @@ type JogSessionResponse = {
 	status?: string;
 	session?: JogSessionSnapshot;
 };
-
-const LIVE_JOINT_FEEDBACK_POLL_MS = 20;
 
 type CommissioningStatus = {
 	tone: "info" | "success" | "error";
@@ -131,11 +136,20 @@ function createJogOwnerId(): string {
 	return `web-ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function isJogSessionTerminalError(message: string | null | undefined): boolean {
+function getJogSessionErrorCode(message: string | null | undefined): string | null {
 	if (!message) {
-		return false;
+		return null;
 	}
-	return /SESSION_EXPIRED|OWNER_CONFLICT|WRONG_SESSION|SESSION_NOT_FOUND|SESSION_INACTIVE/.test(message);
+	const match = message.match(/\b(SESSION_EXPIRED|OWNER_CONFLICT|WRONG_SESSION|SESSION_NOT_FOUND|SESSION_INACTIVE)\b/);
+	return match ? match[1] : null;
+}
+
+function isJogSessionTerminalError(message: string | null | undefined): boolean {
+	return getJogSessionErrorCode(message) !== null;
+}
+
+function isJogSessionRecoverableError(code: string | null): boolean {
+	return code === "SESSION_EXPIRED" || code === "SESSION_NOT_FOUND" || code === "SESSION_INACTIVE";
 }
 
 function formatDriveFaultAxisLabel(axis: DriveFaultAxis): string {
@@ -174,6 +188,15 @@ function expSliderToMultiplier(v: number): number {
 	return mult;
 }
 
+function isZeroJogPayload(payload: JogStatePayload): boolean {
+	return payload.vx === 0 &&
+		payload.vy === 0 &&
+		payload.vz === 0 &&
+		payload.v_roll === 0 &&
+		payload.v_pitch === 0 &&
+		payload.v_yaw === 0;
+}
+
 function formatStepDegrees(value: number): string {
 	if (!Number.isFinite(value)) {
 		return "--";
@@ -203,10 +226,21 @@ async function readErrorMessage(res: Response): Promise<string> {
 					typeof payload.detail === "object" &&
 					typeof (payload.detail as { message?: unknown }).message === "string"
 				) {
-					return String((payload.detail as { message: string }).message);
+					const detailPayload = payload.detail as { code?: unknown; message: string };
+					if (typeof detailPayload.code === "string" && detailPayload.code.trim()) {
+						return `${detailPayload.code}: ${detailPayload.message}`;
+					}
+					return String(detailPayload.message);
 				}
 				if (typeof payload.detail === "string") {
 					return payload.detail;
+				}
+				if (
+					payload.detail &&
+					typeof payload.detail === "object" &&
+					typeof (payload.detail as { code?: unknown }).code === "string"
+				) {
+					return String((payload.detail as { code: string }).code);
 				}
 				if (typeof payload.message === "string") {
 					return payload.message;
@@ -228,7 +262,20 @@ async function readErrorMessage(res: Response): Promise<string> {
 	return `${res.status} ${res.statusText}`;
 }
 
-export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJointFeedback, onError }: Props) {
+export function ControlPanel({
+	apiHost,
+	driveFaults,
+	activeServoBackend,
+	onJointFeedback,
+	onError,
+	motionStatus: controlledMotionStatus,
+	onMotionStatus,
+}: Props) {
+	const liveState = useOptionalLiveState();
+	const latestTelemetry = liveState?.latest ?? null;
+	const isMonitorFresh = liveState?.isMonitorFresh ?? false;
+	const sharedMotionStatus = liveState?.motionStatus ?? null;
+	const setSharedMotionStatus = liveState?.setMotionStatus;
 	const [speedVal, setSpeedVal] = useState<number>(DEFAULT_SPEED_SLIDER); // 0..1000
 	const speedMult = useMemo(() => expSliderToMultiplier(speedVal), [speedVal]);
 	const [grip, setGrip] = useState<number>(0);
@@ -241,7 +288,15 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const [pendingMotionAction, setPendingMotionAction] = useState<string | null>(null);
 	const [commissioningStatus, setCommissioningStatus] = useState<CommissioningStatus | null>(null);
 	const [commissioningExpanded, setCommissioningExpanded] = useState<boolean>(false);
-	const [motionStatus, setMotionStatus] = useState<MotionStatusResponse | null>(null);
+	const [localMotionStatus, setLocalMotionStatus] = useState<MotionStatusResponse | null>(null);
+	const motionStatus = controlledMotionStatus ?? sharedMotionStatus ?? localMotionStatus;
+	const setMotionStatus = useCallback((next: MotionStatusResponse | null) => {
+		if (controlledMotionStatus === undefined && !setSharedMotionStatus) {
+			setLocalMotionStatus(next);
+		}
+		setSharedMotionStatus?.(next);
+		onMotionStatus?.(next);
+	}, [controlledMotionStatus, onMotionStatus, setSharedMotionStatus]);
 	const activeDriveFaultAxes = useMemo(
 		() =>
 			(driveFaults?.axes ?? []).filter(
@@ -270,6 +325,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const jogTimerRef = useRef<number | null>(null);
 	const sendJogTickRef = useRef<() => Promise<void>>(async () => {});
 	const jogEnabledRef = useRef<boolean>(false);
+	const jogHoldActiveRef = useRef<boolean>(false);
 	const deadmanRef = useRef<boolean>(true);
 	const lastSentRef = useRef<JogCommandVector>([0, 0, 0, 0, 0, 0]);
 	const lastSentAtRef = useRef<number>(0);
@@ -380,6 +436,32 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	}, [getJson, onJointFeedback]);
 
 	useEffect(() => {
+		if (!isMonitorFresh || !Array.isArray(latestTelemetry?.joints) || latestTelemetry.joints.length === 0) {
+			return;
+		}
+		const nextAngles = latestTelemetry.joints.map((value) => Number((value * 180) / Math.PI));
+		setJointAnglesDeg((current) => {
+			if (current.length === nextAngles.length) {
+				let changed = false;
+				for (let index = 0; index < nextAngles.length; index += 1) {
+					if (Math.abs((current[index] ?? 0) - nextAngles[index]) > 1e-3) {
+						changed = true;
+						break;
+					}
+				}
+				if (!changed) {
+					return current;
+				}
+			}
+			return nextAngles;
+		});
+		setJointFeedbackError(null);
+	}, [isMonitorFresh, latestTelemetry]);
+
+	useEffect(() => {
+		if (isMonitorFresh && Array.isArray(latestTelemetry?.joints) && latestTelemetry.joints.length > 0) {
+			return;
+		}
 		let disposed = false;
 		let inFlight = false;
 		const tick = async () => {
@@ -402,14 +484,17 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		void tick();
 		const timer = window.setInterval(() => {
 			void tick();
-		}, LIVE_JOINT_FEEDBACK_POLL_MS);
+		}, FALLBACK_JOINT_FEEDBACK_POLL_MS);
 		return () => {
 			disposed = true;
 			window.clearInterval(timer);
 		};
-	}, [refreshJointAngles]);
+	}, [isMonitorFresh, latestTelemetry, refreshJointAngles]);
 
 	useEffect(() => {
+		if (controlledMotionStatus !== undefined || liveState) {
+			return;
+		}
 		let disposed = false;
 		let inFlight = false;
 		const tick = async () => {
@@ -432,7 +517,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 			disposed = true;
 			window.clearInterval(timer);
 		};
-	}, [getJson]);
+	}, [controlledMotionStatus, getJson, liveState, setMotionStatus]);
 
 	// ------------------------
 	// Realtime jog helpers
@@ -455,11 +540,17 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const effectiveLinearMS = useMemo(() => (linBaseMmS / 1000.0) * speedMult, [linBaseMmS, speedMult]);
 	const effectiveAngularDegS = useMemo(() => angBaseDegS * speedMult, [angBaseDegS, speedMult]);
 
+	const hasActiveJogInput = useCallback(() => {
+		const linear = linCountsRef.current;
+		const angular = angCountsRef.current;
+		return linear.x !== 0 || linear.y !== 0 || linear.z !== 0 || angular.x !== 0 || angular.y !== 0 || angular.z !== 0;
+	}, []);
+
 	const buildJogStatePayload = useCallback((
 		commandPayload: JogCommandVector,
-		overrides?: Partial<Pick<JogStatePayload, "active" | "deadman">>,
+		overrides?: Partial<Pick<JogStatePayload, "active" | "deadman" | "stop_reason">>,
 	): JogStatePayload => ({
-		active: overrides?.active ?? jogEnabledRef.current,
+		active: overrides?.active ?? jogHoldActiveRef.current,
 		deadman: overrides?.deadman ?? deadmanRef.current,
 		vx: commandPayload[0],
 		vy: commandPayload[1],
@@ -467,6 +558,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		v_roll: commandPayload[3],
 		v_pitch: commandPayload[4],
 		v_yaw: commandPayload[5],
+		stop_reason: overrides?.stop_reason,
 	}), []);
 
 	const resetJogSessionTracking = useCallback(() => {
@@ -499,10 +591,23 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 						lastSentAtRef.current = Date.now();
 						setLastJogCommand(nextCommand);
 						if (!nextPayload.active) {
+							const activeSessionId = jogSessionIdRef.current;
+							if (activeSessionId) {
+								await post("/control/jog/session/stop", {
+									session_id: activeSessionId,
+									owner_id: jogOwnerIdRef.current,
+									reason: nextPayload.stop_reason ?? "ui-release",
+								}, nextSilent);
+							}
 							resetJogSessionTracking();
 							continue;
 						}
+						if (!jogSessionIdRef.current && isZeroJogPayload(nextPayload)) {
+							jogSessionStatusRef.current = "idle";
+							continue;
+						}
 						const nextSeq = jogSessionSeqRef.current + 1;
+						jogSessionSeqRef.current = nextSeq;
 						const requestBody = {
 							owner_id: jogOwnerIdRef.current,
 							seq: nextSeq,
@@ -529,6 +634,15 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 								: nextSeq;
 							jogSessionStatusRef.current = session.state ?? "active";
 						} else if (isJogSessionTerminalError(lastRequestErrorRef.current)) {
+							const errorCode = getJogSessionErrorCode(lastRequestErrorRef.current);
+							if (isJogSessionRecoverableError(errorCode)) {
+								resetJogSessionTracking();
+								if (nextPayload.active && !isZeroJogPayload(nextPayload)) {
+									queuedJogStateRef.current = nextPayload;
+									queuedJogStateSilentRef.current = nextSilent;
+								}
+								continue;
+							}
 							const zeroCommand: JogCommandVector = [0, 0, 0, 0, 0, 0];
 							setJogEnabled(false);
 							if (jogTimerRef.current) {
@@ -543,6 +657,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 							lastSentRef.current = zeroCommand;
 							lastSentAtRef.current = Date.now();
 							jogEnabledRef.current = false;
+							jogHoldActiveRef.current = false;
 							resetJogSessionTracking();
 						}
 					}
@@ -555,16 +670,23 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	}, [post, resetJogSessionTracking]);
 
 	const sendJogTick = useCallback(async () => {
+		if (!jogHoldActiveRef.current) {
+			return;
+		}
 		const now = Date.now();
 		const v = computeJogVector();
 		const last = lastSentRef.current;
+		const hasSession = Boolean(jogSessionIdRef.current);
 		const isZeroVector =
 			v[0] === 0 && v[1] === 0 && v[2] === 0 &&
 			v[3] === 0 && v[4] === 0 && v[5] === 0;
 		const changed =
 			v[0] !== last[0] || v[1] !== last[1] || v[2] !== last[2] ||
 			v[3] !== last[3] || v[4] !== last[4] || v[5] !== last[5];
-		if (!changed && (isZeroVector || now - lastSentAtRef.current < keepaliveMs)) {
+		if (!changed && now - lastSentAtRef.current < keepaliveMs) {
+			return;
+		}
+		if (!changed && isZeroVector && !hasSession) {
 			return;
 		}
 		const commandPayload: JogCommandVector = [
@@ -591,25 +713,46 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		deadmanRef.current = deadman;
 	}, [deadman]);
 
-	const stopJogLocally = useCallback((clearSessionTracking = false) => {
-		const zeroCommand: JogCommandVector = [0, 0, 0, 0, 0, 0];
-		setJogEnabled(false);
+	const stopJogPolling = useCallback(() => {
 		if (jogTimerRef.current) {
 			window.clearInterval(jogTimerRef.current);
 			jogTimerRef.current = null;
 		}
+	}, []);
+
+	const ensureJogPolling = useCallback(() => {
+		if (jogTimerRef.current) {
+			return;
+		}
+		jogTimerRef.current = window.setInterval(() => {
+			sendJogTickRef.current().catch(() => {});
+		}, jogTickIntervalMs);
+	}, [jogTickIntervalMs]);
+
+	const stopJogLocally = useCallback((options?: { clearSessionTracking?: boolean; disarm?: boolean; clearQueuedState?: boolean }) => {
+		const clearSessionTracking = options?.clearSessionTracking ?? false;
+		const disarm = options?.disarm ?? false;
+		const clearQueuedState = options?.clearQueuedState ?? false;
+		const zeroCommand: JogCommandVector = [0, 0, 0, 0, 0, 0];
+		stopJogPolling();
 		linCountsRef.current = { x: 0, y: 0, z: 0 };
 		angCountsRef.current = { x: 0, y: 0, z: 0 };
-		queuedJogStateRef.current = null;
-		queuedJogStateSilentRef.current = true;
+		if (clearQueuedState) {
+			queuedJogStateRef.current = null;
+			queuedJogStateSilentRef.current = true;
+		}
 		setLastJogCommand(zeroCommand);
 		lastSentRef.current = zeroCommand;
 		lastSentAtRef.current = Date.now();
-		jogEnabledRef.current = false;
+		jogHoldActiveRef.current = false;
+		if (disarm) {
+			setJogEnabled(false);
+			jogEnabledRef.current = false;
+		}
 		if (clearSessionTracking) {
 			resetJogSessionTracking();
 		}
-	}, [resetJogSessionTracking]);
+	}, [resetJogSessionTracking, stopJogPolling]);
 
 	const postJsonBestEffort = useCallback((path: string, body?: unknown) => {
 		const payload = body === undefined ? "" : JSON.stringify(body);
@@ -635,10 +778,10 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 
 	const requestJogFailsafeStop = useCallback(() => {
 		const sessionId = jogSessionIdRef.current;
-		if (!jogEnabledRef.current && !sessionId) {
+		if (!jogEnabledRef.current && !jogHoldActiveRef.current && !sessionId) {
 			return;
 		}
-		stopJogLocally();
+		stopJogLocally({ clearQueuedState: true, disarm: true });
 		if (sessionId) {
 			postJsonBestEffort("/control/jog/session/stop", {
 				session_id: sessionId,
@@ -665,7 +808,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 			document.removeEventListener("visibilitychange", handleVisibilityChange);
 			window.removeEventListener("beforeunload", handlePageHide);
 			window.removeEventListener("pagehide", handlePageHide);
-			if (jogEnabledRef.current || jogSessionIdRef.current) {
+			if (jogEnabledRef.current || jogHoldActiveRef.current || jogSessionIdRef.current) {
 				const sessionId = jogSessionIdRef.current;
 				if (sessionId) {
 					postJsonBestEffort("/control/jog/session/stop", {
@@ -679,24 +822,26 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		};
 	}, [postJsonBestEffort, requestJogFailsafeStop, resetJogSessionTracking]);
 
-	const ensureJogStarted = useCallback(async () => {
-		if (!jogEnabled) {
-			setJogEnabled(true);
-			jogEnabledRef.current = true;
-			// start timer
-			if (jogTimerRef.current) {
-				window.clearInterval(jogTimerRef.current);
-			}
-			jogTimerRef.current = window.setInterval(() => {
-				sendJogTickRef.current().catch(() => {});
-			}, jogTickIntervalMs);
-			await enqueueJogState(buildJogStatePayload([0, 0, 0, 0, 0, 0], { active: true, deadman }), false);
+	const armJogMode = useCallback(() => {
+		if (jogEnabledRef.current) {
+			return;
 		}
-	}, [buildJogStatePayload, deadman, enqueueJogState, jogEnabled, jogTickIntervalMs]);
+		setJogEnabled(true);
+		jogEnabledRef.current = true;
+	}, []);
 
-	const stopJog = useCallback(async () => {
-		const sessionId = jogSessionIdRef.current;
+	const releaseJogHold = useCallback(async (reason = "ui-release") => {
 		stopJogLocally();
+		await enqueueJogState(buildJogStatePayload([0, 0, 0, 0, 0, 0], {
+			active: false,
+			deadman: false,
+			stop_reason: reason,
+		}), true);
+	}, [buildJogStatePayload, enqueueJogState, stopJogLocally]);
+
+	const stopJog = useCallback(async (reason = "ui-disarm") => {
+		const shouldSendStop = jogHoldActiveRef.current || Boolean(jogSessionIdRef.current) || Boolean(queuedJogStateRef.current);
+		stopJogLocally({ disarm: true });
 		try {
 			if (jogStatePublishLoopRef.current) {
 				await jogStatePublishLoopRef.current;
@@ -704,15 +849,16 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 		} catch {
 			// Ignore prior publish failure and still try the stop request.
 		}
-		if (sessionId) {
-			await post("/control/jog/session/stop", {
-				session_id: sessionId,
-				owner_id: jogOwnerIdRef.current,
-				reason: "ui-release",
-			}, false);
+		if (shouldSendStop) {
+			await enqueueJogState(buildJogStatePayload([0, 0, 0, 0, 0, 0], {
+				active: false,
+				deadman: false,
+				stop_reason: reason,
+			}), false);
+		} else {
+			resetJogSessionTracking();
 		}
-		resetJogSessionTracking();
-	}, [post, resetJogSessionTracking, stopJogLocally]);
+	}, [buildJogStatePayload, enqueueJogState, resetJogSessionTracking, stopJogLocally]);
 
 	const runDiscreteMotionCommand = useCallback(async <T,>(actionKey: string, task: () => Promise<T>) => {
 		if (motionBusy || pendingMotionActionRef.current) {
@@ -731,7 +877,7 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	const onDeadmanToggle = useCallback(async (enabled: boolean) => {
 		setDeadman(enabled);
 		deadmanRef.current = enabled;
-		if (jogEnabledRef.current) {
+		if (jogHoldActiveRef.current) {
 			const vector = enabled ? computeJogVector() : ([0, 0, 0, 0, 0, 0] as JogCommandVector);
 			const commandPayload: JogCommandVector = [
 				Number(vector[0].toFixed(6)),
@@ -1096,21 +1242,26 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 	);
 
 	const changeLinearCount = useCallback(async (axis: "x" | "y" | "z", delta: number) => {
-		// Realtime jog: adjust the active axis counts and send an immediate tick.
-		// Jog must already be started via the Start button; we do not auto-start here,
-		// so that a simple button tap can remain purely incremental when realtime is off.
-		await ensureJogStarted();
 		linCountsRef.current = { ...linCountsRef.current, [axis]: linCountsRef.current[axis] + delta };
-		// immediate tick to avoid delay
+		if (!hasActiveJogInput()) {
+			await releaseJogHold();
+			return;
+		}
+		jogHoldActiveRef.current = true;
+		ensureJogPolling();
 		await sendJogTick();
-	}, [ensureJogStarted, sendJogTick]);
+	}, [ensureJogPolling, hasActiveJogInput, releaseJogHold, sendJogTick]);
 
 	const changeAngularCount = useCallback(async (axis: "x" | "y" | "z", delta: number) => {
-		// Realtime jog: adjust the active axis counts and send an immediate tick.
-		await ensureJogStarted();
 		angCountsRef.current = { ...angCountsRef.current, [axis]: angCountsRef.current[axis] + delta };
+		if (!hasActiveJogInput()) {
+			await releaseJogHold();
+			return;
+		}
+		jogHoldActiveRef.current = true;
+		ensureJogPolling();
 		await sendJogTick();
-	}, [ensureJogStarted, sendJogTick]);
+	}, [ensureJogPolling, hasActiveJogInput, releaseJogHold, sendJogTick]);
 
 	const onPress = useCallback((fn: () => void) => (e: React.PointerEvent<HTMLButtonElement>) => {
 		(e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId);
@@ -1337,9 +1488,9 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 						</label>
 						<button
 							className={`rounded px-2 py-1 ${jogEnabled ? "bg-rose-600 text-white" : "bg-slate-800 hover:bg-slate-700"}`}
-							onClick={async () => (jogEnabled ? await stopJog() : await ensureJogStarted())}
+							onClick={async () => (jogEnabled ? await stopJog() : armJogMode())}
 						>
-							{jogEnabled ? "Stop" : "Start"}
+							{jogEnabled ? "Disarm" : "Arm"}
 						</button>
 					</div>
 				</div>
@@ -1381,6 +1532,9 @@ export function ControlPanel({ apiHost, driveFaults, activeServoBackend, onJoint
 					<div className="tabular-nums">
 						<span className="text-slate-400">angular deg/s:</span>{" "}
 						roll={lastJogCommand[3].toFixed(3)} pitch={lastJogCommand[4].toFixed(3)} yaw={lastJogCommand[5].toFixed(3)}
+					</div>
+					<div className="mt-1 text-[10px] text-slate-500">
+						Arm mode enables hold-to-jog. The controller session only exists while a jog button is actively held.
 					</div>
 				</div>
 				<div className="grid grid-cols-3 gap-1">

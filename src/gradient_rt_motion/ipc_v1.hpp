@@ -231,6 +231,36 @@ struct StatusMotionStateV1 {
 };
 static_assert(sizeof(StatusMotionStateV1) == 64, "StatusMotionStateV1 size must match spec");
 
+// High-rate RTCore jog instrumentation for debugging stop/timeout behavior.
+// This reports motor-side feedback, latched hold targets, and the actual CSP
+// outputs RTCore is writing around the jog stop boundary.
+struct StatusJogDebugV1 {
+  uint32_t num_axes;              // <= GRADIENT_MAX_AXES
+  uint32_t active_jog;            // 0/1
+  uint32_t active_jog_axis_mask;  // currently active jog axes
+  uint32_t command_sp_mask;       // per-cycle setpoint mask before DS402 hold/output
+  uint32_t have_hold_mask;        // axes with a latched hold target
+  uint32_t have_jog_target_mask;  // axes with an accumulated jog target
+  uint32_t snap_hold_mask;        // axes snapped to feedback this cycle
+  uint32_t latest_cmd_axis_mask;  // raw latest CmdJogV1 axis mask
+  uint32_t latest_cmd_flags;      // raw latest CmdJogV1 flags
+  uint32_t last_stop_reason;      // enum JogStopReasonV1
+  uint32_t last_stop_axis_mask;   // axes affected by the last stop event
+  uint32_t stop_arrest_mask;      // axes in the post-stop feedback re-latch window
+  uint64_t sample_time_ns;        // CLOCK_MONOTONIC at RTCore sample creation
+  uint64_t active_jog_cmd_seq;    // cmd seq currently driving jog
+  uint64_t latest_jog_seq_seen;   // latest CmdJogV1 seq consumed by RTCore
+  uint64_t active_jog_deadline_ns;
+  uint64_t latest_cmd_timeout_ns;
+  uint64_t last_stop_time_ns;     // CLOCK_MONOTONIC when stop/timeout latched
+  uint64_t last_stop_cmd_seq;     // cmd seq associated with the stop event
+  int32_t feedback_pos_counts[GRADIENT_MAX_AXES];
+  int32_t hold_target_counts[GRADIENT_MAX_AXES];
+  int32_t output_target_counts[GRADIENT_MAX_AXES];
+  int32_t output_target_velocity_counts_per_s[GRADIENT_MAX_AXES];
+};
+static_assert(sizeof(StatusJogDebugV1) == 360, "StatusJogDebugV1 size must match spec");
+
 // ----- Command payloads -----
 
 struct CmdArmV1 {
@@ -332,6 +362,14 @@ static_assert(sizeof(CmdJogV1) == 144, "CmdJogV1 size must match spec");
 enum : uint32_t {
   JOG_FLAG_ACTIVE = 1u << 0,
   JOG_FLAG_STOP = 1u << 1,
+  JOG_FLAG_QUICK_STOP = 1u << 2,
+};
+
+enum : uint32_t {
+  JOG_STOP_REASON_NONE = 0,
+  JOG_STOP_REASON_CMD_STOP = 1,
+  JOG_STOP_REASON_TIMEOUT = 2,
+  JOG_STOP_REASON_TRAJECTORY_PREEMPT = 3,
 };
 
 // ----- I/O snapshot payload -----
@@ -375,6 +413,7 @@ enum : uint16_t {
   MSG_STATUS_AXIS_CONFIG = 0x0203,
   MSG_STATUS_SNAPSHOT = 0x0202,
   MSG_STATUS_MOTION_STATE = 0x0204,
+  MSG_STATUS_JOG_DEBUG = 0x0205,
   MSG_STATUS_IO_SNAPSHOT = 0x0210,
   MSG_EVENT = 0x02FF,
 };

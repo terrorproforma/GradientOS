@@ -8,5 +8,8 @@ export default defineConfig({
     port: 8000,
     host: "0.0.0.0",
     allowedHosts: ["gradientrobotics.local", "jetson.local", "mini-arm.local"]
-  }
+  },
+  test: {
+    environment: "jsdom",
+  },
 });

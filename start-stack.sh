@@ -1315,6 +1315,39 @@ systemd_service_is_active() {
   run_systemctl is-active --quiet "$1" >/dev/null 2>&1
 }
 
+systemd_service_state() {
+  local service_name="$1"
+  local state=""
+  state="$(run_systemctl is-active "${service_name}" 2>/dev/null || true)"
+  state="${state//$'\n'/}"
+  state="${state//$'\r'/}"
+  printf '%s\n' "${state:-unknown}"
+}
+
+wait_for_systemd_service_inactive() {
+  local service_name="$1"
+  local timeout_s="${2:-12}"
+  local deadline=0
+  local now=0
+  local state=""
+
+  deadline=$(( $(date +%s) + timeout_s ))
+  while true; do
+    state="$(systemd_service_state "${service_name}")"
+    case "${state}" in
+      inactive|failed|unknown)
+        return 0
+        ;;
+    esac
+    now="$(date +%s)"
+    if (( now >= deadline )); then
+      warn "${service_name} still ${state} after ${timeout_s}s"
+      return 1
+    fi
+    sleep 0.2
+  done
+}
+
 stop_systemd_service_if_active() {
   local service_name="$1"
   if ! systemd_service_is_active "${service_name}"; then
@@ -1322,7 +1355,15 @@ stop_systemd_service_if_active() {
   fi
   log "Stopping systemd service ${service_name}"
   if run_systemctl stop "${service_name}" >/dev/null 2>&1; then
-    return 0
+    if wait_for_systemd_service_inactive "${service_name}" 12; then
+      return 0
+    fi
+    warn "Escalating ${service_name} stop via systemctl kill"
+    run_systemctl kill --signal=SIGKILL "${service_name}" >/dev/null 2>&1 || true
+    run_systemctl stop "${service_name}" >/dev/null 2>&1 || true
+    if wait_for_systemd_service_inactive "${service_name}" 5; then
+      return 0
+    fi
   fi
   warn "Failed to stop ${service_name} via systemd"
   return 1
@@ -1419,10 +1460,20 @@ perform_shutdown_sequence() {
   if [[ "${HARD_STOP}" -eq 1 ]]; then
     if [[ "${current_state}" == "ACTIVE" || "${current_state}" == "BUS_UP_DISARMED" || "${current_state}" == "FAULTED" || -z "${current_state}" ]]; then
       stop_rtcore_runtime || true
-      sleep 1
     fi
 
     stop_ethercat_master_runtime
+
+    local rtcore_state=""
+    local ethercat_state=""
+    rtcore_state="$(systemd_service_state "${RTCORE_SERVICE_NAME}")"
+    ethercat_state="$(systemd_service_state "${ETHERCAT_SERVICE_NAME}")"
+    if [[ "${rtcore_state}" != "inactive" && "${rtcore_state}" != "failed" && "${rtcore_state}" != "unknown" ]]; then
+      warn "Hard stop ended with ${RTCORE_SERVICE_NAME} still ${rtcore_state}"
+    fi
+    if [[ "${ethercat_state}" != "inactive" && "${ethercat_state}" != "failed" && "${ethercat_state}" != "unknown" ]]; then
+      warn "Hard stop ended with ${ETHERCAT_SERVICE_NAME} still ${ethercat_state}"
+    fi
   else
     log "Soft stop complete: leaving RTCore and EtherCAT master up in the disarmed state."
   fi
@@ -1778,6 +1829,19 @@ stop_managed_stack() {
     if pid_is_live "${LAUNCHER_PID}"; then
       warn "launcher did not exit after SIGTERM; sending SIGKILL"
       kill -KILL "${LAUNCHER_PID}" 2>/dev/null || true
+    fi
+    if [[ "${HARD_STOP}" -eq 1 ]]; then
+      if [[ -z "${WEB_PID:-}" ]]; then
+        WEB_PID="$(discover_pid_by_pattern 'vite')"
+      fi
+      if [[ -z "${CONTROLLER_PID:-}" ]]; then
+        CONTROLLER_PID="$(discover_pid_by_pattern 'gradient_os.run_controller')"
+      fi
+      if [[ -z "${API_PID:-}" ]]; then
+        API_PID="$(discover_pid_by_pattern 'gradient_os.api.main|gradient-api')"
+      fi
+      log "Hard stop requested by CLI; completing RTCore/EtherCAT teardown after launcher exit."
+      perform_shutdown_sequence
     fi
     rm -f "${ACTIVE_STATE}"
     return 0

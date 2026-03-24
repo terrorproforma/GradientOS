@@ -55,6 +55,54 @@ Use this file as persistent, repo-local execution memory.
 
 *(Session entries are cleared regularly. Chronological implementation logs belong in `.cursor/memory/DEVLOG.md`. Historical scratchpad entries are archived in `.cursor/memory/AGENT_SCRATCHPAD_ARCHIVE.md`)*
 
+### 2026-03-23 - Jog mode idle-gap regression
+- [self] In `web-ui/src/ControlPanel.tsx`, once a realtime jog session has started, do not suppress unchanged zero-velocity ticks forever. If zero keepalives stop, the controller lease can expire during the short gap between direction presses and the next hold will hit `SESSION_INACTIVE`.
+- [self] Treat `SESSION_INACTIVE` / `SESSION_EXPIRED` / `SESSION_NOT_FOUND` as recoverable session-loss in the frontend publish loop: clear session tracking and retry/start a fresh session for the current non-zero payload instead of forcing the UI back to incremental mode.
+- [tool] `logs/startups/latest/controller.log` + `api.log` together were the decisive check: they showed a zero-velocity `JOG_SESSION_UPDATE`, then the jog thread stopping, then the next direction falling through to `MOVE_LINE_RELATIVE`.
+
+### 2026-03-23 - Lag review heuristics
+- [self] When the user reports lag during motion, check `logs/startups/latest/api.log` for polling fanout before blaming planner/runtime. In this session the latest API slice showed at least four concurrent localhost clients polling `/info/joints` and `/control/motion-status` at the same time.
+- [tool] `logs/startups/latest/controller.log` is good for separating real motion/planner latency from UI feel: this run showed coarse `MOVE_LINE_RELATIVE` planning around `275-284 ms`, small 1 mm moves around `38-42 ms`, and one `APPLY_JOINT_SETPOINT` that took `3.926 s` because the commanded trajectory itself was 384 steps long.
+- [tool] There is a real host-side legacy connectivity service outside the web UI: `systemd/wifi/gradient-wifi-keepalive.sh`. On this Pi it was confirmed `enabled` and `active` while `nmcli device status` showed `eth1 connected` and `wlan0 disconnected`, so if Wi-Fi fallback is no longer desired this service is a good cleanup target before chasing smaller browser `/health` polls.
+- [self] Low-risk polling consolidation pattern: keep `App` as the owner of shared live state like `motionStatus`, and let `ControlPanel` consume/update that shared state via props instead of polling the same endpoint independently. This removed a duplicate `/control/motion-status` loop without touching jog deadman or unload-stop safety.
+
+### 2026-03-24 - Shared live-state implementation
+- [self] Best low-risk read-path consolidation here is hybrid, not all-at-once: first make the frontend consume `/monitor` as the primary shared source, then move missing fields like `motion_status` into the existing controller telemetry packet instead of inventing a second live snapshot protocol.
+- [self] For `ControlPanel`, the important fallback rule is not "provider present" but "monitor fresh with usable joints". When `/monitor` is fresh, derive panel joint angles from SSE and suppress `/info/joints`; when stale, fall back to REST polling. This preserves commissioning readouts without forcing duplicate high-rate polling during normal operation.
+- [tool] `run_controller.py` can safely expose motion summary in monitor telemetry by caching `command_api.get_motion_execution_status()` and refreshing it at a lower rate (for example 10 Hz) than the main telemetry packet. That keeps `/monitor` useful without paying the full motion-status assembly cost on every 50 Hz frame.
+
+### 2026-03-24 - Post-change log review
+- [tool] After the shared live-state change, the controller-side request mix is the clearest success metric: in this session `logs/startups/latest/controller.log` showed only `GET_JOINT_ANGLES=4` and `GET_MOTION_STATUS=11`, while `GET_PERFORMANCE_STATE=437` dominated the remaining deliberate polling. Use controller-side command counts to judge whether core polling actually dropped.
+- [self] If the diagnostics panel is open, `/debug/performance` becomes the primary remaining live poller and can easily dominate API/controller request volume. Treat diagnostics polling as an opt-in load source when reviewing lag reports.
+- [tool] Repeated `[Jog] NOTE: IK target clamped at joints: [5]` during yaw jog indicates a limit-hit condition, not a session/control-path failure. When users report “lag” or weak response in that direction, check for clamp notes before blaming transport or UI cadence.
+
+### 2026-03-24 - Diagnostics polling + yaw investigation
+- [self] Diagnostics collection here is useful even while the operator is on other tabs because the panel preserves the last successful sample after shutdown. Better compromise than hard-gating by active tab: keep background polling while the diagnostics tab feature is visible, but slow it down (for example `1000 ms`) so it remains useful without dominating request volume as much.
+- [self] The clamp log uses zero-based indices. `[Jog] NOTE: IK target clamped at joints: [5]` means the sixth logical joint (`J6`), not `J5`.
+- [tool] Normal startup/controller logs do not include end-effector `xyz/rpy` for jog steps by default. In this repo, `SET_JOG_DEBUG,true` enables per-step jog pose logs (`CURR pos` / `TARG pos`), and `/info/pose` can return `CURRENT_POSE`, but this latest session did not have either in the logs.
+- [self] The active runtime clamp source is `robot.logical_joint_limits_rad` via `robot_config.LOGICAL_JOINT_LIMITS_RAD`, not live URDF parsing at jog time. The URDF remains an upstream reference, but config drift is possible and must be checked directly.
+- [self] Low-risk way to make pose/joint evidence durable for post-run diagnosis: attach a best-effort `GET_POSITION` snapshot to `/debug/performance` and render it in the diagnostics panel. If the pose probe misses once, do not fail the whole performance endpoint.
+
+### 2026-03-24 - Joint limit operator warning
+- [self] When the user asks for an obvious warning, prefer reusing the existing monitor alert rail instead of inventing a new diagnostics-only path. That keeps the warning visible during normal operation, not only after the fact.
+- [self] For jog-limit hits, emit the alert at the actual clamp site in `command_api._jog_controller_thread()` so the warning reflects a real applied controller constraint, not just an inferred near-limit condition.
+- [self] Include joint labels in human terms (`J6 upper`) and remember the zero-based-to-operator numbering conversion. A backend/internal index like `[5]` should never be the only thing the user sees.
+
+### 2026-03-24 - New run drift confirmation
+- [tool] The latest run in `logs/startups/latest/controller.log` shows real TCP drift during angular-only jog with no `IK target clamped` and no `JOINT_LIMIT` entries. Do not assume the newest drift reports are still limit-related.
+- [tool] In the latest captured pose samples, the clearly aligned angular-only segments were roll commands (`v_roll=+-15`, `v_yaw=0`) and still showed position drift on the order of centimeters over the sampled window. This confirms a broader orientation-only pose-hold problem, not just a yaw-specific limit issue.
+
+### 2026-03-24 - Full diagnostics pose history
+- [user] When the user asks to "code it", prefer shipping the next usable diagnostic instrument immediately rather than debating architecture. For this drift workflow, a visible/exportable pose timeline is more useful than another verbal analysis pass.
+- [self] Best low-risk implementation for post-run drift inspection is frontend retention of `/debug/performance` pose snapshots: keep collecting while diagnostics are enabled, preserve the samples after shutdown, and expose clear/export controls so the operator can inspect or share the full trace.
+- [self] Single latest pose samples are not enough for jog drift debugging. Capture a time-series including `xyz`, `rpy`, joints, motion state, and session state so `rpy`-only and future `xyz` tests can be compared sample-by-sample.
+- [self] A good compromise for diagnostics load versus motion fidelity here is adaptive polling: faster while motion/jog is active (implemented at `250 ms`) and slower when idle (`1000 ms`) so the trace is denser during motion without making idle diagnostics the dominant load source.
+
+### 2026-03-24 - Latest session log interpretation
+- [tool] In the newest `logs/startups/latest/controller.log`, one positive-yaw segment still hits repeated `[Jog] NOTE: IK target clamped at joints: [5]` while pose samples drift upward in `z`; do not treat that portion as proof of the general drift root cause because it is limit-constrained.
+- [tool] The same session also contains a separate negative-yaw segment with `v_yaw=-15.0` and no clamp notes in the inspected window, yet the sampled TCP still drifts by millimeters in `x/y/z`. That is stronger evidence the angular jog path still has a non-limit-related Cartesian hold issue.
+- [tool] The new full pose history is browser-resident unless exported. `logs/diagnostics/` does not automatically receive a new file from the frontend capture, so if exact post-run sample-by-sample analysis is needed outside the live browser, the operator must use the JSON export button.
+
 ### 2026-03-20 - Servo profile refactor
 - [user] DS402 / EtherCAT AL decoding must live in shared profile code, not in `src/gradient_os/run_controller.py` or `start-stack.sh`.
 - [self] For runtime policy changes, `compute_restart_required()` must compare the fully resolved desired runtime, including unsafe backend/profile overrides; comparing only robot defaults hides real restart requirements.
@@ -1071,3 +1119,159 @@ Use this file as persistent, repo-local execution memory.
 - [user] Clarified that the stack had been intentionally stopped and that I needed to restart it again before continuing.
 - [self] Corrective rule: after a user-triggered hard stop, do not treat connection-refused on `:4000` as mysterious flakiness. Re-check the supervised stack state and restart it explicitly before continuing live validation.
 - [tool] Restarted the supervised stack with `./start-stack.sh` into run `20260323-030328` and confirmed healthy bring-up again (`responding=6/6`, `operational=6/6`, `wkc=18`, API on `:4000`, web on `:8000`).
+
+### 2026-03-23 - If the Pi says the UI is "not loading" but `:8000` serves HTML, suspect browser-side startup cost before blaming Vite
+- [user] Reported repeated cases where the UI looked like it was not loading even after the stack was live, and explicitly stopped me when browser-based inspection got stuck waiting on the page.
+- [tool] Runtime checks showed the distinction clearly:
+- [tool] when the stack was stopped, `http://127.0.0.1:8000/` and `http://127.0.0.1:4000/health` returned connection refused
+- [tool] once restarted, both endpoints returned `200`, `src/main.tsx` and `src/App.tsx` served normally, and Vite reported healthy startup in `logs/startups/20260323-035243/web.log`
+- [self] Mistake / corrective rule: if browser automation hangs or aborts while local HTTP probes are healthy, stop retrying the browser tool as the primary diagnostic. Treat it as evidence of a client-side load/perf problem and inspect the app's first-render path directly.
+- [tool] Root-cause candidate found in `web-ui/src/App.tsx`: the page eagerly mounted `ArmVisualizer` on first paint, and `web-ui/src/ArmVisualizer.tsx` immediately created a `THREE.WebGLRenderer`, loaded URDF assets, and started a continuous animation loop.
+- [tool] Fix applied: `App.tsx` now lazy-loads the 3D visualizer chunk and starts in a lightweight mode with a manual `Load 3D Workspace` button so the control UI can open without paying the WebGL/URDF startup cost up front.
+- [tool] Additional load-shedding: reduced the motion-status polling interval from `200 ms` to `500 ms`.
+- [tool] Validation: `npm run build` passed, `ReadLints` on `web-ui/src/App.tsx` found no diagnostics, the build output showed `ArmVisualizer` as its own chunk, and live `GET http://127.0.0.1:8000/src/App.tsx` confirmed the new lightweight startup strings were being served.
+
+### 2026-03-23 - Runtime diagnostics for "UI hung" cases should work from shell first and avoid fuzzy heuristics
+- [user] Asked to add diagnostics so the next browser/UI stall can be diagnosed instead of solved only by rebooting.
+- [tool] Added `src/gradient_os/diagnostics/runtime_snapshot.py` plus API surface `GET /debug/runtime` and docs for `python -m gradient_os.diagnostics.runtime_snapshot`.
+- [tool] The standalone CLI path already works immediately and writes `logs/diagnostics/<timestamp>-runtime.json`; the HTTP route exists in code but any already-running API process must be restarted before `/debug/runtime` appears live.
+- [self] Corrective rule: when adding debug endpoints during an active stack session, separately verify "code/tests pass" vs "live process has reloaded". A `404` on the new route can simply mean the current API process predates the code change.
+- [self] Corrective rule: avoid overly broad substring heuristics in diagnostics. Initial versions falsely matched kernel `changed` lines as `hang` hints and classified Cursor node processes as `browser`; tighten with regex/explicit process groups so the snapshot stays actionable.
+
+### 2026-03-23 - Realtime jog sessions must not start "alive but idle" and the UI must preserve controller error codes
+- [user] Asked to inspect the newest logs because jog commands appeared broken.
+- [tool] Latest `logs/startups/latest/api.log` showed the exact sequence: `POST /control/jog/session/start` returned `200`, then repeated `POST /control/jog/session/update` calls returned `404`.
+- [tool] Matching `logs/startups/latest/controller.log` showed why the UI stayed broken:
+- [tool] the controller started a jog session, then the jog thread stopped before meaningful updates arrived
+- [tool] afterward the UI kept sending `JOG_SESSION_UPDATE` with the same `seq=1` over and over, while the controller treated the session as inactive
+- [tool] Root causes found in `web-ui/src/ControlPanel.tsx`:
+- [tool] `ensureJogStarted()` eagerly opened a controller session with an all-zero command, so a user could arm realtime jog mode and let the session lease expire before pressing an actual direction
+- [tool] `readErrorMessage()` stripped controller error codes like `SESSION_INACTIVE`, leaving only the human message, so terminal-session detection failed and the UI kept retrying against a dead session
+- [tool] the publish loop only advanced `jogSessionSeqRef` after a successful response, so once an update failed the UI could get stuck reusing the same stale sequence forever
+- [tool] Fix applied:
+- [tool] realtime jog now only enables the local timer on Start; it does not create a controller session until the first nonzero command is sent
+- [tool] all-zero active payloads with no active session are skipped instead of opening an idle lease
+- [tool] controller error messages now preserve `code: message`, so `SESSION_INACTIVE` / `SESSION_EXPIRED` are detectable and the UI can reset session state
+- [tool] sequence numbers are advanced optimistically before the request so failed publishes do not pin the UI on one stale `seq`
+- [tool] Validation: `npm run build` passed and `ReadLints` on `web-ui/src/ControlPanel.tsx` found no diagnostics.
+
+### 2026-03-23 - Keep jog mode armed for UX, but only keep the controller session alive while a button is actually held
+- [user] Wanted to avoid the terrible UX of having to click the jog-mode button before every single move, but still wanted the final architecture to match the safer hold-scoped session model.
+- [self] Corrective rule: split `armed jog mode` from `active hold`. The UI may stay armed between clicks, but it must not keep the controller session, heartbeat, or backend jog lease alive unless at least one jog button is actively held.
+- [tool] Updated `web-ui/src/ControlPanel.tsx` so the button now arms/disarms jog mode, button press starts the session/heartbeat, and final release enqueues `/control/jog/session/stop` instead of leaving an idle session running.
+- [self] `owner_conflict_rejects` should mean real cross-owner conflicts only. Do not increment it for same-owner duplicate starts; those are `SESSION_ALREADY_ACTIVE`, not owner conflicts.
+- [tool] When adding frontend tests on this Pi, do not keep the latest `vitest`/`jsdom` pair by default. Node `18.20.4` requires a compatible harness (`vitest@3.x`, `jsdom@26.x`), and `jsdom` needs `setPointerCapture` / `releasePointerCapture` stubbed for these pointer-event tests.
+- [tool] Safe live validation against run `20260323-220541` worked without commanding motion by using `deadman=false`: the controller reported `backend_mode=joint_velocity_lease`, lease expiry produced `last_stop_reason=lease-expired`, and explicit stop preserved the caller-supplied reason.
+
+### 2026-03-23 - Motion-coupled RTCore jog tests show session semantics are right, but physical stop behavior still lags behind the logical stop
+- [tool] In run `20260323-220541`, a tiny live jog test at `vz=0.003 m/s` with real motion confirmed that power-up transitioned DS402 state codes from `2` to `5`, so the axes were actually operation-enabled before the test.
+- [tool] Explicit release path:
+- [tool] controller/API path behaved correctly (`JOG_SESSION_STOP`, controller state `stopped`, `last_stop_reason=agent-explicit-release`), but the arm still drifted about `0.159 mm` after stop before settling.
+- [tool] Lease-expiry path:
+- [tool] controller state transitioned to `expired` with `last_stop_reason=lease-expired`, but measured pose continued moving after expiry, reaching about `1.41 mm` past the hold-end position by `0.45 s` and about `1.67 mm` by `0.75 s`.
+- [tool] `controller.log` showed the jog thread had already stopped before those later pose samples, so continued motion was not caused by the Python controller still publishing updates.
+- [self] Likely mechanism to inspect next: RTCore stop/timeout ends jog setpoint generation, but does not immediately replace the last jog target with a current-position hold setpoint, so CSP keeps chasing the previously generated target for a while after logical stop/expiry.
+- [self] Corrective rule: do not treat `session state = stopped/expired` as proof of physical stop. For safety signoff, always pair logical stop checks with measured post-stop pose deltas.
+
+### 2026-03-23 - RTCore jog stop now snaps hold targets to feedback, and controller stop/expiry paths stop trusting stale loop snapshots
+- [tool] Updated `src/gradient_rt_motion/main.cpp` so jog stop/timeout snapshots the previously jogging axes and snaps their CSP hold targets to live feedback in the same RT cycle instead of leaving the last jog target latched.
+- [self] Follow-up investigation showed the Python jog thread could still finish FK/IK and emit one more backend update after a stop or expiry landed because it only checked session state at the top of the loop.
+- [tool] Updated `src/gradient_os/arm_controller/command_api.py` to re-check `session_active` and `lease_valid` immediately before backend send, stop the RTCore jog backend immediately when the loop notices the session has gone inactive, and send an immediate best-effort backend stop from the API stop handler.
+- [tool] Validation used `make -C src/gradient_rt_motion`, `python3 -m py_compile src/gradient_os/arm_controller/command_api.py`, repeated headless stack restarts, and repeated live motion probes at `vz=0.003 m/s`.
+- [tool] Explicit stop still shows about `0.19-0.23 mm` of post-stop residual motion after the stop response returns, so the stop path is improved in code structure but not yet physically signed off.
+- [tool] Lease-expiry behavior improved materially versus the earlier `~1.67 mm` post-expiry bleed-through: one fine-grained run plateaued from `0.42 s` to `0.50 s` with no additional motion after expiry, but a later run still showed a renewed delta by `0.70 s`, so the path is better but still noisy and not fully deterministic.
+- [self] Corrective rule: validate jog safety around the actual backend-stop boundary with dense sampling; coarse `state=stopped/expired` snapshots can look healthy while late pose deltas still reveal residual motion.
+
+### 2026-03-23 - Hard shutdown / cold restart rerun proved the residual stop behavior survives a clean bring-up
+- [tool] After the user hard-stopped RTCore, verified `gradient-rt-motion.service` and `ethercat.service` were both inactive and API health on `:4000` was refused before restarting anything.
+- [tool] Brought the stack back with `GRADIENT_STACK_INTERACTIVE_CONSOLE=0 ./start-stack.sh --headless`; startup showed full bus recovery (`responding=6/6`, `online=6/6`, `operational=6/6`, `wkc=18`) and the live probe again confirmed DS402 transitioned `2 -> 4 -> 5` before motion.
+- [tool] Fresh post-hard-shutdown explicit-stop probe at `vz=0.003 m/s` still showed about `0.169-0.183 mm` residual motion after the stop response, so the remaining stop lag is reproducible across cold restart and is not just stale session state.
+- [tool] Fresh post-hard-shutdown lease-expiry probe still accumulated motion after expiry, reaching about `1.391 mm` by `0.42 s` and about `1.423 mm` by `0.50 s`, then settling slightly lower around `1.417 mm` by `0.70 s`.
+- [self] Corrective rule: treat cold-restart reproducibility as evidence that the remaining issue is architectural/runtime behavior, not a leftover process or stale RTCore state from previous testing.
+
+### 2026-03-23 - RTCore-native jog debug instrumentation proved the remaining stop motion is now drive convergence to a frozen hold target, not RTCore continuing to advance the target
+- [tool] Added RTCore-native jog debug status plumbing across `src/gradient_rt_motion/ipc_v1.hpp`, `src/gradient_rt_motion/main.cpp`, `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`, and `src/gradient_os/arm_controller/command_api.py`, then exposed it through `/debug/performance` as `controller.jog.rtcore_jog_debug`.
+- [tool] `./start-stack.sh stop --hard` does not actually stop `gradient-rt-motion.service` / `ethercat.service` in this environment; explicit `systemctl restart ethercat.service gradient-rt-motion.service` was required to get the new RTCore binary live.
+- [tool] After explicit RTCore service restart, the new debug block became live and reported motor-side `feedback_pos_counts`, `hold_target_counts`, `output_target_counts`, `output_target_velocity_counts_per_s`, stop reason, and stop age at ~50 Hz.
+- [tool] Instrumented explicit-stop probe at `vz=0.003 m/s` showed:
+- [tool] before stop, RTCore output targets were still ahead of feedback (`max_abs_output_minus_feedback_counts ~= 248`) with nonzero commanded velocity.
+- [tool] by `~20 ms` after stop, `active_jog=false`, `latest_cmd_flags=2`, `last_stop_reason_name=cmd_stop`, and `output_target_velocity_counts_per_s` was all zero.
+- [tool] after stop, `output_target_counts` stayed fixed while `feedback_pos_counts` continued moving toward that frozen hold target; the residual end-effector motion therefore came from servo convergence, not from RTCore advancing the target after stop.
+- [tool] Instrumented lease-expiry probe showed the same pattern:
+- [tool] session expired at the controller level, but RTCore ultimately observed a `cmd_stop` because the controller thread sends an explicit stop as it tears down the expired session.
+- [tool] at expiry boundary, `active_jog` dropped false and `output_target_velocity_counts_per_s` went to zero immediately, while `output_target_counts` remained fixed and feedback continued moving toward the frozen target.
+- [self] Corrective rule: with stale-target runaway ruled out, the next fix must focus on the stop-hold policy itself (for example repeated feedback re-latching / stronger arrest semantics) rather than more command-lifetime plumbing.
+
+### 2026-03-23 - `stop --hard` bug was in the launcher handoff, and larger jog probes showed the residual stop motion stays roughly absolute
+- [self] Root cause of the broken hard stop: `./start-stack.sh stop --hard` only signaled the already-running launcher, but that launcher still had `HARD_STOP=0` in its own environment, so its `cleanup()` path always executed a soft stop.
+- [tool] Fix in `start-stack.sh`: after a CLI-requested hard stop kills the launcher, the caller now completes `perform_shutdown_sequence` itself, and systemd service stops now wait for `inactive` with a `systemctl kill` fallback before declaring success.
+- [tool] Live verification after the patch: running `./start-stack.sh stop --hard` left both `gradient-rt-motion.service` and `ethercat.service` at `inactive`, and `http://127.0.0.1:4000/health` refused connections.
+- [tool] Larger explicit-stop probe at `vz=0.003 m/s` with ~70 updates produced about `11.06 mm` commanded hold displacement; post-stop end-effector motion was still only about `0.139 mm` at `0.10 s`, settling to about `0.097 mm` by `1.0 s`.
+- [tool] Larger lease-expiry probe at the same velocity produced about `10.92 mm` hold displacement; motion after expiry still peaked around `1.49 mm` by `0.50 s` and remained about `1.45 mm` at `1.0 s`, while RTCore had already frozen output targets and zeroed output velocities.
+- [self] Corrective rule: treat the explicit-stop residual as a mostly absolute servo-settling / frozen-target convergence effect rather than a tiny-move measurement artifact; the much larger lease-expiry overshoot remains the higher-priority stop-hold problem.
+
+### 2026-03-23 - The RTCore post-stop arrest window works as implemented, but only modestly improves lease-expiry travel
+- [tool] Implemented a `~200 ms` RTCore stop-arrest window in `src/gradient_rt_motion/main.cpp` that re-latches `hold_target_counts` to live feedback each cycle after jog `cmd_stop` / timeout, and exposed its active axes through `stop_arrest_mask` in the existing `StatusJogDebugV1` payload.
+- [tool] Propagated `stop_arrest_mask` through `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`, `src/gradient_os/arm_controller/command_api.py`, and the targeted parser test in `tests/test_gradient05_limits_and_backends.py`.
+- [tool] Live explicit-stop probe after deploying the new RTCore build showed `stop_arrest_mask=63` and zero `hold_minus_feedback_counts` / `output_minus_feedback_counts` for the first ~`0.1 s`, proving the relatch window is active and stale-target chase is eliminated during that interval.
+- [tool] Despite that, explicit-stop end-effector motion after an ~`11.07 mm` move still sat around `0.153 mm` at `0.10 s` and `0.148 mm` at `1.0 s`, so this change did not materially reduce the explicit-stop residual.
+- [tool] Lease-expiry probe after the same change also showed `stop_arrest_mask=63` with zero hold/output error while the arrest window was active, but post-expiry motion only improved modestly: about `1.49 mm -> 1.41 mm` at `0.50 s`, and about `1.45 mm -> 1.40 mm` at `1.0 s`.
+- [self] Corrective rule: once RTCore is demonstrably following live feedback during the arrest window and the arm still travels materially after expiry, the next fix should shift from CSP target relatching to a stronger motor-side halt / brake semantic (for example DS402 quick-stop / halt behavior), not a longer version of the same relatch trick.
+
+### 2026-03-24 - DS402 quick-stop should be a distinct fail-closed stop class, not the default operator-release stop
+- [tool] Implemented DS402 quick-stop command support end-to-end: added `JOG_FLAG_QUICK_STOP` to `src/gradient_rt_motion/ipc_v1.hpp`, taught RTCore `src/gradient_rt_motion/main.cpp` to start a bounded quick-stop controlword window only when that flag is present, and plumbed the optional `quick_stop` stop argument through `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`, `src/gradient_os/arm_controller/actuator_interface.py`, `src/gradient_os/arm_controller/backends/simulation/backend.py`, and `src/gradient_os/arm_controller/command_api.py`.
+- [tool] Live evidence on the current A6-EC setup: when quick-stop was applied to *all* stop commands, explicit operator stop entered DS402 state `6` and then `4`, but explicit-stop motion got worse; do not treat “more aggressive stop semantics” as automatically safer without measuring the actual arm behavior.
+- [self] Important diagnosis: lease expiry does not naturally appear to RTCore as a timeout; the Python jog thread was tearing down the expired session by sending a normal stop command, so RTCore saw only `latest_cmd_flags=2` unless the controller explicitly tagged the stop as fail-closed.
+- [tool] After fixing the early `session-inactive-before-loop` path in `command_api.py`, lease-expiry teardown now reaches RTCore as `latest_cmd_flags=6` and drives enter DS402 state `6` (`QuickStopActive`) on expiry, while ordinary explicit stop remains untagged.
+- [tool] Mixed live result with the new selective fail-closed flag: on the final expiry probe the quick-stop path definitely engaged (`latest_cmd_flags=6`, DS402 `6` at `0.42-0.50 s`), but motion still peaked around `1.54 mm` before settling to about `0.91 mm` by `1.0 s`; the behavior is different, but not yet unequivocally “better” across the whole window.
+- [self] Corrective rule: now that the plumbing is selective and proven, the next step is to tune / explicitly configure the drive stop semantics (`0x605A`, `0x605D`, `6085h`) rather than changing higher-level session logic again.
+
+### 2026-03-24 - For UI live-state consolidation plans, make ownership and freshness rules explicit before implementation
+- [user] Asked for the `unify-live-state` plan to be updated in-place to reflect the review feedback rather than just discussed.
+- [self] When a plan proposes “one stream” or “one store,” convert that into an explicit ownership/freshness contract: define what is primary, what is fallback-only, and which signals distinguish SSE staleness vs API reachability vs controller/backend freshness.
+- [self] Reuse existing normalized controller contracts where possible; for motion state, prefer the shape from `src/gradient_os/arm_controller/command_api.py:get_motion_execution_status()` instead of creating a second bespoke SSE schema.
+- [self] Keep rich RTCore jog debug / performance data opt-in and outside the default `/monitor` payload, especially after adding stop-arrest and selective quick-stop telemetry on the command side.
+
+### 2026-03-24 - Prefer on-machine diagnostics persistence over browser export for this repo's jog forensics
+- [user] Explicit preference: pose-history capture should save locally on the Pi instead of relying on browser-side JSON export.
+- [tool] Implemented local persistence via `POST /debug/pose-history` in `src/gradient_os/api/main.py`; UI now auto-saves captured history to `logs/diagnostics/*-pose-history.json` when a jog run transitions from active to stopped and also offers a manual "Save Local JSON" action.
+- [self] For IK drift diagnosis, capture the comparison at the source of truth inside `src/gradient_os/arm_controller/command_api.py` right after `solve_ik`: log `current_pose`, `target_pose`, `solved_pose`, `applied_pose`, and target-vs-solved/applied error so drift can be attributed to solver vs clamp/apply.
+- [tool] `npm run build` in `web-ui/` runs `sync:assets` first and can dirty generated asset files / lockfiles even when the task only targets diagnostics UI; check `git status` after validation and avoid surprising the user with generated diffs.
+- [tool] Validation available in this environment: `ReadLints`, `npm run build`, and `python3 -m py_compile ...` succeeded; `python3 -m pytest ...` could not run because `pytest` is not installed globally here.
+
+### 2026-03-24 - When comparing saved pose history to IK snapshots, distinguish model-consistency from sample timing
+- [tool] In `logs/diagnostics/20260324-041345-pose-history.json`, every active sample had non-null `ik_debug` plus `current_joints_deg`, `ik_solution_joints_deg`, and `applied_joints_deg`; there were zero clamps and zero solve failures.
+- [self] Important interpretation rule: `target_vs_solved` / `target_vs_applied` can be numerically perfect while the top-level polled `pose` in the same history sample still differs, because the polled pose and the controller's latest IK snapshot are captured on different loops/cadences.
+- [self] If `ik_solution_joints_deg == applied_joints_deg` and `target_vs_applied ~= 0`, then the internal IK/model path is behaving consistently; remaining drift must be investigated in model calibration mismatch, execution lag, or feedback-vs-command alignment rather than solver clamp error.
+
+### 2026-03-24 - Industrial jog refactors must keep the controller-owned command model and the test harness aligned
+- [user] Explicit preference reinforced: for this jog work, be meticulous and implement the refactor rather than only discussing it.
+- [tool] The safe architecture for `src/gradient_os/arm_controller/command_api.py` is: measured FK only seeds or supervises at explicit boundaries, while active-hold target integration and IK seeding stay on controller-owned commanded pose/joints stored in `src/gradient_os/arm_controller/jog_session.py`.
+- [self] Corrective rule: when replacing jog clamping with single-step gate rejection, update adjacent tests and fixtures to match the new semantics (`JOG_GATE_REJECTED`, no silent clamp drift, `last_gate_failure_reason`) instead of preserving old clamp expectations by habit.
+- [tool] Direct-servo jog tests need two specific guardrails now:
+- [tool] `_jog_controller_thread()` reads feedback once before the loop and again in the first cycle, so mocked feedback sequences need an extra initial sample if the test cares about first-cycle anchoring.
+- [tool] The controller_cartesian_loop path sends a final zero-speed hold write on thread exit; tests that only care about motion commands should filter out that shutdown hold instead of treating it as a regression.
+
+### 2026-03-24 - When a user asks to update a plan after implementation, reflect both completed scope and remaining validation
+- [user] Wants the plan files kept in sync with actual completed work, not left as if everything were still pending.
+- [self] Corrective rule: when updating a plan after implementation, change the frontmatter/todo status markers and add a short progress section that separates completed code/test work from still-pending live validation or UI follow-through.
+
+### 2026-03-24 - For live jog validation after a hard stop, verify service/API state first and record commanded-state spans, not just measured motion
+- [user] Explicitly hard-stopped everything before asking for live validation and expected me to bring the stack back up before testing.
+- [tool] Safe restart sequence here was: confirm `gradient-rt-motion.service` / `ethercat.service` are inactive and HTTP probes refuse connections, then launch `GRADIENT_STACK_INTERACTIVE_CONSOLE=0 ./start-stack.sh --headless`, and wait for `responding=6/6`, `operational=6/6`, `wkc=18`, controller ready, and API `/health` = `200`.
+- [tool] After hard stop, `info/joints-detailed` initially showed DS402 state `2` on the active axes; `POST /control/power-up` brought them back to `5` before motion.
+- [self] Corrective rule: for this industrial-jog refactor, the primary live proof should come from commanded-state spans gathered from `controller.jog.commanded_pose` plus re-sync/gate metadata, not from raw measured pose alone.
+
+### 2026-03-24 - Full live jog sweeps should log both leg displacement and return-to-baseline residual
+- [tool] The saved history from the full sweep lives at `logs/diagnostics/20260324-061926-pose-history.json`.
+- [tool] Useful reporting pattern for these back-and-forth jog runs:
+- [tool] for each forward leg, record achieved end displacement relative to the per-move baseline
+- [tool] for each full out-and-back move, record final residual relative to that same baseline
+- [self] Corrective rule: a successful sweep is not just “no aborts.” Call out the actual return residuals by axis/angle so small repeatability errors are visible session-to-session.
+
+### 2026-03-24 - Multi-move auto-saved pose histories need segment-aware interpretation
+- [tool] The newer UI-generated captures around `logs/diagnostics/20260324-0625*.json` bundle multiple sequential jog segments into one `source: "auto-stop"` history.
+- [self] Corrective rule: do not treat whole-file final-vs-initial pose deltas as proof of per-move return error unless the file is first segmented by active command blocks or session boundaries.
+- [tool] In `logs/diagnostics/20260324-062529-pose-history.json`, every active sample still showed `gate_result="accepted"`, `gate_reason="OK"`, `solve_failed=false`, `clamped=false`, and `target_vs_applied ~= 0`.
+- [self] Interpretation rule: when `target_vs_applied` stays essentially zero but `following_error` grows large, the controller-owned planning/IK path is behaving consistently and the remaining problem is execution/following lag or commanded-rate scaling, not solver drift.
+- [tool] This session reached much larger commanded rates than the earlier validation sweep, including `vy=0.05 m/s` and `v_yaw=66.388 deg/s`; the worst observed following envelopes were about `15.11 mm` position, `9.82 deg` orientation, and `14.92 deg` max joint error.

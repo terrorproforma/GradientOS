@@ -380,18 +380,38 @@ def test_build_motion_execution_metadata_refreshes_stale_rtcore_ack_snapshot(mon
 
 def test_realtime_jog_loop_uses_rtcore_joint_velocity_backend(monkeypatch):
     class _FakeRTCoreJogBackend:
-        def __init__(self):
+        def __init__(self, manager):
             self.calls: list[tuple[str, list[float] | float]] = []
+            self._manager = manager
 
-        def send_realtime_jog_command(self, joint_velocities_rad_s, *, timeout_s):
+        def start_joint_velocity_lease_jog(self, *, timeout_s):
+            self.calls.append(("start", float(timeout_s)))
+
+        def update_joint_velocity_lease_jog(self, joint_velocities_rad_s, *, timeout_s):
             self.calls.append(("send", list(joint_velocities_rad_s)))
             self.calls.append(("timeout", float(timeout_s)))
-            command_api.utils.trajectory_state["is_jogging"] = False
+            self._manager.stop_session(
+                session_id="test-session",
+                owner_id="test-owner",
+                reason="test-stop",
+                allow_missing=True,
+            )
 
-        def stop_realtime_jog(self):
+        def stop_joint_velocity_lease_jog(self, *, quick_stop=False):
             self.calls.append(("stop", 0.0))
 
-    backend = _FakeRTCoreJogBackend()
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        backend_mode="joint_velocity_lease",
+        backend_timeout_s=command_api.JOG_VELOCITY_TIMEOUT_S,
+        session_id="test-session",
+    )
+    backend = _FakeRTCoreJogBackend(fresh_manager)
     direct_write_calls: list[object] = []
 
     monkeypatch.setattr(
@@ -412,6 +432,7 @@ def test_realtime_jog_loop_uses_rtcore_joint_velocity_backend(monkeypatch):
             "jog_thread": None,
         }
     )
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
     monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: backend)
     monkeypatch.setattr(command_api.utils, "gripper_present", False, raising=False)
     monkeypatch.setattr(command_api.time, "sleep", lambda _seconds: None)
@@ -443,8 +464,405 @@ def test_realtime_jog_loop_uses_rtcore_joint_velocity_backend(monkeypatch):
     assert len(send_calls) == 1
     assert len(send_calls[0][1]) == 6
     assert any(abs(float(value)) > 0.0 for value in send_calls[0][1])
-    assert timeout_calls == [("timeout", command_api.JOG_VELOCITY_TIMEOUT_S)]
+    assert timeout_calls == [("timeout", command_api.JOG_BACKEND_LEASE_TIMEOUT_S)]
     assert direct_write_calls == []
+
+
+def test_realtime_jog_loop_pure_rotation_keeps_commanded_xyz_fixed(monkeypatch):
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.0, 0.0, 0.0, 0.0, 0.0, 15.0),
+        backend_mode="controller_cartesian_loop",
+        session_id="test-session",
+    )
+    solve_calls: list[dict[str, list[float]]] = []
+    final_measured_state = [0.2, 0.0, 0.0, 0.0, 0.0, 0.0]
+    measured_states = iter(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            final_measured_state,
+            final_measured_state,
+        ]
+    )
+    direct_write_calls: list[list[float]] = []
+    sleep_calls = 0
+
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: None)
+    monkeypatch.setattr(command_api.utils, "NUM_LOGICAL_JOINTS", 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "LOGICAL_JOINT_LIMITS_RAD", [(-3.14, 3.14)] * 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "gripper_present", False, raising=False)
+    
+    def _sleep_and_stop(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            fresh_manager.stop_session(
+                session_id="test-session",
+                owner_id="test-owner",
+                reason="test-stop",
+                allow_missing=True,
+            )
+
+    monkeypatch.setattr(command_api.time, "sleep", _sleep_and_stop)
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: next(measured_states, final_measured_state),
+    )
+
+    def _fake_fk_matrix(joints):
+        pose = np.eye(4, dtype=float)
+        pose[0, 3] = float(np.asarray(joints, dtype=float)[0])
+        return pose
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+
+    def _capture_solve_ik(**kwargs):
+        solve_calls.append(
+            {
+                "target_position": list(np.asarray(kwargs["target_position"], dtype=float)),
+                "initial_joint_angles": list(np.asarray(kwargs["initial_joint_angles"], dtype=float)),
+            }
+        )
+        return [0.0, 0.0, 0.0, 0.0, 0.0, 0.1 * len(solve_calls)]
+
+    monkeypatch.setattr(command_api.ik_solver, "solve_ik", _capture_solve_ik)
+
+    def _capture_set_servo_positions(logical_joint_angles_rad, speed_value, acceleration_value_deg_s2):
+        direct_write_calls.append(list(np.asarray(logical_joint_angles_rad, dtype=float)))
+
+    monkeypatch.setattr(command_api.servo_driver, "set_servo_positions", _capture_set_servo_positions)
+
+    command_api._jog_controller_thread()
+
+    assert len(solve_calls) >= 2
+    assert np.allclose(solve_calls[0]["target_position"], [0.0, 0.0, 0.0])
+    assert np.allclose(solve_calls[1]["target_position"], [0.0, 0.0, 0.0])
+
+
+def test_realtime_jog_loop_pure_translation_keeps_commanded_orientation_fixed(monkeypatch):
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        backend_mode="controller_cartesian_loop",
+        session_id="test-session",
+    )
+    orientation_targets: list[np.ndarray] = []
+    final_measured_state = [0.0, 0.0, 0.0, 0.0, 0.0, 0.4]
+    measured_states = iter(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            final_measured_state,
+            final_measured_state,
+        ]
+    )
+    direct_write_count = 0
+    sleep_calls = 0
+
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: None)
+    monkeypatch.setattr(command_api.utils, "NUM_LOGICAL_JOINTS", 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "LOGICAL_JOINT_LIMITS_RAD", [(-3.14, 3.14)] * 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "gripper_present", False, raising=False)
+
+    def _sleep_and_stop(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            fresh_manager.stop_session(
+                session_id="test-session",
+                owner_id="test-owner",
+                reason="test-stop",
+                allow_missing=True,
+            )
+
+    monkeypatch.setattr(command_api.time, "sleep", _sleep_and_stop)
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: next(measured_states, final_measured_state),
+    )
+
+    def _fake_fk_matrix(joints):
+        pose = np.eye(4, dtype=float)
+        yaw = float(np.asarray(joints, dtype=float)[5])
+        pose[:3, :3] = command_api.R.from_euler("z", yaw).as_matrix()
+        return pose
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+
+    def _capture_solve_ik(**kwargs):
+        orientation_targets.append(np.asarray(kwargs["target_orientation_matrix"], dtype=float))
+        return [0.05 * len(orientation_targets), 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    monkeypatch.setattr(command_api.ik_solver, "solve_ik", _capture_solve_ik)
+
+    def _capture_set_servo_positions(_logical_joint_angles_rad, _speed_value, _acceleration_value_deg_s2):
+        nonlocal direct_write_count
+        direct_write_count += 1
+
+    monkeypatch.setattr(command_api.servo_driver, "set_servo_positions", _capture_set_servo_positions)
+
+    command_api._jog_controller_thread()
+
+    assert len(orientation_targets) >= 2
+    assert np.allclose(orientation_targets[0], np.eye(3, dtype=float))
+    assert np.allclose(orientation_targets[1], np.eye(3, dtype=float))
+
+
+def test_realtime_jog_loop_seeds_ik_from_previous_commanded_joints(monkeypatch):
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        backend_mode="controller_cartesian_loop",
+        session_id="test-session",
+    )
+    seed_history: list[list[float]] = []
+    final_measured_state = [0.6, 0.0, 0.0, 0.0, 0.0, 0.0]
+    measured_states = iter(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            final_measured_state,
+            final_measured_state,
+        ]
+    )
+    direct_write_count = 0
+    sleep_calls = 0
+
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: None)
+    monkeypatch.setattr(command_api.utils, "NUM_LOGICAL_JOINTS", 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "LOGICAL_JOINT_LIMITS_RAD", [(-3.14, 3.14)] * 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "gripper_present", False, raising=False)
+
+    def _sleep_and_stop(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            fresh_manager.stop_session(
+                session_id="test-session",
+                owner_id="test-owner",
+                reason="test-stop",
+                allow_missing=True,
+            )
+
+    monkeypatch.setattr(command_api.time, "sleep", _sleep_and_stop)
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: next(measured_states, final_measured_state),
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", lambda _q: np.eye(4, dtype=float))
+
+    def _capture_solve_ik(**kwargs):
+        seed_history.append(list(np.asarray(kwargs["initial_joint_angles"], dtype=float)))
+        return [0.1 * len(seed_history), 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    monkeypatch.setattr(command_api.ik_solver, "solve_ik", _capture_solve_ik)
+
+    def _capture_set_servo_positions(_logical_joint_angles_rad, _speed_value, _acceleration_value_deg_s2):
+        nonlocal direct_write_count
+        direct_write_count += 1
+
+    monkeypatch.setattr(command_api.servo_driver, "set_servo_positions", _capture_set_servo_positions)
+
+    command_api._jog_controller_thread()
+
+    assert len(seed_history) >= 2
+    assert np.allclose(seed_history[0], [0.0] * 6)
+    assert np.allclose(seed_history[1], [0.1, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert fresh_manager.get_snapshot()["last_resync_reason"] == "jog-start"
+
+
+def test_realtime_jog_loop_emits_joint_limit_alert(monkeypatch):
+    class _FakeRTCoreJogBackend:
+        def __init__(self, manager):
+            self.calls: list[tuple[str, list[float] | float]] = []
+            self._manager = manager
+
+        def start_joint_velocity_lease_jog(self, *, timeout_s):
+            self.calls.append(("start", float(timeout_s)))
+
+        def update_joint_velocity_lease_jog(self, joint_velocities_rad_s, *, timeout_s):
+            self.calls.append(("send", list(joint_velocities_rad_s)))
+            self.calls.append(("timeout", float(timeout_s)))
+            self._manager.stop_session(
+                session_id="test-session",
+                owner_id="test-owner",
+                reason="test-stop",
+                allow_missing=True,
+            )
+
+        def stop_joint_velocity_lease_jog(self, *, quick_stop=False):
+            self.calls.append(("stop", 0.0))
+
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+        backend_mode="joint_velocity_lease",
+        backend_timeout_s=command_api.JOG_VELOCITY_TIMEOUT_S,
+        session_id="test-session",
+    )
+    backend = _FakeRTCoreJogBackend(fresh_manager)
+    pushed_alerts: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        command_api.utils,
+        "LOGICAL_JOINT_LIMITS_RAD",
+        [(-1.0, 1.0)] * 6,
+        raising=False,
+    )
+    command_api.utils.trajectory_state.update(
+        {
+            "is_jogging": True,
+            "is_running": False,
+            "jog_deadman": True,
+            "jog_debug": False,
+            "jog_velocities": np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0], dtype=float),
+            "jog_gripper_velocity_deg_s": 0.0,
+            "last_jog_command_time": command_api.time.monotonic(),
+            "jog_thread": None,
+        }
+    )
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: backend)
+    monkeypatch.setattr(command_api.utils, "gripper_present", False, raising=False)
+    sleep_calls = 0
+
+    def _sleep_and_stop(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 1:
+            fresh_manager.stop_session(
+                session_id="test-session",
+                owner_id="test-owner",
+                reason="test-stop",
+                allow_missing=True,
+            )
+
+    monkeypatch.setattr(command_api.time, "sleep", _sleep_and_stop)
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: [0.0, 0.0, 0.0, 0.0, 0.0, 0.9],
+    )
+    monkeypatch.setattr(
+        command_api.ik_solver,
+        "get_fk_matrix",
+        lambda q_current: np.eye(4, dtype=float),
+    )
+    monkeypatch.setattr(
+        command_api.ik_solver,
+        "solve_ik",
+        lambda **_kwargs: [0.0, 0.0, 0.0, 0.0, 0.0, 1.01],
+    )
+    monkeypatch.setattr(
+        command_api.telemetry_alerts,
+        "push_alert",
+        lambda level, kind, message, servo_ids=None, details=None, key=None: pushed_alerts.append(
+            {
+                "level": level,
+                "kind": kind,
+                "message": message,
+                "servo_ids": servo_ids,
+                "details": details,
+                "key": key,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "set_servo_positions",
+        lambda *args, **kwargs: None,
+    )
+
+    command_api._jog_controller_thread()
+
+    joint_limit_alerts = [alert for alert in pushed_alerts if alert["kind"] == "JOINT_LIMIT"]
+    gate_alerts = [alert for alert in pushed_alerts if alert["kind"] == "JOG_GATE_REJECTED"]
+    assert len(joint_limit_alerts) == 1
+    alert = joint_limit_alerts[0]
+    assert alert["level"] == "warning"
+    assert "J6 upper" in str(alert["message"])
+    details = alert["details"]
+    assert isinstance(details, dict)
+    assert details["logical_joints"] == [6]
+    assert details["joint_labels"] == ["J6 upper"]
+    assert len(gate_alerts) == 1
+    assert gate_alerts[0]["details"]["reason_code"] == "LIMIT_VIOLATION"
+    assert fresh_manager.get_snapshot()["last_gate_failure_reason"] == "LIMIT_VIOLATION"
+
+
+def test_realtime_jog_loop_gate_rejection_does_not_send_direct_joint_command(monkeypatch):
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.02, 0.0, 0.0, 0.0, 0.0, 0.0),
+        backend_mode="controller_cartesian_loop",
+        session_id="test-session",
+    )
+    direct_write_calls: list[object] = []
+    sleep_calls = 0
+
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: None)
+    monkeypatch.setattr(command_api.utils, "NUM_LOGICAL_JOINTS", 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "LOGICAL_JOINT_LIMITS_RAD", [(-3.14, 3.14)] * 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "gripper_present", False, raising=False)
+
+    def _sleep_and_stop(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 1:
+            fresh_manager.stop_session(
+                session_id="test-session",
+                owner_id="test-owner",
+                reason="test-stop",
+                allow_missing=True,
+            )
+
+    monkeypatch.setattr(command_api.time, "sleep", _sleep_and_stop)
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: [0.0] * 6,
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", lambda _q: np.eye(4, dtype=float))
+    monkeypatch.setattr(command_api.ik_solver, "solve_ik", lambda **_kwargs: [1.5, 0.0, 0.0, 0.0, 0.0, 0.0])
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "set_servo_positions",
+        lambda *args, **kwargs: direct_write_calls.append((args, kwargs)),
+    )
+
+    command_api._jog_controller_thread()
+
+    motion_writes = [call for call in direct_write_calls if len(call[0]) >= 3 and call[0][1] == 800]
+    assert motion_writes == []
+    assert fresh_manager.get_snapshot()["last_gate_failure_reason"] == "IK_JUMP_REJECTED"
 
 
 def test_handle_move_line_forces_rtcore_path_when_closed_loop_requested(monkeypatch):

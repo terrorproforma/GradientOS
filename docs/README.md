@@ -155,6 +155,35 @@ Defaults:
 - Web UI: `http://localhost:8000`
 - API: `http://localhost:4000`
 
+## Capture Runtime Diagnostics
+
+When the UI looks stuck or only partially loads, capture a host/runtime snapshot before
+rebooting if possible. The snapshot is designed to answer the fast questions:
+
+- Is the web server actually up?
+- Is the controller still responding on UDP?
+- Is the Pi under memory or swap pressure?
+- Did the kernel recently log OOM, throttling, or GPU-related warnings?
+- Which browser/web/controller processes were resident at the time?
+
+Shell capture:
+
+```bash
+python -m gradient_os.diagnostics.runtime_snapshot
+```
+
+This writes a JSON artifact under `logs/diagnostics/<timestamp>-runtime.json`.
+
+If the API is still reachable, you can also fetch the same class of snapshot over HTTP:
+
+```bash
+curl http://127.0.0.1:4000/debug/runtime
+```
+
+The payload includes host memory/swap/load, Pi temperature + throttling flags when available,
+interesting process snapshots, local web/controller probes, recent kernel hints, and the tail of
+the latest `api.log`, `web.log`, and `controller.log`.
+
 ## First-Run Operator Workflow (Web UI)
 
 1. Open the UI and set API host if needed.
@@ -333,7 +362,7 @@ Notes:
   npm install
   npm run dev -- --host 0.0.0.0 --port 8000
   ```
-  Visiting `http://<pi-ip>:8000` auto-fills the API endpoint to `http://<pi-ip>:4000`; click **Connect** to subscribe to the `/monitor` SSE stream.
+  Visiting `http://<pi-ip>:8000` auto-fills the API endpoint to `http://<pi-ip>:4000`; click **Connect** to subscribe to the `/monitor` SSE stream. The `/monitor` packet is the primary shared live-state feed for the UI and carries joints, gripper, alerts, drive-fault snapshots, connectivity metadata, and the normalized motion summary. Treat dedicated REST endpoints such as `/info/joints`, `/control/motion-status`, and `/debug/performance` as fallback or opt-in paths rather than the default high-rate live feed.
 - For unattended setups, install the API as a systemd service using the helper scripts in `web-ui/systemd/` (mirrors the arm-controller tooling):
   ```bash
   cd web-ui/systemd

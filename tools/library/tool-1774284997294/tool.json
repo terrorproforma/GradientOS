@@ -1,0 +1,22 @@
+{
+  "tool_id": "tool-1774284997294",
+  "display_name": "test pointer",
+  "description": "",
+  "tool_type": "generic",
+  "keywords": [],
+  "compatible_robot_ids": [],
+  "offset": {
+    "position_mm": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 220.0
+    },
+    "rotation_deg": {
+      "x": 0.0,
+      "y": 0.0,
+      "z": 0.0
+    }
+  },
+  "mesh": null,
+  "weld": {}
+}

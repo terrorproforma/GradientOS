@@ -28,6 +28,18 @@ def test_set_single_servo_position_rads_backend_uses_single_actuator_api(monkeyp
 
 def test_realtime_jog_loop_commands_joint_space_via_servo_driver(monkeypatch):
     commanded: list[tuple[list[float], int, float]] = []
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        backend_mode="controller_cartesian_loop",
+        session_id="test-session",
+    )
+    sleep_calls = 0
+
     monkeypatch.setattr(command_api.utils, "ENCODER_RESOLUTION", None, raising=False)
     monkeypatch.setattr(
         command_api.utils,
@@ -46,8 +58,22 @@ def test_realtime_jog_loop_commands_joint_space_via_servo_driver(monkeypatch):
             "last_jog_command_time": time.monotonic(),
         }
     )
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: None)
     monkeypatch.setattr(command_api.utils, "gripper_present", False, raising=False)
-    monkeypatch.setattr(command_api.time, "sleep", lambda _seconds: None)
+
+    def _sleep_and_stop(_seconds):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 1:
+            fresh_manager.stop_session(
+                session_id="test-session",
+                owner_id="test-owner",
+                reason="test-stop",
+                allow_missing=True,
+            )
+
+    monkeypatch.setattr(command_api.time, "sleep", _sleep_and_stop)
     monkeypatch.setattr(
         command_api.servo_driver,
         "get_current_arm_state_rad",
@@ -66,10 +92,10 @@ def test_realtime_jog_loop_commands_joint_space_via_servo_driver(monkeypatch):
 
     def _capture_set_servo_positions(logical_joint_angles_rad, speed_value, acceleration_value_deg_s2):
         commanded.append((list(logical_joint_angles_rad), int(speed_value), float(acceleration_value_deg_s2)))
-        command_api.utils.trajectory_state["is_jogging"] = False
 
     monkeypatch.setattr(command_api.servo_driver, "set_servo_positions", _capture_set_servo_positions)
 
     command_api._jog_controller_thread()
 
-    assert commanded == [([0.05] * 6, 800, 0.0)]
+    motion_writes = [entry for entry in commanded if entry[1] == 800]
+    assert motion_writes == [([0.05] * 6, 800, 0.0)]

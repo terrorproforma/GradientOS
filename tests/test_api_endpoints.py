@@ -2,6 +2,7 @@ import json
 import base64
 import tempfile
 import os
+from pathlib import Path
 import pytest
 
 pytest.importorskip("httpx")
@@ -203,6 +204,16 @@ def patch_send(monkeypatch):
                     "jog": {
                         "control_frequency_hz": 50,
                         "loop": {"count": 4, "avg_ms": 3.1, "max_ms": 4.0, "last_ms": 3.2, "overrun_count": 0},
+                        "ik_debug": {
+                            "captured_at": "2026-03-24T04:00:00+00:00",
+                            "seq": 41,
+                            "dt_s": 0.02,
+                            "target_vs_solved": {"position_error_mm": 0.42, "orientation_error_deg": 0.03},
+                            "target_vs_applied": {"position_error_mm": 1.95, "orientation_error_deg": 0.03},
+                            "clamped_joint_indices": [5],
+                            "clamped": True,
+                            "solve_failed": False,
+                        },
                     },
                     "motion_state": "executing",
                     "is_running": False,
@@ -426,6 +437,35 @@ def patch_send(monkeypatch):
                         "jog": {
                             "control_frequency_hz": 50,
                             "loop": {"count": 4, "avg_ms": 3.1, "max_ms": 4.0, "last_ms": 3.2, "overrun_count": 0},
+                            "command_state_valid": True,
+                            "commanded_pose": {
+                                "position_m": {"x": 0.1, "y": 0.2, "z": 0.3},
+                                "orientation_euler_deg": {"roll": 10.0, "pitch": 20.0, "yaw": 30.0},
+                            },
+                            "commanded_joints_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                            "measured_pose": {
+                                "position_m": {"x": 0.1, "y": 0.2, "z": 0.3},
+                                "orientation_euler_deg": {"roll": 10.0, "pitch": 20.0, "yaw": 30.0},
+                            },
+                            "measured_joints_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                            "following_error": {
+                                "pose": {"position_error_mm": 0.42, "orientation_error_deg": 0.03},
+                                "joint": {"max_abs_joint_error_deg": 0.2},
+                            },
+                            "last_resync_reason": "jog-start",
+                            "last_resync_age_s": 0.04,
+                            "last_gate_failure_reason": None,
+                            "last_gate_failure_details": None,
+                            "ik_debug": {
+                                "captured_at": "2026-03-24T04:00:00+00:00",
+                                "seq": 41,
+                                "dt_s": 0.02,
+                                "target_vs_solved": {"position_error_mm": 0.42, "orientation_error_deg": 0.03},
+                                "target_vs_applied": {"position_error_mm": 1.95, "orientation_error_deg": 0.03},
+                                "clamped_joint_indices": [],
+                                "clamped": False,
+                                "solve_failed": False,
+                            },
                         },
                         "jog_session": dict(session_state),
                         "motion_state": "executing",
@@ -927,10 +967,81 @@ def test_debug_performance(client, monkeypatch, tmp_path):
     assert body["controller"]["motion_state"] == "executing"
     assert body["controller"]["udp"]["last_command"] == "JOG_SESSION_UPDATE"
     assert body["controller"]["jog"]["control_frequency_hz"] == 50
+    assert body["controller"]["jog"]["ik_debug"]["seq"] == 41
+    assert body["controller"]["jog"]["ik_debug"]["target_vs_solved"]["position_error_mm"] == 0.42
+    assert body["controller"]["jog"]["ik_debug"]["clamped_joint_indices"] == []
+    assert body["controller"]["jog"]["command_state_valid"] is True
+    assert body["controller"]["jog"]["last_resync_reason"] == "jog-start"
     assert body["controller"]["jog_session"]["state"] == "idle"
     assert body["controller"]["jog_session"]["session_active"] is False
+    assert body["controller"]["pose"]["position_m"] == {"x": 0.1, "y": 0.2, "z": 0.3}
+    assert body["controller"]["pose"]["orientation_euler_deg"] == {"roll": 10.0, "pitch": 20.0, "yaw": 30.0}
+    assert body["controller"]["pose"]["joints_deg"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
     assert body["rtcore"]["rt_frequency_hz"] == 1000
     assert body["rtcore"]["rt_overrun_count"] == 2
+
+
+def test_debug_pose_history_save(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(api_main, "_DIAGNOSTICS_LOG_DIR", str(tmp_path))
+    payload = {
+        "exported_at": "2026-03-24T03:57:55.780Z",
+        "sample_count": 1,
+        "pose_history": [
+            {
+                "collected_at": "2026-03-24T03:57:55.780Z",
+                "motion_state": "idle",
+                "is_jogging": False,
+                "session_state": "stopped",
+                "pose": {
+                    "position_m": {"x": 0.1, "y": 0.2, "z": 0.3},
+                    "orientation_euler_deg": {"roll": 10.0, "pitch": 20.0, "yaw": 30.0},
+                    "joints_deg": [1, 2, 3, 4, 5, 6],
+                },
+            }
+        ],
+    }
+    resp = client.post("/debug/pose-history", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["sample_count"] == 1
+    saved_path = body["path"]
+    saved_doc = json.loads(Path(saved_path).read_text(encoding="utf-8"))
+    assert saved_doc["sample_count"] == 1
+    assert saved_doc["pose_history"][0]["pose"]["position_m"] == {"x": 0.1, "y": 0.2, "z": 0.3}
+    assert "saved_at" in saved_doc
+
+
+def test_debug_runtime(client, monkeypatch):
+    snapshot = {
+        "collected_at": "2026-03-23T04:10:00+00:00",
+        "host": {"hostname": "revpi"},
+        "resources": {"memory": {"used_percent": 72.5}, "swap": {"used_percent": 10.0}},
+        "disk": {"project_root": {"free_bytes": 123456}},
+        "processes": {
+            "current_process": {"pid": 101},
+            "interesting": {"browser": [{"pid": 202, "name": "chromium"}]},
+            "top_rss": [],
+        },
+        "raspberry_pi": {"thermal_zone0_c": 58.2},
+        "kernel_hints": {"matches": ["Killed process 999 (chromium) total-vm:1234kB"]},
+        "latest_startup_logs": {
+            "latest_path": "/tmp/latest",
+            "logs": {"web.log": ["VITE ready"]},
+        },
+        "probes": {"web_root": {"ok": True, "status": 200}},
+    }
+
+    def _fake_snapshot(project_root, *, include_local_probes=False):
+        assert include_local_probes is True
+        assert project_root
+        return snapshot
+
+    monkeypatch.setattr(api_main, "get_runtime_diagnostics_snapshot", _fake_snapshot)
+
+    resp = client.get("/debug/runtime")
+    assert resp.status_code == 200
+    assert resp.json() == snapshot
 
 
 def test_control_jog_session_start_update_stop_and_state(client):

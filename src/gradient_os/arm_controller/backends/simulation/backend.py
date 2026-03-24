@@ -328,7 +328,8 @@ class SimulationBackend(ActuatorBackend):
         self._lease_jog_timeout_s = max(0.0, float(timeout_s))
         self._lease_jog_vector = [float(value) for value in joint_velocities_rad_s]
 
-    def stop_joint_velocity_lease_jog(self) -> None:
+    def stop_joint_velocity_lease_jog(self, *, quick_stop: bool = False) -> None:
+        _ = quick_stop
         self._lease_jog_active = False
         self._lease_jog_timeout_s = 0.0
         self._lease_jog_vector = [0.0] * self._num_joints
