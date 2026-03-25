@@ -7,15 +7,12 @@ import {
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
-  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import {
   Camera,
   CameraOff,
   Crosshair,
-  ChevronDown,
-  ChevronRight,
   FolderOpen,
   Flame,
   Home,
@@ -42,7 +39,7 @@ import {
   type StepTransform,
 } from "./ArmVisualizer";
 import { TelemetryWorkspace } from "./TelemetryWorkspace";
-import ControlPanel from "./ControlPanel";
+import ControlPanel, { ControlPanelRuntimeHeader } from "./ControlPanel";
 import {
   buildProgramTree,
   encodePointsForApi,
@@ -60,6 +57,7 @@ import {
 import { SidebarRail, type SidebarItem } from "./components/SidebarRail";
 import { SidebarDrawer } from "./components/SidebarDrawer";
 import { ProgramFeatureTree } from "./components/ProgramFeatureTree";
+import { ProgramTimeline, type ProgramTimelineLane } from "./components/ProgramTimeline";
 import { LiveStateProvider, LIVE_MONITOR_STALE_MS } from "./liveState";
 
 type Alert = {
@@ -248,6 +246,31 @@ type RuntimeOffset = {
   rotation_deg: Axis3;
 };
 
+type ShellPaneLayout = Pick<
+  PersistedSettings,
+  "leftPaneWidthPx" | "rightPaneWidthPx" | "timelineHeightPx"
+>;
+
+type ActiveShellDrag =
+  | {
+      kind: "left";
+      startX: number;
+      startY: number;
+      initialLayout: ShellPaneLayout;
+    }
+  | {
+      kind: "right";
+      startX: number;
+      startY: number;
+      initialLayout: ShellPaneLayout;
+    }
+  | {
+      kind: "timeline";
+      startX: number;
+      startY: number;
+      initialLayout: ShellPaneLayout;
+    };
+
 type ToolOffsetMm = {
   position_mm: Axis3;
   rotation_deg: Axis3;
@@ -382,6 +405,9 @@ type PersistedSettings = {
   programTreeViewMode: ProgramTreeViewMode;
   expandedProgramTreeNodeIds: string[];
   selectedProgramNodeId: string | null;
+  leftPaneWidthPx: number;
+  rightPaneWidthPx: number;
+  timelineHeightPx: number;
 };
 
 type SidebarPanelId = "step" | "trajectory" | "tools" | "weld" | "telemetry";
@@ -724,6 +750,19 @@ function angleFromPointer(
 }
 
 const SETTINGS_STORAGE_KEY = "gradient-ui:settings";
+const DEFAULT_LEFT_PANE_WIDTH_PX = 368;
+const DEFAULT_RIGHT_PANE_WIDTH_PX = 384;
+const DEFAULT_TIMELINE_HEIGHT_PX = 188;
+const MIN_LEFT_PANE_WIDTH_PX = 220;
+const MAX_LEFT_PANE_WIDTH_PX = 640;
+const MIN_RIGHT_PANE_WIDTH_PX = 220;
+const MAX_RIGHT_PANE_WIDTH_PX = 560;
+const MIN_TIMELINE_HEIGHT_PX = 72;
+const MAX_TIMELINE_HEIGHT_PX = 520;
+const MIN_CENTER_STAGE_WIDTH_PX = 320;
+const SHELL_SPLITTER_SIZE_PX = 8;
+const SHELL_WIDTH_CHROME_PX = 120;
+const SHELL_HEIGHT_CHROME_PX = 220;
 // Keep initial visualizer identity stable before runtime snapshot hydration completes.
 const DEFAULT_VISUALIZER_ROBOT_ID = "gradient-05";
 const LazyArmVisualizer = lazy(async () => {
@@ -804,6 +843,69 @@ function cloneToolDefinition(tool: ToolDefinition): ToolDefinition {
   };
 }
 
+function coercePaneSize(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function clampShellPaneLayout(
+  layout: ShellPaneLayout,
+  viewportWidth: number,
+  viewportHeight: number,
+): ShellPaneLayout {
+  const safeViewportWidth = Number.isFinite(viewportWidth) ? viewportWidth : 1600;
+  const safeViewportHeight = Number.isFinite(viewportHeight) ? viewportHeight : 900;
+
+  const initialLeft = clamp(
+    coercePaneSize(layout.leftPaneWidthPx, DEFAULT_LEFT_PANE_WIDTH_PX),
+    MIN_LEFT_PANE_WIDTH_PX,
+    MAX_LEFT_PANE_WIDTH_PX,
+  );
+  const rightMax = Math.max(
+    MIN_RIGHT_PANE_WIDTH_PX,
+    Math.min(
+      MAX_RIGHT_PANE_WIDTH_PX,
+      safeViewportWidth - initialLeft - MIN_CENTER_STAGE_WIDTH_PX - SHELL_WIDTH_CHROME_PX,
+    ),
+  );
+  const right = clamp(
+    coercePaneSize(layout.rightPaneWidthPx, DEFAULT_RIGHT_PANE_WIDTH_PX),
+    MIN_RIGHT_PANE_WIDTH_PX,
+    rightMax,
+  );
+  const leftMax = Math.max(
+    MIN_LEFT_PANE_WIDTH_PX,
+    Math.min(
+      MAX_LEFT_PANE_WIDTH_PX,
+      safeViewportWidth - right - MIN_CENTER_STAGE_WIDTH_PX - SHELL_WIDTH_CHROME_PX,
+    ),
+  );
+  const left = clamp(initialLeft, MIN_LEFT_PANE_WIDTH_PX, leftMax);
+  const timelineMax = Math.max(
+    MIN_TIMELINE_HEIGHT_PX,
+    Math.min(MAX_TIMELINE_HEIGHT_PX, safeViewportHeight - SHELL_HEIGHT_CHROME_PX),
+  );
+  const timeline = clamp(
+    coercePaneSize(layout.timelineHeightPx, DEFAULT_TIMELINE_HEIGHT_PX),
+    MIN_TIMELINE_HEIGHT_PX,
+    timelineMax,
+  );
+
+  return {
+    leftPaneWidthPx: left,
+    rightPaneWidthPx: right,
+    timelineHeightPx: timeline,
+  };
+}
+
+function sameShellPaneLayout(a: ShellPaneLayout, b: ShellPaneLayout): boolean {
+  return (
+    a.leftPaneWidthPx === b.leftPaneWidthPx &&
+    a.rightPaneWidthPx === b.rightPaneWidthPx &&
+    a.timelineHeightPx === b.timelineHeightPx
+  );
+}
+
 function loadPersistedSettings(): PersistedSettings {
   const defaults: PersistedSettings = {
     showBoundingBox: true,
@@ -817,6 +919,9 @@ function loadPersistedSettings(): PersistedSettings {
     programTreeViewMode: "chronological",
     expandedProgramTreeNodeIds: ["program_root", "setup_primary", "op_chronological", "op_weld"],
     selectedProgramNodeId: null,
+    leftPaneWidthPx: DEFAULT_LEFT_PANE_WIDTH_PX,
+    rightPaneWidthPx: DEFAULT_RIGHT_PANE_WIDTH_PX,
+    timelineHeightPx: DEFAULT_TIMELINE_HEIGHT_PX,
   };
   if (typeof window === "undefined") {
     return defaults;
@@ -880,6 +985,9 @@ function loadPersistedSettings(): PersistedSettings {
           typeof parsed.selectedProgramNodeId === "string"
             ? parsed.selectedProgramNodeId
             : defaults.selectedProgramNodeId,
+        leftPaneWidthPx: coercePaneSize(parsed.leftPaneWidthPx, defaults.leftPaneWidthPx),
+        rightPaneWidthPx: coercePaneSize(parsed.rightPaneWidthPx, defaults.rightPaneWidthPx),
+        timelineHeightPx: coercePaneSize(parsed.timelineHeightPx, defaults.timelineHeightPx),
       };
     }
   } catch {
@@ -1511,38 +1619,38 @@ function TelemetryPanel({ latest }: { latest: TelemetryEvent | null }) {
   );
 }
 
-type CollapsibleOverlayPanelProps = {
-  title: string;
-  collapsed: boolean;
-  onToggle: () => void;
-  children: ReactNode;
-  widthClassName?: string;
-};
-
-function CollapsibleOverlayPanel({
-  title,
-  collapsed,
-  onToggle,
-  children,
-  widthClassName = "w-full max-w-xs",
-}: CollapsibleOverlayPanelProps) {
+function PaneResizeHandle({
+  orientation,
+  active = false,
+  onPointerDown,
+}: {
+  orientation: "vertical" | "horizontal";
+  active?: boolean;
+  onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+}) {
+  const isVertical = orientation === "vertical";
   return (
-    <div className={`pointer-events-auto ${widthClassName}`}>
+    <div
+      className={`flex items-center justify-center ${
+        isVertical ? "h-full w-full cursor-col-resize" : "h-full w-full cursor-row-resize"
+      }`}
+    >
       <button
         type="button"
-        onClick={onToggle}
-        className="flex w-full items-center justify-between rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-2 text-left shadow-md shadow-slate-900/30 backdrop-blur transition hover:border-slate-500/70"
+        aria-label={isVertical ? "Resize side panes" : "Resize timeline height"}
+        onPointerDown={onPointerDown}
+        className={`group relative flex items-center justify-center rounded-full border border-slate-800/80 bg-slate-950/88 transition ${
+          isVertical
+            ? "h-20 w-1.5 cursor-col-resize"
+            : "h-1.5 w-20 cursor-row-resize"
+        } ${active ? "border-cyan-400/60 bg-cyan-500/15" : "hover:border-cyan-400/40 hover:bg-cyan-500/10"}`}
       >
-        <span className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-200/80">
-          {title}
-        </span>
-        {collapsed ? (
-          <ChevronRight size={16} className="text-slate-300/80" />
-        ) : (
-          <ChevronDown size={16} className="text-slate-300/80" />
-        )}
+        <span
+          className={`rounded-full bg-slate-500/70 transition group-hover:bg-cyan-200/80 ${
+            isVertical ? "h-10 w-px" : "h-px w-10"
+          } ${active ? "bg-cyan-200/90" : ""}`}
+        />
       </button>
-      {!collapsed && <div className="mt-2">{children}</div>}
     </div>
   );
 }
@@ -1754,59 +1862,37 @@ function TrajectoryPanel({
   const canSimulate = runtimeMode === "simulate" && !!preview;
   const canRunLive = runtimeMode === "live" && !!preview;
   const hasDraftWaypoints = plannerPoints.length > 0;
+  const interactionLocked = isPlanLoading || isSubmittingRun || isMotionActive;
+  const statusLabel = isPlanLoading
+    ? "Planning"
+    : isSubmittingRun
+      ? "Submitting"
+      : isPlanning
+        ? "Editing"
+        : preview
+          ? "Ready"
+          : "Idle";
 
   return (
     <div className="pointer-events-auto w-full">
-      <div className="mb-3 flex items-center justify-end">
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onPlanToggle}
-            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
-            className={`rounded-full border border-slate-600/50 p-2 transition ${
-              isPlanning
-                ? "bg-cyan-500/80 text-slate-950 shadow-inner shadow-cyan-400/40"
-                : "bg-slate-900/60 text-slate-200 hover:border-slate-400 hover:text-slate-100"
-            } ${isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""}`}
-            aria-label="Select trajectory target"
-          >
-            <Route size={18} strokeWidth={2} />
-          </button>
-          <button
-            type="button"
-            onClick={onUndoPoint}
-            disabled={plannerPoints.length === 0 || isPlanLoading || isSubmittingRun || isMotionActive}
-            className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
-              plannerPoints.length === 0 || isPlanLoading || isSubmittingRun || isMotionActive
-                ? "opacity-60"
-                : ""
-            }`}
-            aria-label="Remove last waypoint"
-          >
-            <Undo2 size={18} strokeWidth={2} />
-          </button>
-          <button
-            type="button"
-            onClick={onCapturePose}
-            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
-            className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
-              isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
-            }`}
-            aria-label="Capture current robot pose"
-          >
-            <Crosshair size={18} strokeWidth={2} />
-          </button>
-          <button
-            type="button"
-            onClick={onClear}
-            disabled={(!preview && !isPlanning) || isPlanLoading}
-            className={`rounded-full border border-slate-600/50 bg-slate-900/60 p-2 text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
-              ((!preview && !isPlanning) || isPlanLoading) ? "opacity-60" : ""
-            }`}
-            aria-label="Clear planned trajectory"
-          >
-            <Trash2 size={18} strokeWidth={2} />
-          </button>
+      <div className="mb-3 rounded-xl border border-slate-700/60 bg-slate-950/45 px-3 py-3">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200/80">
+              Trajectory Authoring
+            </div>
+            <div className="mt-1 text-[13px] leading-5 text-slate-300/90">
+              Build waypoint-based robot motion with pose capture, IK-planned interpolation, and explicit SIM/LIVE execution.
+            </div>
+          </div>
+          <div className="flex flex-col items-end gap-1">
+            <span className="rounded border border-slate-700/70 bg-slate-900/70 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+              {statusLabel}
+            </span>
+            <span className="rounded border border-slate-700/70 bg-slate-900/70 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+              {runtimeMode === "simulate" ? "SIM" : runtimeMode === "live" ? "LIVE" : "UNKNOWN"}
+            </span>
+          </div>
         </div>
       </div>
       <MotionStatusCard
@@ -1815,135 +1901,168 @@ function TrajectoryPanel({
         isSubmitting={isSubmittingRun}
         submittingLabel="Submitting trajectory run..."
       />
-      <div className="mt-3 rounded border border-slate-700/60 bg-slate-950/40 px-3 py-3">
-        <div className="mb-1 flex items-center justify-between">
+      <div className="mt-3 rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-3">
+        <div className="mb-2 flex items-center justify-between">
           <span className={DRAWER_SECTION_TITLE_CLASS}>Create Trajectory</span>
-          <span className={DRAWER_META_TEXT_CLASS}>
-            {hasDraftWaypoints ? `${plannerPoints.length} draft waypoint(s)` : "start here"}
+          <span className="rounded border border-cyan-500/20 bg-cyan-500/8 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-cyan-100/90">
+            {hasDraftWaypoints ? `${plannerPoints.length} draft waypoint(s)` : "Start here"}
           </span>
         </div>
-        <div className="text-[12px] leading-5 text-slate-300/90">
-          <p>
+        <div className="rounded-lg border border-slate-700/60 bg-slate-900/40 px-2.5 py-2 text-[12px] leading-5 text-slate-300/90">
+          <div>
             1. Click <span className="font-semibold text-slate-100">{isPlanning ? "Stop Editing" : "Start Editing"}</span>.
-          </p>
-          <p>
-            2. While editing, <span className="font-semibold text-slate-100">Shift-click the 3D workspace</span> to place waypoints,
-            or use <span className="font-semibold text-slate-100">Capture Pose</span> to grab the robot TCP.
-          </p>
-          <p>
-            3. Fine-tune XYZ plus roll/pitch/yaw in the <span className="font-semibold text-slate-100">Program Tree</span>.
-          </p>
+          </div>
+          <div>
+            2. While editing, <span className="font-semibold text-slate-100">Shift-click the 3D workspace</span> or use <span className="font-semibold text-slate-100">Capture Pose</span>.
+          </div>
+          <div>
+            3. Adjust XYZ and roll/pitch/yaw in the <span className="font-semibold text-slate-100">Program Tree</span>.
+          </div>
         </div>
-        <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <div className="mt-3 grid grid-cols-2 gap-2">
           <button
             type="button"
             onClick={onPlanToggle}
-            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
-            className={`rounded-lg border px-3 py-2 text-left ${DRAWER_ACTION_TEXT_CLASS} transition ${
+            disabled={interactionLocked}
+            className={`rounded-xl border px-3 py-2 text-left transition ${
               isPlanning
-                ? "border-cyan-400/60 bg-cyan-500/15 text-cyan-100"
-                : "border-slate-600/60 bg-slate-900/60 text-slate-100 hover:border-slate-400 hover:text-slate-50"
-            } ${isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""}`}
+                ? "border-cyan-400/60 bg-cyan-500/18 text-cyan-50 shadow-inner shadow-cyan-500/10"
+                : "border-cyan-500/40 bg-cyan-500/12 text-cyan-50 hover:border-cyan-300/70 hover:bg-cyan-500/18"
+            } ${interactionLocked ? "opacity-60" : ""}`}
           >
-            {isPlanning ? "Stop Editing" : "Start Editing"}
+            <div className={`${DRAWER_ACTION_TEXT_CLASS}`}>{isPlanning ? "Stop Editing" : "Start Editing"}</div>
+            <div className="mt-0.5 text-[11px] text-current/75">
+              {isPlanning ? "Finish placing points" : "Enable waypoint placement"}
+            </div>
           </button>
           <button
             type="button"
             onClick={onAddWaypoint}
-            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
-            className={`rounded-lg border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left ${DRAWER_ACTION_TEXT_CLASS} text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
-              isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
+            disabled={interactionLocked}
+            className={`rounded-xl border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+              interactionLocked ? "opacity-60" : ""
             }`}
           >
-            <span className="inline-flex items-center gap-2">
+            <span className={`inline-flex items-center gap-2 ${DRAWER_ACTION_TEXT_CLASS}`}>
               <Plus size={14} />
               Add Waypoint
             </span>
+            <div className="mt-0.5 text-[11px] text-slate-400">
+              Insert a numeric waypoint now
+            </div>
           </button>
           <button
             type="button"
             onClick={onCapturePose}
-            disabled={isPlanLoading || isSubmittingRun || isMotionActive}
-            className={`rounded-lg border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left ${DRAWER_ACTION_TEXT_CLASS} text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
-              isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
+            disabled={interactionLocked}
+            className={`rounded-xl border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+              interactionLocked ? "opacity-60" : ""
             }`}
           >
-            Capture Pose
+            <div className={`${DRAWER_ACTION_TEXT_CLASS}`}>Capture Pose</div>
+            <div className="mt-0.5 text-[11px] text-slate-400">
+              Read the robot TCP directly
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={onUndoPoint}
+            disabled={plannerPoints.length === 0 || interactionLocked}
+            className={`rounded-xl border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+              plannerPoints.length === 0 || interactionLocked ? "opacity-60" : ""
+            }`}
+          >
+            <div className={`inline-flex items-center gap-2 ${DRAWER_ACTION_TEXT_CLASS}`}>
+              <Undo2 size={14} />
+              Undo Last
+            </div>
+            <div className="mt-0.5 text-[11px] text-slate-400">
+              Remove the most recent point
+            </div>
           </button>
         </div>
       </div>
-      <div className="text-[13px] leading-[1.35] text-slate-100/90">
-        <div className="mb-2 flex items-center gap-2">
-          <span className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-200">
-            Runtime {runtimeMode === "simulate" ? "SIM" : runtimeMode === "live" ? "LIVE" : "UNKNOWN"}
-          </span>
+      <div className="mt-3 rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-3">
+        <div className="mb-2 flex items-center justify-between">
+          <span className={DRAWER_SECTION_TITLE_CLASS}>Draft Summary</span>
           <span className={DRAWER_META_TEXT_CLASS}>
-            Preview draws the path locally. Only `Simulate Trajectory` runs safely in SIM mode.
+            {preview ? "preview ready" : hasDraftWaypoints ? "draft only" : "empty"}
           </span>
         </div>
-        {isPlanLoading ? (
-          <p>Planning preview trajectory…</p>
-        ) : isSubmittingRun ? (
-          <p>Submitting trajectory run…</p>
-        ) : isPlanning ? (
-          <p>
-            Shift-click in the workspace to add waypoints. Use capture pose to
-            record the robot TCP directly, and undo to remove the last point.
-          </p>
-        ) : preview ? (
-          <div className="flex flex-col gap-2">
-            <div className={DRAWER_META_TEXT_CLASS}>
-              Loaded:{" "}
-              <span className="font-semibold text-slate-100">{preview.name}</span>
+        <div className="grid grid-cols-2 gap-2">
+          <div className="rounded-lg border border-slate-700/60 bg-slate-900/45 px-2.5 py-2">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">Waypoints</div>
+            <div className="mt-1 text-[18px] font-semibold text-slate-100">{waypointCount}</div>
+          </div>
+          <div className="rounded-lg border border-slate-700/60 bg-slate-900/45 px-2.5 py-2">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">Preview</div>
+            <div className="mt-1 text-[18px] font-semibold text-slate-100">
+              {preview ? "Ready" : isPlanLoading ? "Planning" : "None"}
             </div>
-            <div className={DRAWER_META_TEXT_CLASS}>
-              Waypoints:{" "}
-              <span className="font-semibold text-slate-100">{waypointCount}</span>
-            </div>
-            {lastPoint && (
-              <div className={DRAWER_META_TEXT_CLASS}>
-                Last point (m):{" "}
+          </div>
+        </div>
+        <div className="mt-2 rounded-lg border border-slate-700/60 bg-slate-900/35 px-2.5 py-2 text-[12px] leading-5 text-slate-300/90">
+          {isPlanLoading ? (
+            <p>Planning preview trajectory…</p>
+          ) : isSubmittingRun ? (
+            <p>Submitting trajectory run…</p>
+          ) : lastPoint ? (
+            <>
+              <div>
+                Last point:{" "}
                 <span className="font-semibold text-slate-100">
-                  {lastPoint.x.toFixed(3)}, {lastPoint.y.toFixed(3)},{" "}
-                  {lastPoint.z.toFixed(3)}
+                  {lastPoint.x.toFixed(3)}, {lastPoint.y.toFixed(3)}, {lastPoint.z.toFixed(3)} m
                 </span>
               </div>
-            )}
-            {lastPoint ? (
-              <div className={DRAWER_META_TEXT_CLASS}>
-                Last pose: <span className="font-semibold text-slate-100">{poseOrientationSummary(lastPoint)}</span>
+              <div className="mt-1">
+                Pose: <span className="font-semibold text-slate-100">{poseOrientationSummary(lastPoint)}</span>
               </div>
-            ) : null}
-          </div>
-        ) : (
-          <p>No preview loaded yet. Start editing, place or capture waypoints, and the preview will appear automatically.</p>
-        )}
+            </>
+          ) : (
+            <p>Start editing, place or capture waypoints, and the preview will appear automatically.</p>
+          )}
+        </div>
       </div>
-      <div className="mt-3 grid grid-cols-2 gap-2">
-        <button
-          type="button"
-          onClick={onSimulate}
-          disabled={!canSimulate || isPlanLoading || isSubmittingRun || isMotionActive}
-          className={`rounded-lg border border-cyan-500/50 bg-cyan-500/10 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-cyan-100 transition hover:border-cyan-300 hover:text-cyan-50 ${
-            !canSimulate || isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
-          }`}
-        >
-          Simulate Trajectory
-        </button>
-        <button
-          type="button"
-          onClick={onRunLive}
-          disabled={!canRunLive || isPlanLoading || isSubmittingRun || isMotionActive}
-          className={`rounded-lg border border-rose-500/50 bg-rose-500/10 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-rose-100 transition hover:border-rose-300 hover:text-rose-50 ${
-            !canRunLive || isPlanLoading || isSubmittingRun || isMotionActive ? "opacity-60" : ""
-          }`}
-        >
-          Run Trajectory
-        </button>
+      <div className="mt-3 rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-3">
+        <div className="mb-2 flex items-center justify-between">
+          <span className={DRAWER_SECTION_TITLE_CLASS}>Execution</span>
+          <span className={DRAWER_META_TEXT_CLASS}>preview draws path locally</span>
+        </div>
+        <div className="mb-3 rounded-lg border border-slate-700/60 bg-slate-900/35 px-2.5 py-2 text-[12px] leading-5 text-slate-300/90">
+          Only <span className="font-semibold text-slate-100">Simulate Trajectory</span> is allowed in SIM mode.
+          <span className="block">
+            <span className="font-semibold text-slate-100">Run Trajectory</span> is only enabled in LIVE mode.
+          </span>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={onSimulate}
+            disabled={!canSimulate || interactionLocked}
+            className={`rounded-xl border border-cyan-500/50 bg-cyan-500/10 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-cyan-100 transition hover:border-cyan-300 hover:text-cyan-50 ${
+              !canSimulate || interactionLocked ? "opacity-60" : ""
+            }`}
+          >
+            Simulate Trajectory
+          </button>
+          <button
+            type="button"
+            onClick={onRunLive}
+            disabled={!canRunLive || interactionLocked}
+            className={`rounded-xl border border-rose-500/50 bg-rose-500/10 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-rose-100 transition hover:border-rose-300 hover:text-rose-50 ${
+              !canRunLive || interactionLocked ? "opacity-60" : ""
+            }`}
+          >
+            Run Trajectory
+          </button>
+        </div>
       </div>
-      <div className="mt-4 border-t border-slate-700/50 pt-3">
+      <div className="mt-3 rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-3">
         <div className="mb-2 flex items-center justify-between">
           <span className={DRAWER_SECTION_TITLE_CLASS}>Save Program</span>
+          <span className={DRAWER_META_TEXT_CLASS}>
+            {preview ? "ready to save" : "needs preview"}
+          </span>
         </div>
         <div className="flex items-center gap-2">
           <input
@@ -1964,7 +2083,7 @@ function TrajectoryPanel({
           </button>
         </div>
       </div>
-      <div className="mt-4 border-t border-slate-700/50 pt-3">
+      <div className="mt-3 rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-3">
         <div className="mb-2 flex items-center justify-between">
           <span className={DRAWER_SECTION_TITLE_CLASS}>
             Saved Programs
@@ -2019,6 +2138,19 @@ function TrajectoryPanel({
             No saved programs available.
           </p>
         )}
+      </div>
+      <div className="mt-3 flex justify-end">
+        <button
+          type="button"
+          onClick={onClear}
+          disabled={(!preview && !isPlanning && plannerPoints.length === 0) || isPlanLoading}
+          className={`inline-flex items-center gap-2 rounded-lg border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-[12px] font-semibold text-slate-200 transition hover:border-slate-400 hover:text-slate-100 ${
+            ((!preview && !isPlanning && plannerPoints.length === 0) || isPlanLoading) ? "opacity-60" : ""
+          }`}
+        >
+          <Trash2 size={14} />
+          Clear Draft
+        </button>
       </div>
     </div>
   );
@@ -3978,6 +4110,107 @@ export default function App() {
     },
     [],
   );
+  const [shellPaneLayout, setShellPaneLayout] = useState<ShellPaneLayout>(() =>
+    clampShellPaneLayout(
+      {
+        leftPaneWidthPx: settings.leftPaneWidthPx,
+        rightPaneWidthPx: settings.rightPaneWidthPx,
+        timelineHeightPx: settings.timelineHeightPx,
+      },
+      typeof window !== "undefined" ? window.innerWidth : 1600,
+      typeof window !== "undefined" ? window.innerHeight : 900,
+    ),
+  );
+  const [activeShellDrag, setActiveShellDrag] = useState<ActiveShellDrag | null>(null);
+  const shellPaneLayoutRef = useRef<ShellPaneLayout>(shellPaneLayout);
+
+  useEffect(() => {
+    shellPaneLayoutRef.current = shellPaneLayout;
+  }, [shellPaneLayout]);
+
+  useEffect(() => {
+    const handleViewportResize = () => {
+      setShellPaneLayout((prev) => {
+        const next = clampShellPaneLayout(prev, window.innerWidth, window.innerHeight);
+        return sameShellPaneLayout(prev, next) ? prev : next;
+      });
+    };
+    handleViewportResize();
+    window.addEventListener("resize", handleViewportResize);
+    return () => window.removeEventListener("resize", handleViewportResize);
+  }, []);
+
+  useEffect(() => {
+    if (!activeShellDrag) {
+      return;
+    }
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor =
+      activeShellDrag.kind === "timeline" ? "row-resize" : "col-resize";
+    document.body.style.userSelect = "none";
+
+    const onPointerMove = (event: PointerEvent) => {
+      const deltaX = event.clientX - activeShellDrag.startX;
+      const deltaY = event.clientY - activeShellDrag.startY;
+      const base = activeShellDrag.initialLayout;
+      const next =
+        activeShellDrag.kind === "left"
+          ? {
+              ...base,
+              leftPaneWidthPx: base.leftPaneWidthPx + deltaX,
+            }
+          : activeShellDrag.kind === "right"
+            ? {
+                ...base,
+                rightPaneWidthPx: base.rightPaneWidthPx - deltaX,
+              }
+            : {
+                ...base,
+                timelineHeightPx: base.timelineHeightPx - deltaY,
+              };
+      const clamped = clampShellPaneLayout(next, window.innerWidth, window.innerHeight);
+      shellPaneLayoutRef.current = clamped;
+      setShellPaneLayout(clamped);
+    };
+
+    const stopDragging = () => {
+      const finalLayout = clampShellPaneLayout(
+        shellPaneLayoutRef.current,
+        window.innerWidth,
+        window.innerHeight,
+      );
+      setShellPaneLayout(finalLayout);
+      updateSettings(finalLayout);
+      setActiveShellDrag(null);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", stopDragging);
+    window.addEventListener("pointercancel", stopDragging);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", stopDragging);
+      window.removeEventListener("pointercancel", stopDragging);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+    };
+  }, [activeShellDrag, updateSettings]);
+
+  const startShellDrag = useCallback(
+    (kind: ActiveShellDrag["kind"]) => (event: ReactPointerEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      setActiveShellDrag({
+        kind,
+        startX: event.clientX,
+        startY: event.clientY,
+        initialLayout: shellPaneLayoutRef.current,
+      });
+    },
+    [],
+  );
 
   const activeRobotId = runtimeConfigSnapshot?.active?.robot?.robot_id ?? null;
   const activeToolId = runtimeConfigSnapshot?.active?.tool?.active_tool_id ?? null;
@@ -4704,6 +4937,110 @@ export default function App() {
   const canTreeWaypointApply =
     canTreeWaypointValueEdit &&
     (weldDraft ? weldEditableWaypoints.length > 1 : treeEditableWaypoints.length > 0);
+  const activePanelTitle = activePanel === "step"
+    ? "STEP Import"
+    : activePanel === "trajectory"
+      ? "Trajectory Authoring"
+      : activePanel === "tools"
+        ? "Tool Library"
+        : activePanel === "weld"
+          ? "Weld Authoring"
+          : activePanel === "telemetry"
+            ? "Live Charts"
+            : "Workspace";
+  const selectedProgramNodeTypeLabel = selectedProgramNode
+    ? selectedProgramNode.type
+        .replace(/([A-Z])/g, " $1")
+        .replace(/^./, (value) => value.toUpperCase())
+    : null;
+  const currentPlayheadLabel = selectedProgramNode?.label ?? "No timeline block selected";
+  const currentPlayheadDetail = selectedProgramNode?.subtitle
+    ?? (selectedProgramNodeTypeLabel ? `Selected ${selectedProgramNodeTypeLabel}` : activePanelTitle);
+  const timelineLanes = useMemo<ProgramTimelineLane[]>(() => {
+    const lanes: ProgramTimelineLane[] = [];
+    if (visualWaypoints.length > 0) {
+      lanes.push({
+        id: "trajectory-waypoints",
+        title: "Control Points",
+        subtitle: `${visualWaypoints.length} waypoint(s) driving the trajectory preview`,
+        tone: "cyan",
+        items: visualWaypoints.map((point, index) => {
+          const nodeId = `control_point_${index}`;
+          return {
+            id: nodeId,
+            label: `P${index + 1}`,
+            subtitle: `${point.x.toFixed(3)}, ${point.y.toFixed(3)}, ${point.z.toFixed(3)} m`,
+            tone: "cyan" as const,
+            active:
+              selectedProgramNodeId === nodeId ||
+              selectedProgramWaypointIndices.includes(index),
+            disabled: !programNodeById.has(nodeId),
+          };
+        }),
+      });
+    }
+    const previewMoves = Array.isArray(previewPlan?.trajectory?.moves)
+      ? previewPlan.trajectory.moves
+      : [];
+    if (previewMoves.length > 0) {
+      lanes.push({
+        id: "trajectory-moves",
+        title: "Controller Moves",
+        subtitle: `${previewMoves.length} ordered move command(s) from the preview plan`,
+        tone: "amber",
+        items: previewMoves.map((move, index) => {
+          const nodeId = `move_${index}`;
+          return {
+            id: nodeId,
+            label: `Move ${index + 1}`,
+            subtitle: String(move?.command ?? "unknown").replace(/_/g, " "),
+            tone: "amber" as const,
+            active: selectedProgramNode?.focus?.moveIndex === index,
+            disabled: !programNodeById.has(nodeId),
+          };
+        }),
+      });
+    }
+    if (weldDraft?.segments && weldDraft.segments.length > 0) {
+      lanes.push({
+        id: "weld-segments",
+        title: "Weld Sections",
+        subtitle: `${weldDraft.segments.length} selected weld segment(s)`,
+        tone: "emerald",
+        items: weldDraft.segments.map((segment, index) => {
+          const nodeId = findWeldProgramNodeIdByEdge(programNodeById, segment.edgeId);
+          return {
+            id: nodeId ?? `weld-segment-${index}`,
+            label: `Segment ${index + 1}`,
+            subtitle: `${segment.weldType} • ${segment.edgeId}`,
+            tone: "emerald" as const,
+            active:
+              selectedProgramNode?.focus?.weldSegmentEdgeId === segment.edgeId ||
+              activeWeldSegment?.edgeId === segment.edgeId,
+            disabled: !nodeId,
+          };
+        }),
+      });
+    }
+    return lanes;
+  }, [
+    activeWeldSegment?.edgeId,
+    programNodeById,
+    previewPlan,
+    selectedProgramNode,
+    selectedProgramNodeId,
+    selectedProgramWaypointIndices,
+    visualWaypoints,
+    weldDraft,
+  ]);
+  const { leftPaneWidthPx, rightPaneWidthPx, timelineHeightPx } = shellPaneLayout;
+  const shellGridStyle = {
+    gridTemplateRows: `minmax(0,1fr) ${SHELL_SPLITTER_SIZE_PX}px ${timelineHeightPx}px`,
+    gridTemplateColumns: `minmax(0,1fr) ${SHELL_SPLITTER_SIZE_PX}px ${rightPaneWidthPx}px`,
+  } as const;
+  const workspaceColumnsStyle = {
+    gridTemplateColumns: `${leftPaneWidthPx}px ${SHELL_SPLITTER_SIZE_PX}px minmax(0,1fr)`,
+  } as const;
   const sidebarItems = useMemo<SidebarItem[]>(
     () => [
       { id: "step", label: "STEP Import", icon: <FolderOpen size={17} />, shortcut: "1" },
@@ -5039,6 +5376,15 @@ export default function App() {
     setVisionError(null);
     setIsVisionActive(true);
   }, [isVisionActive]);
+  const showStage3d = useCallback(() => {
+    setVisionError(null);
+    setIsVisualizerEnabled(true);
+    setIsVisionActive(false);
+  }, []);
+  const showVisionStage = useCallback(() => {
+    setVisionError(null);
+    setIsVisionActive(true);
+  }, []);
 
   const handleResetView = useCallback(() => {
     visualizerRef.current?.resetView();
@@ -5235,9 +5581,9 @@ export default function App() {
           throw new Error(message || `Plan request failed (${response.status})`);
         }
         const data = await response.json();
-        const { plan, waypoints } = previewFromPlannerPayload(data);
+        const { plan, waypoints: previewWaypoints } = previewFromPlannerPayload(data);
         setPreviewPlan(plan);
-        setPlannerPoints(waypoints);
+        setPlannerPoints(previewWaypoints);
         setWeldPreviewGhostJoints(null);
         setWeldPreviewCacheReady(false);
       } catch (err) {
@@ -6152,14 +6498,6 @@ export default function App() {
   }, [disconnect]);
 
   useEffect(() => {
-    if (isConnected) {
-      setIsVisionActive(true);
-    } else {
-      setIsVisionActive(false);
-    }
-  }, [isConnected]);
-
-  useEffect(() => {
     setVisionError(null);
   }, [normalisedVisionHost]);
 
@@ -6402,17 +6740,29 @@ export default function App() {
   const headerAlert = [error, visionError].filter(Boolean).join(" • ");
   const hasHeaderAlert = headerAlert.length > 0;
   const alertTone = error ? "rose" : "amber";
+  const stageSurfaceHeading = isVisionActive
+    ? "Live Camera Workspace"
+    : (selectedProgramNode?.label ?? "Robot Workspace");
+  const currentProgramLabel = programTreeRoot?.label?.trim() ?? "";
+  const showCurrentProgramLabel = currentProgramLabel.length > 0 && currentProgramLabel.toLowerCase() !== "no program";
+  const stageGuidance = isVisionActive
+    ? (
+        visionError
+          ? "Vision stream unavailable. Retry the feed or switch back to the 3D workspace while the camera comes back."
+          : "Vision view is active. Switch back to 3D to inspect robot pose, paths, and weld geometry."
+      )
+    : (
+        weldSelectionMode
+          ? "Weld selection is active. Click highlighted edges in the 3D stage to build weld sections."
+          : isPlanning
+            ? "Trajectory editing is active. Shift-click the stage or capture the live robot pose to add waypoints."
+            : "Select a program node or timeline block to focus the stage on that part of the job."
+      );
   const controllerStatusTone = apiHealthError?.startsWith("API unreachable")
     ? "rose"
     : apiHealthError
       ? "amber"
       : null;
-  const activeDrawerWidthClass = activePanel === "telemetry"
-    ? "w-[38rem] max-w-[calc(100vw-7rem)]"
-    : activePanel === "tools"
-      ? "w-[23rem] max-w-[calc(100vw-7rem)]"
-      : "w-[20rem] max-w-[calc(100vw-7rem)]";
-  const activeDrawerHeightMode: "content" | "full" = "content";
   const activeDrawerHeader = activePanel === "step"
     ? (
         <span className="text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200/80">
@@ -6755,10 +7105,14 @@ export default function App() {
 
   return (
     <LiveStateProvider value={liveStateValue}>
-      <div className="flex min-h-screen flex-col bg-gradient-to-b from-slate-900/80 via-slate-950 to-black text-slate-100">
-      <header className="relative flex flex-col gap-2 border-b border-slate-800/40 bg-slate-950/60 px-6 py-2.5 shadow-inner shadow-slate-900/40 backdrop-blur">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex flex-col shrink-0">
+      <div className="flex h-[100dvh] min-h-0 flex-col overflow-hidden bg-gradient-to-b from-slate-900/80 via-slate-950 to-black text-slate-100">
+      <header className={`relative shrink-0 flex flex-col border-b border-slate-800/40 bg-slate-950/60 px-6 pt-2 pb-0 shadow-inner shadow-slate-900/40 backdrop-blur ${
+        hasHeaderAlert ? "gap-1 pb-1" : "gap-0"
+      }`}>
+        <div className={`relative flex flex-col gap-2 xl:flex-row xl:items-stretch ${
+          hasHeaderAlert ? "min-h-[3.25rem]" : "min-h-[3rem]"
+        }`}>
+          <div className="flex shrink-0 flex-col justify-center">
             <div className="flex justify-end text-lg font-semibold tracking-tight text-cyan-300 sm:text-xl w-full leading-tight">
               Control Center
             </div>
@@ -6766,24 +7120,19 @@ export default function App() {
               Gradient Robotics
             </div>
           </div>
-          <div className="flex min-w-0 flex-1 items-center sm:px-3">
-            <div
-              className={`flex h-7 w-full items-center overflow-hidden rounded-lg border px-2 text-[11px] sm:text-xs ${
-                hasHeaderAlert
-                  ? alertTone === "rose"
-                    ? "border-rose-500/40 bg-rose-500/10 text-rose-200"
-                    : "border-amber-500/40 bg-amber-500/10 text-amber-200"
-                  : "border-transparent bg-transparent text-transparent"
-              }`}
-              role={hasHeaderAlert ? "alert" : undefined}
-              aria-live={hasHeaderAlert ? "polite" : undefined}
-              aria-hidden={!hasHeaderAlert}
-              title={hasHeaderAlert ? headerAlert : undefined}
-            >
-              {hasHeaderAlert && <span className="w-full truncate">{headerAlert}</span>}
+          <div className="flex h-full min-w-0 justify-center xl:pointer-events-none xl:absolute xl:inset-y-0 xl:left-1/2 xl:w-[min(52rem,calc(100%-28rem))] xl:-translate-x-1/2">
+            <div className="flex h-full min-w-0 items-stretch justify-center">
+              <ControlPanelRuntimeHeader
+                apiHost={normalizedApiHost}
+                driveFaults={latest?.drive_faults ?? null}
+                activeServoBackend={runtimeConfigSnapshot?.active?.servo_backend?.effective_backend ?? null}
+                onJointFeedback={handleFallbackJointFeedback}
+                onError={(message) => setError(message)}
+                className="min-w-0 h-full flex-wrap justify-center xl:pointer-events-auto xl:flex-nowrap"
+              />
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 xl:ml-auto">
             {apiHealthError ? (
               <span
                 className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
@@ -6864,7 +7213,7 @@ export default function App() {
               type="button"
               onClick={toggleVision}
               className={cameraButtonClasses}
-              aria-label={isVisionActive ? "Disable camera overlay" : "Enable camera overlay"}
+              aria-label={isVisionActive ? "Show 3D workspace" : "Show vision workspace"}
             >
               {isVisionActive ? (
                 <Camera size={16} strokeWidth={2} />
@@ -6906,179 +7255,353 @@ export default function App() {
             </button>
           </div>
         </div>
+        {hasHeaderAlert ? (
+          <div
+            className={`flex h-7 w-full items-center overflow-hidden rounded-lg border px-2 text-[11px] sm:text-xs ${
+              alertTone === "rose"
+                ? "border-rose-500/40 bg-rose-500/10 text-rose-200"
+                : "border-amber-500/40 bg-amber-500/10 text-amber-200"
+            }`}
+            role="alert"
+            aria-live="polite"
+            title={headerAlert}
+          >
+            <span className="w-full truncate">{headerAlert}</span>
+          </div>
+        ) : null}
       </header>
-      <main className="relative flex-1 overflow-hidden">
-        {isVisualizerEnabled ? (
-          <Suspense
-            fallback={
-              <div className="absolute inset-0 flex items-center justify-center bg-slate-950/80">
-                <div className="rounded-2xl border border-cyan-500/20 bg-slate-950/85 px-5 py-4 text-sm text-slate-200 shadow-2xl shadow-black/40">
-                  Loading 3D workspace...
+      <main className="min-h-0 h-full flex-1 overflow-hidden p-4">
+        <div className="grid h-full min-h-0 gap-0" style={shellGridStyle}>
+          <div className="col-start-1 row-start-1 grid min-h-0 gap-0" style={workspaceColumnsStyle}>
+              <div className="grid min-h-0 grid-cols-[4.75rem_minmax(0,1fr)] grid-rows-[minmax(0,1.15fr)_minmax(0,1fr)] gap-4">
+                <div className="relative z-30 row-span-2 min-h-0 overflow-visible">
+                  <SidebarRail
+                    items={sidebarItems}
+                    activeItemId={activePanel}
+                    onSelect={handleSelectSidebarPanel}
+                  />
+                </div>
+                {activePanel && activeDrawerContent ? (
+                  <SidebarDrawer
+                    onClose={() => updateSettings({ activePanel: null })}
+                    headerContent={activeDrawerHeader}
+                    widthClassName="row-span-2 w-full"
+                    heightMode="full"
+                  >
+                    {activeDrawerContent}
+                  </SidebarDrawer>
+                ) : (
+                  <section className="row-span-2 flex min-h-0 flex-col justify-center rounded-2xl border border-slate-800/80 bg-slate-950/72 p-5 shadow-xl shadow-black/20">
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-200/80">
+                      Authoring Surface
+                    </div>
+                    <h2 className="mt-2 text-xl font-semibold tracking-tight text-slate-50">
+                      Select a workspace from the left rail
+                    </h2>
+                    <p className="mt-2 text-sm leading-6 text-slate-400">
+                      The menu is back on the left-hand side so the shell feels closer to the earlier
+                      layout, while the authoring panes remain docked and non-overlapping.
+                    </p>
+                    <div className="mt-4 rounded-2xl border border-slate-700/70 bg-slate-900/55 px-4 py-3">
+                      <div className="text-[12px] font-semibold text-slate-100">Available sections</div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {sidebarItems.map((item) => (
+                          <button
+                            key={`workspace-chip-${item.id}`}
+                            type="button"
+                            onClick={() => handleSelectSidebarPanel(item.id)}
+                            className="rounded-full border border-slate-700/70 bg-slate-950/70 px-3 py-1.5 text-[11px] font-semibold text-slate-300 transition hover:border-cyan-400/40 hover:text-cyan-100"
+                          >
+                            {item.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </section>
+                )}
+              </div>
+              <PaneResizeHandle
+                orientation="vertical"
+                active={activeShellDrag?.kind === "left"}
+                onPointerDown={startShellDrag("left")}
+              />
+              <section className="relative min-h-0 overflow-hidden rounded-[1.75rem] border border-slate-800/80 bg-slate-950 shadow-2xl shadow-black/30">
+              {isVisualizerEnabled ? (
+                <Suspense
+                  fallback={
+                    <div className="absolute inset-0 flex items-center justify-center bg-slate-950/80">
+                      <div className="rounded-2xl border border-cyan-500/20 bg-slate-950/85 px-5 py-4 text-sm text-slate-200 shadow-2xl shadow-black/40">
+                        Loading 3D workspace...
+                      </div>
+                    </div>
+                  }
+                >
+                  <LazyArmVisualizer
+                    robotId={visualizerRobotId}
+                    activeTool={visualizerTool}
+                    ref={visualizerRef}
+                    joints={latest?.joints}
+                    showBoundingBox={showBoundingBox}
+                    selectionMode={isPlanning && !isPlanLoading}
+                    onPointSelected={handlePointSelected}
+                    weldSelectionMode={weldSelectionMode}
+                    topologyEdges={topologyOverlays}
+                    selectedTopologyEdgeId={activeWeldSegment?.edgeId ?? null}
+                    selectedTopologyEdgeIds={selectedTopologyEdgeIds}
+                    onTopologyEdgeSelected={handleTopologyEdgeSelected}
+                    weldActive={weldActive}
+                    weldIndicatorPoint={weldIndicatorPoint}
+                    weldStartPoint={weldStartPoint}
+                    weldStopPoint={weldStopPoint}
+                    weldSegmentPoints={weldSegmentPoints}
+                    showEndEffectorFrame={showEndEffectorFrame}
+                    weldAnglePreview={weldAnglePreview}
+                    weldGhostJoints={weldPreviewGhostJoints}
+                    pathPoints={visualPathPoints}
+                    waypoints={visualWaypoints}
+                    highlightPathRange={selectedProgramPathRange}
+                    highlightWaypointIndices={selectedProgramWaypointIndices}
+                    stepFile={stepFile}
+                    stepTransform={stepTransform}
+                    onStepStatusChange={setStepLoadStatus}
+                  />
+                </Suspense>
+              ) : (
+                <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.12),transparent_32%),linear-gradient(180deg,rgba(2,6,23,0.88),rgba(2,6,23,1))]">
+                  <div className="pointer-events-none flex h-full items-center justify-center px-6">
+                    <div className="pointer-events-auto max-w-xl rounded-2xl border border-slate-700/70 bg-slate-950/88 p-6 shadow-2xl shadow-black/40 backdrop-blur">
+                      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-300/80">
+                        Lightweight startup
+                      </div>
+                      <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-50">
+                        Control UI loaded with 3D paused
+                      </h2>
+                      <p className="mt-3 max-w-lg text-sm leading-6 text-slate-300">
+                        The robot visualizer is the heaviest part of the page on this device. It now
+                        stays paused until you ask for it, so the rest of the UI can open reliably.
+                      </p>
+                      <div className="mt-5 flex flex-wrap items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => setIsVisualizerEnabled(true)}
+                          className="rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-sm font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-400/20"
+                        >
+                          Load 3D Workspace
+                        </button>
+                        <span className="text-xs text-slate-400">
+                          Jog, telemetry, settings, and the control panel stay available without it.
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+              {isVisionActive ? (
+                <div className="absolute inset-0 z-10 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.1),transparent_34%),linear-gradient(180deg,rgba(2,6,23,0.86),rgba(2,6,23,1))]">
+                  {visionError ? (
+                    <div className="pointer-events-none flex h-full items-center justify-center px-6">
+                      <div className="pointer-events-auto max-w-xl rounded-2xl border border-slate-700/70 bg-slate-950/88 p-6 shadow-2xl shadow-black/40 backdrop-blur">
+                        <div className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-300/80">
+                          Vision Feed
+                        </div>
+                        <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-50">
+                          Camera stream unavailable
+                        </h2>
+                        <p className="mt-3 max-w-lg text-sm leading-6 text-slate-300">
+                          {visionError}
+                        </p>
+                        <div className="mt-5 flex flex-wrap items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={showVisionStage}
+                            className="rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-sm font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-400/20"
+                          >
+                            Retry Camera Feed
+                          </button>
+                          <button
+                            type="button"
+                            onClick={showStage3d}
+                            className="rounded-lg border border-slate-700/70 bg-slate-900/80 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:border-slate-500/70 hover:text-white"
+                          >
+                            Show 3D Workspace
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <img
+                      src={visionStreamUrl}
+                      alt="Gradient Vision stream"
+                      className="h-full w-full object-contain bg-slate-950"
+                      onLoad={() => setVisionError(null)}
+                      onError={() => {
+                        setVisionError(
+                          "Unable to load the vision stream. Ensure Gradient Vision is running and accessible.",
+                        );
+                      }}
+                    />
+                  )}
+                </div>
+              ) : null}
+              <div className="pointer-events-none absolute inset-x-4 top-4 z-20 flex justify-center">
+                <AlertsPanel
+                  alerts={alerts}
+                  onDismiss={(idx) =>
+                    setAlerts((prev) => {
+                      const copy = [...prev];
+                      copy.splice(idx, 1);
+                      return copy;
+                    })
+                  }
+                />
+              </div>
+              <div className="pointer-events-none absolute left-4 top-4 z-20">
+                <div className="pointer-events-auto inline-flex max-w-[calc(100%-17rem)] items-center gap-1.5 border border-slate-700/70 bg-slate-950/82 px-2 py-1.5 text-xs text-slate-200">
+                  <div className="flex min-w-0 items-center gap-2 border-r border-slate-700/70 pr-2">
+                    <span className="max-w-[10rem] truncate text-sm font-semibold tracking-tight text-slate-50">
+                      {stageSurfaceHeading}
+                    </span>
+                  </div>
+                  <span className="shrink-0 border border-slate-700/70 bg-slate-900/70 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-200">
+                    {activePanelTitle}
+                  </span>
+                  <span className="shrink-0 border border-slate-700/70 bg-slate-900/70 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-200">
+                    {runtimeMode === "simulate" ? "SIM" : runtimeMode === "live" ? "LIVE" : "UNKNOWN"}
+                  </span>
+                  {showCurrentProgramLabel ? (
+                    <span className="max-w-[10rem] truncate border border-slate-700/70 bg-slate-900/70 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-200">
+                      {currentProgramLabel}
+                    </span>
+                  ) : null}
                 </div>
               </div>
-            }
-          >
-            <LazyArmVisualizer
-              robotId={visualizerRobotId}
-              activeTool={visualizerTool}
-              ref={visualizerRef}
-              joints={latest?.joints}
-              showBoundingBox={showBoundingBox}
-              selectionMode={isPlanning && !isPlanLoading}
-              onPointSelected={handlePointSelected}
-              weldSelectionMode={weldSelectionMode}
-              topologyEdges={topologyOverlays}
-              selectedTopologyEdgeId={activeWeldSegment?.edgeId ?? null}
-              selectedTopologyEdgeIds={selectedTopologyEdgeIds}
-              onTopologyEdgeSelected={handleTopologyEdgeSelected}
-              weldActive={weldActive}
-              weldIndicatorPoint={weldIndicatorPoint}
-              weldStartPoint={weldStartPoint}
-              weldStopPoint={weldStopPoint}
-              weldSegmentPoints={weldSegmentPoints}
-              showEndEffectorFrame={showEndEffectorFrame}
-              weldAnglePreview={weldAnglePreview}
-              weldGhostJoints={weldPreviewGhostJoints}
-              pathPoints={visualPathPoints}
-              waypoints={visualWaypoints}
-              highlightPathRange={selectedProgramPathRange}
-              highlightWaypointIndices={selectedProgramWaypointIndices}
-              stepFile={stepFile}
-              stepTransform={stepTransform}
-              onStepStatusChange={setStepLoadStatus}
-            />
-          </Suspense>
-        ) : (
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.12),transparent_32%),linear-gradient(180deg,rgba(2,6,23,0.88),rgba(2,6,23,1))]">
-            <div className="pointer-events-none flex h-full items-center justify-center px-6">
-              <div className="pointer-events-auto max-w-xl rounded-2xl border border-slate-700/70 bg-slate-950/88 p-6 shadow-2xl shadow-black/40 backdrop-blur">
-                <div className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-300/80">
-                  Lightweight startup
-                </div>
-                <h2 className="mt-2 text-2xl font-semibold tracking-tight text-slate-50">
-                  Control UI loaded with 3D paused
-                </h2>
-                <p className="mt-3 max-w-lg text-sm leading-6 text-slate-300">
-                  The robot visualizer is the heaviest part of the page on this device. It now
-                  stays paused until you ask for it, so the rest of the UI can open reliably.
-                </p>
-                <div className="mt-5 flex flex-wrap items-center gap-3">
+              <div className="pointer-events-none absolute right-4 top-4 z-20">
+                <div className="pointer-events-auto inline-flex items-center gap-1 rounded-2xl border border-slate-700/70 bg-slate-950/82 p-1.5 shadow-xl shadow-black/20 backdrop-blur">
                   <button
                     type="button"
-                    onClick={() => setIsVisualizerEnabled(true)}
-                    className="rounded-lg border border-cyan-400/40 bg-cyan-500/15 px-4 py-2 text-sm font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-400/20"
+                    onClick={showStage3d}
+                    className={`inline-flex items-center rounded-xl px-3 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
+                      !isVisionActive
+                        ? "bg-cyan-400 text-slate-950 shadow-sm shadow-cyan-400/30"
+                        : "text-slate-300 hover:bg-slate-800/80 hover:text-slate-100"
+                    }`}
                   >
-                    Load 3D Workspace
+                    3D Stage
                   </button>
-                  <span className="text-xs text-slate-400">
-                    Jog, telemetry, settings, and the control panel stay available without it.
-                  </span>
+                  <button
+                    type="button"
+                    onClick={showVisionStage}
+                    className={`inline-flex items-center rounded-xl px-3 py-2 text-xs font-semibold uppercase tracking-[0.18em] transition ${
+                      isVisionActive
+                        ? "bg-cyan-400 text-slate-950 shadow-sm shadow-cyan-400/30"
+                        : "text-slate-300 hover:bg-slate-800/80 hover:text-slate-100"
+                    }`}
+                  >
+                    Vision Feed
+                  </button>
                 </div>
               </div>
+              <div className="pointer-events-none absolute bottom-4 left-4 z-20">
+                <div className="pointer-events-auto rounded-2xl border border-slate-700/70 bg-slate-950/82 px-4 py-3 text-sm text-slate-300 shadow-xl shadow-black/20 backdrop-blur">
+                  <span>{stageGuidance}</span>
+                </div>
+              </div>
+              </section>
+          </div>
+          <div className="col-start-1 row-start-2 min-h-0">
+            <PaneResizeHandle
+              orientation="horizontal"
+              active={activeShellDrag?.kind === "timeline"}
+              onPointerDown={startShellDrag("timeline")}
+            />
+          </div>
+          <div className="col-start-1 row-start-3 min-h-0 h-full overflow-hidden pt-1">
+            <ProgramTimeline
+              lanes={timelineLanes}
+              playheadLabel={currentPlayheadLabel}
+              playheadDetail={currentPlayheadDetail}
+              onSelectItem={handleSelectProgramTreeNode}
+            />
+          </div>
+          <div className="col-start-2 row-start-1 row-span-3 min-h-0">
+            <PaneResizeHandle
+              orientation="vertical"
+              active={activeShellDrag?.kind === "right"}
+              onPointerDown={startShellDrag("right")}
+            />
+          </div>
+          <div className="col-start-3 row-start-1 row-span-3 flex h-full min-h-0 flex-col overflow-hidden pl-2 pr-1">
+            <div className="flex min-h-0 flex-1 flex-col gap-3">
+              <div className="min-h-[17rem] shrink-0">
+                {showProgramTree ? (
+                  <ProgramFeatureTree
+                    root={programTreeRoot}
+                    expandedNodeIds={expandedProgramTreeNodeIds}
+                    selectedNodeId={selectedProgramNodeId}
+                    viewMode={programTreeViewMode}
+                    editableControlPoint={selectedProgramControlPoint}
+                    canEditWaypointValues={canTreeWaypointValueEdit}
+                    canAddWaypoint={canTreeWaypointAdd}
+                    canRemoveWaypoint={canTreeWaypointRemove}
+                    canMoveWaypointUp={canTreeWaypointMoveUp}
+                    canMoveWaypointDown={canTreeWaypointMoveDown}
+                    canApplyWaypointEdits={canTreeWaypointApply}
+                    onToggleExpand={handleToggleProgramTreeNode}
+                    onSelectNode={handleSelectProgramTreeNode}
+                    onChangeViewMode={handleChangeProgramTreeViewMode}
+                    onWaypointChange={handleTreeWaypointChange}
+                    onAddWaypoint={handleTreeAddWaypoint}
+                    onRemoveWaypoint={handleTreeRemoveWaypoint}
+                    onMoveWaypointUp={() => handleTreeMoveWaypoint(-1)}
+                    onMoveWaypointDown={() => handleTreeMoveWaypoint(1)}
+                    onApplyWaypointEdits={handleApplyTreeWaypointEdits}
+                  />
+                ) : (
+                  <section className="flex h-full min-h-0 flex-col items-center justify-center rounded-2xl border border-dashed border-slate-800/80 bg-slate-950/50 px-6 py-5 text-center">
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-400">
+                      Program Tree Hidden
+                    </div>
+                    <div className="mt-2 max-w-sm text-sm leading-6 text-slate-400">
+                      Reopen the docked program tree to edit waypoints and keep the stage and timeline in sync.
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => updateSettings({ showProgramTree: true })}
+                      className="mt-4 rounded-xl border border-cyan-400/40 bg-cyan-500/10 px-4 py-2 text-sm font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-500/18"
+                    >
+                      Show Program Tree
+                    </button>
+                  </section>
+                )}
+              </div>
+              <section className="gradient-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto rounded-2xl border border-slate-800/80 bg-slate-950/72 p-4 shadow-xl shadow-black/20">
+                <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-200/80">
+                  Robot Control
+                </div>
+                <div className="mt-1 text-sm text-slate-400">
+                  Runtime controls stay persistently docked on the right so authoring never collides with execution tools.
+                </div>
+                <div className="mt-4">
+                  <div className="pr-1">
+                    <ControlPanel
+                      apiHost={normalizedApiHost}
+                      driveFaults={latest?.drive_faults ?? null}
+                      activeServoBackend={runtimeConfigSnapshot?.active?.servo_backend?.effective_backend ?? null}
+                      onJointFeedback={handleFallbackJointFeedback}
+                      onError={(m) => setError(m)}
+                      splitStatusSections
+                      showStatusSections={false}
+                      controlsCollapsed={isRobotControlCollapsed}
+                      onToggleControlsCollapsed={() =>
+                        updateSettings({ collapseRobotControl: !isRobotControlCollapsed })
+                      }
+                    />
+                  </div>
+                </div>
+              </section>
             </div>
           </div>
-        )}
-        <SidebarRail
-          items={sidebarItems}
-          activeItemId={activePanel}
-          onSelect={handleSelectSidebarPanel}
-        />
-        {activePanel && activeDrawerContent ? (
-          <SidebarDrawer
-            onClose={() => updateSettings({ activePanel: null })}
-            headerContent={activeDrawerHeader}
-            widthClassName={activeDrawerWidthClass}
-            heightMode={activeDrawerHeightMode}
-          >
-            {activeDrawerContent}
-          </SidebarDrawer>
-        ) : null}
-        {showProgramTree ? (
-          <ProgramFeatureTree
-            root={programTreeRoot}
-            expandedNodeIds={expandedProgramTreeNodeIds}
-            selectedNodeId={selectedProgramNodeId}
-            viewMode={programTreeViewMode}
-            editableControlPoint={selectedProgramControlPoint}
-            canEditWaypointValues={canTreeWaypointValueEdit}
-            canAddWaypoint={canTreeWaypointAdd}
-            canRemoveWaypoint={canTreeWaypointRemove}
-            canMoveWaypointUp={canTreeWaypointMoveUp}
-            canMoveWaypointDown={canTreeWaypointMoveDown}
-            canApplyWaypointEdits={canTreeWaypointApply}
-            onToggleExpand={handleToggleProgramTreeNode}
-            onSelectNode={handleSelectProgramTreeNode}
-            onChangeViewMode={handleChangeProgramTreeViewMode}
-            onWaypointChange={handleTreeWaypointChange}
-            onAddWaypoint={handleTreeAddWaypoint}
-            onRemoveWaypoint={handleTreeRemoveWaypoint}
-            onMoveWaypointUp={() => handleTreeMoveWaypoint(-1)}
-            onMoveWaypointDown={() => handleTreeMoveWaypoint(1)}
-            onApplyWaypointEdits={handleApplyTreeWaypointEdits}
-          />
-        ) : null}
-        <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2 transform">
-          <AlertsPanel
-            alerts={alerts}
-            onDismiss={(idx) =>
-              setAlerts((prev) => {
-                const copy = [...prev];
-                copy.splice(idx, 1);
-                return copy;
-              })
-            }
-          />
         </div>
-        {isVisionActive && !visionError ? (
-          <div className="pointer-events-auto absolute bottom-6 left-24 z-20 w-72 overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950/85 shadow-lg shadow-slate-950/40 backdrop-blur">
-            <img
-              src={visionStreamUrl}
-              alt="Gradient Vision stream"
-              className="block max-h-56 w-full object-cover"
-              onLoad={() => setVisionError(null)}
-              onError={() => {
-                setVisionError(
-                  "Unable to load the vision stream. Ensure Gradient Vision is running and accessible.",
-                );
-                setIsVisionActive(false);
-              }}
-            />
-          </div>
-        ) : null}
-        {isRobotControlCollapsed ? (
-          <div className="pointer-events-auto absolute bottom-6 right-6 z-20 w-[340px] max-w-[calc(100vw-2rem)]">
-            <button
-              type="button"
-              onClick={() => updateSettings({ collapseRobotControl: false })}
-              className="flex w-full items-center justify-between rounded-lg border border-slate-700/60 bg-slate-900/80 px-3 py-2 text-left shadow-md shadow-slate-900/30 backdrop-blur transition hover:border-slate-500/70"
-              aria-label="Show robot control panel"
-            >
-              <span className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-200/80">
-                Robot Control
-              </span>
-              <ChevronRight size={16} className="text-slate-300/80" />
-            </button>
-          </div>
-        ) : (
-          <div className="pointer-events-auto absolute bottom-6 right-6 z-20 w-[340px] max-w-[calc(100vw-2rem)]">
-            <button
-              type="button"
-              onClick={() => updateSettings({ collapseRobotControl: true })}
-              className="absolute right-3 top-3 z-10 rounded-lg border border-slate-700/70 bg-slate-900/70 p-1 text-slate-300 transition hover:border-slate-500 hover:text-slate-100"
-              aria-label="Hide robot control panel"
-              title="Hide robot control panel"
-            >
-              <ChevronDown size={14} />
-            </button>
-            <ControlPanel
-              apiHost={normalizedApiHost}
-              driveFaults={latest?.drive_faults ?? null}
-              activeServoBackend={runtimeConfigSnapshot?.active?.servo_backend?.effective_backend ?? null}
-              onJointFeedback={handleFallbackJointFeedback}
-              onError={(m) => setError(m)}
-            />
-          </div>
-        )}
       </main>
       <SettingsDialog
         isOpen={isSettingsOpen}

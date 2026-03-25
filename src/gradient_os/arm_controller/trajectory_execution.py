@@ -751,6 +751,7 @@ def _plan_high_fidelity_trajectory(cartesian_points: list,
                 path_points=attempt_points,
                 initial_joint_angles=start_q,
                 target_orientations=attempt_orientations,
+                verbose=False,
             )
         t_end_ik = time.monotonic()
         print(

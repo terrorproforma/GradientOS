@@ -1,3 +1,15 @@
+/*
+ * ARM DISPLAY GUARDRAILS: if the robot disappears, assume it is a regression in this viewer or its
+ * surrounding stage/dev-server wiring first, not "missing files." The Gradient-05 source STL files live at
+ * `/home/pi/GradientOS/robots/gradient-05/stl-files/`, and the synced web-served copies live at
+ * `/home/pi/GradientOS/web-ui/public/assets/robots/gradient-05/stl-files/`; the URDF served by this UI points
+ * at those STL names. Common ways to break the arm display are: unmounting/replacing `ArmVisualizer` during
+ * stage/view toggles, changing `resolveRobotUrdfConfig()` or Vite public-asset serving so URDF/STLs resolve to
+ * the SPA shell instead of real bytes, changing `robotId` selection/hydration, or changing camera grounding /
+ * focus behavior so the grid renders but the arm is effectively out of frame. Before making layout or asset-path
+ * changes here, preserve the existing visualizer lifecycle, treat a missing arm as a regression you introduced,
+ * and verify live URDF/STL HTTP responses plus actual arm visibility after the change.
+ */
 import {
   forwardRef,
   type ForwardedRef,
@@ -12,6 +24,8 @@ import { STLLoader } from "three/examples/jsm/loaders/STLLoader";
 import URDFLoader, { type URDFRobot } from "urdf-loader";
 import occtWasmUrl from "occt-import-js/dist/occt-import-js.wasm?url";
 import type { Point3 } from "./previewUtils";
+
+declare const __GRADIENT_PUBLIC_DIR_FS__: string;
 
 type ArmVisualizerProps = {
   robotId?: string | null;
@@ -194,6 +208,17 @@ type RobotAssetIndex = {
   defaultRobotId: string;
   robots: Record<string, { urdfPath: string }>;
 };
+
+function buildDevServedPublicAssetUrl(assetPath: string): string | null {
+  const publicDirFs =
+    typeof __GRADIENT_PUBLIC_DIR_FS__ === "string" ? __GRADIENT_PUBLIC_DIR_FS__.trim() : "";
+  if (!publicDirFs) {
+    return null;
+  }
+  const normalizedRoot = publicDirFs.replace(/\\/g, "/").replace(/\/+$/, "");
+  const normalizedAssetPath = assetPath.startsWith("/") ? assetPath : `/${assetPath}`;
+  return `/@fs${normalizedRoot}${normalizedAssetPath}`;
+}
 
 function buildActiveToolSignature(tool: ArmVisualizerProps["activeTool"]): string {
   if (!tool) {
@@ -814,30 +839,47 @@ async function resolveRobotUrdfConfig(selectedRobotId?: string | null): Promise<
   urdfPath: string;
   assetBasePath: string;
 }> {
-  // In this Vite dev setup, static JSON indexes can be served from `/public/...`
-  // even when sibling URDF assets are reachable from `/assets/...`.
-  const candidateUrls = [
-    "/assets/robots/index.json",
-    "/public/assets/robots/index.json",
-  ];
+  const candidateSources = [
+    {
+      indexUrl: "/assets/robots/index.json",
+      resolveAssetUrl: (assetPath: string) => assetPath,
+    },
+    {
+      indexUrl: buildDevServedPublicAssetUrl("/assets/robots/index.json"),
+      resolveAssetUrl: (assetPath: string) => buildDevServedPublicAssetUrl(assetPath) ?? assetPath,
+    },
+    {
+      indexUrl: "/public/assets/robots/index.json",
+      resolveAssetUrl: (assetPath: string) => `/public${assetPath}`,
+    },
+  ].filter(
+    (candidate): candidate is {
+      indexUrl: string;
+      resolveAssetUrl: (assetPath: string) => string;
+    } => typeof candidate.indexUrl === "string" && candidate.indexUrl.length > 0,
+  );
   let parsed: Partial<RobotAssetIndex> | null = null;
+  let resolvedAssetUrl: ((assetPath: string) => string) | null = null;
   let lastError: Error | null = null;
 
-  for (const url of candidateUrls) {
+  for (const candidate of candidateSources) {
     try {
-      const response = await fetch(url, { cache: "no-store" });
+      const response = await fetch(candidate.indexUrl, { cache: "no-store" });
       if (!response.ok) {
-        lastError = new Error(`Failed to load robot asset index from ${url}: HTTP ${response.status}`);
+        lastError = new Error(
+          `Failed to load robot asset index from ${candidate.indexUrl}: HTTP ${response.status}`,
+        );
         continue;
       }
       const contentType = response.headers.get("content-type") ?? "";
       if (!contentType.includes("json")) {
         lastError = new Error(
-          `Robot asset index at ${url} returned '${contentType || "unknown"}' instead of JSON.`,
+          `Robot asset index at ${candidate.indexUrl} returned '${contentType || "unknown"}' instead of JSON.`,
         );
         continue;
       }
       parsed = (await response.json()) as Partial<RobotAssetIndex>;
+      resolvedAssetUrl = candidate.resolveAssetUrl;
       break;
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
@@ -862,14 +904,15 @@ async function resolveRobotUrdfConfig(selectedRobotId?: string | null): Promise<
     throw new Error(`Robot '${resolvedRobotId}' missing urdfPath in index`);
   }
 
-  const slashIndex = selected.urdfPath.lastIndexOf("/");
+  const urdfPath = resolvedAssetUrl ? resolvedAssetUrl(selected.urdfPath) : selected.urdfPath;
+  const slashIndex = urdfPath.lastIndexOf("/");
   if (slashIndex < 0) {
-    throw new Error(`Invalid URDF path in robot asset index: ${selected.urdfPath}`);
+    throw new Error(`Invalid URDF path in robot asset index: ${urdfPath}`);
   }
-  const assetBasePath = selected.urdfPath.slice(0, slashIndex + 1);
+  const assetBasePath = urdfPath.slice(0, slashIndex + 1);
   return {
     robotId: resolvedRobotId,
-    urdfPath: selected.urdfPath,
+    urdfPath,
     assetBasePath,
   };
 }
@@ -974,6 +1017,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   const [toolTcpVersion, setToolTcpVersion] = useState(0);
   const pendingDynamicBoundsRef = useRef(false);
   const lastLiveBoundsRefreshMsRef = useRef(0);
+  const lastContainerSizeRef = useRef<{ width: number; height: number } | null>(null);
   const boundingWallsRef = useRef<THREE.Mesh[]>([]);
   const boundingEdgesRef = useRef<THREE.LineSegments | null>(null);
   const boundingMarkersRef = useRef<THREE.Object3D[]>([]);
@@ -1708,15 +1752,37 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     };
     void loadRobotModel();
 
-    const handleResize = () => {
+    const applyResize = (snapCamera = false) => {
       if (!container) {
         return;
       }
       const { clientWidth, clientHeight } = container;
+      if (clientWidth <= 0 || clientHeight <= 0) {
+        return;
+      }
       renderer.setSize(clientWidth, clientHeight);
       camera.aspect = clientWidth / Math.max(clientHeight, 1);
       camera.updateProjectionMatrix();
+      const previousSize = lastContainerSizeRef.current;
+      const firstMeasuredSize = previousSize === null;
+      lastContainerSizeRef.current = {
+        width: clientWidth,
+        height: clientHeight,
+      };
+      if (robotRef.current && (snapCamera || firstMeasuredSize)) {
+        alignToGroundAndUpdateBounds({ snapCamera: true, applySnapshot: false });
+      }
     };
+    const handleResize = () => {
+      applyResize(false);
+    };
+    const resizeObserver = new ResizeObserver(() => {
+      handleResize();
+    });
+    resizeObserver.observe(container);
+    const initialResizeFrame = window.requestAnimationFrame(() => {
+      applyResize(true);
+    });
 
     let animationFrameId: number;
     const animate = (time?: number) => {
@@ -1773,6 +1839,8 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       renderer.domElement.removeEventListener("pointerleave", handlePointerLeave);
       attachActiveToolVisualRef.current = null;
       window.removeEventListener("resize", handleResize);
+      resizeObserver.disconnect();
+      window.cancelAnimationFrame(initialResizeFrame);
       cancelAnimationFrame(animationFrameId);
       controls.dispose();
       controlsRef.current = null;
@@ -1874,6 +1942,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       cameraRef.current = null;
       isGroundedRef.current = false;
       pendingDynamicBoundsRef.current = false;
+      lastContainerSizeRef.current = null;
       boundingWallsRef.current.forEach((wall) => {
         scene.remove(wall);
         if ((wall.material as THREE.Material | THREE.Material[])) {

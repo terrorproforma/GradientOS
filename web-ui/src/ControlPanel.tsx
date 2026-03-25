@@ -1,3 +1,4 @@
+import { Activity, AlertTriangle, Power, ShieldAlert, ShieldCheck } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_SPEED_SLIDER } from "./uiConstants";
 import {
@@ -13,6 +14,21 @@ type Props = {
 	onError?: (message: string) => void;
 	motionStatus?: MotionStatusResponse | null;
 	onMotionStatus?: (status: MotionStatusResponse | null) => void;
+	splitStatusSections?: boolean;
+	showStatusSections?: boolean;
+	controlsCollapsed?: boolean;
+	onToggleControlsCollapsed?: () => void;
+};
+
+type RuntimeHeaderProps = {
+	apiHost: string;
+	driveFaults?: DriveFaultSnapshot | null;
+	activeServoBackend?: string | null;
+	onJointFeedback?: (anglesDeg: number[], gripperDeg?: number) => void;
+	onError?: (message: string) => void;
+	motionStatus?: MotionStatusResponse | null;
+	onMotionStatus?: (status: MotionStatusResponse | null) => void;
+	className?: string;
 };
 
 type JointInfoResponse = {
@@ -317,6 +333,311 @@ async function readErrorMessage(res: Response): Promise<string> {
 	return `${res.status} ${res.statusText}`;
 }
 
+export function ControlPanelRuntimeHeader({
+	apiHost,
+	driveFaults,
+	activeServoBackend,
+	onJointFeedback,
+	onError,
+	motionStatus: controlledMotionStatus,
+	onMotionStatus,
+	className,
+}: RuntimeHeaderProps) {
+	const liveState = useOptionalLiveState();
+	const sharedMotionStatus = liveState?.motionStatus ?? null;
+	const setSharedMotionStatus = liveState?.setMotionStatus;
+	const [localMotionStatus, setLocalMotionStatus] = useState<MotionStatusResponse | null>(null);
+	const motionStatus = controlledMotionStatus ?? sharedMotionStatus ?? localMotionStatus;
+	const setMotionStatus = useCallback((next: MotionStatusResponse | null) => {
+		if (controlledMotionStatus === undefined && !setSharedMotionStatus) {
+			setLocalMotionStatus(next);
+		}
+		setSharedMotionStatus?.(next);
+		onMotionStatus?.(next);
+	}, [controlledMotionStatus, onMotionStatus, setSharedMotionStatus]);
+	const [pendingPowerAction, setPendingPowerAction] = useState<string | null>(null);
+	const activeDriveFaultAxes = useMemo(
+		() =>
+			(driveFaults?.axes ?? []).filter(
+				(axis) => axis.error_code !== 0 || axis.ds402_state === "Fault" || axis.ds402_state === "FaultReactionActive",
+			),
+		[driveFaults],
+	);
+	const driveControlBackend = (driveFaults?.servo_backend ?? activeServoBackend ?? "").trim().toLowerCase();
+	const requiresExplicitDrivePower = driveControlBackend === "ethercat_rtcore";
+	const isDrivePowerActive = (driveFaults?.driver_state ?? "").trim().toUpperCase() === "ACTIVE";
+	const motionStateName = (motionStatus?.state ?? motionStatus?.execution?.state_name ?? "idle").trim().toLowerCase();
+	const motionBusy = motionStateName === "accepted" || motionStateName === "queued" || motionStateName === "executing";
+	const powerTransitionBlockerDetails = (
+		motionStatus?.power_transition_blocker_details
+		?? motionStatus?.execution?.power_transition_blocker_details
+		?? []
+	) as PowerTransitionBlocker[];
+	const powerTransitionSafe = motionStatus?.safe_for_power_transition ?? motionStatus?.execution?.safe_for_power_transition;
+	const powerTransitionKnown = typeof powerTransitionSafe === "boolean";
+	const powerUpBlocked =
+		activeDriveFaultAxes.length > 0
+		|| (powerTransitionKnown ? powerTransitionSafe !== true : true);
+	const powerUpBlockerMessage = activeDriveFaultAxes.length > 0
+		? "Clear all drive faults before enabling the drives."
+		: powerTransitionBlockerDetails.length > 0
+			? powerTransitionBlockerDetails.map(formatPowerTransitionBlocker).join(" ")
+			: "Waiting for the motion-state safety check before enabling the drives.";
+	const reportRequestError = useCallback((err: unknown, fallback: string, silent = false) => {
+		const msg = err instanceof Error ? err.message : fallback;
+		if (!silent) {
+			try {
+				onError?.(msg);
+			} catch {
+				// ignore
+			}
+		}
+		return msg;
+	}, [onError]);
+	const post = useCallback(async (path: string, body?: unknown) => {
+		try {
+			const res = await fetch(`${apiHost}${path}`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: body ? JSON.stringify(body) : undefined,
+			});
+			if (!res.ok) {
+				const msg = await readErrorMessage(res);
+				throw new Error(msg || `${res.status} ${res.statusText}`);
+			}
+			const contentType = res.headers.get("content-type") ?? "";
+			if (contentType.includes("application/json")) {
+				return await res.json();
+			}
+			return null;
+		} catch (err) {
+			reportRequestError(err, "request failed");
+			return null;
+		}
+	}, [apiHost, reportRequestError]);
+	const refreshJointAngles = useCallback(async () => {
+		try {
+			const res = await fetch(`${apiHost}/info/joints`, {
+				method: "GET",
+				headers: { Accept: "application/json" },
+			});
+			if (!res.ok) {
+				const msg = await readErrorMessage(res);
+				throw new Error(msg || `${res.status} ${res.statusText}`);
+			}
+			const payload = await res.json() as JointInfoResponse;
+			if (!Array.isArray(payload.arm_deg)) {
+				return false;
+			}
+			onJointFeedback?.(
+				payload.arm_deg,
+				typeof payload.gripper_deg === "number" ? payload.gripper_deg : undefined,
+			);
+			return true;
+		} catch (err) {
+			reportRequestError(err, "Joint feedback unavailable.", true);
+			return false;
+		}
+	}, [apiHost, onJointFeedback, reportRequestError]);
+	const handleResetFaults = useCallback(async () => {
+		if (pendingPowerAction || !requiresExplicitDrivePower) {
+			return;
+		}
+		const confirmed = window.confirm(
+			"Request a drive fault reset for all RTCore axes? Use this only when a driver is faulted.",
+		);
+		if (!confirmed) {
+			return;
+		}
+		setPendingPowerAction("reset-faults");
+		try {
+			const result = await post("/control/reset-faults") as MotionStatusResponse | null;
+			if (result) {
+				setMotionStatus(result);
+				await refreshJointAngles();
+			}
+		} finally {
+			setPendingPowerAction(null);
+		}
+	}, [pendingPowerAction, post, refreshJointAngles, requiresExplicitDrivePower, setMotionStatus]);
+	const handlePowerUpDrives = useCallback(async () => {
+		if (pendingPowerAction || !requiresExplicitDrivePower) {
+			return;
+		}
+		if (powerUpBlocked) {
+			onError?.(powerUpBlockerMessage);
+			return;
+		}
+		const confirmed = window.confirm(
+			"Power up RTCore-controlled drives now? This will only proceed if the runtime is neutral, synchronized, and fault-free.",
+		);
+		if (!confirmed) {
+			return;
+		}
+		setPendingPowerAction("power-up");
+		try {
+			const result = await post("/control/power-up") as MotionStatusResponse | null;
+			if (result) {
+				setMotionStatus(result);
+				await refreshJointAngles();
+			}
+		} finally {
+			setPendingPowerAction(null);
+		}
+	}, [
+		onError,
+		pendingPowerAction,
+		post,
+		powerUpBlocked,
+		powerUpBlockerMessage,
+		refreshJointAngles,
+		requiresExplicitDrivePower,
+		setMotionStatus,
+	]);
+	const handlePowerDownDrives = useCallback(async () => {
+		if (pendingPowerAction || !requiresExplicitDrivePower) {
+			return;
+		}
+		const confirmed = window.confirm(
+			"Power down RTCore-controlled drives now? This will disable and disarm the configured axes.",
+		);
+		if (!confirmed) {
+			return;
+		}
+		setPendingPowerAction("power-down");
+		try {
+			const result = await post("/control/power-down", { wait_for_idle: true }) as MotionStatusResponse | null;
+			if (result) {
+				setMotionStatus(result);
+				await refreshJointAngles();
+			}
+		} finally {
+			setPendingPowerAction(null);
+		}
+	}, [pendingPowerAction, post, refreshJointAngles, requiresExplicitDrivePower, setMotionStatus]);
+	const driveStatusLabel = !requiresExplicitDrivePower
+		? "AUTO"
+		: pendingPowerAction === "power-up"
+			? "ARMING"
+			: pendingPowerAction === "power-down"
+				? "DISARM"
+				: isDrivePowerActive
+					? "ARMED"
+					: "DISARM";
+	const motionStatusLabel = motionStateName === "faulted" || motionStateName === "aborted" || motionStateName === "underrun"
+		? "FAULT"
+		: motionBusy
+			? "BUSY"
+			: motionStateName === "completed"
+				? "DONE"
+				: formatMotionStateLabel(motionStateName);
+	const safetyStatusLabel = powerTransitionKnown
+		? (powerTransitionSafe ? "SAFE" : "BLOCKED")
+		: "CHECK";
+	const driveStatusTitle = requiresExplicitDrivePower
+		? (
+			driveFaults
+				? `Drive power ${isDrivePowerActive ? "armed" : "disarmed"}. Backend ${driveFaults.servo_backend ?? "unknown"} | driver ${driveFaults.driver_state ?? "unknown"} | EtherCAT ${driveFaults.ethercat_master_state ?? "unknown"} | RTCore ${driveFaults.rtcore_state ?? "unknown"} | op-enabled ${driveFaults.op_enabled_axes ?? 0}/${driveFaults.num_axes ?? 0}`
+				: "Waiting for RTCore drive-state telemetry."
+		)
+		: "Drive power controls are only required for the EtherCAT RTCore backend.";
+	const motionStatusTitle = motionStatus
+		? `Motion ${formatMotionStateLabel(motionStateName)}. Source ${motionStatus.source_of_truth ?? "controller"} | scope ${motionStatus.completion_scope ?? "unknown"} | mode ${motionStatus.execution?.active_mode_name ?? "n/a"} | queue ${motionStatus.execution?.queue_depth ?? 0}/${motionStatus.execution?.queue_capacity ?? 0}`
+		: "Waiting for controller motion status.";
+	const safetyStatusTitle = powerTransitionKnown && powerTransitionSafe
+		? "Runtime is neutral and synchronized; explicit drive enable is allowed."
+		: powerUpBlockerMessage;
+	return (
+		<div className={`flex min-w-0 h-full items-stretch gap-1.5 ${className ?? ""}`}>
+			<span
+				title={driveStatusTitle}
+				className={`inline-flex shrink-0 h-full items-center gap-1 border px-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
+					requiresExplicitDrivePower
+						? (isDrivePowerActive
+							? "border-emerald-500/40 bg-emerald-400/10 text-emerald-100"
+							: "border-amber-500/40 bg-amber-400/10 text-amber-100")
+						: "border-slate-600/70 bg-slate-900/70 text-slate-300"
+				}`}
+			>
+				<Power size={11} />
+				{driveStatusLabel}
+			</span>
+			<span
+				title={motionStatusTitle}
+				className={`inline-flex shrink-0 h-full items-center gap-1 border px-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
+					motionStateName === "faulted" || motionStateName === "aborted" || motionStateName === "underrun"
+						? "border-rose-500/40 bg-rose-400/10 text-rose-100"
+						: motionBusy
+							? "border-cyan-500/40 bg-cyan-400/10 text-cyan-100"
+							: motionStateName === "completed"
+								? "border-emerald-500/40 bg-emerald-400/10 text-emerald-100"
+								: "border-slate-600/70 bg-slate-900/70 text-slate-300"
+				}`}
+			>
+				<Activity size={11} />
+				{motionStatusLabel}
+			</span>
+			<span
+				title={safetyStatusTitle}
+				className={`inline-flex shrink-0 h-full items-center gap-1 border px-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
+					powerTransitionKnown && powerTransitionSafe
+						? "border-emerald-500/40 bg-emerald-400/10 text-emerald-100"
+						: "border-amber-500/40 bg-amber-400/10 text-amber-100"
+				}`}
+			>
+				{powerTransitionKnown && powerTransitionSafe ? <ShieldCheck size={11} /> : <ShieldAlert size={11} />}
+				{safetyStatusLabel}
+			</span>
+			{activeDriveFaultAxes.length > 0 ? (
+				<span
+					title={`${activeDriveFaultAxes.length} active drive fault${activeDriveFaultAxes.length === 1 ? "" : "s"} detected. Use Reset to request a DS402 fault reset.`}
+					className="inline-flex shrink-0 h-full items-center gap-1 border border-rose-500/40 bg-rose-400/10 px-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-rose-100"
+				>
+					<AlertTriangle size={11} />
+					{activeDriveFaultAxes.length}
+				</span>
+			) : null}
+			{requiresExplicitDrivePower ? (
+				<>
+					<button
+						type="button"
+						onClick={() => {
+							void handlePowerUpDrives();
+						}}
+						disabled={pendingPowerAction !== null || isDrivePowerActive || powerUpBlocked}
+						title={powerUpBlocked ? powerUpBlockerMessage : "Explicitly arm and enable RTCore-controlled axes"}
+						className="shrink-0 h-full border border-cyan-500/40 bg-cyan-400/10 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+					>
+						{pendingPowerAction === "power-up" ? "Arming..." : "Arm"}
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							void handlePowerDownDrives();
+						}}
+						disabled={pendingPowerAction !== null || !isDrivePowerActive}
+						title="Explicitly disable and disarm RTCore-controlled axes"
+						className="shrink-0 h-full border border-rose-500/40 bg-rose-400/10 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-rose-100 transition hover:border-rose-300/60 hover:bg-rose-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+					>
+						{pendingPowerAction === "power-down" ? "Disarming..." : "Disarm"}
+					</button>
+					<button
+						type="button"
+						onClick={() => {
+							void handleResetFaults();
+						}}
+						disabled={pendingPowerAction !== null}
+						title="Request a DS402 fault reset for all RTCore-controlled axes"
+						className="shrink-0 h-full border border-amber-500/40 bg-amber-400/10 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+					>
+						{pendingPowerAction === "reset-faults" ? "Resetting..." : "Reset"}
+					</button>
+				</>
+			) : null}
+		</div>
+	);
+}
+
 export function ControlPanel({
 	apiHost,
 	driveFaults,
@@ -325,6 +646,10 @@ export function ControlPanel({
 	onError,
 	motionStatus: controlledMotionStatus,
 	onMotionStatus,
+	splitStatusSections = false,
+	showStatusSections = true,
+	controlsCollapsed = false,
+	onToggleControlsCollapsed,
 }: Props) {
 	const liveState = useOptionalLiveState();
 	const latestTelemetry = liveState?.latest ?? null;
@@ -392,6 +717,7 @@ export function ControlPanel({
 	const [linBaseMmS, setLinBaseMmS] = useState<number>(50);
 	const [angBaseDegS, setAngBaseDegS] = useState<number>(15);
 	const [lastJogCommand, setLastJogCommand] = useState<JogCommandVector>([0, 0, 0, 0, 0, 0]);
+	const driveControlsReferenceLabel = showStatusSections ? "Drive Power section above" : "header drive controls above";
 	const jogTimerRef = useRef<number | null>(null);
 	const sendJogTickRef = useRef<() => Promise<void>>(async () => {});
 	const jogEnabledRef = useRef<boolean>(false);
@@ -1357,191 +1683,193 @@ export function ControlPanel({
 		fn();
 	}, []);
 
-	return (
-		<div className="pointer-events-auto w-full rounded-xl border border-slate-700/60 bg-slate-900/80 p-4 text-slate-100 shadow-lg shadow-slate-900/40 backdrop-blur">
-			<div className="mb-2 text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200/80">
-				Robot Control
-			</div>
-			<div className="mb-3 rounded-lg border border-cyan-500/25 bg-cyan-500/5 p-3">
-				<div className="mb-2 flex items-center justify-between gap-2 text-xs text-cyan-100/90">
-					<span className="font-semibold uppercase tracking-[0.18em]">Drive Power</span>
-					<span
-						className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
-							isDrivePowerActive
-								? "border-emerald-400/40 bg-emerald-400/10 text-emerald-100"
-								: "border-amber-400/40 bg-amber-400/10 text-amber-100"
-						}`}
-					>
-						{driveFaults?.driver_state ?? (requiresExplicitDrivePower ? "STATUS PENDING" : "NOT APPLICABLE")}
-					</span>
-				</div>
-				<div className="mb-2 text-[11px] leading-relaxed text-slate-300">
-					{requiresExplicitDrivePower
-						? "Startup leaves the RTCore drives disarmed. Power them up explicitly when you are ready to energize the axes."
-						: "Drive power controls are only used for the EtherCAT RTCore backend."}
-				</div>
-				<div className="mb-3 text-[10px] text-slate-400">
-					{driveFaults
-						? `Backend ${driveFaults.servo_backend ?? "unknown"} | driver ${driveFaults.driver_state ?? "unknown"} | EtherCAT ${driveFaults.ethercat_master_state ?? "unknown"} | RTCore ${driveFaults.rtcore_state ?? "unknown"} | enable mask ${driveFaults.axis_enable_mask_hex ?? "unknown"} | op-enabled ${driveFaults.op_enabled_axes ?? 0}/${driveFaults.num_axes ?? 0}`
-						: requiresExplicitDrivePower
-							? "Waiting for live drive-state telemetry..."
-							: "No RTCore drive state available for this backend."}
-				</div>
-				<div className="grid grid-cols-3 gap-2">
-					<button
-						type="button"
-						className={`rounded border px-2 py-2 text-[11px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
-							isDrivePowerActive
-								? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100 hover:border-emerald-300/60 hover:bg-emerald-300/15"
-								: "border-cyan-500/30 bg-cyan-400/10 text-cyan-100 hover:border-cyan-300/60 hover:bg-cyan-300/15"
-						}`}
-						onClick={() => {
-							void handlePowerUpDrives();
-						}}
-						disabled={pendingJointAction !== null || !requiresExplicitDrivePower || isDrivePowerActive || powerUpBlocked}
-						title={powerUpBlocked ? powerUpBlockerMessage : "Explicitly arm and enable RTCore-controlled axes"}
-					>
-						{pendingJointAction === "power-up" ? "..." : "Power Up Drives"}
-					</button>
-					<button
-						type="button"
-						className="rounded border border-rose-500/35 bg-rose-400/10 px-2 py-2 text-[11px] font-semibold text-rose-100 transition hover:border-rose-300/60 hover:bg-rose-300/15 disabled:cursor-not-allowed disabled:opacity-50"
-						onClick={() => {
-							void handlePowerDownDrives();
-						}}
-						disabled={pendingJointAction !== null || !requiresExplicitDrivePower || !isDrivePowerActive}
-						title="Explicitly disable and disarm RTCore-controlled axes"
-					>
-						{pendingJointAction === "power-down" ? "..." : "Power Down Drives"}
-					</button>
-					<button
-						type="button"
-						className="rounded border border-amber-500/40 bg-amber-400/10 px-2 py-2 text-[11px] font-semibold text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
-						onClick={() => {
-							void handleResetFaults();
-						}}
-						disabled={pendingJointAction !== null || !requiresExplicitDrivePower}
-						title="Request a DS402 fault reset for all RTCore-controlled axes"
-					>
-						{pendingJointAction?.startsWith("reset-faults") ? "..." : "Reset All Faults"}
-					</button>
-				</div>
-				{driveFaults ? (
-					<div
-						className={`mt-3 rounded border px-2 py-2 text-[11px] leading-relaxed ${
-							activeDriveFaultAxes.length > 0
-								? "border-rose-500/30 bg-rose-400/10 text-rose-100"
-								: "border-slate-700/60 bg-slate-900/70 text-slate-200"
-						}`}
-					>
-						<div className="flex items-center justify-between gap-2">
-							<span className="font-semibold">
-								{activeDriveFaultAxes.length > 0 ? `Drive faults detected (${activeDriveFaultAxes.length})` : "Drive fault status"}
-							</span>
-							<span
-								className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
-									activeDriveFaultAxes.length > 0
-										? "border-rose-400/40 bg-rose-400/10 text-rose-100"
-										: "border-slate-600/70 bg-slate-800/70 text-slate-300"
-								}`}
-							>
-								{driveFaults.physical_state ?? "unknown"}
-							</span>
-						</div>
-						<div className="mt-1 text-[10px] text-current/70">
-							Fault reference:{" "}
-							{driveFaults.reference?.available
-								? driveFaults.reference.label ?? driveFaults.reference.profile_id ?? "configured"
-								: "raw only"}
-						</div>
-						{activeDriveFaultAxes.length > 0 ? (
-							<div className="mt-1 text-[10px] text-current/70">
-								Reset individual faulted joints below, or use <span className="font-semibold">Reset All Faults</span> to
-								pulse DS402 fault reset across every RTCore axis.
-							</div>
-						) : null}
-						{activeDriveFaultAxes.length > 0 ? (
-							<div className="mt-2 space-y-1">
-								{activeDriveFaultAxes.map((axis) => (
-									<div
-										key={`drive-fault-${axis.axis}`}
-										className="rounded border border-current/15 bg-black/10 px-2 py-1 text-[10px]"
-									>
-										<div className="flex items-center justify-between gap-2">
-											<span className="min-w-0 flex-1">{formatDriveFaultDescription(axis)}</span>
-											{axis.fault?.resettable === true &&
-											typeof axis.logical_joint === "number" &&
-											Number.isFinite(axis.logical_joint) ? (
-												<button
-													type="button"
-													className="shrink-0 rounded border border-amber-400/35 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
-													onClick={() => {
-														void handleResetFaults(axis.logical_joint);
-													}}
-													disabled={pendingJointAction !== null}
-													title={`Request a DS402 fault reset for J${axis.logical_joint}`}
-												>
-													Reset J{axis.logical_joint}
-												</button>
-											) : null}
-										</div>
-									</div>
-								))}
-							</div>
-						) : (
-							<div className="mt-2 text-[10px] text-current/70">
-								No active drive faults in the latest telemetry snapshot.
-							</div>
-						)}
-					</div>
-				) : null}
-			</div>
-			<div className="mb-3 rounded-lg border border-slate-700/60 bg-slate-950/30 p-3">
-				<div className="mb-2 flex items-center justify-between gap-2 text-xs text-slate-300/80">
-					<span className="font-semibold uppercase tracking-[0.18em]">Motion State</span>
-					<span
-						className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
-							motionStateName === "faulted" || motionStateName === "aborted" || motionStateName === "underrun"
-								? "border-rose-500/40 bg-rose-400/10 text-rose-100"
-								: motionBusy
-									? "border-cyan-500/40 bg-cyan-400/10 text-cyan-100"
-									: motionStateName === "completed"
-										? "border-emerald-500/40 bg-emerald-400/10 text-emerald-100"
-										: "border-slate-600/70 bg-slate-800/70 text-slate-300"
-						}`}
-					>
-						{formatMotionStateLabel(motionStateName)}
-					</span>
-				</div>
-				<div className="text-[11px] leading-relaxed text-slate-300">
-					{motionStatus
-						? `Source ${motionStatus.source_of_truth ?? "controller"} | scope ${motionStatus.completion_scope ?? "unknown"}`
-						: "Waiting for controller motion status..."}
-				</div>
-				<div className="mt-1 text-[10px] text-slate-400">
-					{motionStatus
-						? `traj ${motionTrajectoryId ?? "none"} | mode ${motionStatus.execution?.active_mode_name ?? "n/a"} | queue ${motionStatus.execution?.queue_depth ?? 0}/${motionStatus.execution?.queue_capacity ?? 0} | done ${motionStatus.execution?.motion_done ? "yes" : "no"} | stale ${motionStatus.execution?.stale_command ? "yes" : "no"} | underruns ${motionStatus.execution?.underrun_count ?? 0}`
-						: "No RTCore execution metadata yet."}
-				</div>
-				<div
-					className={`mt-2 rounded border px-2 py-2 text-[10px] leading-relaxed ${
-						powerTransitionKnown && powerTransitionSafe
-							? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100"
-							: "border-amber-500/30 bg-amber-400/10 text-amber-100"
+	const controlsAreCollapsible = splitStatusSections && typeof onToggleControlsCollapsed === "function";
+	const drivePowerSection = (
+		<div className={`${splitStatusSections ? "" : "mb-3 "}border border-cyan-500/25 bg-cyan-500/5 p-3`}>
+			<div className="mb-2 flex items-center justify-between gap-2 text-xs text-cyan-100/90">
+				<span className="font-semibold uppercase tracking-[0.18em]">Drive Power</span>
+				<span
+					className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
+						isDrivePowerActive
+							? "border-emerald-400/40 bg-emerald-400/10 text-emerald-100"
+							: "border-amber-400/40 bg-amber-400/10 text-amber-100"
 					}`}
 				>
-					<div className="font-semibold uppercase tracking-[0.14em]">
-						{powerTransitionKnown && powerTransitionSafe
-							? "Safe For Power Transition"
-							: "Power-Up Blocked"}
+					{driveFaults?.driver_state ?? (requiresExplicitDrivePower ? "STATUS PENDING" : "NOT APPLICABLE")}
+				</span>
+			</div>
+			<div className="mb-2 text-[11px] leading-relaxed text-slate-300">
+				{requiresExplicitDrivePower
+					? "Startup leaves the RTCore drives disarmed. Power them up explicitly when you are ready to energize the axes."
+					: "Drive power controls are only used for the EtherCAT RTCore backend."}
+			</div>
+			<div className="mb-3 text-[10px] text-slate-400">
+				{driveFaults
+					? `Backend ${driveFaults.servo_backend ?? "unknown"} | driver ${driveFaults.driver_state ?? "unknown"} | EtherCAT ${driveFaults.ethercat_master_state ?? "unknown"} | RTCore ${driveFaults.rtcore_state ?? "unknown"} | enable mask ${driveFaults.axis_enable_mask_hex ?? "unknown"} | op-enabled ${driveFaults.op_enabled_axes ?? 0}/${driveFaults.num_axes ?? 0}`
+					: requiresExplicitDrivePower
+						? "Waiting for live drive-state telemetry..."
+						: "No RTCore drive state available for this backend."}
+			</div>
+			<div className="grid grid-cols-3 gap-2">
+				<button
+					type="button"
+					className={`rounded border px-2 py-2 text-[11px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-50 ${
+						isDrivePowerActive
+							? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100 hover:border-emerald-300/60 hover:bg-emerald-300/15"
+							: "border-cyan-500/30 bg-cyan-400/10 text-cyan-100 hover:border-cyan-300/60 hover:bg-cyan-300/15"
+					}`}
+					onClick={() => {
+						void handlePowerUpDrives();
+					}}
+					disabled={pendingJointAction !== null || !requiresExplicitDrivePower || isDrivePowerActive || powerUpBlocked}
+					title={powerUpBlocked ? powerUpBlockerMessage : "Explicitly arm and enable RTCore-controlled axes"}
+				>
+					{pendingJointAction === "power-up" ? "..." : "Power Up Drives"}
+				</button>
+				<button
+					type="button"
+					className="rounded border border-rose-500/35 bg-rose-400/10 px-2 py-2 text-[11px] font-semibold text-rose-100 transition hover:border-rose-300/60 hover:bg-rose-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+					onClick={() => {
+						void handlePowerDownDrives();
+					}}
+					disabled={pendingJointAction !== null || !requiresExplicitDrivePower || !isDrivePowerActive}
+					title="Explicitly disable and disarm RTCore-controlled axes"
+				>
+					{pendingJointAction === "power-down" ? "..." : "Power Down Drives"}
+				</button>
+				<button
+					type="button"
+					className="rounded border border-amber-500/40 bg-amber-400/10 px-2 py-2 text-[11px] font-semibold text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+					onClick={() => {
+						void handleResetFaults();
+					}}
+					disabled={pendingJointAction !== null || !requiresExplicitDrivePower}
+					title="Request a DS402 fault reset for all RTCore-controlled axes"
+				>
+					{pendingJointAction?.startsWith("reset-faults") ? "..." : "Reset All Faults"}
+				</button>
+			</div>
+			{driveFaults ? (
+				<div
+					className={`mt-3 rounded border px-2 py-2 text-[11px] leading-relaxed ${
+						activeDriveFaultAxes.length > 0
+							? "border-rose-500/30 bg-rose-400/10 text-rose-100"
+							: "border-slate-700/60 bg-slate-900/70 text-slate-200"
+					}`}
+				>
+					<div className="flex items-center justify-between gap-2">
+						<span className="font-semibold">
+							{activeDriveFaultAxes.length > 0 ? `Drive faults detected (${activeDriveFaultAxes.length})` : "Drive fault status"}
+						</span>
+						<span
+							className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
+								activeDriveFaultAxes.length > 0
+									? "border-rose-400/40 bg-rose-400/10 text-rose-100"
+									: "border-slate-600/70 bg-slate-800/70 text-slate-300"
+							}`}
+						>
+							{driveFaults.physical_state ?? "unknown"}
+						</span>
 					</div>
-					<div className="mt-1">
-						{powerTransitionKnown && powerTransitionSafe
-							? "Runtime is neutral and synchronized; explicit drive enable is allowed."
-							: powerUpBlockerMessage}
+					<div className="mt-1 text-[10px] text-current/70">
+						Fault reference:{" "}
+						{driveFaults.reference?.available
+							? driveFaults.reference.label ?? driveFaults.reference.profile_id ?? "configured"
+							: "raw only"}
 					</div>
+					{activeDriveFaultAxes.length > 0 ? (
+						<div className="mt-1 text-[10px] text-current/70">
+							Reset individual faulted joints below, or use <span className="font-semibold">Reset All Faults</span> to
+							pulse DS402 fault reset across every RTCore axis.
+						</div>
+					) : null}
+					{activeDriveFaultAxes.length > 0 ? (
+						<div className="mt-2 space-y-1">
+							{activeDriveFaultAxes.map((axis) => (
+								<div
+									key={`drive-fault-${axis.axis}`}
+									className="rounded border border-current/15 bg-black/10 px-2 py-1 text-[10px]"
+								>
+									<div className="flex items-center justify-between gap-2">
+										<span className="min-w-0 flex-1">{formatDriveFaultDescription(axis)}</span>
+										{axis.fault?.resettable === true &&
+										typeof axis.logical_joint === "number" &&
+										Number.isFinite(axis.logical_joint) ? (
+											<button
+												type="button"
+												className="shrink-0 rounded border border-amber-400/35 bg-amber-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+												onClick={() => {
+													void handleResetFaults(axis.logical_joint);
+												}}
+												disabled={pendingJointAction !== null}
+												title={`Request a DS402 fault reset for J${axis.logical_joint}`}
+											>
+												Reset J{axis.logical_joint}
+											</button>
+										) : null}
+									</div>
+								</div>
+							))}
+						</div>
+					) : (
+						<div className="mt-2 text-[10px] text-current/70">
+							No active drive faults in the latest telemetry snapshot.
+						</div>
+					)}
+				</div>
+			) : null}
+		</div>
+	);
+	const motionStateSection = (
+		<div className={`${splitStatusSections ? "" : "mb-3 "}border border-slate-700/60 bg-slate-950/30 p-3`}>
+			<div className="mb-2 flex items-center justify-between gap-2 text-xs text-slate-300/80">
+				<span className="font-semibold uppercase tracking-[0.18em]">Motion State</span>
+				<span
+					className={`rounded border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
+						motionStateName === "faulted" || motionStateName === "aborted" || motionStateName === "underrun"
+							? "border-rose-500/40 bg-rose-400/10 text-rose-100"
+							: motionBusy
+								? "border-cyan-500/40 bg-cyan-400/10 text-cyan-100"
+								: motionStateName === "completed"
+									? "border-emerald-500/40 bg-emerald-400/10 text-emerald-100"
+									: "border-slate-600/70 bg-slate-800/70 text-slate-300"
+					}`}
+				>
+					{formatMotionStateLabel(motionStateName)}
+				</span>
+			</div>
+			<div className="text-[11px] leading-relaxed text-slate-300">
+				{motionStatus
+					? `Source ${motionStatus.source_of_truth ?? "controller"} | scope ${motionStatus.completion_scope ?? "unknown"}`
+					: "Waiting for controller motion status..."}
+			</div>
+			<div className="mt-1 text-[10px] text-slate-400">
+				{motionStatus
+					? `traj ${motionTrajectoryId ?? "none"} | mode ${motionStatus.execution?.active_mode_name ?? "n/a"} | queue ${motionStatus.execution?.queue_depth ?? 0}/${motionStatus.execution?.queue_capacity ?? 0} | done ${motionStatus.execution?.motion_done ? "yes" : "no"} | stale ${motionStatus.execution?.stale_command ? "yes" : "no"} | underruns ${motionStatus.execution?.underrun_count ?? 0}`
+					: "No RTCore execution metadata yet."}
+			</div>
+			<div
+				className={`mt-2 rounded border px-2 py-2 text-[10px] leading-relaxed ${
+					powerTransitionKnown && powerTransitionSafe
+						? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100"
+						: "border-amber-500/30 bg-amber-400/10 text-amber-100"
+				}`}
+			>
+				<div className="font-semibold uppercase tracking-[0.14em]">
+					{powerTransitionKnown && powerTransitionSafe
+						? "Safe For Power Transition"
+						: "Power-Up Blocked"}
+				</div>
+				<div className="mt-1">
+					{powerTransitionKnown && powerTransitionSafe
+						? "Runtime is neutral and synchronized; explicit drive enable is allowed."
+						: powerUpBlockerMessage}
 				</div>
 			</div>
+		</div>
+	);
+	const controlsBody = (
+		<>
 			{/* Removed step move blocks; unified under realtime jog below */}
 			<div className="mb-3 rounded-lg border border-slate-700/60 p-2">
 				<div className="mb-2 flex items-center justify-between text-xs text-slate-300/80">
@@ -1938,7 +2266,7 @@ export function ControlPanel({
 						</div>
 						{requiresExplicitDrivePower && !drivePowerReady ? (
 							<div className="mb-2 rounded border border-cyan-500/20 bg-cyan-400/10 px-2 py-1.5 text-[11px] text-cyan-100">
-								Drives are currently disarmed. Use the <span className="font-semibold">Drive Power</span> section above before jogging.
+								Drives are currently disarmed. Use the <span className="font-semibold">{driveControlsReferenceLabel}</span> before jogging.
 							</div>
 						) : null}
 						<div className="mb-2">
@@ -2153,6 +2481,52 @@ export function ControlPanel({
 					Rest
 				</button>
 			</div>
+		</>
+	);
+	return splitStatusSections ? (
+		<div className="pointer-events-auto w-full space-y-3 text-slate-100">
+			{showStatusSections ? drivePowerSection : null}
+			{showStatusSections ? motionStateSection : null}
+			<div className="w-full">
+				{controlsAreCollapsible ? (
+					<button
+						type="button"
+						onClick={onToggleControlsCollapsed}
+						className="flex w-full items-center justify-between border border-slate-700/60 bg-slate-900/80 px-3 py-2 text-left transition hover:border-slate-500/70"
+					>
+						<span className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-200/80">
+							Controls
+						</span>
+						<span className="text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-300">
+							{controlsCollapsed ? "Show" : "Hide"}
+						</span>
+					</button>
+				) : (
+					<div className="border border-slate-700/60 bg-slate-900/80 px-3 py-2 text-xs font-semibold uppercase tracking-[0.22em] text-cyan-200/80">
+						Controls
+					</div>
+				)}
+				{controlsAreCollapsible ? (
+					controlsCollapsed ? null : (
+						<div className="mt-2 border border-slate-700/60 bg-slate-900/80 p-3">
+							{controlsBody}
+						</div>
+					)
+				) : (
+					<div className="mt-2 border border-slate-700/60 bg-slate-900/80 p-3">
+						{controlsBody}
+					</div>
+				)}
+			</div>
+		</div>
+	) : (
+		<div className="pointer-events-auto w-full border border-slate-700/60 bg-slate-900/80 p-4 text-slate-100">
+			<div className="mb-2 text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200/80">
+				Robot Control
+			</div>
+			{showStatusSections ? drivePowerSection : null}
+			{showStatusSections ? motionStateSection : null}
+			{controlsBody}
 		</div>
 	);
 }

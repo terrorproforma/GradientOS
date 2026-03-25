@@ -4450,18 +4450,48 @@ def _plan_preview_points_payload(
             )
 
     if not planning_succeeded or len(planned_steps) == 0:
+        planner_diag_suffix = ""
+        planner_diag = utils.trajectory_state.get("last_planner_diagnostics")
+        if isinstance(planner_diag, dict):
+            diag_parts: list[str] = []
+            diag_reason = str(planner_diag.get("reason_code", "")).strip()
+            if diag_reason:
+                diag_parts.append(f"reason={diag_reason}")
+            diag_attempt = str(planner_diag.get("attempt", "")).strip()
+            if diag_attempt:
+                diag_parts.append(f"attempt={diag_attempt}")
+            fallback_level = planner_diag.get("fallback_level")
+            if isinstance(fallback_level, (int, float)):
+                diag_parts.append(f"fallback_level={int(fallback_level)}")
+            residuals = planner_diag.get("residuals")
+            if isinstance(residuals, dict):
+                for key in (
+                    "joint_limit_margin_rad",
+                    "max_joint_step_rad",
+                    "cartesian_residual_m",
+                    "orientation_residual_deg",
+                ):
+                    value = residuals.get(key)
+                    try:
+                        numeric_value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(numeric_value):
+                        diag_parts.append(f"{key}={numeric_value:.5f}")
+            if diag_parts:
+                planner_diag_suffix = " planner_diag={" + ", ".join(diag_parts) + "}"
         if failed_waypoint_idx is not None and failed_waypoint_target is not None:
             failed_target = [round(float(v), 4) for v in failed_waypoint_target.tolist()]
             if failed_segment_start_fk is not None and failed_segment_start_fk.shape[0] >= 3:
                 start_fk = [round(float(v), 4) for v in failed_segment_start_fk[:3].tolist()]
                 raise RuntimeError(
                     f"Planning failed at waypoint #{failed_waypoint_idx} target={failed_target} "
-                    f"from start_fk={start_fk}."
+                    f"from start_fk={start_fk}.{planner_diag_suffix}"
                 )
             raise RuntimeError(
-                f"Planning failed at waypoint #{failed_waypoint_idx} target={failed_target}."
+                f"Planning failed at waypoint #{failed_waypoint_idx} target={failed_target}.{planner_diag_suffix}"
             )
-        raise RuntimeError("Planning failed for one or more waypoints.")
+        raise RuntimeError(f"Planning failed for one or more waypoints.{planner_diag_suffix}")
 
     # Build recorded trajectory representation from planned steps.
     moves = []

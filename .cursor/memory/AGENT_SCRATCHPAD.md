@@ -1361,8 +1361,180 @@ Use this file as persistent, repo-local execution memory.
 - [self] Corrective rule: do not treat a safe hardware probe as proof that the motion-status contract is fixed; after every live power-down, verify both `./start-stack.sh probe` and `/control/motion-status` and look specifically for latched `active_traj_id` / completed trajectory blockers.
 - [tool] Fresh startup logs for `logs/startups/20260324-215329` contained no `APPLY_JOINT_SETPOINT`, `MOVE_*`, `ROTATE`, or `SET_ORIENTATION` markers during the validation run, matching the intended "no motion commands" test.
 
+### 2026-03-24 - Narrow industrial drawers need real hierarchy, not just more instructions
+- [user] Feedback after the first trajectory-creation fix: the UI still needed to simply look better, not just explain itself better.
+- [tool] A stronger pattern for this app's side drawers is: top summary/header card, one clear authoring card, one draft-status card, one execution card, then save/load sections below.
+- [self] Corrective rule: when a drawer is narrow, replace icon-only toolbars and dense text blocks with stacked control cards, 2-column action grids, and short status chips so the workflow scans in seconds.
+
 ### 2026-03-24 - RTCore-backed STOP must not inject a hold trajectory during power-down
 - [tool] Root cause of the stale post-power-down blocker was `handle_stop_command()` calling `servo_driver.set_servo_positions(current_angles, 0, 100)` even on the EtherCAT RTCore backend; that backend maps the write to a one-point RTCore trajectory via `set_joint_positions()`.
 - [self] Corrective rule: when the active backend exposes RTCore execution status, `STOP` should abort RTCore ownership and stop jog, then skip the legacy servo-driver brake write entirely.
 - [tool] After that fix, the live rerun (`logs/startups/20260324-215735`) passed end to end: pre-enable `safe_for_power_transition=true`, post-power-down `./start-stack.sh probe` returned `BUS_UP_DISARMED`, and `/control/motion-status` also returned `idle` with `active_traj_id=0`, `last_submitted_traj_id=0`, and `safe_for_power_transition=true`.
 - [tool] Updated docs in `docs/rtcore_owned_motion_contract.md`, `docs/ethercat/bringup.md`, and `docs/command_api.md` to record the final RTCore power-transition contract and the validated no-motion power-cycle procedure.
+
+### 2026-03-24 - Runtime TDZ bugs can survive builds in renamed-destructure UI code
+- [tool] The trajectory waypoint-record path threw `Cannot access 'waypoints2' before initialization` even though `npm run build` still passed.
+- [self] Root cause: in `web-ui/src/App.tsx`, `requestPlannerPreview(async (waypoints) => ...)` destructured `const { plan, waypoints } = previewFromPlannerPayload(data)`, which shadowed the parameter and triggered a runtime temporal-dead-zone failure after bundler renaming.
+- [self] Corrective rule: in React/TS callbacks, never reuse a parameter name in downstream destructuring; prefer explicit aliases like `previewWaypoints` for response payloads when the same concept already exists as an argument.
+
+### 2026-03-24 - Editor-shell refactors should move layout into shell primitives, not into feature panels
+- [user] Preference reinforced again: explain the UI work, but actually implement the redesign instead of stopping at the plan.
+- [tool] The safest way to convert `web-ui` from floating overlays to a docked shell was to keep the existing authoring/runtime state in `web-ui/src/App.tsx` and `web-ui/src/previewUtils.ts`, then recompose it with docked pane components plus a timeline derived from existing `control_point_*`, `move_*`, and weld-segment node IDs.
+- [self] Corrective rule: when replacing floating panels, strip absolute positioning out of reusable surfaces like `web-ui/src/components/SidebarDrawer.tsx`, `SidebarRail.tsx`, and `ProgramFeatureTree.tsx`; the shell grid in `App.tsx` should own placement.
+- [self] Corrective rule: timeline items that point at selection IDs must be disabled when the corresponding program-tree node does not exist yet, otherwise draft-only planner states create transient invalid selections.
+
+### 2026-03-24 - Docked 3D panes need true viewport height and container-resize handling
+- [user] Immediate feedback after the shell refactor: the page height must stay constrained to the viewport and the robot must remain visible in the docked stage.
+- [self] Root cause pattern: `min-h-screen` on the app shell plus a fixed bottom timeline row can push content below the viewport even when inner panes use `overflow-hidden`.
+- [self] Corrective rule: full-screen editor shells should use a true viewport-height root (`h-[100dvh]`/equivalent), make the header `shrink-0`, and let the main grid consume only the remaining space.
+- [tool] The docked visualizer also needs a `ResizeObserver`; window `resize` alone misses pane/grid layout changes, which can leave the WebGL canvas and camera out of sync with the new stage size.
+
+### 2026-03-24 - When users ask for the old left-side menu feel back, restore the rail layout, not just the labels
+- [user] Explicit UI preference: the workspace menu should feel closer to the earlier vertical left-hand navigation, with items down the left side, rather than a stacked card list.
+- [self] Corrective rule: for shell redesign follow-up tweaks, preserve the new docked-pane architecture but move navigation back into a slim left rail before adding more decorative card affordances.
+- [tool] A good compromise is a narrow icon rail spanning the full left column height, with the active authoring surface and program tree docked to its right inside the same column.
+
+### 2026-03-24 - Resizable editor shells should persist pane sizes through the existing settings store
+- [user] Asked for draggable pane resizing and wanted the layout to come back the same on the next app launch.
+- [self] Corrective rule: if the frontend already has a persisted UI settings object, add pane sizes there first instead of introducing a second persistence path just for layout.
+- [tool] For this `web-ui`, left pane width, right inspector width, and bottom timeline height are good persisted dimensions; window `resize` should clamp them, while pointer-drag end should commit them to storage.
+
+### 2026-03-24 - Rail flyout labels need to escape neighboring panes
+- [user] Reported that the left rail tooltip/flyout was not visible after the rail/menu restyle.
+- [self] Corrective rule: when compact rails sit beside docked panes, give the rail and its flyouts explicit stacking/overflow freedom; otherwise labels can be visually hidden even when the hover logic is correct.
+- [tool] A good fallback is to keep the active item's flyout visible by default and only reserve pure hover-only labels for inactive items.
+
+### 2026-03-25 - If the user says a rail tooltip should be hover-only, remove all sticky-active visibility
+- [user] Explicit correction: the left rail flyout should not stay out after clicking; it should only appear on hover.
+- [self] Corrective rule: when a user specifies hover-only behavior, do not keep an exception for the active item or focused item just because it helped discoverability.
+
+### 2026-03-25 - Resizable panes must avoid hardcoded minimums inside empty states
+- [user] Reported that shrinking the bottom timeline moved it out of frame instead of letting it compress within the viewport.
+- [self] Corrective rule: when a pane itself is resizable, remove internal `min-height` guards from empty states and nested wrappers unless they are absolutely necessary; otherwise the drag math can be correct while the content still overflows.
+
+### 2026-03-25 - If a bottom pane should stop before the inspector, restructure the outer grid rather than fighting inner widths
+- [user] Wanted the bottom timeline to stop before the right-hand panel and let the right side stay full height.
+- [self] Corrective rule: when one column must span full shell height while another pane only lives under the workspace area, split the outer shell into `workspace | splitter | full-height inspector` and place the bottom pane only in the workspace column.
+
+### 2026-03-25 - A shell row cannot stop before the inspector unless the root grid owns both rows and columns
+- [user] Follow-up correction: the divider gap should be thinner, the right-hand side must truly reach the bottom, and the timeline should be allowed to resize larger.
+- [self] Mistake: moving only the top workspace into a three-column grid was not enough; leaving the timeline in a root-level full-width row still made it visually span under the inspector.
+- [self] Corrective rule: when a bottom pane should end before another column, put the top workspace, bottom splitter, bottom pane, side splitter, and inspector all in the same root grid with explicit row and column placement.
+- [tool] A small splitter track plus extra wrapper padding can read as a "thick gap" even if the math is correct; reduce both together when tuning pane seams.
+
+### 2026-03-25 - Docked inspector sections should scroll inside their card, not against the viewport
+- [user] Reported that the right-side robot control content overflowed past its panel instead of staying contained.
+- [self] Corrective rule: for resizable docked panes, avoid `max-h` values derived from `100vh` inside nested cards; make the card a `flex min-h-0 flex-col overflow-hidden` container and let the inner body use `h-full min-h-0 overflow-y-auto`.
+- [tool] If a collapsible wrapper sits inside a constrained panel, it also needs `min-h-0`/`flex-1` on its content wrapper or the child scroller will not inherit the available height.
+
+### 2026-03-25 - If the user says the whole right panel scrolls, inspect the parent inspector column before the child widget
+- [user] Clarified that the problem was the entire right-hand inspector column becoming scrollable, not just the robot-control subsection.
+- [self] Corrective rule: when a docked sidebar should stay fixed, give the sidebar grid `overflow-hidden` and remove nested `min-h-*` floors in sibling sections so the parent column cannot become the scroll surface.
+
+### 2026-03-25 - Superseded: this inspector should use parent scrolling, not nested subpanel scrolling
+- [user] Final clarification: the right-hand inspector height should stay locked to the shell, and the parent inspector column should scroll its content; `Robot Control` itself should not have its own inner scrollbar.
+- [self] Superseded prior assumption from the previous two notes for this specific shell.
+- [self] Corrective rule: when the user asks for a fixed-height sidebar with scrollable contents, prefer a parent `flex-col overflow-y-auto` stack with `shrink-0` cards, and avoid fractional row grids plus nested scrollers unless they explicitly want independent pane scrolling.
+
+### 2026-03-25 - If stage and camera are alternate views of the same workspace, make the center pane the shared viewer
+- [user] Wanted the vision feed to live where the stage is, with the ability to switch between the live camera view and the 3D workspace.
+- [self] Corrective rule: when two views represent the same primary workspace, do not duplicate them in separate panels; use one main viewer with an explicit mode switch and update the surrounding status copy to match the active view.
+- [self] Corrective rule: once a viewer mode becomes user-selected, do not auto-toggle it from unrelated connection state such as robot API connectivity.
+
+### 2026-03-25 - Do not unmount the 3D visualizer just to show the camera in the same stage
+- [user] Reported that after the stage/vision refactor the robot render disappeared, even though the STL files and URDF references were already working before.
+- [self] Mistake: I made the center stage swap the entire viewer tree between vision and 3D, which risked tearing down and rebuilding the robot visualizer when the user only wanted an alternate view in the same surface.
+- [self] Corrective rule: when a 3D scene is known-good, keep it mounted and layer alternate media views like camera feeds over it instead of conditionally replacing the whole stage subtree.
+- [self] Corrective rule: if the user explicitly switches to `3D Stage`, treat that as permission to enable the visualizer immediately.
+
+### 2026-03-25 - Robot rendering is a protected behavior in this repo
+- [user] Explicit preference: emphasize for future sessions that stage/layout refactors routinely risk breaking robot rendering, and preserving the existing URDF/STL-backed robot view matters more than UI experimentation.
+- [self] Hard guardrail: before changing viewer layout, stage mode logic, or visualizer mount conditions, assume the robot render is fragile and preserve the existing `ArmVisualizer` lifecycle unless the task explicitly requires changing it.
+- [self] Hard guardrail: after any change touching `web-ui/src/App.tsx` stage composition or `web-ui/src/ArmVisualizer.tsx`, verify that the robot itself still renders, not just the grid/axes/canvas.
+- [self] Hard guardrail: do not explain away a missing robot with asset theory if the regression appeared immediately after a UI refactor; first revert or isolate the mount/rendering change that was just introduced.
+
+### 2026-03-25 - Shell resize stops come from explicit clamp constants, not from the browser
+- [user] Asked why the stage/vision block could not be made smaller and pointed out the current slider stops felt too restrictive.
+- [self] Corrective rule: when resize handles "stop early", inspect `clampShellPaneLayout()` and the min constants first; invisible hardcoded pane minimums are easy to forget after layout refactors.
+- [self] Corrective rule: keep robot rendering protected, but do not use oversized stage minimums as a blanket safety measure for UI layout. Prefer smaller, still-usable clamp values unless the user asks for stricter limits.
+
+### 2026-03-25 - If a sidebar card duplicates stage context, remove it instead of keeping ornamental chrome
+- [user] Called out the top `Context Inspector` card on the right as unnecessary.
+- [self] Corrective rule: when the same selection/runtime info already appears in the main stage overlays, avoid repeating it in a secondary sidebar summary card unless it enables a distinct workflow.
+
+### 2026-03-25 - If the user wants square UI, prefer one global radius reset over piecemeal class edits
+- [user] Asked to get rid of the corner radius from everything.
+- [self] Corrective rule: when the requested visual direction is repo-wide and many Tailwind `rounded-*` utilities are already in use, implement a global override in `web-ui/src/index.css` instead of chasing every class across the component tree.
+
+### 2026-03-25 - For a truly flat shell, harden borders and remove softening effects globally
+- [user] Approved the follow-up pass to make the flatter shell feel more intentional.
+- [self] Corrective rule: if the UI direction is square/flat/industrial, global border strengthening plus removal of heavy shadows and backdrop blur is usually more coherent than editing a few hero panels by hand.
+
+### 2026-03-25 - If a sidebar card should align to the shell bottom, make the card fill the column rather than sizing to content
+- [user] Wanted the bottom of the `Robot Control` panel to align with the bottom of the shared timeline.
+- [self] Corrective rule: when a right-hand panel must share the shell baseline with another pane, the sidebar column can span full height but the card itself also needs `flex-1 min-h-0`; a `shrink-0` card will stop at content height and visually break alignment.
+
+### 2026-03-25 - If power and motion are status blocks, separate them from the main controls body
+- [user] Clarified that `Drive Power` and `Motion State` should sit above the controls rather than being part of the main control block.
+- [self] Corrective rule: when a section mixes status/overview with dense interaction widgets, split the summary/status cards from the main controls container instead of burying them inside one monolithic panel.
+
+### 2026-03-25 - Stage header overlays should collapse into a single top strip when they compete with view controls
+- [user] Pointed out that the `Robot Workspace` overlay was taking too much room and wanted it reduced to a single line aligned with the `3D Stage / Vision Feed` switch.
+- [self] Corrective rule: if the main stage already has top-corner controls, keep the stage context overlay to one horizontal strip with truncation instead of a stacked card that steals viewport from the viewer.
+
+### 2026-03-25 - Do not leave a `flex-1` spacer in a compact stage strip
+- [user] Asked to clean up the gaps between the top-stage header items after the strip was collapsed.
+- [self] Corrective rule: in compact overlay strips, avoid a `flex-1` heading span between the label and status pills; group the label/title together with bounded truncation so the pills stay visually packed instead of drifting apart.
+
+### 2026-03-25 - Promote high-value robot state into the stage header instead of duplicating bulky status cards
+- [user] Wanted `Drive Power` and `Motion State` collapsed into the top header, with verbose wording moved into hover tooltips and the empty header space used for arming/disarming.
+- [self] Corrective rule: when runtime state is operationally critical but visually repetitive, extract a compact reusable header control row with status chips plus primary actions, and hide the large sidebar status cards so the right panel stays focused on dense controls.
+
+### 2026-03-25 - Distinguish the global page header from a stage overlay header
+- [user] Corrected me that `Drive Power` and `Motion Status` belonged in the page header, not the stage overlay.
+- [self] Corrective rule: when the user says `PAGE HEADER`, place controls in the top app shell header bar, not in a local workspace/stage overlay even if both are visually "headers".
+
+### 2026-03-25 - Center critical runtime controls with a dedicated header action lane
+- [user] Asked for the header buttons to be full height and centered in the middle of the screen.
+- [self] Corrective rule: when a global header carries primary robot actions, give them a dedicated centered action lane with vertical stretch; do not leave them floating as a small inline row inside a left/right content flow.
+
+### 2026-03-25 - Remove shell padding/gap if header controls still show a bottom gutter
+- [user] Noticed what looked like a bottom margin under the centered header controls and asked to remove it.
+- [self] Corrective rule: if a full-height header action band still appears to float, check the parent header's `gap` and bottom padding before changing the button sizing again.
+
+### 2026-03-25 - When program structure is more important than left-column filler, dock it above runtime controls
+- [user] Asked for the `Program Tree` to sit above the `Robot Control` panel instead of occupying the lower-left workspace area.
+- [self] Corrective rule: if the program-structure panel becomes a higher-priority navigator than the secondary left-column slot, move it into the right sidebar stack above runtime controls and let the left authoring drawer span the full left pane.
+
+### 2026-03-25 - Do not reserve empty alert-strip height in the page header
+- [user] Pointed out the header still had too much bottom gap and should become shorter.
+- [self] Corrective rule: if the page header has an alert strip, render it only when an alert exists; a transparent fixed-height alert row still counts as layout height and makes centered controls look vertically unbalanced.
+
+### 2026-03-25 - When the robot disappears again, treat it as a regression in viewer/path handling first
+- [user] Reiterated that the robot files are not "missing" and that this repo's recurring failure mode is regression after UI/viewer changes.
+- [self] Mistake: I drifted back toward an asset-missing theory instead of prioritizing the existing render-path guardrails.
+- [self] Corrective rule: if the 3D grid/axes still render but the robot is gone, first treat it as a visualizer lifecycle or asset-resolution regression and verify live URDF/STL HTTP responses before making broader claims about repository contents.
+- [self] Corrective rule: after changing Vite dev config for viewer assets, restart the dev server; HMR will not apply `vite.config.ts` changes.
+
+### 2026-03-25 - Put robot-render guardrails at the top of `ArmVisualizer.tsx`
+- [user] Asked for a top-of-file warning block in `web-ui/src/ArmVisualizer.tsx` that states the arm disappearing is usually a regression and lists the STL locations.
+- [self] Corrective rule: when a file is a known regression hotspot, put the guardrails in the file itself above the imports so any future editor sees the warning before touching the implementation.
+
+### 2026-03-25 - If a shell status card is called out as too large, reduce line count first
+- [user] Pointed at the bottom-right playhead block in the shared timeline and asked for it to be at most two lines.
+- [self] Corrective rule: for compact shell status cards, cap the vertical information stack before shrinking the whole pane; combine secondary detail into a single truncated line under a short label when the user wants the block shorter.
+
+### 2026-03-25 - If the label is redundant in a compact shell chip, remove it entirely
+- [user] Followed up that the `Playhead` text itself should be removed from the compact timeline status card.
+- [self] Corrective rule: once a shell status card has already been compressed, remove redundant micro-labels instead of preserving them out of habit if the surrounding placement already makes the card's meaning obvious.
+
+### 2026-03-25 - Trajectory preview failures need planner diagnostics, not raw sequential IK spam
+- [user] Asked to investigate recurring `trajectory/plan-points` failures from the live stack log.
+- [self] Corrective rule: when trajectory preview fails with `LIMIT_VIOLATION`, compare whether the same waypoint succeeds from a different start pose before calling the Cartesian target unreachable; the failure can be seed/start-state dependent.
+- [self] Corrective rule: if sequential IK fallback is only being used as an internal retry, keep `solve_ik_path_sequential(..., verbose=False)` so the terminal shows the actual planner gate failure instead of hundreds of `Path Point ...` lines.
+- [self] Corrective rule: bubble `last_planner_diagnostics` into preview-planning exceptions so future failures expose `reason`, `fallback_level`, and residual margins in the API error text.
+
+### 2026-03-25 - A `trajectory/run` 503 can still mean the controller started the run
+- [self] Corrective rule: when the terminal shows `POST /trajectory/run HTTP/1.1" 503` but also shows the controller receiving `RUN_TRAJECTORY,...` and entering `Starting Trajectory Planning Phase`, treat it as an API timeout / late ACK mismatch, not a rejected run.
+- [self] Corrective rule: correlate `trajectory/run` 503s with controller-side planning/execution lines before retrying from the UI; duplicate clicks can reissue a command that already started.
+- [self] Corrective rule: repeated `GET /info/joints` 503s during planning/execution are secondary telemetry poll failures and should be triaged separately from the primary motion/planner error.

@@ -15,6 +15,31 @@
 }
 
 @layer utilities {
+  [class~="rounded"],
+  [class^="rounded-"],
+  [class*=" rounded-"] {
+    border-radius: 0 !important;
+  }
+
+  [class^="border-slate-"],
+  [class*=" border-slate-"] {
+    border-color: rgba(148, 163, 184, 0.42) !important;
+  }
+
+  [class~="shadow"],
+  [class^="shadow-"],
+  [class*=" shadow"],
+  [class*=" shadow-"] {
+    box-shadow: none !important;
+  }
+
+  [class~="backdrop-blur"],
+  [class^="backdrop-blur"],
+  [class*=" backdrop-blur"] {
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+  }
+
   .gradient-scrollbar {
     scrollbar-width: thin;
     scrollbar-color: rgba(100, 116, 139, 0.85) rgba(2, 6, 23, 0.45);
@@ -25,7 +50,7 @@
   }
 
   .gradient-scrollbar::-webkit-scrollbar-track {
-    border-radius: 9999px;
+    border-radius: 0;
     background: linear-gradient(
       180deg,
       rgba(2, 6, 23, 0.5) 0%,
@@ -35,7 +60,7 @@
 
   .gradient-scrollbar::-webkit-scrollbar-thumb {
     border: 2px solid rgba(2, 6, 23, 0.7);
-    border-radius: 9999px;
+    border-radius: 0;
     background: linear-gradient(
       180deg,
       rgba(56, 189, 248, 0.32) 0%,

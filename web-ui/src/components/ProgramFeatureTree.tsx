@@ -136,8 +136,8 @@ export function ProgramFeatureTree({
     return Number.isFinite(parsed) ? parsed : fallback;
   };
   return (
-    <div className="pointer-events-auto absolute right-6 top-6 z-30 w-[340px] max-w-[calc(100vw-2rem)] rounded-2xl border border-slate-700/70 bg-slate-950/82 p-3 shadow-2xl shadow-black/40 backdrop-blur">
-      <div className="mb-2 flex items-center justify-between">
+    <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-2xl border border-slate-700/70 bg-slate-950/72 shadow-xl shadow-black/20 backdrop-blur">
+      <div className="flex items-center justify-between border-b border-slate-700/50 px-4 py-3">
         <span className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-200/80">
           Program Tree
         </span>
@@ -145,164 +145,173 @@ export function ProgramFeatureTree({
           {root ? root.label : "No program loaded"}
         </span>
       </div>
-      <div className="mb-2 flex items-center justify-end gap-1 text-[10px]">
-        <button
-          type="button"
-          onClick={() => onChangeViewMode("chronological")}
-          className={`rounded border px-2 py-1 ${
-            viewMode === "chronological"
-              ? "border-cyan-400/60 bg-cyan-500/20 text-cyan-100"
-              : "border-slate-700/80 bg-slate-900/70 text-slate-300 hover:border-slate-500"
-          }`}
-        >
-          Chronological
-        </button>
-        <button
-          type="button"
-          onClick={() => onChangeViewMode("grouped")}
-          className={`rounded border px-2 py-1 ${
-            viewMode === "grouped"
-              ? "border-cyan-400/60 bg-cyan-500/20 text-cyan-100"
-              : "border-slate-700/80 bg-slate-900/70 text-slate-300 hover:border-slate-500"
-          }`}
-        >
-          Grouped
-        </button>
-      </div>
-      <div className="max-h-[52vh] overflow-y-auto rounded-lg border border-slate-800/80 bg-slate-900/35 p-1">
-        {root ? (
-          <NodeRow
-            node={root}
-            depth={0}
-            expanded={expanded}
-            selectedNodeId={selectedNodeId}
-            onToggleExpand={onToggleExpand}
-            onSelectNode={onSelectNode}
-          />
-        ) : (
-          <div className="px-2 py-2 text-xs text-slate-500">
-            Plan a trajectory or weld to populate the tree.
-          </div>
-        )}
-      </div>
-      {editableControlPoint ? (
-        <div className="mt-2 rounded-lg border border-slate-700/70 bg-slate-900/40 p-2">
-          <div className="mb-1 flex items-center justify-between">
-            <span className="text-[11px] font-semibold uppercase tracking-[0.12em] text-cyan-200/85">
-              Edit Control Point {editableControlPoint.index + 1}
-            </span>
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={onAddWaypoint}
-                disabled={!canAddWaypoint}
-                className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
-                  !canAddWaypoint ? "opacity-60" : ""
-                }`}
-                aria-label="Add control point"
-                title="Add control point"
-              >
-                +
-              </button>
-              <button
-                type="button"
-                onClick={() => onRemoveWaypoint(editableControlPoint.index)}
-                disabled={!canRemoveWaypoint}
-                className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
-                  !canRemoveWaypoint ? "opacity-60" : ""
-                }`}
-                aria-label="Remove control point"
-                title="Remove control point"
-              >
-                -
-              </button>
-              <button
-                type="button"
-                onClick={onMoveWaypointUp}
-                disabled={!canMoveWaypointUp}
-                className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
-                  !canMoveWaypointUp ? "opacity-60" : ""
-                }`}
-                aria-label="Move control point up"
-                title="Move control point earlier"
-              >
-                ^
-              </button>
-              <button
-                type="button"
-                onClick={onMoveWaypointDown}
-                disabled={!canMoveWaypointDown}
-                className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
-                  !canMoveWaypointDown ? "opacity-60" : ""
-                }`}
-                aria-label="Move control point down"
-                title="Move control point later"
-              >
-                v
-              </button>
-            </div>
-          </div>
-          <div className="grid grid-cols-3 gap-1">
-            {(["x", "y", "z"] as const).map((axis) => (
-              <input
-                key={`tree-control-${editableControlPoint.index}-${axis}`}
-                className={`rounded border border-slate-600/70 bg-slate-950/70 px-1.5 py-1 text-[12px] text-slate-100 ${
-                  !canEditWaypointValues ? "opacity-60" : ""
-                }`}
-                type="number"
-                step="0.001"
-                value={Number(editableControlPoint.point[axis].toFixed(4))}
-                disabled={!canEditWaypointValues}
-                onChange={(event) =>
-                  onWaypointChange(
-                    editableControlPoint.index,
-                    axis,
-                    parseOrKeep(event.target.value, editableControlPoint.point[axis]),
-                  )
-                }
-              />
-            ))}
-          </div>
-          <div className="mt-1 grid grid-cols-3 gap-1">
-            {(
-              [
-                ["rollDeg", "Roll"],
-                ["pitchDeg", "Pitch"],
-                ["yawDeg", "Yaw"],
-              ] as const
-            ).map(([axis, label]) => (
-              <input
-                key={`tree-control-rot-${editableControlPoint.index}-${axis}`}
-                className={`rounded border border-slate-600/70 bg-slate-950/70 px-1.5 py-1 text-[12px] text-slate-100 ${
-                  !canEditWaypointValues ? "opacity-60" : ""
-                }`}
-                type="number"
-                step="0.1"
-                title={label}
-                value={editableControlPoint.point[axis] ?? 0}
-                disabled={!canEditWaypointValues}
-                onChange={(event) =>
-                  onWaypointChange(
-                    editableControlPoint.index,
-                    axis,
-                    parseOrKeep(event.target.value, editableControlPoint.point[axis] ?? 0),
-                  )
-                }
-              />
-            ))}
-          </div>
+      <div className="flex items-center justify-between gap-3 px-4 py-3">
+        <div className="text-[12px] text-slate-400">
+          Select a node to sync the editor, timeline, and 3D stage.
+        </div>
+        <div className="flex items-center justify-end gap-1 text-[10px]">
           <button
             type="button"
-            onClick={onApplyWaypointEdits}
-            disabled={!canApplyWaypointEdits}
-            className={`mt-2 w-full rounded border border-slate-600/70 bg-slate-900/60 px-2 py-1.5 text-[12px] font-semibold text-slate-100 transition hover:border-slate-400 ${
-              !canApplyWaypointEdits ? "opacity-60" : ""
+            onClick={() => onChangeViewMode("chronological")}
+            className={`rounded border px-2 py-1 ${
+              viewMode === "chronological"
+                ? "border-cyan-400/60 bg-cyan-500/20 text-cyan-100"
+                : "border-slate-700/80 bg-slate-900/70 text-slate-300 hover:border-slate-500"
             }`}
           >
-            Apply Waypoint Edits
+            Chronological
+          </button>
+          <button
+            type="button"
+            onClick={() => onChangeViewMode("grouped")}
+            className={`rounded border px-2 py-1 ${
+              viewMode === "grouped"
+                ? "border-cyan-400/60 bg-cyan-500/20 text-cyan-100"
+                : "border-slate-700/80 bg-slate-900/70 text-slate-300 hover:border-slate-500"
+            }`}
+          >
+            Grouped
           </button>
         </div>
-      ) : null}
-    </div>
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col px-3 pb-3">
+        <div className="flex h-full min-h-0 flex-col rounded-xl border border-slate-800/80 bg-slate-900/35 p-2">
+          <div className="min-h-0 flex-1 overflow-y-auto rounded-lg px-1 py-1">
+            {root ? (
+              <NodeRow
+                node={root}
+                depth={0}
+                expanded={expanded}
+                selectedNodeId={selectedNodeId}
+                onToggleExpand={onToggleExpand}
+                onSelectNode={onSelectNode}
+              />
+            ) : (
+              <div className="px-2 py-2 text-xs text-slate-500">
+                Plan a trajectory or weld to populate the tree.
+              </div>
+            )}
+          </div>
+          {editableControlPoint ? (
+            <div className="mt-2 rounded-lg border border-slate-700/70 bg-slate-900/45 p-2">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-[11px] font-semibold uppercase tracking-[0.12em] text-cyan-200/85">
+                  Edit Control Point {editableControlPoint.index + 1}
+                </span>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={onAddWaypoint}
+                    disabled={!canAddWaypoint}
+                    className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
+                      !canAddWaypoint ? "opacity-60" : ""
+                    }`}
+                    aria-label="Add control point"
+                    title="Add control point"
+                  >
+                    +
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onRemoveWaypoint(editableControlPoint.index)}
+                    disabled={!canRemoveWaypoint}
+                    className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
+                      !canRemoveWaypoint ? "opacity-60" : ""
+                    }`}
+                    aria-label="Remove control point"
+                    title="Remove control point"
+                  >
+                    -
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onMoveWaypointUp}
+                    disabled={!canMoveWaypointUp}
+                    className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
+                      !canMoveWaypointUp ? "opacity-60" : ""
+                    }`}
+                    aria-label="Move control point up"
+                    title="Move control point earlier"
+                  >
+                    ^
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onMoveWaypointDown}
+                    disabled={!canMoveWaypointDown}
+                    className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
+                      !canMoveWaypointDown ? "opacity-60" : ""
+                    }`}
+                    aria-label="Move control point down"
+                    title="Move control point later"
+                  >
+                    v
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-1">
+                {(["x", "y", "z"] as const).map((axis) => (
+                  <input
+                    key={`tree-control-${editableControlPoint.index}-${axis}`}
+                    className={`rounded border border-slate-600/70 bg-slate-950/70 px-1.5 py-1 text-[12px] text-slate-100 ${
+                      !canEditWaypointValues ? "opacity-60" : ""
+                    }`}
+                    type="number"
+                    step="0.001"
+                    value={Number(editableControlPoint.point[axis].toFixed(4))}
+                    disabled={!canEditWaypointValues}
+                    onChange={(event) =>
+                      onWaypointChange(
+                        editableControlPoint.index,
+                        axis,
+                        parseOrKeep(event.target.value, editableControlPoint.point[axis]),
+                      )
+                    }
+                  />
+                ))}
+              </div>
+              <div className="mt-1 grid grid-cols-3 gap-1">
+                {(
+                  [
+                    ["rollDeg", "Roll"],
+                    ["pitchDeg", "Pitch"],
+                    ["yawDeg", "Yaw"],
+                  ] as const
+                ).map(([axis, label]) => (
+                  <input
+                    key={`tree-control-rot-${editableControlPoint.index}-${axis}`}
+                    className={`rounded border border-slate-600/70 bg-slate-950/70 px-1.5 py-1 text-[12px] text-slate-100 ${
+                      !canEditWaypointValues ? "opacity-60" : ""
+                    }`}
+                    type="number"
+                    step="0.1"
+                    title={label}
+                    value={editableControlPoint.point[axis] ?? 0}
+                    disabled={!canEditWaypointValues}
+                    onChange={(event) =>
+                      onWaypointChange(
+                        editableControlPoint.index,
+                        axis,
+                        parseOrKeep(event.target.value, editableControlPoint.point[axis] ?? 0),
+                      )
+                    }
+                  />
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={onApplyWaypointEdits}
+                disabled={!canApplyWaypointEdits}
+                className={`mt-2 w-full rounded border border-slate-600/70 bg-slate-900/60 px-2 py-1.5 text-[12px] font-semibold text-slate-100 transition hover:border-slate-400 ${
+                  !canApplyWaypointEdits ? "opacity-60" : ""
+                }`}
+              >
+                Apply Waypoint Edits
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </section>
   );
 }

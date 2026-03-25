@@ -5488,6 +5488,34 @@
 - Follow-up notes / risks:
   - This makes the entry path obvious in the panel, but the underlying scene interaction still uses Shift-click for free placement; if that remains awkward on touch devices, the next step is a dedicated on-canvas placement mode indicator or toolbar.
 
+## 2026-03-24 20:18 +0000
+
+- Task summary:
+  - Polished the trajectory drawer UI so it reads like a compact industrial control card instead of a cramped stack of instructions and buttons.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - replaced the icon-only top toolbar with a stronger header/status card
+    - reorganized the trajectory drawer into distinct `Create Trajectory`, `Draft Summary`, `Execution`, `Save Program`, and `Saved Programs` sections
+    - converted authoring controls into clearer 2-column action cards with short helper copy
+    - moved destructive clear behavior to its own low-priority footer action
+- Validation:
+  - `npm run build` in `web-ui/`
+  - `ReadLints` reported no diagnostics on the edited drawer file
+- Follow-up notes / risks:
+  - The drawer now scans much better at the current width; if we want another pass later, the next high-value improvement would be a compact inline waypoint list or mini timeline preview inside `Draft Summary`.
+
+## 2026-03-24 20:27 +0000
+
+- Task summary:
+  - Fixed a runtime regression in the trajectory waypoint-record flow after the recent UI refactor.
+- Changes:
+  - Updated `web-ui/src/App.tsx` to stop shadowing the `waypoints` callback parameter inside `requestPlannerPreview(...)`; the planner response payload now aliases the returned waypoint list as `previewWaypoints`.
+- Validation:
+  - `npm run build` in `web-ui/`
+  - `ReadLints` reported no diagnostics on the edited file
+- Follow-up notes / risks:
+  - This was a runtime-only temporal-dead-zone bug that still survived a successful production build, so future UI refactors should watch for parameter/destructure name reuse even when TypeScript and Vite appear happy.
+
 ## 2026-03-24 20:07 +0000
 
 - Task summary:
@@ -5615,3 +5643,506 @@
 - Outcome / follow-up:
   - The original safe power-transition hardening now behaves correctly in the no-motion restart/power-up/power-down scenario on hardware.
   - The stack was left fully stopped after validation, so the machine is not left bus-up/disarmed at the end of the task.
+
+## 2026-03-24 23:16 +0000
+
+- Task summary:
+  - Implemented the editor-shell redesign for `web-ui` so authoring/navigation, the 3D stage, robot controls, and a shared bottom timeline are docked panes instead of floating overlays.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Replaced the absolute overlay main layout with a three-column editor shell plus a bottom timeline row.
+    - Kept existing trajectory/weld/program-tree selection state and reused it to drive stage focus, inspector content, and timeline selection.
+    - Docked the vision feed and robot controls into the right inspector column.
+  - `web-ui/src/components/SidebarRail.tsx`
+    - Converted the icon-only floating rail into a docked workspace navigation list with labels and shortcuts.
+  - `web-ui/src/components/SidebarDrawer.tsx`
+    - Converted the floating drawer wrapper into a reusable docked pane surface.
+  - `web-ui/src/components/ProgramFeatureTree.tsx`
+    - Removed absolute positioning and made the tree behave like a normal docked pane with a flexible scroll region.
+  - `web-ui/src/components/ProgramTimeline.tsx`
+    - Added a shared bottom timeline that renders control points, controller moves, and weld sections from the existing program-selection model.
+- Validation:
+  - `ReadLints` on the edited `web-ui` files reported no diagnostics.
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-up notes / risks:
+  - This pass validated typing/build integrity, but it did not include a browser interaction pass for resizing, scroll behavior, or live timeline clicking on-device.
+  - Vite still reports large bundle warnings for `ArmVisualizer` / `occt-import-js`; unrelated to this shell refactor, but worth revisiting if frontend performance becomes a priority.
+
+## 2026-03-24 23:32 +0000
+
+- Task summary:
+  - Tightened the docked editor shell to the viewport and fixed the visualizer so the robot stays visible when the stage is resized by the new pane layout.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Switched the shell root from `min-h-screen` to a true viewport-height container with `overflow-hidden`.
+    - Marked the header as `shrink-0` and let the main region consume the remaining height.
+    - Changed the bottom timeline row from a fixed `18rem` track to a shrinkable `minmax(10rem, 15rem)` track so it no longer forces page overflow on shorter viewports.
+  - `web-ui/src/ArmVisualizer.tsx`
+    - Added `ResizeObserver`-based container resize handling in addition to window resize handling.
+    - Triggered a post-mount resize/snap pass so the WebGL canvas and camera re-sync with the docked stage dimensions after layout settles.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/ArmVisualizer.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-up notes / risks:
+  - This should resolve the obvious viewport overflow and the most likely cause of the “robot missing” report, but I still did not complete a live browser interaction pass in this environment.
+
+## 2026-03-24 23:34 +0000
+
+- Task summary:
+  - Restored the workspace navigation to a slim vertical left-hand rail so the shell feels closer to the previous menu style while keeping the new docked panes.
+- Changes:
+  - `web-ui/src/components/SidebarRail.tsx`
+    - Replaced the wide card-based workspace list with a narrow icon rail, stacked menu buttons, and compact hover labels.
+  - `web-ui/src/App.tsx`
+    - Reworked the left editor column into a two-column layout: slim rail on the far left, active authoring pane and program tree docked to its right.
+    - Simplified the empty-state copy to point users back to the left rail instead of a card chooser.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/SidebarRail.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-up notes / risks:
+  - This matches the requested overall menu direction more closely, but if you want the flyout itself to behave more like the reference image, the next refinement would be a persistent submenu panel tied to the active icon rather than just compact hover labels.
+
+## 2026-03-24 23:40 +0000
+
+- Task summary:
+  - Added draggable pane resizing for the docked shell and persisted the layout so the same pane sizes return on the next app launch.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Extended `PersistedSettings` with saved left pane width, right inspector width, and bottom timeline height values.
+    - Added visible vertical/horizontal resize handles between the left pane, stage, right inspector, and timeline.
+    - Added drag logic with viewport-aware clamping and committed final pane sizes back into the existing UI settings persistence.
+    - Switched the main shell grid from fixed Tailwind track sizes to dynamic inline grid templates driven by the saved pane dimensions.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-up notes / risks:
+  - Pane layout persistence currently uses the app's existing browser-side settings store (`localStorage` via `gradient-ui:settings`), not a new backend-managed file on disk.
+
+## 2026-03-24 23:49 +0000
+
+- Task summary:
+  - Fixed the left rail flyout/tooltip visibility so menu labels remain visible beside the compact icon rail.
+- Changes:
+  - `web-ui/src/components/SidebarRail.tsx`
+    - Raised the rail and flyout stacking context.
+    - Changed the flyout labels to fade/slide in for hover and stay visible for the active item by default.
+  - `web-ui/src/App.tsx`
+    - Marked the rail container as `overflow-visible` with elevated stacking so the flyout can render above adjacent panes.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/SidebarRail.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 01:00 +0000
+
+- Task summary:
+  - Changed the left rail flyout back to strict hover-only behavior so it no longer stays visible after clicking an item.
+- Changes:
+  - `web-ui/src/components/SidebarRail.tsx`
+    - Removed the sticky active-item flyout state.
+    - Left the stacking/overflow fixes in place so the label still renders correctly, but now only while hovering.
+- Validation:
+  - `ReadLints` on `web-ui/src/components/SidebarRail.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 01:03 +0000
+
+- Task summary:
+  - Fixed the bottom timeline so shrinking it compresses within the viewport instead of forcing the pane out of frame.
+- Changes:
+  - `web-ui/src/components/ProgramTimeline.tsx`
+    - Made the timeline root fill its assigned row height.
+    - Removed the empty-state `min-h-[10rem]` floor so the timeline can compress when resized.
+    - Marked the header as non-shrinking and kept the scroll region as the flexible part of the pane.
+  - `web-ui/src/App.tsx`
+    - Made the bottom timeline wrapper fill its row height and reduced the extra top padding slightly.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/ProgramTimeline.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 01:05 +0000
+
+- Task summary:
+  - Reworked the shell so the bottom timeline stops before the right-hand inspector and the right column spans the full editor height.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Changed the outer shell columns to `workspace | vertical splitter | right inspector`.
+    - Nested the left-pane/stage split inside the workspace column.
+    - Made the right inspector column span all shell rows, including the timeline row.
+    - Limited the horizontal timeline splitter and timeline pane to the workspace column only.
+    - Made the right-side vertical splitter span the full shell height so inspector resizing still works across the whole layout.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 01:13 +0000
+
+- Task summary:
+  - Tightened the editor shell seams so the right inspector truly spans to the bottom, the timeline only occupies the workspace column, and the timeline can be resized taller.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Moved the shell root to a single row-and-column grid so the workspace, bottom splitter, timeline, side splitter, and inspector all share the same layout frame.
+    - Reduced splitter thickness and trimmed the extra padding above the timeline/right column so the gaps read thinner.
+    - Increased the maximum persisted timeline height and narrowed the draggable splitter affordances to match the slimmer seams.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 01:21 +0000
+
+- Task summary:
+  - Fixed the docked robot-control panel so its content scrolls inside the inspector card instead of overflowing past the panel bounds.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Made `CollapsibleOverlayPanel` a constrained flex column and gave its expanded body `min-h-0 flex-1 overflow-hidden`.
+    - Converted the `Robot Control` section to a flex/overflow-contained card.
+    - Replaced the viewport-based `max-h-[calc(100vh-26rem)]` scroller with a panel-bounded `h-full min-h-0 overflow-y-auto` wrapper.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 01:47 +0000
+
+- Task summary:
+  - Locked the full right-hand inspector column to its bounds so the sidebar itself no longer becomes the scrollable surface.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Added `overflow-hidden` to the right inspector grid container.
+    - Made the context inspector section explicitly `min-h-0 overflow-hidden`.
+    - Removed the `Vision Feed` empty-state `min-h-[10rem]` floor so sibling sections can shrink within the docked sidebar.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 01:53 +0000
+
+- Task summary:
+  - Reworked the right inspector again so the parent sidebar scrolls as one fixed-height column and `Robot Control` no longer has its own nested scrollbar.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Changed the inspector column from a fixed three-row grid to a `flex` stack with `overflow-y-auto`.
+    - Marked the three inspector cards as `shrink-0` so they contribute to the parent scroll height instead of being forced into fractional tracks.
+    - Removed the `Robot Control` inner scroll wrapper and returned `CollapsibleOverlayPanel` to a simple natural-height body.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 02:11 +0000
+
+- Task summary:
+  - Moved the live vision feed into the main stage area so the center workspace can switch between `3D Stage` and `Vision Feed` instead of showing camera output in the right sidebar.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Reused the existing vision state as the center viewer mode and added explicit `3D Stage` / `Vision Feed` controls inside the main workspace surface.
+    - Rendered the live camera stream and camera-error recovery UI inside the stage panel.
+    - Updated stage labels/guidance to reflect the active viewer mode.
+    - Removed the duplicated `Vision Feed` card from the right inspector column.
+    - Stopped auto-switching the vision view based on robot connection state so the user controls the active viewer.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 03:13 +0000
+
+- Task summary:
+  - Fixed the stage-view refactor so switching between `Vision Feed` and `3D Stage` no longer tears down the robot visualizer.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Changed the center stage back to always render the 3D visualizer/startup layer.
+    - Moved the camera feed to an overlay on top of the same stage surface instead of replacing the 3D viewer subtree.
+    - Updated `showStage3d()` to enable the visualizer when the user explicitly switches back to the 3D workspace.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 03:14 +0000
+
+- Task summary:
+  - Recorded an explicit repo-local guardrail that robot rendering is protected behavior and must be preserved during future stage/layout refactors.
+- Changes:
+  - `.cursor/memory/AGENT_SCRATCHPAD.md`
+    - Added hard rules to preserve the `ArmVisualizer` lifecycle and verify the robot model itself still renders after viewer-related changes.
+- Validation:
+  - User confirmed the robot render is back after the stage fix.
+
+## 2026-03-25 03:17 +0000
+
+- Task summary:
+  - Loosened the editor-shell resize clamps so the center `Stage/Vision` panel can be made smaller.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Reduced the minimum left pane width from `300px` to `220px`.
+    - Reduced the minimum right pane width from `280px` to `220px`.
+    - Reduced the minimum timeline height from `132px` to `72px`.
+    - Reduced the minimum center stage width from `480px` to `320px`.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 03:40 +0000
+
+- Task summary:
+  - Removed the redundant `Context Inspector` card from the right sidebar.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Deleted the top inspector summary card so the right column focuses on runtime controls instead of duplicating context already shown in the stage overlays.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 03:44 +0000
+
+- Task summary:
+  - Flattened the web UI by removing corner radius globally.
+- Changes:
+  - `web-ui/src/index.css`
+    - Added a global override for Tailwind `rounded-*` utility classes so UI surfaces render square corners across the app.
+    - Flattened the custom gradient scrollbar track and thumb radius as well.
+- Validation:
+  - `ReadLints` on `web-ui/src/index.css`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 03:46 +0000
+
+- Task summary:
+  - Pushed the shell further toward a flat/industrial look with harsher borders and less visual softening.
+- Changes:
+  - `web-ui/src/index.css`
+    - Strengthened global `border-slate-*` borders.
+    - Removed global Tailwind shadow utilities via a CSS override.
+    - Disabled global `backdrop-blur` utilities so panels no longer use frosted glass.
+- Validation:
+  - `ReadLints` on `web-ui/src/index.css`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 03:50 +0000
+
+- Task summary:
+  - Aligned the `Robot Control` card bottom edge with the shared timeline baseline.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Changed the right sidebar wrapper to a non-scrolling full-height column.
+    - Made the `Robot Control` card `flex-1 min-h-0` and its own scroll surface so it fills the entire sidebar height down to the shell bottom.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 03:56 +0000
+
+- Task summary:
+  - Split `Drive Power` and `Motion State` out above the main control body.
+- Changes:
+  - `web-ui/src/ControlPanel.tsx`
+    - Refactored the panel into reusable `Drive Power`, `Motion State`, and `Controls` sections.
+    - Added a separated layout mode where the status sections render above a collapsible controls block.
+  - `web-ui/src/App.tsx`
+    - Switched the right sidebar to the separated control-panel layout.
+    - Removed the old wrapper used to collapse the entire robot-control area and trimmed its dead imports.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/ControlPanel.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 03:59 +0000
+
+- Task summary:
+  - Compressed the stage context overlay into a single-line top strip aligned with the stage view switch.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Replaced the multi-line `Robot Workspace` stage summary card with a one-line strip showing the active surface label, workspace name, and compact status pills.
+    - Removed the now-unused stage subtitle state.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+
+## 2026-03-25 04:02 +0000
+
+- Task summary:
+  - Tightened the top-stage context strip spacing so the label, workspace name, and status pills sit together without the large empty gap.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Replaced the strip's stretching `flex-1` heading layout with a compact grouped label/title block and smaller pill spacing.
+    - Reduced parent strip padding and chip padding to make the header read as one clean control row.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-ups or risks:
+  - Visual only; if you want it denser still, the next pass would likely remove or shorten the workspace title rather than squeezing the pills further.
+
+## 2026-03-25 04:12 +0000
+
+- Task summary:
+  - Moved compact drive/motion runtime state into the stage header and removed the redundant `Stage` label and bulky sidebar status cards.
+- Changes:
+  - `web-ui/src/ControlPanel.tsx`
+    - Added `ControlPanelRuntimeHeader`, a compact reusable row that surfaces drive state, motion state, power-transition safety, fault count, and `Arm` / `Disarm` / `Reset` actions with hover tooltips.
+    - Added `showStatusSections` so the right-hand control panel can keep the dense controls body while hiding the large `Drive Power` and `Motion State` cards.
+    - Updated the commissioning warning copy to point at the header drive controls when the sidebar status sections are suppressed.
+  - `web-ui/src/App.tsx`
+    - Removed the `Stage` label from the top-left stage strip.
+    - Wired the new compact runtime header controls into the stage strip and only show the program chip when a real program name exists.
+    - Passed `showStatusSections={false}` to the docked `ControlPanel` so power/motion status is no longer duplicated in the right sidebar.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-ups or risks:
+  - The header now carries more operational weight, so a future pass may be needed to tune truncation or wrapping at very narrow stage widths.
+
+## 2026-03-25 04:18 +0000
+
+- Task summary:
+  - Corrected the placement of the compact drive/motion controls by moving them from the stage overlay into the actual page header.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Moved `ControlPanelRuntimeHeader` into the global shell header's center band above the header alert strip.
+    - Removed the runtime control cluster from the stage overlay so the stage header only carries workspace-specific context again.
+    - Let the page header shift to an `xl` row layout so the central runtime controls have room before collapsing.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-ups or risks:
+  - If the header still feels crowded on narrower widths, the next pass should collapse some chip labels to icon-first variants rather than moving them back into the stage.
+
+## 2026-03-25 04:23 +0000
+
+- Task summary:
+  - Reworked the page header so the runtime control cluster sits centered on the screen and stretches to the full height of the header action row.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Converted the top header band into a dedicated action lane with a minimum height and absolutely centered runtime controls on wide screens.
+    - Moved the alert strip into its own row below the action lane so the centered runtime controls can span the full action-row height cleanly.
+  - `web-ui/src/ControlPanel.tsx`
+    - Updated `ControlPanelRuntimeHeader` so its chips and `Arm` / `Disarm` / `Reset` buttons stretch vertically to fill the header action lane.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-ups or risks:
+  - On very narrow widths the centered cluster still wraps; if you want a stricter single-line header, the next pass should shorten some labels rather than reducing the button height again.
+
+## 2026-03-25 04:29 +0000
+
+- Task summary:
+  - Removed the remaining bottom gutter under the centered page-header runtime controls.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Removed the header row gap and bottom padding that were making the centered runtime control band look like it had a bottom margin.
+    - Made the centered runtime-control wrappers explicitly `h-full` so the chip/button band stretches through the full header action lane.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-ups or risks:
+  - If the controls still look visually offset after this, the next likely culprit is the separate alert strip row rather than margin on the controls themselves.
+
+## 2026-03-25 04:31 +0000
+
+- Task summary:
+  - Moved the `Program Tree` into the right sidebar above `Robot Control` and let the left authoring surface fill the full left pane.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Made the left `SidebarDrawer` / authoring placeholder span both left-side rows now that the program tree no longer occupies the lower-left slot.
+    - Moved the `ProgramFeatureTree` render block into the right sidebar stack above the `Robot Control` section, preserving the hidden-state placeholder there as well.
+  - `web-ui/src/components/ProgramFeatureTree.tsx`
+    - Added `h-full` to the root section so the tree fills its new dock cleanly.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `ReadLints` on `web-ui/src/components/ProgramFeatureTree.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-ups or risks:
+  - The tree now has a fixed dock above the controls; if you want finer tuning next, the likely adjustment is that dock's minimum height rather than the overall shell structure.
+
+## 2026-03-25 04:33 +0000
+
+- Task summary:
+  - Shortened the page header by removing the empty reserved alert-strip row and reducing the header action-lane height.
+- Changes:
+  - `web-ui/src/App.tsx`
+    - Made the header alert strip conditional so it only renders when `hasHeaderAlert` is true.
+    - Reduced the header top padding and lowered the action row minimum height so the centered runtime controls sit in a shorter shell header.
+    - Kept a small gap/padding only when an alert row is actually present.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+- Follow-ups or risks:
+  - If you want the header even tighter after this, the next lever is shortening the left brand block or the right utility buttons rather than reintroducing hidden spacer rows.
+
+## 2026-03-25 04:54 +0000
+
+- Task summary:
+  - Fixed the robot-render regression by hardening the visualizer's dev-time URDF/STL asset resolution path and restarting the Vite dev server so the new config applied.
+- Changes:
+  - `web-ui/src/ArmVisualizer.tsx`
+    - Added a dev fallback that can resolve robot assets from Vite's `@fs` public-file path when the normal `/assets/robots/...` lookup falls back to the SPA shell instead of returning JSON/URDF bytes.
+    - Kept the existing visualizer lifecycle intact; the fix was path resolution, not another stage-mount refactor.
+  - `web-ui/vite.config.ts`
+    - Added a compile-time define for the web UI `public` directory so `ArmVisualizer` can construct a safe dev-only `@fs` fallback URL for the robot bundle.
+- Validation:
+  - `ReadLints` on `web-ui/src/ArmVisualizer.tsx`
+  - `ReadLints` on `web-ui/vite.config.ts`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+  - Restarted `npm run dev -- --host 127.0.0.1 --port 4173`
+  - Verified `http://127.0.0.1:4173/assets/robots/index.json` now returns `application/json`
+  - Verified `http://127.0.0.1:4173/assets/robots/gradient-05/stl-files/base.stl` now returns `model/stl`
+- Follow-ups or risks:
+  - Because this path issue only surfaced on the dev server, the next check if the robot disappears again should be live asset URL responses before touching viewer layout.
+
+## 2026-03-25 05:00 +0000
+
+- Task summary:
+  - Added a top-of-file guardrail comment to `ArmVisualizer.tsx` warning future editors that missing arm renders are usually regressions and documenting the STL locations.
+- Changes:
+  - `web-ui/src/ArmVisualizer.tsx`
+    - Added a multi-line comment above the imports describing common ways to break the arm display, the source and synced STL directories, and the expectation that a missing arm should be treated as a regression first.
+- Validation:
+  - `ReadLints` on `web-ui/src/ArmVisualizer.tsx`
+
+## 2026-03-25 05:07 +0000
+
+- Task summary:
+  - Compressed the shared timeline playhead block to a maximum of two lines so it occupies less vertical space.
+- Changes:
+  - `web-ui/src/components/ProgramTimeline.tsx`
+    - Reduced the playhead card padding and merged the detail text into a single truncated second line beneath the `Playhead` label.
+    - Added a max width so the compact status card stays visually contained.
+- Validation:
+  - `ReadLints` on `web-ui/src/components/ProgramTimeline.tsx`
+
+## 2026-03-25 05:08 +0000
+
+- Task summary:
+  - Removed the redundant `Playhead` label from the compact shared timeline status card.
+- Changes:
+  - `web-ui/src/components/ProgramTimeline.tsx`
+    - Deleted the small `Playhead` heading so the status card now shows only the compact label/detail line.
+- Validation:
+  - `ReadLints` on `web-ui/src/components/ProgramTimeline.tsx`
+
+## 2026-03-25 05:16 +0000
+
+- Task summary:
+  - Investigated a live `trajectory/plan-points` failure and hardened preview-planning diagnostics so joint-limit rejections are easier to interpret from the API/log output.
+- Changes:
+  - `src/gradient_os/arm_controller/trajectory_execution.py`
+    - Disabled verbose per-point terminal spam during sequential IK fallback retries by passing `verbose=False` to `solve_ik_path_sequential(...)`.
+  - `src/gradient_os/arm_controller/command_api.py`
+    - Appended `last_planner_diagnostics` summaries (reason, fallback level, residual margins, attempt when available) to preview-planning runtime errors so 502 responses expose the planner gate details.
+- Validation:
+  - `ReadLints` on `src/gradient_os/arm_controller/command_api.py`
+  - `ReadLints` on `src/gradient_os/arm_controller/trajectory_execution.py`
+  - `python3 -m py_compile "src/gradient_os/arm_controller/command_api.py" "src/gradient_os/arm_controller/trajectory_execution.py"`
+- Follow-ups or risks:
+  - The log evidence indicates the failing first waypoint is start-state dependent; the next failed preview should now report the planner residuals directly so we can tell whether the limit hit is positional, orientational, or branch-selection related.
+
+## 2026-03-25 05:24 +0000
+
+- Task summary:
+  - Reviewed the full live terminal log and identified that many `trajectory/run` and `info/joints` HTTP errors are availability artifacts around controller-side planning/execution rather than hard execution failures.
+- Changes:
+  - No code changes in this pass.
+  - Confirmed from the live log that `POST /trajectory/run` can return `503` even after the controller has already received `RUN_TRAJECTORY,...` and entered the pre-compute planning phase.
+  - Confirmed repeated `GET /info/joints` `503`s cluster during controller planning/execution windows and recover to `200 OK` afterward.
+- Validation:
+  - Read `/home/pi/.cursor/projects/home-pi-GradientOS/terminals/1.txt`
+  - Searched the log for `ERROR|WARNING|503 Service Unavailable|502 Bad Gateway|RUN_TRAJECTORY`
+  - Read `src/gradient_os/api/main.py` around `/trajectory/run`
+- Follow-ups or risks:
+  - The current `/trajectory/run` API can mislead the UI into thinking the run failed when the controller has already started planning; retrying immediately risks duplicate launches.
