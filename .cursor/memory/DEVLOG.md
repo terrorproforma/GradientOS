@@ -1,3 +1,252 @@
+## 2026-03-26 05:35 +0000
+
+- Task summary:
+  - Fixed a trajectory-editor regression where changing a control point move type invalidated the preview and caused the program tree/editor context to disappear.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added a `programTreePlan` fallback that synthesizes a draft `PreviewPlan` from current `plannerPoints` when the real `previewPlan` has been cleared
+    - changed `buildProgramTree(...)` to consume that fallback plan so move-type edits can invalidate the runnable preview without ejecting the user from the program tree/editor
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - The runnable preview is still invalidated for safety when authored waypoints change; this fix preserves editing context only and does not keep stale execution geometry runnable.
+
+## 2026-03-26 05:31 +0000
+
+- Task summary:
+  - Added labeled trajectory annotations in the 3D preview so major control points and move segments render as `CP#` and `M#`.
+- Changes:
+  - Updated `web-ui/src/ArmVisualizer.tsx`:
+    - added preview label constants plus ordered waypoint-to-path index matching helpers
+    - rendered `CP1`, `CP2`, etc. next to waypoint markers
+    - rendered `M1`, `M2`, etc. near each waypoint-to-waypoint move segment midpoint
+    - made selected points/segments reuse the existing orange highlight color for their labels
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/ArmVisualizer.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - Labels are always shown for authored preview waypoints/moves now; if dense trajectories become visually noisy later, the next refinement should be a toggle rather than removing the labels.
+
+## 2026-03-26 05:18 +0000
+
+- Task summary:
+  - Wrapped grouped trajectory tree content in a dedicated motion container so the program tree shows major waypoints and move groups under a coherent `Trajectory Sequence` section.
+- Changes:
+  - Updated `web-ui/src/previewUtils.ts`:
+    - changed grouped trajectory nodes to live under `op_motion`
+    - kept the interleaved `Control Point N / Move N / Control Point N+1` structure inside that container
+    - fixed the `move_absolute` endpoint subtitle typing by supplying `moveType: "linear"` to `poseSubtitle(...)`
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/previewUtils.ts` (no diagnostics)
+- Follow-up notes / risks:
+  - This is a tree-structure/UI organization change only; execution behavior was not modified.
+
+## 2026-03-26 05:10 +0000
+
+- Task summary:
+  - Added top-of-file guardrail comments explaining why `useCache` must stay disabled for normal saved trajectory runs.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added a top-of-file note warning that standard saved trajectory caches are live-start-state-dependent and unsafe to reuse
+  - Updated `src/gradient_os/api/main.py`:
+    - added a top-of-file note warning against re-enabling saved-trajectory cache reuse except for explicitly cache-safe flows
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` and `src/gradient_os/api/main.py` (no diagnostics)
+- Follow-up notes / risks:
+  - This is a documentation/hardening pass only; runtime behavior did not change beyond the already-fixed cache policy.
+
+## 2026-03-26 05:04 +0000
+
+- Task summary:
+  - Fixed a saved-trajectory execution regression where the UI could reuse a stale planned-steps cache for normal authored trajectories, causing the robot to jump from the current pose into an older start-state-dependent joint path.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - forced non-weld trajectory runs to submit `/trajectory/run` with `use_cache: false`
+    - forced loaded saved trajectory previews to hydrate with `useCache: false`
+  - Updated `src/gradient_os/api/main.py`:
+    - changed saved trajectory load annotation to stop advertising cache reuse for normal saved trajectory programs
+    - kept saved trajectory materialization, but removed the previous cache-reuse signal that could make old preview caches runnable from a different robot start pose
+  - Updated `tests/test_api_endpoints.py`:
+    - added regression coverage proving a loaded saved trajectory with a matching preview cache still returns `planned_trajectory.useCache == false`
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_api_endpoints.py -q` (passed, 57 tests)
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on edited frontend/backend/test files (no diagnostics)
+- Follow-up notes / risks:
+  - The terminal evidence for `test-1` showed a cached first move planned from older joint state being replayed after a fresh home, which is unsafe for normal saved trajectories.
+  - This pass intentionally keeps weld cache behavior separate; normal trajectory runs now prefer fresh planning from the current pose.
+
+## 2026-03-26 04:13 +0000
+
+- Task summary:
+  - Reworked grouped program-tree mode so trajectory waypoints and move groups appear as siblings, with each move group expanding to the exact path samples for that segment only.
+- Changes:
+  - Updated `web-ui/src/previewUtils.ts`:
+    - added ordered waypoint-to-path index matching for grouped tree segmentation
+    - changed grouped mode from separate `Exact Path Samples` / `Control Points` / `Controller Commands` buckets to an interleaved sequence of control points and `Move N` groups
+    - made each `Move N` group selectable and scoped to the path range plus endpoint waypoints for that segment
+    - populated each move group with only the exact path samples belonging to that move segment, falling back to the related command node only when no exact path samples exist
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/previewUtils.ts` (no diagnostics)
+- Follow-up notes / risks:
+  - This changes grouped tree semantics only; chronological mode still shows the full exact execution list.
+  - Validation was build/lint only; no live browser automation pass was run.
+
+## 2026-03-26 04:04 +0000
+
+- Task summary:
+  - Reworked the trajectory timeline so point and move blocks share one compact chronological strip, and made timeline selection drive 3D highlight/focus for both waypoint points and between-waypoint move segments.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added synthetic timeline segment selection state for move blocks that do not map 1:1 to saved tree nodes
+    - derived trajectory move blocks from `visualWaypoints` and `visualPathPoints` as segments between adjacent waypoints
+    - mapped selected timeline/tree move blocks to `highlightPathRange` and waypoint endpoint highlights in the visualizer
+    - changed the trajectory timeline from separate control-point and controller-move lanes to one chronological `Trajectory Sequence` lane
+  - Updated `web-ui/src/components/ProgramTimeline.tsx`:
+    - made mixed-tone items render correctly within a single lane
+    - reduced block width/padding so the shared strip fits more items at once
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/ProgramTimeline.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - Timeline move blocks now reflect visible path segments between waypoints rather than raw preview command rows, which is a better operator-facing abstraction but intentionally not a literal dump of `trajectory.moves`.
+  - This pass was validated by build/lint only; no live browser automation click-through was run.
+
+## 2026-03-26 01:14 +0000
+
+- Task summary:
+  - Added a runtime-only trajectory loop option in the trajectory execution drawer and kept the loop wrapper move outside saved trajectory/program data.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added a `Loop trajectory` execution toggle in the trajectory drawer with runtime-only helper copy
+    - threaded the toggle through `handleRunPreview()` as `/trajectory/run` `loop_override`
+    - kept save/load behavior unchanged so loop state is not persisted in saved trajectory programs
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - changed the loop-start move-to-first-waypoint wrapper to seed from `_get_best_available_joint_state()` instead of cached logical joints
+  - Updated `tests/test_api_endpoints.py`:
+    - added regression coverage for `/trajectory/run` forwarding `loop_override=True` to `RUN_TRAJECTORY,...,true`
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_api_endpoints.py -q` (passed, 56 tests)
+  - `ReadLints` on edited frontend/backend/test files (no diagnostics)
+- Follow-up notes / risks:
+  - The controller already had runtime loop wrapper logic; this pass surfaced it in the UI and corrected the start-state source for the initial move-to-start bridge.
+  - This pass did not add a browser automation flow, so the new toggle layout was validated by build/lint rather than a live click-through.
+
+## 2026-03-25 23:16 +0000
+
+- Task summary:
+  - Fixed a stale-preview execution bug where edited trajectory waypoints could coexist with an older runnable preview, causing the robot to execute old controller moves instead of the currently shown control points.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - made the trajectory panel treat a preview as runnable only when it matches the current authored waypoints and is not stale
+    - added an effect that clears `previewPlan` when `plannerPoints` no longer match the current preview
+    - added a hard execution guard in `handleRunPreview()` that refuses to run out-of-sync previews even if one still exists in state
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - This was a frontend state-consistency bug: old preview/controller moves could survive behind new control points after edits or failed replans. The UI now fails closed instead of running stale motion.
+
+## 2026-03-25 22:54 +0000
+
+- Task summary:
+  - Relaxed trajectory program save/load behavior so authored waypoints can be saved independently of a currently valid computed path.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - removed the requirement that trajectory save must have a fresh matching `previewPlan`
+    - changed save to always persist authored waypoint data and move types when at least one waypoint exists
+    - changed save to include `planned_trajectory` only when the current preview matches the authored waypoints and is not stale
+    - stopped trajectory load from auto-calling regenerate when a saved program has no computed path yet
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - Saved trajectory programs can now intentionally exist as authoring-only records with `planned_trajectory: null`; they need an explicit regenerate before they become runnable previews.
+
+## 2026-03-25 22:49 +0000
+
+- Task summary:
+  - Fixed a preview-planning start-state mismatch that made first joint/home trajectory visualizations appear offset from the live robot.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added `_get_best_available_joint_state()`
+    - changed preview trajectory planning to prefer live servo feedback for `current_q` instead of using only `utils.current_logical_joint_angles_rad`
+    - changed the earlier trajectory planning path to use the same live-preferred joint snapshot for consistency
+  - Updated `tests/test_command_api_direct_setpoint.py`:
+    - added regression coverage proving `plan_preview_trajectory_points()` seeds joint previews from live servo feedback when available
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/command_api.py` (passed)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py` (passed, 76 tests)
+  - `ReadLints` on edited backend/test files (no diagnostics)
+- Follow-up notes / risks:
+  - Preview planning still falls back to cached controller state if live servo feedback is unavailable, but it no longer mixes live target capture with cached start joints when live feedback exists.
+
+## 2026-03-25 22:44 +0000
+
+- Task summary:
+  - Fixed the first joint/home waypoint insertion path so trajectory authoring no longer seeds previews from world zero.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added `fetchLiveTrajectoryPoseWaypoint()` to read the live TCP pose from `/info/pose`
+    - changed the first `Add Waypoint` insertion to seed from the live pose with `moveType: "joint"`
+    - changed the first `Move to Home` insertion to seed from the live pose with `moveType: "home"` before preview planning
+    - removed the previous `(0,0,0)` first-point seeding that caused a bogus preview segment from the robot base/origin to the real start pose
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - This fix depends on `/info/pose` being available when the first joint/home waypoint is inserted; if that request fails, insertion now aborts with an error instead of falling back to a misleading origin pose.
+
+## 2026-03-25 22:17 +0000
+
+- Task summary:
+  - Updated the trajectory authoring drawer so the existing buttons map directly to motion intent: linear capture, joint waypoint insertion, and explicit move-to-home insertion.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added a new `Move to Home` action in the trajectory authoring drawer
+    - rewrote the drawer helper copy so `Capture Pose` / `Shift-click` describe linear moves and `Add Waypoint` describes joint moves
+    - changed numeric waypoint insertion to default to `moveType: "joint"`
+    - changed the new home insertion path to default to `moveType: "home"`
+    - forced `Shift-click` placement and `Capture Pose` inserts to remain `moveType: "linear"` instead of inheriting a prior waypoint's non-linear move type
+    - widened `Undo Last` to a full-width row so the added home button does not leave an awkward trailing grid cell
+  - Updated `web-ui/src/components/ProgramFeatureTree.tsx`:
+    - relabeled the add-point control tooltip/ARIA text to clarify that it adds a joint control point
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/ProgramFeatureTree.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - This pass did not add browser automation coverage, so the visual fit and click flow were validated by build/lint only.
+  - The tree editor already has a move-type dropdown, so the new top-level home button is mainly a faster authoring shortcut rather than the only way to create a home move.
+
+## 2026-03-25 22:07 +0000
+
+- Task summary:
+  - Corrected the in-flight trajectory move-mode implementation to reuse existing `command_api` move semantics instead of introducing a parallel serialized command name.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - replaced the temporary `move_joint_absolute` serialized/program token with existing `move` semantics for explicit joint-intent absolute waypoints
+    - kept `home` as the dedicated move-to-home command
+    - preserved explicit authored `move_type` handling and regenerate-overwrite behavior already added in the API/UI flow
+  - Updated `web-ui/src/previewUtils.ts`:
+    - mapped saved/programmed `move` commands back to waypoint `moveType: "joint"`
+    - fixed `home` waypoint fallback decoding to use the serialized endpoint vector when available
+  - Updated `tests/test_api_endpoints.py`:
+    - added regression coverage for waypoint `move_type` round-tripping through `/trajectory/plan-points`
+    - added regression coverage for trajectory program save/load preserving authored waypoint move intent
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/command_api.py src/gradient_os/api/main.py` (passed)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_api_endpoints.py` (passed, 54 tests)
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on edited backend/frontend/test files (no diagnostics)
+- Follow-up notes / risks:
+  - The explicit user-facing move mode is now aligned to existing serialized command semantics, but there is not yet a dedicated controller-program test exercising `command_api.plan_preview_trajectory_points()` end-to-end for `move` vs `home` serialization.
+  - Existing saved programs that only contain `move_absolute` continue to load as `linear`; newer saved programs can now preserve `joint` / `home` intent through authoring metadata and planned trajectory serialization.
+
 ## 2026-03-24 04:14 +0000
 
 - Task summary:
@@ -6146,3 +6395,366 @@
   - Read `src/gradient_os/api/main.py` around `/trajectory/run`
 - Follow-ups or risks:
   - The current `/trajectory/run` API can mislead the UI into thinking the run failed when the controller has already started planning; retrying immediately risks duplicate launches.
+
+## 2026-03-25 16:08 +0000
+
+- Task summary:
+  - Hardened path continuity around equivalent joint branches and trimmed numeric IK wrapper overhead while investigating why locked-orientation linear planning feels slower than expected.
+- Changes:
+  - `src/gradient_os/arm_controller/trajectory_execution.py`
+    - Added start-seed-aware unwrapping so the first IK sample is aligned to the current joint state before continuity and gate validation.
+    - Extended gate diagnostics with first-step jump metadata and the worst violating joint / pose index for limit rejections.
+    - Validated path continuity against the live `start_q`, not only between successive solved samples.
+  - `src/gradient_os/arm_controller/command_api.py`
+    - Included the new violating-joint and first-step metadata in planner failure summaries returned through preview-planning errors.
+  - `src/numeric_solver/numeric_wrapper.py`
+    - Reduced Python overhead in `solve_ik_path(...)` by vectorizing quaternion conversion, preallocating the result array, and calling the underlying solver directly inside the loop.
+- Validation:
+  - `ReadLints` on `src/gradient_os/arm_controller/trajectory_execution.py`
+  - `ReadLints` on `src/gradient_os/arm_controller/command_api.py`
+  - `ReadLints` on `src/numeric_solver/numeric_wrapper.py`
+  - `python3 -m py_compile "src/gradient_os/arm_controller/trajectory_execution.py" "src/gradient_os/arm_controller/command_api.py" "src/numeric_solver/numeric_wrapper.py"`
+- Follow-ups or risks:
+  - The numeric wrapper still does iterative per-pose solves from Python rather than a native C++ path solve, so the biggest remaining performance win would require either a true batch pyquik API or a lower-rate IK sampling strategy with safe resampling.
+
+## 2026-03-25 16:08 +0000
+
+- Task summary:
+  - Exposed native C++ multi-pose QuIK methods through `pyquik` and switched the numeric wrapper to use a native rolling-seed path solve instead of a Python loop when available.
+- Changes:
+  - `src/numeric_solver/pyquik/bindings.cpp`
+    - Added `IKSolver.solve_batch(...)` for the existing independent multi-pose QuIK overload.
+    - Added `IKSolver.solve_path(...)`, a native rolling-seed multi-pose path solve that preserves path continuity while avoiding Python per-pose overhead.
+    - Released the GIL around native multi-pose solve execution.
+  - `src/numeric_solver/numeric_wrapper.py`
+    - Updated `solve_ik_path(...)` to call native `solve_path(...)` when the rebuilt extension provides it, falling back to the Python loop otherwise.
+    - Added `solve_ik_batch(...)` helper for future independent-batch use.
+  - `src/numeric_solver/pyquik/pyquik.cpython-311-aarch64-linux-gnu.so`
+    - Rebuilt successfully via CMake so the new native methods are present on disk.
+- Validation:
+  - `ReadLints` on `src/numeric_solver/pyquik/bindings.cpp`
+  - `ReadLints` on `src/numeric_solver/numeric_wrapper.py`
+  - `python3 -m py_compile "src/numeric_solver/numeric_wrapper.py"`
+  - `cmake -S "/home/pi/GradientOS/src/numeric_solver/pyquik" -B "/home/pi/GradientOS/src/numeric_solver/pyquik/build" && cmake --build "/home/pi/GradientOS/src/numeric_solver/pyquik/build" -j2`
+- Follow-ups or risks:
+  - The currently running API/controller process will keep the old extension loaded until it restarts.
+  - Shell-side import smoke checks still fail under system `python3` because that interpreter lacks `numpy`, so live verification should be done through the actual app runtime after restart.
+
+## 2026-03-25 16:34 +0000
+
+- Task summary:
+  - Added explicit planner stage timing logs so live terminal output shows where linear locked-orientation planning time is spent.
+- Changes:
+  - `src/gradient_os/arm_controller/trajectory_execution.py`
+    - Logged `_plan_linear_move(...)` stage timings for FK seed lookup, Cartesian profile generation, orientation preparation, high-fidelity planning total, and total plan time.
+    - Logged `_plan_high_fidelity_trajectory(...)` stage timings for densification, per-attempt unwrap/validation cost, smoothing validation cost, selected attempt, and total high-fidelity planning time.
+  - `src/numeric_solver/numeric_wrapper.py`
+    - Logged once per process whether the numeric solver path/batch APIs are using native `pyquik.solve_path` / `solve_batch` or the Python-loop fallback.
+- Validation:
+  - `ReadLints` on `src/gradient_os/arm_controller/trajectory_execution.py`
+  - `ReadLints` on `src/numeric_solver/numeric_wrapper.py`
+  - `python3 -m py_compile "src/gradient_os/arm_controller/trajectory_execution.py" "src/numeric_solver/numeric_wrapper.py"`
+- Follow-ups or risks:
+  - Because the service had already been restarted before these new log statements were added, the running process still needs one more restart before the terminal shows the new timing lines.
+
+## 2026-03-25 17:51 +0000
+
+- Task summary:
+  - Repaired Git repository corruption caused by zero-byte loose objects so normal Git commands work again.
+- Changes:
+  - Backed up `.git` to `/home/pi/git-recovery-backups/git-corrupt-2026-03-25-175122`.
+  - Quarantined 15 zero-byte files from `.git/objects/*/*` into the backup directory instead of deleting them permanently.
+  - Refetched repository objects from `origin` with `git fetch origin --prune --tags`.
+- Validation:
+  - `git ls-remote --heads origin` confirmed the current branch tip `93164c06d655fb62bf44c6a9f00ab9bd52108b8a` exists on the remote.
+  - `git fsck --full` (passed with no output after recovery).
+  - `git status --short --branch` (passed after recovery).
+  - `df -h .` showed root filesystem usage at `46%` (`15G` free), so the corruption was not caused by disk-full conditions.
+  - `journalctl -k --no-pager -n 300` filtering showed recent `systemd-journald` messages that journal files were `corrupted or uncleanly shut down`.
+- Follow-up notes / risks:
+  - Because multiple loose objects became zero-byte at once, storage or abrupt-power issues are possible; if this repeats, inspect filesystem and SD/media health instead of treating it as a one-off Git problem.
+
+## 2026-03-25 19:08 +0000
+
+- Task summary:
+  - Implemented jump-recovery hardening for trajectory previews, surfaced structured planner diagnostics through the API/UI, and added focused regression tests for the new fallback behavior.
+- Changes:
+  - `src/gradient_os/arm_controller/trajectory_execution.py`
+    - Added `_solve_ik_path(...)` and `_try_jump_recovery(...)` so `IK_JUMP_REJECTED` attempts can retry the failing suffix sequentially from the last accepted joint sample.
+    - Added bounded linear subsegment fallback in `_plan_linear_move(...)` for jump-rejected linear moves, with a one-level `_allow_jump_split` guard and `split_recovery` diagnostics.
+    - Extended planner diagnostics to preserve successful recovery metadata in `last_planner_diagnostics`.
+  - `src/gradient_os/api/main.py`
+    - Added planner-failure helpers so `/trajectory/plan-points` and `/trajectory/plan-weld` return structured `detail` payloads with `message` plus `planner_diagnostics` when planning fails.
+  - `web-ui/src/previewUtils.ts`
+    - Added typed `PlannerDiagnostics` parsing and attached `plannerDiagnostics` to `PreviewPlan`.
+  - `web-ui/src/App.tsx`
+    - Added shared API error parsing for structured FastAPI `detail` payloads.
+    - Updated trajectory preview/run handlers to parse JSON failure detail instead of relying on raw response text.
+    - Added trajectory-local warning/diagnostic blocks and surfaced `motionStatus.detail` in the execution status card.
+  - `tests/test_planning.py`
+    - Added unit coverage for local jump-reseed recovery and bounded linear subsegment splitting.
+  - `tests/test_api_endpoints.py`
+    - Added API coverage for structured planner-failure payloads on `/trajectory/plan-points`.
+- Validation:
+  - `ReadLints` on `src/gradient_os/arm_controller/trajectory_execution.py`
+  - `ReadLints` on `src/gradient_os/api/main.py`
+  - `ReadLints` on `web-ui/src/App.tsx`
+  - `ReadLints` on `web-ui/src/previewUtils.ts`
+  - `ReadLints` on `tests/test_planning.py`
+  - `ReadLints` on `tests/test_api_endpoints.py`
+  - `python3 -m py_compile "src/gradient_os/arm_controller/trajectory_execution.py" "src/gradient_os/api/main.py"`
+  - `python3 -m py_compile "tests/test_planning.py" "tests/test_api_endpoints.py"`
+  - `npm run build` in `web-ui`
+- Follow-up notes / risks:
+  - `python3 -m pytest ...` could not run in this shell because system `python3` does not have `pytest`.
+  - `python3 -m unittest tests.test_planning` also could not execute here because system `python3` lacks `numpy`.
+  - Live verification of the new recovery paths still requires the app/controller process to restart into the real runtime environment so the updated Python modules are loaded.
+
+## 2026-03-25 20:03 +0000
+
+- Task summary:
+  - Revalidated the jump-recovery work in the repo virtualenv and updated the handoff plan checklist to reflect completed implementation work.
+- Changes:
+  - `tests/test_planning.py`
+    - Fixed the linear split fallback test to derive the mocked segment endpoint from the requested split target and to match the current 3-way split threshold for a `0.20 m` move.
+  - `/home/pi/.cursor/plans/jump_recovery_hardening_f737c131.plan.md`
+    - Marked all checklist items completed and added a `Completed Work` section summarizing implementation and remaining runtime verification.
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && python -m pytest "/home/pi/GradientOS/tests/test_planning.py" "/home/pi/GradientOS/tests/test_api_endpoints.py"`
+  - Result: `57 passed`
+  - `ReadLints` on `tests/test_planning.py`
+  - `ReadLints` on `/home/pi/.cursor/plans/jump_recovery_hardening_f737c131.plan.md`
+- Follow-up notes / risks:
+  - The focused Python tests now pass in the repo venv, but live planner verification still requires the running API/controller process to restart and load the updated modules.
+
+## 2026-03-25 20:28 +0000
+
+- Task summary:
+  - Reviewed the latest live regenerate failure logs after the RT core reset to confirm whether the new jump-recovery paths actually executed.
+- Changes:
+  - No code changes in this pass.
+  - Confirmed from `logs/startups/20260325-201425/api.log` that the updated planner executed:
+    - all four base attempts on the 813-point segment
+    - two local reseed retries per attempt (`recovery_attempts=2`)
+    - a follow-up shorter 351-point planning pass, proving the bounded subsegment split fallback also ran
+  - Confirmed the 351-point split segment still failed all four attempts plus local reseed retries, after which preview planning honestly returned the waypoint #4 failure.
+- Validation:
+  - Read `logs/startups/20260325-201425/api.log` around the failing regenerate request
+  - Read `/home/pi/.cursor/projects/home-pi-GradientOS/terminals/1.txt` around the same window
+- Follow-up notes / risks:
+  - The current blocker is no longer "recovery code not loaded"; both recovery layers ran and still failed.
+  - The exact `max_joint_step_rad=6.28305` with zero Cartesian/orientation residual strongly suggests a persistent `2pi` branch-flip continuity issue, likely near a joint-limit boundary, rather than a basic unreachable Cartesian target.
+
+## 2026-03-25 21:00 +0000
+
+- Task summary:
+  - Applied the user correction that the `follo-edge` continuity issue should be treated as the active `#3 -> #4` segment, not as a special `#1 -> #4` repeated-pose check, then revalidated live.
+- Changes:
+  - `src/gradient_os/arm_controller/command_api.py`
+    - removed the preview-time repeated-waypoint branch-anchor lookup so each waypoint plan is seeded only from the immediately preceding solved segment state,
+    - kept the richer planner failure summaries intact.
+  - `src/gradient_os/arm_controller/trajectory_execution.py`
+    - retained the richer joint-level jump diagnostics and optional branch-anchor plumbing for lower-level experimentation, but the normal trajectory preview path no longer injects a prior-matching authored waypoint as the continuity reference.
+  - `src/numeric_solver/numeric_wrapper.py`
+    - aligned native and fallback numeric IK path outputs to the nearest `2pi`-equivalent branch relative to the rolling seed before Python-side planner unwrap.
+  - `src/numeric_solver/pyquik/bindings.cpp`
+    - added equivalent-angle alignment in native single, batch, and rolling-path solves relative to the provided seed vectors.
+  - `src/gradient_os/api/main.py`
+    - kept planner-failure detail payloads and updated pose-waypoint compatibility matching to use wrapped-angle comparison.
+  - `web-ui/src/previewUtils.ts`
+    - added coercion for new joint-level jump and raw-jump diagnostic fields.
+  - `web-ui/src/App.tsx`
+    - surfaced gate-jump, raw solver jump, recovery-attempt, and split-segment details in the trajectory diagnostics panel.
+  - `tests/test_planning.py`
+    - added coverage for joint-level jump diagnostics and internal branch-anchor recovery behavior.
+  - `tests/test_api_endpoints.py`
+    - extended planner-failure payload assertions for the new joint-level diagnostic fields.
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/trajectory_execution.py src/gradient_os/arm_controller/command_api.py src/gradient_os/api/main.py src/numeric_solver/numeric_wrapper.py tests/test_planning.py tests/test_api_endpoints.py`
+  - `cmake --build build -j2` in `src/numeric_solver/pyquik`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_planning.py tests/test_api_endpoints.py`
+    - passed (`59 passed`)
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on edited Python/TS files
+    - no diagnostics
+  - Live stack restarts with `./start-stack.sh stop` then `./start-stack.sh`
+  - Live `follo-edge` API repro via `POST http://127.0.0.1:4000/trajectory/plan-points`
+    - still failed
+    - failure payload now showed `branch_anchor_available=false`, confirming the planner was no longer using the old repeated-pose cross-check
+    - current live failure is `LIMIT_VIOLATION` on waypoint `#4` with `violating_joint_index=4`, `violating_pose_index=538`, `max_joint_step_rad≈0.0283`, and effectively zero Cartesian/orientation residual
+  - Direct standalone repo-venv numeric replay with `MINI_ARM_SOLVER=numeric`
+    - still aborted in native Eigen/QuIK before Python could surface planner diagnostics
+- Follow-up notes / risks:
+  - The current blocker is now clearly a segment-local `#3 -> #4` near-limit issue rather than the previously emphasized `#1 -> #4` repeated-pose comparison.
+  - Because live API validation still reports a joint-4 margin failure with excellent Cartesian/orientation residuals, the next narrowing pass should inspect why the numeric path solve drifts J4 onto a near-limit branch late in the return-home segment.
+  - The standalone numeric replay crash should be investigated separately, since it makes low-level solver experiments less reliable than live stack validation for now.
+
+## 2026-03-25 21:15 UTC - Fix `follo-edge` waypoint-4 preview failure
+- Context:
+  - After the repeated-pose branch-anchor removal, the live `follo-edge` preview still failed on waypoint `#4` with a J4 `LIMIT_VIOLATION`.
+  - The failure margin was `0.0299666 rad`, only `3.3e-05 rad` inside the generic `0.03 rad` planner guard, with effectively zero Cartesian/orientation error and small per-step joint motion.
+- Changes:
+  - `src/gradient_os/arm_controller/trajectory_execution.py`
+    - added `_joint_limit_margin_for_index(...)` so joints with an approximately full-turn logical range use a narrower preview margin (`0.005 rad`) instead of the generic `0.03 rad`,
+    - threaded the joint-specific margin through `_select_equivalent_joint_angle(...)` candidate ranking,
+    - updated `_validate_joint_trajectory_gates(...)` to use the same joint-specific margin when checking limit violations,
+    - retained the new equivalent-branch recentering helper so future wrap-boundary cases can still be corrected without ad hoc API logic.
+  - `tests/test_planning.py`
+    - added regression coverage for equivalent-branch recentering and for the narrower margin behavior on wrap-capable joints.
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/trajectory_execution.py tests/test_planning.py`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_planning.py tests/test_api_endpoints.py`
+    - passed (`62 passed`)
+  - `ReadLints` on edited files
+    - no diagnostics
+  - Live stack restart with `./start-stack.sh stop` then `./start-stack.sh`
+  - Live repro via `POST http://127.0.0.1:4000/trajectory/plan-points` using `recorded_programs/follo-edge.json`
+    - now returns `200 OK`
+    - response includes `source.mode="pose_waypoints"` and a populated `cartesian_path` (`2354` samples)
+- Follow-up notes / risks:
+  - This fix specifically treats wide, wrap-capable logical joints differently from narrow-range joints; it should reduce false negatives near `±2pi` software boundaries without weakening normal joint-limit checks elsewhere.
+  - The standalone repo-venv numeric replay crash remains a separate low-level issue and was not required to resolve this live preview failure.
+
+## 2026-03-25 21:45 UTC - Fix false `/trajectory/run` failure after preview program already starts
+- Context:
+  - User reported that the preview regenerated and physically ran, but the UI still showed `Failed to run trajectory: No response for command 'RUN_TRAJECTORY,__planner_preview__,false'`.
+  - Live logs confirmed the mismatch: `logs/startups/20260325-213253/api.log` showed `POST /trajectory/run` returning `503 Service Unavailable`, while `logs/startups/20260325-213253/controller.log` showed the controller receiving `RUN_TRAJECTORY,__planner_preview__,false`, performing pre-compute planning, executing all RTCore segments, and finishing the executor thread.
+- Changes:
+  - `src/gradient_os/api/main.py`
+    - added timeout-recovery logic for `/trajectory/run`: when `RUN_TRAJECTORY` times out waiting for a UDP reply, the API now polls `GET_MOTION_STATUS` and converts the request into success only if the same program name is already active/planning/executing,
+    - included explicit response flags `ack_inferred`, `run_request_timed_out`, and `run_request_detail` so callers can distinguish inferred acceptance from a normal immediate ACK.
+  - `tests/test_api_endpoints.py`
+    - added a regression test proving preview-program `RUN_TRAJECTORY` timeouts are recovered from motion status instead of surfacing a false UI failure.
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/api/main.py tests/test_api_endpoints.py`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_api_endpoints.py`
+    - passed (`53 passed`)
+  - `ReadLints` on edited files
+    - no diagnostics
+  - Restarted stack with `./start-stack.sh stop` then `./start-stack.sh`
+  - Non-motion health checks after restart:
+    - `GET /health` -> `200`
+    - `GET /info/runtime-config` -> `200`
+- Follow-up notes / risks:
+  - I did not trigger another live trajectory run after the API fix, to avoid moving the robot without explicit user approval; live validation of the exact UI path still needs one user-initiated run.
+  - The launcher required SIGKILL during restart in this pass, but the stack came back healthy afterward.
+
+## 2026-03-25 23:57 +0000
+
+- Task summary:
+  - Fixed the trajectory regenerate/run failure chain by correcting API-side preview seed sourcing and the regenerate overwrite payload sent to `/robot-program/save`.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - hardened `_get_best_available_joint_state()` so API-process preview planning falls back to controller-synced cached joints when there is no initialized backend or detected local servos, instead of trusting a bogus local all-zero legacy read.
+  - Updated `src/gradient_os/api/main.py`:
+    - changed `_get_live_joint_angles_from_controller()` to convert `GET_POSITION` joint angles from degrees to radians before seeding local planner state,
+    - kept `/trajectory/plan-points` and `/trajectory/plan-weld` seeding `current_logical_joint_angles_rad`, now with correctly converted radians.
+  - Updated `web-ui/src/App.tsx`:
+    - added `kind: "trajectory"` to the regenerate persistence request to `/robot-program/save`,
+    - switched persist-error handling to `readApiErrorResponse(...)` so future save failures surface their real backend message instead of opaque text.
+  - Updated `tests/test_command_api_direct_setpoint.py`:
+    - adjusted live-feedback coverage to mark local servos as present when exercising the live-read path,
+    - added regression coverage proving preview planning uses cached controller joints when local hardware feedback is unavailable.
+  - Updated `tests/test_api_endpoints.py`:
+    - added regression coverage proving `/trajectory/plan-points` seeds the local planner cache with controller joint feedback in radians.
+- Validation:
+  - `ReadLints` on edited files
+    - no diagnostics
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py`
+    - passed (`78 passed`)
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - I did not trigger a fresh live robot run from the UI in this pass, so the runtime fix is validated by code path inspection, regression tests, and the build, not by a new physical motion run.
+
+## 2026-03-26 00:03 +0000
+
+- Task summary:
+  - Fixed a trajectory authoring regression where planning overwrote the recorded waypoint draft, causing previously captured moves to appear deleted or rewritten instead of remaining in sequential authored order.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - changed `requestPlannerPreview(...)` so it no longer calls `setPlannerPoints(...)` with backend-derived preview waypoints,
+    - changed the planned preview object persisted to `/robot-program/save` so `planned_trajectory.waypoints` mirrors the authored waypoint list passed into the planner call.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - This fix preserves authored control points as the UI source of truth, but I did not do a fresh browser/live robot interaction in this pass, so the remaining check is one real capture/regenerate flow to confirm sequential points now stay intact on-screen and in saved trajectory records.
+
+## 2026-03-26 00:22 UTC
+
+- Task summary:
+  - Fixed a second trajectory authoring regression where additional control points could appear to delete or replace earlier points/moves instead of strictly appending.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added `plannerPointsRef` / `previewPlanRef` so async authoring handlers append against the latest draft instead of stale closure state,
+    - changed trajectory `Add Waypoint`, `Move to Home`, captured-pose append, and tree-side add behavior to append at the end of the authored list instead of inserting relative to the selected control point,
+    - added `AbortController` cancellation around `requestPlannerPreview(...)` so superseded `/trajectory/plan-points` responses cannot overwrite a newer appended draft/preview,
+    - updated the trajectory drawer summary to prefer live draft waypoints over an older preview snapshot while replanning is in flight,
+    - cancelled active preview requests during clear/load/disconnect flows to avoid stale preview rehydration after the user changes context.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - I did not perform a live browser or robot capture session in this pass, so the remaining validation is a real authoring flow: waypoint -> pose, waypoint -> waypoint, and repeated rapid appends.
+
+## 2026-03-26 00:26 UTC
+
+- Task summary:
+  - Applied the user correction that `Add Waypoint` must use the exact same live-pose append path as `Capture Pose`, rather than duplicating the previous waypoint and only changing the move type.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - removed the duplicate-last-point branch from `handleAddTrajectoryWaypoint()`,
+    - changed `handleAddTrajectoryWaypoint()` to call `fetchLiveTrajectoryPoseWaypoint("joint")` and append that captured pose to the current draft,
+    - refactored `handleCaptureTrajectoryPose()` to use the same `fetchLiveTrajectoryPoseWaypoint("linear")` helper so both buttons now share the same capture implementation.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - I still have not run a live browser or hardware authoring session, so the remaining validation is the exact user repro in the running UI after restart.
+
+## 2026-03-26 01:02 UTC
+
+- Task summary:
+  - Fixed a preview-visualization mismatch where the stage showed an extra non-authored segment that looked like an automatic home/return move even though the saved preview trajectory did not contain one.
+- Changes:
+  - Updated `web-ui/src/previewUtils.ts`:
+    - added path trimming so when explicit authored waypoints are present, the displayed `cartesian_path` is clipped to the span between the first and last authored control points,
+    - preserved authored waypoint markers while hiding planner-only prefix/suffix motion that was not explicitly programmed by the user.
+- Validation:
+  - Read `recorded_trajectories/__planner_preview__.json`
+    - confirmed the latest saved preview contained only three authored `move` commands and no `home` command
+  - `ReadLints` on `web-ui/src/previewUtils.ts`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - This pass fixes the visualization layer; I did not change backend execution semantics in `src/gradient_os/arm_controller/command_api.py`.
+
+## 2026-03-26 00:40 UTC
+
+- Task summary:
+  - Hid the right-side `Gripper` control card by default and added a Settings toggle so operators can show or hide that panel persistently.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added persisted `showGripperPanel` settings storage/load behavior with a default of `false`,
+    - exposed a `Show gripper panel` checkbox in the General tab of the Settings modal,
+    - passed the persisted visibility flag into the docked `ControlPanel`.
+  - Updated `web-ui/src/ControlPanel.tsx`:
+    - added an optional `showGripperPanel` prop,
+    - conditionally hid the gripper slider/button card when that prop is `false`,
+    - kept the component default as visible for backwards compatibility with other callers/tests.
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on edited files
+    - still reported a stale `showGripperPanel` prop diagnostic in `web-ui/src/App.tsx`, but the production TypeScript/Vite build succeeded with the updated prop type in place.
+- Follow-up notes / risks:
+  - I did not run a live browser session against the settings modal in this pass, so the remaining check is the exact UI interaction: Settings -> General -> toggle `Show gripper panel` on/off and confirm the right-side card responds immediately.

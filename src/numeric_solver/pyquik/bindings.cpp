@@ -1,6 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/eigen.h>
 #include <pybind11/stl.h>
+#include <algorithm>
+#include <cmath>
 #include <memory>
 #include "Eigen/Dense"
 #include "quik/Robot.hpp"
@@ -10,6 +12,31 @@ namespace py = pybind11;
 
 using RobotDyn = quik::Robot<Eigen::Dynamic>;
 using IKSolverDyn = quik::IKSolver<Eigen::Dynamic>;
+
+namespace {
+
+constexpr double kTwoPi = 2.0 * 3.14159265358979323846;
+
+double alignEquivalentAngleToReference(double angle, double reference) {
+    if (!std::isfinite(angle) || !std::isfinite(reference)) {
+        return angle;
+    }
+    return reference + std::remainder(angle - reference, kTwoPi);
+}
+
+Eigen::VectorXd alignEquivalentVectorToReference(
+    const Eigen::VectorXd& angles,
+    const Eigen::VectorXd& reference
+) {
+    Eigen::VectorXd aligned = angles;
+    const Eigen::Index count = std::min(aligned.size(), reference.size());
+    for (Eigen::Index idx = 0; idx < count; ++idx) {
+        aligned(idx) = alignEquivalentAngleToReference(aligned(idx), reference(idx));
+    }
+    return aligned;
+}
+
+}  // namespace
 
 // Helper to convert list of ints (0=revolute,1=prismatic) to JOINTTYPE vector
 auto linkTypesFromList(const std::vector<int>& lst) {
@@ -72,10 +99,79 @@ PYBIND11_MODULE(pyquik, m) {
             int iter;
             quik::BREAKREASON_t br;
             self.IK(quat, d, q0, q_star, e_star, iter, br);
+            q_star = alignEquivalentVectorToReference(q_star, q0);
 
             std::vector<double> q_vec(q_star.data(), q_star.data() + q_star.size());
             std::vector<double> e_vec(e_star.data(), e_star.data() + 6);
 
             return py::make_tuple(q_vec, e_vec, iter, static_cast<int>(br));
+        }, py::arg("quat"), py::arg("d"), py::arg("q0"))
+        .def("solve_batch", [](const IKSolverDyn& self,
+                               const Eigen::Matrix<double, 4, Eigen::Dynamic>& quat,
+                               const Eigen::Matrix<double, 3, Eigen::Dynamic>& d,
+                               const Eigen::MatrixXd& q0_batch) {
+            if (quat.cols() != d.cols()) {
+                throw std::runtime_error("quat and d must have the same number of columns.");
+            }
+            const int pose_count = static_cast<int>(quat.cols());
+            if (q0_batch.rows() != self.R->dof || q0_batch.cols() != pose_count) {
+                throw std::runtime_error("q0_batch must have shape [dof x pose_count].");
+            }
+
+            Eigen::MatrixXd q_star(self.R->dof, pose_count);
+            Eigen::Matrix<double, 6, Eigen::Dynamic> e_star(6, pose_count);
+            std::vector<int> iter(pose_count, 0);
+            std::vector<quik::BREAKREASON_t> break_reason(pose_count, quik::BREAKREASON_MAX_ITER);
+            {
+                py::gil_scoped_release release;
+                self.IK(quat, d, q0_batch, q_star, e_star, iter, break_reason);
+            }
+            for (int idx = 0; idx < pose_count; ++idx) {
+                q_star.col(idx) = alignEquivalentVectorToReference(q_star.col(idx), q0_batch.col(idx));
+            }
+
+            std::vector<int> break_reason_codes;
+            break_reason_codes.reserve(pose_count);
+            for (const auto reason : break_reason) {
+                break_reason_codes.push_back(static_cast<int>(reason));
+            }
+            return py::make_tuple(q_star, e_star, iter, break_reason_codes);
+        }, py::arg("quat"), py::arg("d"), py::arg("q0_batch"))
+        .def("solve_path", [](const IKSolverDyn& self,
+                              const Eigen::Matrix<double, 4, Eigen::Dynamic>& quat,
+                              const Eigen::Matrix<double, 3, Eigen::Dynamic>& d,
+                              const Eigen::VectorXd& q0) {
+            if (quat.cols() != d.cols()) {
+                throw std::runtime_error("quat and d must have the same number of columns.");
+            }
+            if (q0.size() != self.R->dof) {
+                throw std::runtime_error("q0 must have length equal to robot dof.");
+            }
+
+            const int pose_count = static_cast<int>(quat.cols());
+            Eigen::MatrixXd q_star(self.R->dof, pose_count);
+            Eigen::Matrix<double, 6, Eigen::Dynamic> e_star(6, pose_count);
+            std::vector<int> iter(pose_count, 0);
+            std::vector<int> break_reason_codes(pose_count, static_cast<int>(quik::BREAKREASON_MAX_ITER));
+
+            {
+                py::gil_scoped_release release;
+                Eigen::VectorXd q_seed = q0;
+                for (int idx = 0; idx < pose_count; ++idx) {
+                    Eigen::VectorXd q_star_i(self.R->dof);
+                    Eigen::Vector<double, 6> e_star_i;
+                    int iter_i = 0;
+                    quik::BREAKREASON_t break_reason_i = quik::BREAKREASON_MAX_ITER;
+                    self.IK(quat.col(idx), d.col(idx), q_seed, q_star_i, e_star_i, iter_i, break_reason_i);
+                    q_star_i = alignEquivalentVectorToReference(q_star_i, q_seed);
+                    q_star.col(idx) = q_star_i;
+                    e_star.col(idx) = e_star_i;
+                    iter[idx] = iter_i;
+                    break_reason_codes[idx] = static_cast<int>(break_reason_i);
+                    q_seed = q_star_i;
+                }
+            }
+
+            return py::make_tuple(q_star, e_star, iter, break_reason_codes);
         }, py::arg("quat"), py::arg("d"), py::arg("q0"));
 } 

@@ -1,3 +1,7 @@
+// NOTE: Keep `use_cache` disabled for standard saved trajectory runs/loading.
+// Preview planned-step caches are seeded from the robot's live joints at plan
+// time, so replaying them later from a different pose can produce unsafe jumps.
+// Only weld previews should opt back into cache-backed execution.
 import {
   Suspense,
   lazy,
@@ -42,22 +46,29 @@ import { TelemetryWorkspace } from "./TelemetryWorkspace";
 import ControlPanel, { ControlPanelRuntimeHeader } from "./ControlPanel";
 import {
   buildProgramTree,
+  coercePlannerDiagnostics,
   encodePointsForApi,
   encodePoseWaypointsForApi,
   coercePoseWaypointList,
   previewFromPlannerPayload,
   previewFromTrajectoryDetail,
+  type PlannerDiagnostics,
   type ProgramNode,
   type ProgramTreeViewMode,
   type Point3,
   type PoseWaypoint,
   type PreviewPlan,
   type SavedRobotProgramRecord,
+  type WaypointMoveType,
 } from "./previewUtils";
 import { SidebarRail, type SidebarItem } from "./components/SidebarRail";
 import { SidebarDrawer } from "./components/SidebarDrawer";
 import { ProgramFeatureTree } from "./components/ProgramFeatureTree";
-import { ProgramTimeline, type ProgramTimelineLane } from "./components/ProgramTimeline";
+import {
+  ProgramTimeline,
+  type ProgramTimelineItem,
+  type ProgramTimelineLane,
+} from "./components/ProgramTimeline";
 import { LiveStateProvider, LIVE_MONITOR_STALE_MS } from "./liveState";
 
 type Alert = {
@@ -224,6 +235,52 @@ type MotionStatusResponse = {
   program?: ProgramStatusPayload;
 };
 
+type PlannerFailureState = {
+  message: string;
+  plannerDiagnostics?: PlannerDiagnostics;
+};
+
+function parseApiErrorPayload(rawBody: string, fallbackMessage: string): PlannerFailureState {
+  const trimmedBody = rawBody.trim();
+  if (!trimmedBody) {
+    return { message: fallbackMessage };
+  }
+  try {
+    const payload = JSON.parse(trimmedBody) as { detail?: unknown };
+    if (typeof payload?.detail === "string") {
+      return { message: payload.detail.trim() || fallbackMessage };
+    }
+    if (payload?.detail && typeof payload.detail === "object") {
+      const detail = payload.detail as Record<string, unknown>;
+      const parsedDiagnostics = coercePlannerDiagnostics(
+        detail.planner_diagnostics ?? detail.plannerDiagnostics,
+      );
+      const message =
+        typeof detail.message === "string" && detail.message.trim()
+          ? detail.message.trim()
+          : fallbackMessage;
+      return {
+        message,
+        plannerDiagnostics: parsedDiagnostics,
+      };
+    }
+  } catch {
+    // Non-JSON error body; fall through to plain-text message.
+  }
+  return { message: trimmedBody || fallbackMessage };
+}
+
+async function readApiErrorResponse(response: Response): Promise<PlannerFailureState> {
+  const fallbackMessage = `${response.status} ${response.statusText}`.trim();
+  let rawBody = "";
+  try {
+    rawBody = await response.text();
+  } catch {
+    rawBody = "";
+  }
+  return parseApiErrorPayload(rawBody, fallbackMessage);
+}
+
 const LIVE_JOINT_FALLBACK_MAX_AGE_S = LIVE_MONITOR_STALE_MS / 1000;
 const TERMINAL_MOTION_STATES = new Set(["idle", "completed", "aborted", "faulted", "underrun", "timeout"]);
 
@@ -237,6 +294,51 @@ function areJointArraysClose(a: number[] | undefined, b: number[]): boolean {
     }
   }
   return true;
+}
+
+function formatPlannerNumber(
+  value: number | null | undefined,
+  digits = 3,
+): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return value.toFixed(digits);
+}
+
+function describePlannerJump(
+  residuals: PlannerDiagnostics["residuals"] | undefined,
+): string | null {
+  if (!residuals) {
+    return null;
+  }
+  const parts: string[] = [];
+  if (typeof residuals.jumpJointIndex === "number") {
+    parts.push(`joint J${Math.round(residuals.jumpJointIndex)}`);
+  }
+  const prevValue = formatPlannerNumber(residuals.jumpJointPreviousRad);
+  const currValue = formatPlannerNumber(residuals.jumpJointCurrentRad);
+  if (prevValue && currValue) {
+    parts.push(`prev ${prevValue} -> curr ${currValue}`);
+  }
+  const rawStep = formatPlannerNumber(residuals.jumpJointRawStepRad);
+  if (rawStep) {
+    parts.push(`raw ${rawStep} rad`);
+  }
+  const wrappedStep = formatPlannerNumber(residuals.jumpJointWrappedStepRad);
+  if (wrappedStep) {
+    parts.push(`wrapped ${wrappedStep} rad`);
+  }
+  if (typeof residuals.jumpPoseIndex === "number") {
+    parts.push(`sample ${Math.round(residuals.jumpPoseIndex) + 1}`);
+  }
+  if (residuals.stepSource) {
+    parts.push(`source ${residuals.stepSource}`);
+  }
+  if (residuals.jumpContext) {
+    parts.push(`stage ${residuals.jumpContext}`);
+  }
+  return parts.length > 0 ? parts.join(" | ") : null;
 }
 
 type Axis3 = { x: number; y: number; z: number };
@@ -395,6 +497,7 @@ type RuntimeConfigSnapshot = {
 
 type PersistedSettings = {
   showBoundingBox: boolean;
+  showGripperPanel: boolean;
   collapseLiveCharts: boolean;
   collapseStepImport: boolean;
   collapseTrajectory: boolean;
@@ -411,6 +514,16 @@ type PersistedSettings = {
 };
 
 type SidebarPanelId = "step" | "trajectory" | "tools" | "weld" | "telemetry";
+
+type TimelineSyntheticSelection = {
+  id: string;
+  label: string;
+  detail?: string;
+  openPanel?: "trajectory" | "weld";
+  pathRange?: { start: number; end: number } | null;
+  waypointIndices?: number[];
+  relatedMoveIndex?: number | null;
+};
 
 type TopologyModel = {
   model_id: string;
@@ -676,6 +789,10 @@ function MotionStatusCard({
   if (program?.segment_execution_policy) {
     detailParts.push(`program path ${program.segment_execution_policy}`);
   }
+  const detailMessage =
+    typeof motionStatus.detail === "string" && motionStatus.detail.trim()
+      ? motionStatus.detail.trim()
+      : "";
 
   const programState = program?.state?.trim().toLowerCase();
   const programSummaryParts: string[] = [];
@@ -730,6 +847,11 @@ function MotionStatusCard({
       {programSummaryParts.length > 0 ? (
         <div className={`mt-1 text-[12px] leading-5 ${toneClasses.text}`}>
           {programSummaryParts.join(" | ")}
+        </div>
+      ) : null}
+      {detailMessage ? (
+        <div className={`mt-1 text-[12px] leading-5 ${toneClasses.text}`}>
+          {detailMessage}
         </div>
       ) : null}
     </div>
@@ -909,6 +1031,7 @@ function sameShellPaneLayout(a: ShellPaneLayout, b: ShellPaneLayout): boolean {
 function loadPersistedSettings(): PersistedSettings {
   const defaults: PersistedSettings = {
     showBoundingBox: true,
+    showGripperPanel: false,
     collapseLiveCharts: false,
     collapseStepImport: false,
     collapseTrajectory: false,
@@ -938,6 +1061,10 @@ function loadPersistedSettings(): PersistedSettings {
           typeof parsed.showBoundingBox === "boolean"
             ? parsed.showBoundingBox
             : defaults.showBoundingBox,
+        showGripperPanel:
+          typeof parsed.showGripperPanel === "boolean"
+            ? parsed.showGripperPanel
+            : defaults.showGripperPanel,
         collapseLiveCharts:
           typeof parsed.collapseLiveCharts === "boolean"
             ? parsed.collapseLiveCharts
@@ -1400,7 +1527,7 @@ function normalizeWeldDraftRecord(
 
 function buildPoseWaypoint(
   point: Point3,
-  orientation?: Partial<Pick<PoseWaypoint, "rollDeg" | "pitchDeg" | "yawDeg">> | null,
+  orientation?: Partial<Pick<PoseWaypoint, "rollDeg" | "pitchDeg" | "yawDeg" | "moveType">> | null,
 ): PoseWaypoint {
   return {
     x: Number(point.x),
@@ -1409,15 +1536,93 @@ function buildPoseWaypoint(
     rollDeg: Number.isFinite(Number(orientation?.rollDeg)) ? Number(orientation?.rollDeg) : null,
     pitchDeg: Number.isFinite(Number(orientation?.pitchDeg)) ? Number(orientation?.pitchDeg) : null,
     yawDeg: Number.isFinite(Number(orientation?.yawDeg)) ? Number(orientation?.yawDeg) : null,
+    moveType:
+      orientation?.moveType === "joint" || orientation?.moveType === "home"
+        ? orientation.moveType
+        : "linear",
   };
 }
 
 function poseOrientationSummary(waypoint: PoseWaypoint): string {
   const values = [waypoint.rollDeg, waypoint.pitchDeg, waypoint.yawDeg];
+  const moveSummary =
+    waypoint.moveType === "joint"
+      ? "joint move"
+      : waypoint.moveType === "home"
+        ? "move to home"
+        : "linear move";
   if (values.some((value) => value === null || !Number.isFinite(Number(value)))) {
-    return "orientation inherited";
+    return `${moveSummary}, orientation inherited`;
   }
-  return `R ${Number(waypoint.rollDeg).toFixed(1)} deg, P ${Number(waypoint.pitchDeg).toFixed(1)} deg, Y ${Number(waypoint.yawDeg).toFixed(1)} deg`;
+  return `${moveSummary}, R ${Number(waypoint.rollDeg).toFixed(1)} deg, P ${Number(waypoint.pitchDeg).toFixed(1)} deg, Y ${Number(waypoint.yawDeg).toFixed(1)} deg`;
+}
+
+function previewPlanMatchesWaypoints(plan: PreviewPlan | null, waypoints: PoseWaypoint[]): boolean {
+  if (!plan || plan.waypoints.length !== waypoints.length) {
+    return false;
+  }
+  const posTolerance = 1e-4;
+  const orientToleranceDeg = 0.5;
+  return waypoints.every((waypoint, index) => {
+    const planned = plan.waypoints[index];
+    if (!planned) {
+      return false;
+    }
+    const positionMatches =
+      Math.abs(planned.x - waypoint.x) <= posTolerance &&
+      Math.abs(planned.y - waypoint.y) <= posTolerance &&
+      Math.abs(planned.z - waypoint.z) <= posTolerance;
+    if (!positionMatches) {
+      return false;
+    }
+    if ((waypoint.moveType ?? "linear") !== (planned.moveType ?? "linear")) {
+      return false;
+    }
+    const authoredValues = [waypoint.rollDeg, waypoint.pitchDeg, waypoint.yawDeg];
+    const plannedValues = [planned.rollDeg, planned.pitchDeg, planned.yawDeg];
+    const authoredHasOrientation = authoredValues.every((value) => value !== null && Number.isFinite(Number(value)));
+    const plannedHasOrientation = plannedValues.every((value) => value !== null && Number.isFinite(Number(value)));
+    if (authoredHasOrientation !== plannedHasOrientation) {
+      return false;
+    }
+    if (!authoredHasOrientation) {
+      return true;
+    }
+    return authoredValues.every(
+      (value, axisIndex) => Math.abs(Number(value) - Number(plannedValues[axisIndex])) <= orientToleranceDeg,
+    );
+  });
+}
+
+function pointDistanceSquared(a: Point3, b: Point3): number {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const dz = a.z - b.z;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+function describeWaypointMoveType(moveType: WaypointMoveType): string {
+  return moveType === "joint" ? "joint move" : moveType === "home" ? "home move" : "linear move";
+}
+
+function buildOrderedWaypointPathIndices(pathPoints: Point3[], waypoints: Point3[]): number[] {
+  if (pathPoints.length === 0 || waypoints.length === 0) {
+    return [];
+  }
+  let searchStart = 0;
+  return waypoints.map((waypoint) => {
+    let bestIndex = Math.max(0, Math.min(pathPoints.length - 1, searchStart));
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (let index = searchStart; index < pathPoints.length; index += 1) {
+      const distance = pointDistanceSquared(pathPoints[index], waypoint);
+      if (distance <= bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    }
+    searchStart = bestIndex;
+    return bestIndex;
+  });
 }
 
 function normalizeTrajectoryProgramRecord(raw: unknown): TrajectoryProgramRecord | null {
@@ -1804,6 +2009,7 @@ type TrajectoryPanelProps = {
   isMotionActive: boolean;
   motionStatus: MotionStatusResponse | null;
   preview: PreviewPlan | null;
+  plannerFailure: PlannerFailureState | null;
   plannerPoints: PoseWaypoint[];
   savedTrajectories: string[];
   selectedTrajectory: string;
@@ -1817,12 +2023,16 @@ type TrajectoryPanelProps = {
   onPlanToggle: () => void;
   onSimulate: () => void;
   onRunLive: () => void;
+  loopEnabled: boolean;
+  onLoopEnabledChange: (enabled: boolean) => void;
   onCapturePose: () => void;
   onAddWaypoint: () => void;
+  onAddHomeWaypoint: () => void;
   onClear: () => void;
   onRefreshTrajectories: () => void;
   onSelectTrajectory: (value: string) => void;
   onLoadTrajectory: () => void;
+  onRegenerateTrajectory: () => void;
   onUndoPoint: () => void;
 };
 
@@ -1833,6 +2043,7 @@ function TrajectoryPanel({
   isMotionActive,
   motionStatus,
   preview,
+  plannerFailure,
   plannerPoints,
   savedTrajectories,
   selectedTrajectory,
@@ -1846,23 +2057,127 @@ function TrajectoryPanel({
   onPlanToggle,
   onSimulate,
   onRunLive,
+  loopEnabled,
+  onLoopEnabledChange,
   onCapturePose,
   onAddWaypoint,
+  onAddHomeWaypoint,
   onClear,
   onRefreshTrajectories,
   onSelectTrajectory,
   onLoadTrajectory,
+  onRegenerateTrajectory,
   onUndoPoint,
 }: TrajectoryPanelProps) {
-  const waypointList = preview?.waypoints ?? plannerPoints;
+  const waypointList = plannerPoints.length > 0 ? plannerPoints : preview?.waypoints ?? [];
   const waypointCount = waypointList.length;
   const hasSavedTrajectories = savedTrajectories.length > 0;
   const lastPoint =
     waypointList.length > 0 ? waypointList[waypointList.length - 1] : null;
-  const canSimulate = runtimeMode === "simulate" && !!preview;
-  const canRunLive = runtimeMode === "live" && !!preview;
+  const previewMatchesDraft = previewPlanMatchesWaypoints(preview, plannerPoints);
+  const hasRunnablePreview = Boolean(preview) && previewMatchesDraft && !preview?.isStale;
+  const canSimulate = runtimeMode === "simulate" && hasRunnablePreview;
+  const canRunLive = runtimeMode === "live" && hasRunnablePreview;
   const hasDraftWaypoints = plannerPoints.length > 0;
   const interactionLocked = isPlanLoading || isSubmittingRun || isMotionActive;
+  const savedPlanIsStale = Boolean(preview?.isStale);
+  const planningWarnings = preview?.planningWarnings ?? [];
+  const activePlannerDiagnostics = plannerFailure?.plannerDiagnostics ?? preview?.plannerDiagnostics;
+  const plannerSummaryParts: string[] = [];
+  if (activePlannerDiagnostics?.attempt) {
+    plannerSummaryParts.push(`attempt ${activePlannerDiagnostics.attempt}`);
+  }
+  if (activePlannerDiagnostics?.reasonCode) {
+    plannerSummaryParts.push(`reason ${activePlannerDiagnostics.reasonCode}`);
+  }
+  if (typeof activePlannerDiagnostics?.fallbackLevel === "number") {
+    plannerSummaryParts.push(`fallback ${activePlannerDiagnostics.fallbackLevel}`);
+  }
+  if (typeof activePlannerDiagnostics?.residuals?.jumpPoseIndex === "number") {
+    plannerSummaryParts.push(
+      `jump sample ${Math.round(activePlannerDiagnostics.residuals.jumpPoseIndex) + 1}`,
+    );
+  }
+  if (activePlannerDiagnostics?.residuals?.stepSource) {
+    plannerSummaryParts.push(`source ${activePlannerDiagnostics.residuals.stepSource}`);
+  }
+  if (typeof activePlannerDiagnostics?.residuals?.maxJointStepRad === "number") {
+    plannerSummaryParts.push(
+      `max step ${activePlannerDiagnostics.residuals.maxJointStepRad.toFixed(3)} rad`,
+    );
+  }
+  if (typeof activePlannerDiagnostics?.residuals?.jumpJointIndex === "number") {
+    plannerSummaryParts.push(`jump joint J${Math.round(activePlannerDiagnostics.residuals.jumpJointIndex)}`);
+  }
+  if (activePlannerDiagnostics?.branchAnchorAvailable) {
+    plannerSummaryParts.push("branch anchor available");
+  }
+  if (activePlannerDiagnostics?.recovery?.used) {
+    plannerSummaryParts.push(
+      `jump recovery ${activePlannerDiagnostics.recovery.strategy ?? activePlannerDiagnostics.recovery.kind ?? "used"}`,
+    );
+  }
+  if (activePlannerDiagnostics?.splitRecovery?.used) {
+    const splitCount = activePlannerDiagnostics.splitRecovery.splitCount;
+    plannerSummaryParts.push(
+      typeof splitCount === "number"
+        ? `segment split ${splitCount}x`
+        : "segment split used",
+    );
+  }
+  const plannerJumpDetail = describePlannerJump(activePlannerDiagnostics?.residuals);
+  const plannerRawJumpDetail = describePlannerJump(activePlannerDiagnostics?.rawJump);
+  const plannerRecoveryAttemptDetails = (activePlannerDiagnostics?.recovery?.attempts ?? []).map(
+    (attempt, index) => {
+      const parts: string[] = [];
+      if (attempt.strategy) {
+        parts.push(attempt.strategy);
+      } else {
+        parts.push(`attempt ${index + 1}`);
+      }
+      if (typeof attempt.suffixStartIndex === "number") {
+        parts.push(`suffix ${Math.round(attempt.suffixStartIndex) + 1}`);
+      }
+      if (attempt.reasonCode) {
+        parts.push(`reason ${attempt.reasonCode}`);
+      }
+      if (typeof attempt.accepted === "boolean") {
+        parts.push(attempt.accepted ? "accepted" : "rejected");
+      }
+      const rawJumpDetail = describePlannerJump(attempt.rawJump);
+      if (rawJumpDetail) {
+        parts.push(`raw ${rawJumpDetail}`);
+      }
+      const attemptJumpDetail = describePlannerJump(attempt.residuals);
+      if (attemptJumpDetail) {
+        parts.push(`gate ${attemptJumpDetail}`);
+      }
+      return parts.join(" | ");
+    },
+  );
+  const splitSegmentDetails = (activePlannerDiagnostics?.splitRecovery?.segments ?? []).map(
+    (segment, index) => {
+      const parts: string[] = [];
+      const segmentIndex = Number(segment.segment_index ?? segment.segmentIndex ?? index + 1);
+      if (Number.isFinite(segmentIndex)) {
+        parts.push(`segment ${Math.round(segmentIndex)}`);
+      }
+      if (typeof segment.accepted === "boolean") {
+        parts.push(segment.accepted ? "accepted" : "rejected");
+      }
+      const plannerDiagnostics = coercePlannerDiagnostics(
+        segment.planner_diagnostics ?? segment.plannerDiagnostics,
+      );
+      if (plannerDiagnostics?.reasonCode) {
+        parts.push(`reason ${plannerDiagnostics.reasonCode}`);
+      }
+      const segmentJumpDetail = describePlannerJump(plannerDiagnostics?.residuals);
+      if (segmentJumpDetail) {
+        parts.push(segmentJumpDetail);
+      }
+      return parts.join(" | ");
+    },
+  );
   const statusLabel = isPlanLoading
     ? "Planning"
     : isSubmittingRun
@@ -1913,10 +2228,13 @@ function TrajectoryPanel({
             1. Click <span className="font-semibold text-slate-100">{isPlanning ? "Stop Editing" : "Start Editing"}</span>.
           </div>
           <div>
-            2. While editing, <span className="font-semibold text-slate-100">Shift-click the 3D workspace</span> or use <span className="font-semibold text-slate-100">Capture Pose</span>.
+            2. Use <span className="font-semibold text-slate-100">Shift-click in the 3D workspace</span> or <span className="font-semibold text-slate-100">Capture Pose</span> to add a linear move.
           </div>
           <div>
-            3. Adjust XYZ and roll/pitch/yaw in the <span className="font-semibold text-slate-100">Program Tree</span>.
+            3. Use <span className="font-semibold text-slate-100">Add Waypoint</span> for a joint move or <span className="font-semibold text-slate-100">Move to Home</span> for a home return.
+          </div>
+          <div>
+            4. Adjust XYZ and roll/pitch/yaw in the <span className="font-semibold text-slate-100">Program Tree</span>.
           </div>
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2">
@@ -1937,6 +2255,19 @@ function TrajectoryPanel({
           </button>
           <button
             type="button"
+            onClick={onCapturePose}
+            disabled={interactionLocked}
+            className={`rounded-xl border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+              interactionLocked ? "opacity-60" : ""
+            }`}
+          >
+            <div className={`${DRAWER_ACTION_TEXT_CLASS}`}>Capture Pose</div>
+            <div className="mt-0.5 text-[11px] text-slate-400">
+              Read the robot TCP as a linear move
+            </div>
+          </button>
+          <button
+            type="button"
             onClick={onAddWaypoint}
             disabled={interactionLocked}
             className={`rounded-xl border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
@@ -1948,27 +2279,30 @@ function TrajectoryPanel({
               Add Waypoint
             </span>
             <div className="mt-0.5 text-[11px] text-slate-400">
-              Insert a numeric waypoint now
+              Insert a numeric joint move waypoint
             </div>
           </button>
           <button
             type="button"
-            onClick={onCapturePose}
+            onClick={onAddHomeWaypoint}
             disabled={interactionLocked}
             className={`rounded-xl border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
               interactionLocked ? "opacity-60" : ""
             }`}
           >
-            <div className={`${DRAWER_ACTION_TEXT_CLASS}`}>Capture Pose</div>
+            <div className={`inline-flex items-center gap-2 ${DRAWER_ACTION_TEXT_CLASS}`}>
+              <Home size={14} />
+              Move to Home
+            </div>
             <div className="mt-0.5 text-[11px] text-slate-400">
-              Read the robot TCP directly
+              Insert a commanded home move
             </div>
           </button>
           <button
             type="button"
             onClick={onUndoPoint}
             disabled={plannerPoints.length === 0 || interactionLocked}
-            className={`rounded-xl border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+            className={`col-span-2 rounded-xl border border-slate-600/60 bg-slate-900/60 px-3 py-2 text-left text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
               plannerPoints.length === 0 || interactionLocked ? "opacity-60" : ""
             }`}
           >
@@ -2034,6 +2368,25 @@ function TrajectoryPanel({
             <span className="font-semibold text-slate-100">Run Trajectory</span> is only enabled in LIVE mode.
           </span>
         </div>
+        <label
+          className={`mb-3 flex cursor-pointer items-start gap-3 rounded-lg border border-slate-700/60 bg-slate-900/35 px-2.5 py-2 ${
+            interactionLocked ? "opacity-60" : ""
+          }`}
+        >
+          <input
+            type="checkbox"
+            checked={loopEnabled}
+            onChange={(event) => onLoopEnabledChange(event.target.checked)}
+            disabled={interactionLocked}
+            className="mt-0.5 h-4 w-4 rounded border-slate-500/70 bg-slate-950 text-cyan-400 accent-cyan-400"
+          />
+          <span className="min-w-0">
+            <span className="block text-[12px] font-semibold text-slate-100">Loop trajectory</span>
+            <span className="block text-[11px] leading-5 text-slate-300/80">
+              Runtime only. The controller moves to the first waypoint before the loop and closes each pass back to the start without saving that wrapper move into the trajectory.
+            </span>
+          </span>
+        </label>
         <div className="grid grid-cols-2 gap-2">
           <button
             type="button"
@@ -2132,12 +2485,150 @@ function TrajectoryPanel({
             >
               {isLoadingSavedTrajectory ? "Loading…" : "Load"}
             </button>
+            <button
+              type="button"
+              onClick={onRegenerateTrajectory}
+              disabled={!hasDraftWaypoints || interactionLocked}
+              className={`rounded-lg border border-slate-600/60 bg-slate-900/60 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-slate-100 transition hover:border-slate-400 hover:text-slate-50 ${
+                (!hasDraftWaypoints || interactionLocked)
+                  ? "cursor-not-allowed opacity-60"
+                  : ""
+              }`}
+              aria-label="Regenerate the trajectory path from saved waypoints"
+            >
+              Regenerate
+            </button>
           </div>
         ) : (
           <p className={DRAWER_META_TEXT_CLASS}>
             No saved programs available.
           </p>
         )}
+        {savedPlanIsStale ? (
+          <p className={`${DRAWER_META_TEXT_CLASS} mt-2 text-amber-300`}>
+            Saved path is stale for these waypoints. Regenerate to rebuild the runnable path without re-teaching points.
+          </p>
+        ) : null}
+        {planningWarnings.length > 0 ? (
+          <div className="mt-3 rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-2">
+            <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-amber-200">
+              Planning Warnings
+            </div>
+            <div className="space-y-1 text-[12px] leading-5 text-amber-100/90">
+              {planningWarnings.map((warning) => (
+                <div
+                  key={`trajectory-planning-warning-${warning}`}
+                  className="rounded border border-amber-500/20 bg-amber-500/5 px-1.5 py-1"
+                >
+                  {warning}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {plannerFailure || plannerSummaryParts.length > 0 ? (
+          <div
+            className={`mt-3 rounded-lg border px-2.5 py-2 ${
+              plannerFailure
+                ? "border-rose-500/40 bg-rose-500/10"
+                : "border-cyan-500/30 bg-cyan-500/10"
+            }`}
+          >
+            <div
+              className={`mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${
+                plannerFailure ? "text-rose-200" : "text-cyan-200"
+              }`}
+            >
+              {plannerFailure ? "Planner Failure Details" : "Planner Diagnostics"}
+            </div>
+            {plannerFailure ? (
+              <div className="text-[12px] leading-5 text-rose-100/90">
+                {plannerFailure.message}
+              </div>
+            ) : null}
+            {plannerSummaryParts.length > 0 ? (
+              <div
+                className={`text-[12px] leading-5 ${
+                  plannerFailure ? "mt-1 text-rose-100/85" : "text-cyan-100/85"
+                }`}
+              >
+                {plannerSummaryParts.join(" | ")}
+              </div>
+            ) : null}
+            {plannerJumpDetail ? (
+              <div
+                className={`mt-1 rounded border px-1.5 py-1 text-[12px] leading-5 ${
+                  plannerFailure
+                    ? "border-rose-400/20 bg-rose-500/5 text-rose-100/85"
+                    : "border-cyan-400/20 bg-cyan-500/5 text-cyan-100/85"
+                }`}
+              >
+                Gate jump: {plannerJumpDetail}
+              </div>
+            ) : null}
+            {plannerRawJumpDetail ? (
+              <div
+                className={`mt-1 rounded border px-1.5 py-1 text-[12px] leading-5 ${
+                  plannerFailure
+                    ? "border-rose-400/20 bg-rose-500/5 text-rose-100/80"
+                    : "border-cyan-400/20 bg-cyan-500/5 text-cyan-100/80"
+                }`}
+              >
+                Raw solver jump: {plannerRawJumpDetail}
+              </div>
+            ) : null}
+            {plannerRecoveryAttemptDetails.length > 0 ? (
+              <div className="mt-2">
+                <div
+                  className={`text-[10px] font-semibold uppercase tracking-[0.14em] ${
+                    plannerFailure ? "text-rose-200/80" : "text-cyan-200/80"
+                  }`}
+                >
+                  Recovery Attempts
+                </div>
+                <div className="mt-1 space-y-1 text-[12px] leading-5">
+                  {plannerRecoveryAttemptDetails.map((detail, index) => (
+                    <div
+                      key={`planner-recovery-attempt-${index}`}
+                      className={`rounded border px-1.5 py-1 ${
+                        plannerFailure
+                          ? "border-rose-400/15 bg-rose-500/5 text-rose-100/85"
+                          : "border-cyan-400/15 bg-cyan-500/5 text-cyan-100/85"
+                      }`}
+                    >
+                      {detail}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {splitSegmentDetails.length > 0 ? (
+              <div className="mt-2">
+                <div
+                  className={`text-[10px] font-semibold uppercase tracking-[0.14em] ${
+                    plannerFailure ? "text-rose-200/80" : "text-cyan-200/80"
+                  }`}
+                >
+                  Split Segments
+                </div>
+                <div className="mt-1 space-y-1 text-[12px] leading-5">
+                  {splitSegmentDetails.map((detail, index) => (
+                    <div
+                      key={`planner-split-segment-${index}`}
+                      className={`rounded border px-1.5 py-1 ${
+                        plannerFailure
+                          ? "border-rose-400/15 bg-rose-500/5 text-rose-100/85"
+                          : "border-cyan-400/15 bg-cyan-500/5 text-cyan-100/85"
+                      }`}
+                    >
+                      {detail}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </div>
       <div className="mt-3 flex justify-end">
         <button
@@ -3108,6 +3599,7 @@ type SettingsDialogProps = {
   apiHost: string;
   visionHost: string;
   showBoundingBox: boolean;
+  showGripperPanel: boolean;
   robots: RobotPolicyOption[];
   selectedRobotName: string;
   selectedRtMaxRpmInput: string;
@@ -3132,6 +3624,7 @@ type SettingsDialogProps = {
   onHostChange: (value: string) => void;
   onVisionHostChange: (value: string) => void;
   onShowBoundingBoxChange: (value: boolean) => void;
+  onShowGripperPanelChange: (value: boolean) => void;
   onSelectedRobotNameChange: (value: string) => void;
   onSelectedRtMaxRpmInputChange: (value: string) => void;
   onSelectedToolIdChange: (value: string) => void;
@@ -3165,6 +3658,7 @@ function SettingsDialog({
   apiHost,
   visionHost,
   showBoundingBox,
+  showGripperPanel,
   robots,
   selectedRobotName,
   selectedRtMaxRpmInput,
@@ -3189,6 +3683,7 @@ function SettingsDialog({
   onHostChange,
   onVisionHostChange,
   onShowBoundingBoxChange,
+  onShowGripperPanelChange,
   onSelectedRobotNameChange,
   onSelectedRtMaxRpmInputChange,
   onSelectedToolIdChange,
@@ -3880,6 +4375,17 @@ function SettingsDialog({
             <input
               type="checkbox"
               className="h-4 w-4 rounded border border-slate-600 bg-slate-900 text-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+              checked={showGripperPanel}
+              onChange={(event) => onShowGripperPanelChange(event.target.checked)}
+            />
+            Show gripper panel
+            </label>
+            ) : null}
+            {activeTab === "general" ? (
+            <label className="mt-4 flex items-center gap-3 text-sm font-medium text-slate-200/90">
+            <input
+              type="checkbox"
+              className="h-4 w-4 rounded border border-slate-600 bg-slate-900 text-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
               checked={showBoundingBox}
               onChange={(event) => onShowBoundingBoxChange(event.target.checked)}
             />
@@ -4044,6 +4550,7 @@ export default function App() {
   const [isVisionActive, setIsVisionActive] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
   const [previewPlan, setPreviewPlan] = useState<PreviewPlan | null>(null);
+  const [trajectoryPlannerFailure, setTrajectoryPlannerFailure] = useState<PlannerFailureState | null>(null);
   const [plannerPoints, setPlannerPoints] = useState<PoseWaypoint[]>([]);
   const [isPlanning, setIsPlanning] = useState(false);
   const [isPlanLoading, setIsPlanLoading] = useState(false);
@@ -4053,8 +4560,11 @@ export default function App() {
   const [isTrajectoryListLoading, setIsTrajectoryListLoading] = useState(false);
   const [selectedTrajectory, setSelectedTrajectory] = useState("");
   const [isLoadingSavedTrajectory, setIsLoadingSavedTrajectory] = useState(false);
+  const [trajectoryLoopEnabled, setTrajectoryLoopEnabled] = useState(false);
   const [trajectoryProgramName, setTrajectoryProgramName] = useState("trajectory_program");
   const [isSavingTrajectoryProgram, setIsSavingTrajectoryProgram] = useState(false);
+  const [loadedTrajectoryMetadata, setLoadedTrajectoryMetadata] = useState<Record<string, unknown> | null>(null);
+  const [selectedTimelineSyntheticId, setSelectedTimelineSyntheticId] = useState<string | null>(null);
   const [isHoming, setIsHoming] = useState(false);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [isResting, setIsResting] = useState(false);
@@ -4088,6 +4598,7 @@ export default function App() {
     previewPlan: PreviewPlan | null;
   } | null>(null);
   const showBoundingBox = settings.showBoundingBox;
+  const showGripperPanel = settings.showGripperPanel;
   const activePanel = settings.activePanel;
   const showProgramTree = settings.showProgramTree;
   const programTreeViewMode = settings.programTreeViewMode;
@@ -4095,12 +4606,49 @@ export default function App() {
   const expandedProgramTreeNodeIds = settings.expandedProgramTreeNodeIds;
   const selectedProgramNodeId = settings.selectedProgramNodeId;
   const visualizerRef = useRef<ArmVisualizerHandle | null>(null);
+  const plannerPointsRef = useRef<PoseWaypoint[]>(plannerPoints);
+  const previewPlanRef = useRef<PreviewPlan | null>(previewPlan);
+  const trajectoryPreviewAbortRef = useRef<AbortController | null>(null);
   const normalizedApiHost = useMemo(() => normaliseApiHost(apiHost), [apiHost]);
   const motionStatusActive = useMemo(() => isMotionActive(motionStatus), [motionStatus]);
   const normalisedVisionHost = useMemo(
     () => normaliseVisionHost(visionHost),
     [visionHost],
   );
+
+  useEffect(() => {
+    plannerPointsRef.current = plannerPoints;
+  }, [plannerPoints]);
+
+  useEffect(() => {
+    previewPlanRef.current = previewPlan;
+  }, [previewPlan]);
+
+  useEffect(() => {
+    if (previewPlan) {
+      setTrajectoryPlannerFailure(null);
+    }
+  }, [previewPlan]);
+
+  useEffect(() => {
+    if (!previewPlan) {
+      return;
+    }
+    if (previewPlanMatchesWaypoints(previewPlan, plannerPoints)) {
+      return;
+    }
+    setPreviewPlan(null);
+  }, [plannerPoints, previewPlan]);
+
+  const cancelTrajectoryPreviewRequest = useCallback(() => {
+    trajectoryPreviewAbortRef.current?.abort();
+    trajectoryPreviewAbortRef.current = null;
+  }, []);
+
+  const getLatestTrajectoryDraftWaypoints = useCallback((): PoseWaypoint[] => {
+    const current = plannerPointsRef.current;
+    return current.length > 0 ? current : previewPlanRef.current?.waypoints ?? [];
+  }, []);
 
   const updateSettings = useCallback(
     (partial: Partial<PersistedSettings>) => {
@@ -4739,6 +5287,27 @@ export default function App() {
     previewPlan?.pathPoints && previewPlan.pathPoints.length > 0
       ? previewPlan.pathPoints
       : visualWaypoints;
+  const programTreePlan = useMemo<PreviewPlan | null>(() => {
+    if (previewPlan) {
+      return previewPlan;
+    }
+    if (plannerPoints.length === 0 || weldDraft) {
+      return null;
+    }
+    const draftName = trajectoryProgramName.trim() || selectedTrajectory.trim() || "Trajectory Draft";
+    return {
+      name: draftName,
+      trajectory: {
+        description: "Authored trajectory draft",
+        moves: [],
+      },
+      pathPoints: plannerPoints,
+      waypoints: plannerPoints,
+      planningWarnings: [],
+      useCache: false,
+      isStale: true,
+    };
+  }, [plannerPoints, previewPlan, selectedTrajectory, trajectoryProgramName, weldDraft]);
   const topologyOverlays = useMemo(
     () => toTopologyEdgeOverlay(topologyModel),
     [topologyModel],
@@ -4842,12 +5411,12 @@ export default function App() {
   const programTreeRoot = useMemo(
     () =>
       buildProgramTree({
-        plan: previewPlan,
+        plan: programTreePlan,
         weldSegments: weldDraft?.segments ?? [],
         weldType: weldDraft?.weldType,
         viewMode: programTreeViewMode,
       }),
-    [previewPlan, weldDraft, programTreeViewMode],
+    [programTreePlan, weldDraft, programTreeViewMode],
   );
   const programNodeById = useMemo(
     () => indexProgramNodes(programTreeRoot),
@@ -4862,30 +5431,103 @@ export default function App() {
   );
   const selectedProgramPathRange = selectedProgramNode?.focus?.pathRange ?? null;
   const selectedProgramWaypointIndices = selectedProgramNode?.focus?.waypointIndices ?? [];
+  const previewMoves = Array.isArray(previewPlan?.trajectory?.moves)
+    ? previewPlan.trajectory.moves
+    : [];
+  const waypointPathIndices = useMemo(
+    () => buildOrderedWaypointPathIndices(visualPathPoints, visualWaypoints),
+    [visualPathPoints, visualWaypoints],
+  );
+  const trajectoryMoveTimelineSelections = useMemo<TimelineSyntheticSelection[]>(() => {
+    if (visualWaypoints.length < 2) {
+      return [];
+    }
+    const pathPointCount = visualPathPoints.length;
+    const moveCountMatchesWaypoints = previewMoves.length === visualWaypoints.length;
+    return visualWaypoints.slice(0, -1).map((point, index) => {
+      const nextPoint = visualWaypoints[index + 1];
+      const relatedMoveIndex = moveCountMatchesWaypoints
+        ? index + 1
+        : index < previewMoves.length
+          ? index
+          : null;
+      const rawStart = waypointPathIndices[index] ?? 0;
+      const rawEnd = waypointPathIndices[index + 1] ?? rawStart;
+      let start = Math.max(0, Math.min(pathPointCount - 1, rawStart));
+      let end = Math.max(start, Math.min(pathPointCount - 1, rawEnd));
+      if (pathPointCount >= 2 && start === end) {
+        if (end < pathPointCount - 1) {
+          end += 1;
+        } else if (start > 0) {
+          start -= 1;
+        }
+      }
+      const pathRange = pathPointCount >= 2 ? { start, end } : null;
+      return {
+        id: `timeline_segment_${index}`,
+        label: `M${index + 1}`,
+        detail: `P${index + 1} -> P${index + 2} • ${describeWaypointMoveType(nextPoint.moveType)}`,
+        openPanel: "trajectory",
+        pathRange,
+        waypointIndices: [index, index + 1],
+        relatedMoveIndex,
+      };
+    });
+  }, [previewMoves.length, visualPathPoints.length, visualWaypoints, waypointPathIndices]);
+  const selectedTimelineFocus = useMemo(
+    () =>
+      selectedTimelineSyntheticId
+        ? (trajectoryMoveTimelineSelections.find((item) => item.id === selectedTimelineSyntheticId) ?? null)
+        : null,
+    [selectedTimelineSyntheticId, trajectoryMoveTimelineSelections],
+  );
+  const selectedProgramMoveTimelineFocus = useMemo(() => {
+    const moveIndex = selectedProgramNode?.focus?.moveIndex;
+    if (typeof moveIndex !== "number" || !Number.isInteger(moveIndex)) {
+      return null;
+    }
+    return (
+      trajectoryMoveTimelineSelections.find((item) => item.relatedMoveIndex === moveIndex) ?? null
+    );
+  }, [selectedProgramNode, trajectoryMoveTimelineSelections]);
+  const activeSelectionPathRange =
+    selectedTimelineFocus?.pathRange ??
+    selectedProgramMoveTimelineFocus?.pathRange ??
+    selectedProgramPathRange;
+  const activeSelectionWaypointIndices =
+    selectedTimelineFocus?.waypointIndices ??
+    selectedProgramMoveTimelineFocus?.waypointIndices ??
+    selectedProgramWaypointIndices;
   const selectedNodeFocusPoints = useMemo(() => {
-    const node = selectedProgramNode;
-    if (!node) {
+    if (!selectedProgramNode && !selectedTimelineFocus && !selectedProgramMoveTimelineFocus) {
       return [];
     }
     const out: Point3[] = [];
-    const focus = node.focus;
-    if (focus?.pathRange && visualPathPoints.length > 0) {
-      const start = Math.max(0, Math.min(visualPathPoints.length - 1, focus.pathRange.start));
-      const end = Math.max(start, Math.min(visualPathPoints.length - 1, focus.pathRange.end));
+    if (activeSelectionPathRange && visualPathPoints.length > 0) {
+      const start = Math.max(0, Math.min(visualPathPoints.length - 1, activeSelectionPathRange.start));
+      const end = Math.max(start, Math.min(visualPathPoints.length - 1, activeSelectionPathRange.end));
       out.push(...visualPathPoints.slice(start, end + 1));
     }
-    if (Array.isArray(focus?.waypointIndices) && focus.waypointIndices.length > 0) {
-      focus.waypointIndices.forEach((index) => {
+    if (Array.isArray(activeSelectionWaypointIndices) && activeSelectionWaypointIndices.length > 0) {
+      activeSelectionWaypointIndices.forEach((index) => {
         if (index >= 0 && index < visualWaypoints.length) {
           out.push(visualWaypoints[index]);
         }
       });
     }
-    if (out.length === 0 && node.type === "program") {
+    if (out.length === 0 && selectedProgramNode?.type === "program") {
       return visualPathPoints.length > 0 ? visualPathPoints : visualWaypoints;
     }
     return out;
-  }, [selectedProgramNode, visualPathPoints, visualWaypoints]);
+  }, [
+    activeSelectionPathRange,
+    activeSelectionWaypointIndices,
+    selectedProgramMoveTimelineFocus,
+    selectedProgramNode,
+    selectedTimelineFocus,
+    visualPathPoints,
+    visualWaypoints,
+  ]);
   const selectedProgramControlPointIndex = useMemo(() => {
     if (!selectedProgramNode?.id.startsWith("control_point_")) {
       return null;
@@ -4953,52 +5595,51 @@ export default function App() {
         .replace(/([A-Z])/g, " $1")
         .replace(/^./, (value) => value.toUpperCase())
     : null;
-  const currentPlayheadLabel = selectedProgramNode?.label ?? "No timeline block selected";
-  const currentPlayheadDetail = selectedProgramNode?.subtitle
+  const currentPlayheadLabel =
+    selectedTimelineFocus?.label ??
+    selectedProgramMoveTimelineFocus?.label ??
+    selectedProgramNode?.label ??
+    "No timeline block selected";
+  const currentPlayheadDetail = selectedTimelineFocus?.detail
+    ?? selectedProgramMoveTimelineFocus?.detail
+    ?? selectedProgramNode?.subtitle
     ?? (selectedProgramNodeTypeLabel ? `Selected ${selectedProgramNodeTypeLabel}` : activePanelTitle);
   const timelineLanes = useMemo<ProgramTimelineLane[]>(() => {
     const lanes: ProgramTimelineLane[] = [];
     if (visualWaypoints.length > 0) {
-      lanes.push({
-        id: "trajectory-waypoints",
-        title: "Control Points",
-        subtitle: `${visualWaypoints.length} waypoint(s) driving the trajectory preview`,
-        tone: "cyan",
-        items: visualWaypoints.map((point, index) => {
-          const nodeId = `control_point_${index}`;
-          return {
-            id: nodeId,
-            label: `P${index + 1}`,
-            subtitle: `${point.x.toFixed(3)}, ${point.y.toFixed(3)}, ${point.z.toFixed(3)} m`,
-            tone: "cyan" as const,
+      const trajectoryItems: ProgramTimelineItem[] = [];
+      visualWaypoints.forEach((point, index) => {
+        const nodeId = `control_point_${index}`;
+        trajectoryItems.push({
+          id: nodeId,
+          label: `P${index + 1}`,
+          subtitle: `${point.x.toFixed(3)}, ${point.y.toFixed(3)}, ${point.z.toFixed(3)} m`,
+          tone: "cyan",
+          active:
+            selectedProgramNodeId === nodeId ||
+            selectedProgramWaypointIndices.includes(index),
+          disabled: !programNodeById.has(nodeId),
+        });
+        if (index < trajectoryMoveTimelineSelections.length) {
+          const moveSelection = trajectoryMoveTimelineSelections[index];
+          trajectoryItems.push({
+            id: moveSelection.id,
+            label: moveSelection.label,
+            subtitle: moveSelection.detail,
+            tone: "amber",
             active:
-              selectedProgramNodeId === nodeId ||
-              selectedProgramWaypointIndices.includes(index),
-            disabled: !programNodeById.has(nodeId),
-          };
-        }),
+              selectedTimelineSyntheticId === moveSelection.id ||
+              selectedProgramMoveTimelineFocus?.id === moveSelection.id,
+            disabled: !moveSelection.pathRange,
+          });
+        }
       });
-    }
-    const previewMoves = Array.isArray(previewPlan?.trajectory?.moves)
-      ? previewPlan.trajectory.moves
-      : [];
-    if (previewMoves.length > 0) {
       lanes.push({
-        id: "trajectory-moves",
-        title: "Controller Moves",
-        subtitle: `${previewMoves.length} ordered move command(s) from the preview plan`,
-        tone: "amber",
-        items: previewMoves.map((move, index) => {
-          const nodeId = `move_${index}`;
-          return {
-            id: nodeId,
-            label: `Move ${index + 1}`,
-            subtitle: String(move?.command ?? "unknown").replace(/_/g, " "),
-            tone: "amber" as const,
-            active: selectedProgramNode?.focus?.moveIndex === index,
-            disabled: !programNodeById.has(nodeId),
-          };
-        }),
+        id: "trajectory-sequence",
+        title: "Trajectory Sequence",
+        subtitle: `${visualWaypoints.length} waypoint(s) • ${trajectoryMoveTimelineSelections.length} move segment(s) between them`,
+        tone: "slate",
+        items: trajectoryItems,
       });
     }
     if (weldDraft?.segments && weldDraft.segments.length > 0) {
@@ -5026,12 +5667,14 @@ export default function App() {
   }, [
     activeWeldSegment?.edgeId,
     programNodeById,
-    previewPlan,
+    selectedProgramMoveTimelineFocus,
     selectedProgramNode,
     selectedProgramNodeId,
+    selectedTimelineSyntheticId,
     selectedProgramWaypointIndices,
     visualWaypoints,
     weldDraft,
+    trajectoryMoveTimelineSelections,
   ]);
   const { leftPaneWidthPx, rightPaneWidthPx, timelineHeightPx } = shellPaneLayout;
   const shellGridStyle = {
@@ -5073,6 +5716,7 @@ export default function App() {
   const lastAutoWeldAnglePreviewKeyRef = useRef<string>("");
 
   const disconnect = useCallback(() => {
+    cancelTrajectoryPreviewRequest();
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
     setIsConnected(false);
@@ -5108,7 +5752,7 @@ export default function App() {
     setPendingWeldProgramRestore(null);
     lastTelemetrySourceTimeRef.current = null;
     lastAcceptedJointsRef.current = null;
-  }, []);
+  }, [cancelTrajectoryPreviewRequest]);
 
   const handleMessage = useCallback((payload: string) => {
     let joints: number[] | undefined;
@@ -5560,40 +6204,91 @@ export default function App() {
   }, [stepFile, normalizedApiHost, pendingWeldProgramRestore]);
 
   const requestPlannerPreview = useCallback(
-    async (waypoints: PoseWaypoint[]) => {
+    async (
+      waypoints: PoseWaypoint[],
+      options?: {
+        persistProgramName?: string;
+        persistMetadata?: Record<string, unknown> | null;
+      },
+    ) => {
+      cancelTrajectoryPreviewRequest();
       if (waypoints.length === 0) {
+        setIsPlanLoading(false);
         setPreviewPlan(null);
+        setTrajectoryPlannerFailure(null);
         setPlannerPoints([]);
         setWeldPreviewGhostJoints(null);
         setWeldPreviewCacheReady(false);
         return;
       }
+      const abortController = new AbortController();
+      trajectoryPreviewAbortRef.current = abortController;
       setIsPlanLoading(true);
       setError(null);
+      setTrajectoryPlannerFailure(null);
       try {
         const response = await fetch(`${normalizedApiHost}/trajectory/plan-points`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: abortController.signal,
           body: JSON.stringify({ waypoints: encodePoseWaypointsForApi(waypoints) }),
         });
         if (!response.ok) {
-          const message = await response.text();
-          throw new Error(message || `Plan request failed (${response.status})`);
+          const parsedError = await readApiErrorResponse(response);
+          setTrajectoryPlannerFailure(parsedError);
+          throw new Error(parsedError.message || `Plan request failed (${response.status})`);
         }
         const data = await response.json();
-        const { plan, waypoints: previewWaypoints } = previewFromPlannerPayload(data);
-        setPreviewPlan(plan);
-        setPlannerPoints(previewWaypoints);
+        const { plan } = previewFromPlannerPayload(data);
+        const authoredPlan: PreviewPlan = {
+          ...plan,
+          // Keep authored control points as the source of truth. The preview path
+          // is derived state and must not overwrite or reorder recorded waypoints.
+          waypoints: waypoints.map((waypoint) => ({ ...waypoint })),
+        };
+        if (options?.persistProgramName) {
+          const persistResponse = await fetch(`${normalizedApiHost}/robot-program/save`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: abortController.signal,
+            body: JSON.stringify({
+              kind: "trajectory",
+              name: options.persistProgramName,
+              authoring: {
+                waypoints: encodePoseWaypointsForApi(waypoints),
+                metadata: options.persistMetadata ?? {},
+              },
+              planned_trajectory: authoredPlan,
+            }),
+          });
+          if (!persistResponse.ok) {
+            const parsedError = await readApiErrorResponse(persistResponse);
+            throw new Error(
+              parsedError.message || `Failed to overwrite saved trajectory (${persistResponse.status})`,
+            );
+          }
+        }
+        if (trajectoryPreviewAbortRef.current !== abortController) {
+          return;
+        }
+        setPreviewPlan(authoredPlan);
+        setTrajectoryPlannerFailure(null);
         setWeldPreviewGhostJoints(null);
         setWeldPreviewCacheReady(false);
       } catch (err) {
+        if (abortController.signal.aborted) {
+          return;
+        }
         setError(`Failed to plan trajectory: ${(err as Error).message}`);
         setWeldPreviewGhostJoints(null);
       } finally {
-        setIsPlanLoading(false);
+        if (trajectoryPreviewAbortRef.current === abortController) {
+          trajectoryPreviewAbortRef.current = null;
+          setIsPlanLoading(false);
+        }
       }
     },
-    [normalizedApiHost],
+    [cancelTrajectoryPreviewRequest, normalizedApiHost],
   );
 
   const handlePlanToggle = useCallback(() => {
@@ -5614,41 +6309,88 @@ export default function App() {
     });
   }, [isPlanLoading, isRunningPreview, motionStatusActive, previewPlan]);
 
+  const fetchLiveTrajectoryPoseWaypoint = useCallback(
+    async (moveType: WaypointMoveType): Promise<PoseWaypoint> => {
+      const response = await fetch(`${normalizedApiHost}/info/pose`);
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || `Pose request failed (${response.status})`);
+      }
+      const pose = (await response.json()) as {
+        position_m?: { x?: number; y?: number; z?: number };
+        orientation_euler_deg?: { roll?: number; pitch?: number; yaw?: number };
+      };
+      return buildPoseWaypoint(
+        {
+          x: Number(pose.position_m?.x ?? 0),
+          y: Number(pose.position_m?.y ?? 0),
+          z: Number(pose.position_m?.z ?? 0),
+        },
+        {
+          rollDeg: Number(pose.orientation_euler_deg?.roll ?? null),
+          pitchDeg: Number(pose.orientation_euler_deg?.pitch ?? null),
+          yawDeg: Number(pose.orientation_euler_deg?.yaw ?? null),
+          moveType,
+        },
+      );
+    },
+    [normalizedApiHost],
+  );
+
   const handleAddTrajectoryWaypoint = useCallback(async () => {
     if (isPlanLoading || isRunningPreview || motionStatusActive) {
       return;
     }
-    const basePoints =
-      plannerPoints.length > 0
-        ? plannerPoints
-        : (previewPlan?.waypoints ?? []);
+    setError(null);
+    const basePoints = getLatestTrajectoryDraftWaypoints();
     let nextPoints: PoseWaypoint[];
-    if (basePoints.length === 0) {
-      nextPoints = [buildPoseWaypoint({ x: 0, y: 0, z: 0 })];
-    } else {
-      const insertFromIndex =
-        selectedProgramControlPointIndex !== null
-          ? Math.max(0, Math.min(basePoints.length - 1, selectedProgramControlPointIndex))
-          : basePoints.length - 1;
-      const source = basePoints[insertFromIndex] ?? basePoints[basePoints.length - 1];
-      nextPoints = [
-        ...basePoints.slice(0, insertFromIndex + 1),
-        { ...source },
-        ...basePoints.slice(insertFromIndex + 1),
-      ];
-      updateSettings({ selectedProgramNodeId: `control_point_${insertFromIndex + 1}` });
+    try {
+      const nextWaypoint = await fetchLiveTrajectoryPoseWaypoint("joint");
+      nextPoints = [...basePoints, nextWaypoint];
+    } catch (err) {
+      setError(`Failed to capture current joint waypoint: ${(err as Error).message}`);
+      return;
     }
     setIsPlanning(true);
     setPlannerPoints(nextPoints);
     await requestPlannerPreview(nextPoints);
   }, [
+    getLatestTrajectoryDraftWaypoints,
     isPlanLoading,
     isRunningPreview,
     motionStatusActive,
-    plannerPoints,
-    previewPlan,
+    fetchLiveTrajectoryPoseWaypoint,
     requestPlannerPreview,
-    selectedProgramControlPointIndex,
+  ]);
+
+  const handleAddTrajectoryHomeWaypoint = useCallback(async () => {
+    if (isPlanLoading || isRunningPreview || motionStatusActive) {
+      return;
+    }
+    const basePoints = getLatestTrajectoryDraftWaypoints();
+    let nextPoints: PoseWaypoint[];
+    if (basePoints.length === 0) {
+      try {
+        nextPoints = [await fetchLiveTrajectoryPoseWaypoint("home")];
+      } catch (err) {
+        setError(`Failed to seed home waypoint from current pose: ${(err as Error).message}`);
+        return;
+      }
+    } else {
+      const source = basePoints[basePoints.length - 1];
+      nextPoints = [...basePoints, { ...source, moveType: "home" }];
+      updateSettings({ selectedProgramNodeId: `control_point_${nextPoints.length - 1}` });
+    }
+    setIsPlanning(true);
+    setPlannerPoints(nextPoints);
+    await requestPlannerPreview(nextPoints);
+  }, [
+    getLatestTrajectoryDraftWaypoints,
+    isPlanLoading,
+    isRunningPreview,
+    motionStatusActive,
+    fetchLiveTrajectoryPoseWaypoint,
+    requestPlannerPreview,
     updateSettings,
   ]);
 
@@ -5657,22 +6399,29 @@ export default function App() {
       if (!isPlanning || isPlanLoading) {
         return;
       }
-      const lastOrientationSource = plannerPoints[plannerPoints.length - 1] ?? previewPlan?.waypoints?.[previewPlan.waypoints.length - 1] ?? null;
+      const currentPoints = getLatestTrajectoryDraftWaypoints();
+      const lastOrientationSource = currentPoints[currentPoints.length - 1] ?? null;
       const nextPoints = [
-        ...plannerPoints,
-        buildPoseWaypoint(point, lastOrientationSource),
+        ...currentPoints,
+        buildPoseWaypoint(point, {
+          rollDeg: lastOrientationSource?.rollDeg ?? null,
+          pitchDeg: lastOrientationSource?.pitchDeg ?? null,
+          yawDeg: lastOrientationSource?.yawDeg ?? null,
+          moveType: "linear",
+        }),
       ];
       setPlannerPoints(nextPoints);
       await requestPlannerPreview(nextPoints);
     },
-    [isPlanning, isPlanLoading, plannerPoints, previewPlan, requestPlannerPreview],
+    [getLatestTrajectoryDraftWaypoints, isPlanning, isPlanLoading, requestPlannerPreview],
   );
 
   const handleUndoPoint = useCallback(async () => {
-    if (plannerPoints.length === 0 || isPlanLoading) {
+    const currentPoints = getLatestTrajectoryDraftWaypoints();
+    if (currentPoints.length === 0 || isPlanLoading) {
       return;
     }
-    const nextPoints = plannerPoints.slice(0, -1);
+    const nextPoints = currentPoints.slice(0, -1);
     setPlannerPoints(nextPoints);
     if (nextPoints.length === 0) {
       setPreviewPlan(null);
@@ -5680,17 +6429,20 @@ export default function App() {
       return;
     }
     await requestPlannerPreview(nextPoints);
-  }, [plannerPoints, isPlanLoading, requestPlannerPreview]);
+  }, [getLatestTrajectoryDraftWaypoints, isPlanLoading, requestPlannerPreview]);
 
   const handleClearPreview = useCallback(() => {
+    cancelTrajectoryPreviewRequest();
     setError(null);
     setPreviewPlan(null);
+    setTrajectoryPlannerFailure(null);
     setPlannerPoints([]);
     setWeldEditableWaypoints([]);
     setWeldPreviewGhostJoints(null);
     setWeldPreviewCacheReady(false);
     setIsPlanning(false);
-  }, []);
+    setIsPlanLoading(false);
+  }, [cancelTrajectoryPreviewRequest]);
 
   const requestWeldPreview = useCallback(
     async (draft: WeldDraft, waypointsOverride?: Point3[]): Promise<PreviewPlan | null> => {
@@ -5836,7 +6588,14 @@ export default function App() {
     }
     setIsRunningPreview(true);
     setError(null);
+      setTrajectoryPlannerFailure(null);
     try {
+      if (!previewPlanMatchesWaypoints(previewPlan, plannerPoints)) {
+        throw new Error("Preview path is out of sync with the current waypoints. Regenerate before running.");
+      }
+      if (previewPlan.isStale) {
+        throw new Error("Saved path is stale. Regenerate the path from the loaded waypoints before running.");
+      }
       const trajectoryMeta = previewPlan.trajectory as unknown as Record<string, unknown>;
       const isWeldPreview =
         Boolean(trajectoryMeta) &&
@@ -5864,11 +6623,19 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         // Weld previews need cached high-fidelity paths; endpoint-only re-planning
         // flattens the weld arc into sparse straight segments.
-        body: JSON.stringify({ name: runName, use_cache: useCache, execution_mode: executionMode }),
+        body: JSON.stringify({
+          name: runName,
+          use_cache: useCache,
+          execution_mode: executionMode,
+          loop_override: trajectoryLoopEnabled,
+        }),
       });
       if (!response.ok) {
-        const message = await response.text();
-        throw new Error(message || `Run request failed (${response.status})`);
+        const parsedError = await readApiErrorResponse(response);
+        if (parsedError.plannerDiagnostics) {
+          setTrajectoryPlannerFailure(parsedError);
+        }
+        throw new Error(parsedError.message || `Run request failed (${response.status})`);
       }
       const payload = (await response.json()) as MotionStatusResponse;
       setMotionStatus(payload);
@@ -5878,11 +6645,13 @@ export default function App() {
       setIsRunningPreview(false);
     }
   }, [
+    plannerPoints,
     previewPlan,
     isPlanLoading,
     isRunningPreview,
     motionStatusActive,
     normalizedApiHost,
+    trajectoryLoopEnabled,
     weldDraft,
     requestWeldPreview,
   ]);
@@ -5972,6 +6741,25 @@ export default function App() {
     [weldDraft],
   );
 
+  const handleTreeWaypointMoveTypeChange = useCallback(
+    (index: number, moveType: WaypointMoveType) => {
+      if (weldDraft) {
+        return;
+      }
+      setPlannerPoints((current) =>
+        current.map((point, pointIndex) =>
+          pointIndex === index
+            ? {
+                ...point,
+                moveType,
+              }
+            : point,
+        ),
+      );
+    },
+    [weldDraft],
+  );
+
   const handleTreeAddWaypoint = useCallback(() => {
     if (weldDraft) {
       setWeldEditableWaypoints((current) => {
@@ -5995,22 +6783,14 @@ export default function App() {
       setWeldPreviewCacheReady(false);
       return;
     }
-    setPlannerPoints((current) => {
-      if (current.length === 0) {
-        return [buildPoseWaypoint({ x: 0, y: 0, z: 0 })];
-      }
-      const insertFromIndex =
-        selectedProgramControlPointIndex !== null
-          ? Math.max(0, Math.min(current.length - 1, selectedProgramControlPointIndex))
-          : current.length - 1;
-      const source = current[insertFromIndex] ?? current[current.length - 1];
-      return [
-        ...current.slice(0, insertFromIndex + 1),
-        { ...source },
-        ...current.slice(insertFromIndex + 1),
-      ];
-    });
-  }, [selectedProgramControlPointIndex, weldDraft]);
+    const currentPoints = getLatestTrajectoryDraftWaypoints();
+    const nextPoints: PoseWaypoint[] =
+      currentPoints.length === 0
+        ? [buildPoseWaypoint({ x: 0, y: 0, z: 0 }, { moveType: "joint" })]
+        : [...currentPoints, { ...currentPoints[currentPoints.length - 1], moveType: "joint" as const }];
+    setPlannerPoints(nextPoints);
+    updateSettings({ selectedProgramNodeId: `control_point_${nextPoints.length - 1}` });
+  }, [getLatestTrajectoryDraftWaypoints, selectedProgramControlPointIndex, updateSettings, weldDraft]);
 
   const handleTreeRemoveWaypoint = useCallback((index: number) => {
     if (weldDraft) {
@@ -6082,34 +6862,21 @@ export default function App() {
     }
     setError(null);
     try {
-      const response = await fetch(`${normalizedApiHost}/info/pose`);
-      if (!response.ok) {
-        const message = await response.text();
-        throw new Error(message || `Pose request failed (${response.status})`);
-      }
-      const pose = (await response.json()) as {
-        position_m?: { x?: number; y?: number; z?: number };
-        orientation_euler_deg?: { roll?: number; pitch?: number; yaw?: number };
-      };
-      const nextWaypoint = buildPoseWaypoint(
-        {
-          x: Number(pose.position_m?.x ?? 0),
-          y: Number(pose.position_m?.y ?? 0),
-          z: Number(pose.position_m?.z ?? 0),
-        },
-        {
-          rollDeg: Number(pose.orientation_euler_deg?.roll ?? null),
-          pitchDeg: Number(pose.orientation_euler_deg?.pitch ?? null),
-          yawDeg: Number(pose.orientation_euler_deg?.yaw ?? null),
-        },
-      );
-      const nextWaypoints = [...plannerPoints, nextWaypoint];
+      const nextWaypoint = await fetchLiveTrajectoryPoseWaypoint("linear");
+      const nextWaypoints = [...getLatestTrajectoryDraftWaypoints(), nextWaypoint];
       setPlannerPoints(nextWaypoints);
       await requestPlannerPreview(nextWaypoints);
     } catch (err) {
       setError(`Failed to capture current pose: ${(err as Error).message}`);
     }
-  }, [isPlanLoading, isRunningPreview, motionStatusActive, normalizedApiHost, plannerPoints, requestPlannerPreview]);
+  }, [
+    getLatestTrajectoryDraftWaypoints,
+    fetchLiveTrajectoryPoseWaypoint,
+    isPlanLoading,
+    isRunningPreview,
+    motionStatusActive,
+    requestPlannerPreview,
+  ]);
 
 
   const refreshWeldProgramList = useCallback(async () => {
@@ -6310,8 +7077,8 @@ export default function App() {
   }, [normalizedApiHost]);
 
   const handleSaveTrajectoryProgram = useCallback(async () => {
-    if (!previewPlan || plannerPoints.length === 0) {
-      setError("Plan a trajectory before saving it.");
+    if (plannerPoints.length === 0) {
+      setError("Add at least one waypoint before saving.");
       return;
     }
     const programName = trajectoryProgramName.trim();
@@ -6319,6 +7086,10 @@ export default function App() {
       setError("Program name is required.");
       return;
     }
+    const plannedTrajectoryForSave =
+      previewPlan && previewPlanMatchesWaypoints(previewPlan, plannerPoints) && !previewPlan.isStale
+        ? previewPlan
+        : null;
     setIsSavingTrajectoryProgram(true);
     setError(null);
     try {
@@ -6334,7 +7105,7 @@ export default function App() {
               source: "trajectory_editor",
             },
           },
-          planned_trajectory: previewPlan,
+          planned_trajectory: plannedTrajectoryForSave,
         }),
       });
       if (!response.ok) {
@@ -6343,6 +7114,7 @@ export default function App() {
       }
       await refreshTrajectoryList();
       setSelectedTrajectory(programName);
+      setLoadedTrajectoryMetadata({ source: "trajectory_editor" });
     } catch (err) {
       setError(`Failed to save trajectory program: ${(err as Error).message}`);
     } finally {
@@ -6354,10 +7126,36 @@ export default function App() {
     setSelectedTrajectory(value);
   }, []);
 
+  const handleRegenerateTrajectory = useCallback(async () => {
+    if (plannerPoints.length === 0 || isPlanLoading || isRunningPreview || motionStatusActive) {
+      return;
+    }
+    setError(null);
+    const persistProgramName =
+      selectedTrajectory && trajectoryProgramName.trim() === selectedTrajectory
+        ? selectedTrajectory
+        : undefined;
+    await requestPlannerPreview(plannerPoints, {
+      persistProgramName,
+      persistMetadata: persistProgramName ? loadedTrajectoryMetadata : null,
+    });
+  }, [
+    plannerPoints,
+    isPlanLoading,
+    isRunningPreview,
+    motionStatusActive,
+    requestPlannerPreview,
+    selectedTrajectory,
+    trajectoryProgramName,
+    loadedTrajectoryMetadata,
+  ]);
+
   const handleLoadTrajectory = useCallback(async () => {
     if (!selectedTrajectory || isLoadingSavedTrajectory) {
       return;
     }
+    cancelTrajectoryPreviewRequest();
+    setIsPlanLoading(false);
     setError(null);
     setIsLoadingSavedTrajectory(true);
     try {
@@ -6377,15 +7175,26 @@ export default function App() {
         throw new Error("Saved trajectory program has no waypoints.");
       }
       const savedPlan = record.planned_trajectory ?? null;
+      const savedPlanMatches = previewPlanMatchesWaypoints(savedPlan, waypoints);
+      const hydratedSavedPlan = savedPlan
+        ? {
+            ...savedPlan,
+            name: record.name,
+            useCache: false,
+            isStale: !savedPlanMatches || Boolean(savedPlan.isStale),
+            sourcePlanName: savedPlan.sourcePlanName ?? savedPlan.name,
+          }
+        : null;
       setPlannerPoints(waypoints);
-      setPreviewPlan(savedPlan);
+      setPreviewPlan(hydratedSavedPlan);
       setTrajectoryProgramName(record.name);
+      setLoadedTrajectoryMetadata(record.authoring?.metadata ?? null);
       setWeldDraft(null);
       setWeldEditableWaypoints([]);
       setWeldPreviewGhostJoints(null);
       setWeldPreviewCacheReady(false);
-      if (!savedPlan) {
-        await requestPlannerPreview(waypoints);
+      if (savedPlan && !savedPlanMatches) {
+        setError("Saved computed path does not match the stored waypoints. Regenerate the path to resolve it.");
       }
       setIsPlanning(false);
     } catch (err) {
@@ -6394,7 +7203,7 @@ export default function App() {
     } finally {
       setIsLoadingSavedTrajectory(false);
     }
-  }, [selectedTrajectory, isLoadingSavedTrajectory, normalizedApiHost, requestPlannerPreview]);
+  }, [cancelTrajectoryPreviewRequest, selectedTrajectory, isLoadingSavedTrajectory, normalizedApiHost]);
 
   const issueStop = useCallback(async () => {
     if (isStopping) {
@@ -6578,6 +7387,23 @@ export default function App() {
   }, [selectedProgramNodeId, programNodeById, updateSettings]);
 
   useEffect(() => {
+    if (!selectedProgramNodeId) {
+      return;
+    }
+    setSelectedTimelineSyntheticId(null);
+  }, [selectedProgramNodeId]);
+
+  useEffect(() => {
+    if (!selectedTimelineSyntheticId) {
+      return;
+    }
+    if (trajectoryMoveTimelineSelections.some((item) => item.id === selectedTimelineSyntheticId)) {
+      return;
+    }
+    setSelectedTimelineSyntheticId(null);
+  }, [selectedTimelineSyntheticId, trajectoryMoveTimelineSelections]);
+
+  useEffect(() => {
     if (panelSelectionOriginRef.current !== "tree") {
       return;
     }
@@ -6632,11 +7458,23 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (!selectedProgramNodeId || selectedNodeFocusPoints.length === 0) {
+    if (
+      !selectedProgramNodeId &&
+      !selectedTimelineSyntheticId &&
+      !selectedProgramMoveTimelineFocus
+    ) {
+      return;
+    }
+    if (selectedNodeFocusPoints.length === 0) {
       return;
     }
     visualizerRef.current?.focusOnPoints(selectedNodeFocusPoints);
-  }, [selectedProgramNodeId, selectedNodeFocusPoints]);
+  }, [
+    selectedProgramMoveTimelineFocus,
+    selectedProgramNodeId,
+    selectedTimelineSyntheticId,
+    selectedNodeFocusPoints,
+  ]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -6695,6 +7533,7 @@ export default function App() {
     (nodeId: string) => {
       const node = programNodeById.get(nodeId);
       const nextPanel = node?.focus?.openPanel;
+      setSelectedTimelineSyntheticId(null);
       panelSelectionOriginRef.current = "tree";
       updateSettings({
         selectedProgramNodeId: nodeId,
@@ -6702,6 +7541,25 @@ export default function App() {
       });
     },
     [programNodeById, updateSettings, activePanel],
+  );
+  const handleSelectTimelineItem = useCallback(
+    (itemId: string) => {
+      if (itemId.startsWith("timeline_segment_")) {
+        const selectedSegment = trajectoryMoveTimelineSelections.find((item) => item.id === itemId);
+        if (!selectedSegment) {
+          return;
+        }
+        setSelectedTimelineSyntheticId(itemId);
+        panelSelectionOriginRef.current = null;
+        updateSettings({
+          selectedProgramNodeId: null,
+          activePanel: selectedSegment.openPanel ?? activePanel,
+        });
+        return;
+      }
+      handleSelectProgramTreeNode(itemId);
+    },
+    [activePanel, handleSelectProgramTreeNode, trajectoryMoveTimelineSelections, updateSettings],
   );
   const handleChangeProgramTreeViewMode = useCallback(
     (value: ProgramTreeViewMode) => {
@@ -6823,6 +7681,7 @@ export default function App() {
             isMotionActive={motionStatusActive}
             motionStatus={motionStatus}
             preview={previewPlan}
+            plannerFailure={trajectoryPlannerFailure}
             plannerPoints={plannerPoints}
             savedTrajectories={savedTrajectories}
             selectedTrajectory={selectedTrajectory}
@@ -6836,12 +7695,16 @@ export default function App() {
             onPlanToggle={handlePlanToggle}
             onSimulate={handleSimulatePreview}
             onRunLive={handleRunPreviewLive}
+            loopEnabled={trajectoryLoopEnabled}
+            onLoopEnabledChange={setTrajectoryLoopEnabled}
             onCapturePose={handleCaptureTrajectoryPose}
             onAddWaypoint={handleAddTrajectoryWaypoint}
+            onAddHomeWaypoint={handleAddTrajectoryHomeWaypoint}
             onClear={handleClearPreview}
             onRefreshTrajectories={refreshTrajectoryList}
             onSelectTrajectory={handleSelectTrajectory}
             onLoadTrajectory={handleLoadTrajectory}
+            onRegenerateTrajectory={handleRegenerateTrajectory}
             onUndoPoint={handleUndoPoint}
           />
         )
@@ -7359,8 +8222,8 @@ export default function App() {
                     weldGhostJoints={weldPreviewGhostJoints}
                     pathPoints={visualPathPoints}
                     waypoints={visualWaypoints}
-                    highlightPathRange={selectedProgramPathRange}
-                    highlightWaypointIndices={selectedProgramWaypointIndices}
+                    highlightPathRange={activeSelectionPathRange}
+                    highlightWaypointIndices={activeSelectionWaypointIndices}
                     stepFile={stepFile}
                     stepTransform={stepTransform}
                     onStepStatusChange={setStepLoadStatus}
@@ -7520,7 +8383,7 @@ export default function App() {
               lanes={timelineLanes}
               playheadLabel={currentPlayheadLabel}
               playheadDetail={currentPlayheadDetail}
-              onSelectItem={handleSelectProgramTreeNode}
+              onSelectItem={handleSelectTimelineItem}
             />
           </div>
           <div className="col-start-2 row-start-1 row-span-3 min-h-0">
@@ -7550,6 +8413,7 @@ export default function App() {
                     onSelectNode={handleSelectProgramTreeNode}
                     onChangeViewMode={handleChangeProgramTreeViewMode}
                     onWaypointChange={handleTreeWaypointChange}
+                    onWaypointMoveTypeChange={handleTreeWaypointMoveTypeChange}
                     onAddWaypoint={handleTreeAddWaypoint}
                     onRemoveWaypoint={handleTreeRemoveWaypoint}
                     onMoveWaypointUp={() => handleTreeMoveWaypoint(-1)}
@@ -7591,6 +8455,7 @@ export default function App() {
                       onError={(m) => setError(m)}
                       splitStatusSections
                       showStatusSections={false}
+                      showGripperPanel={showGripperPanel}
                       controlsCollapsed={isRobotControlCollapsed}
                       onToggleControlsCollapsed={() =>
                         updateSettings({ collapseRobotControl: !isRobotControlCollapsed })
@@ -7609,6 +8474,7 @@ export default function App() {
         apiHost={apiHost}
         visionHost={visionHost}
         showBoundingBox={showBoundingBox}
+        showGripperPanel={showGripperPanel}
         robots={robotOptions}
         selectedRobotName={selectedRobotName}
         selectedRtMaxRpmInput={selectedRtMaxRpmInput}
@@ -7633,6 +8499,7 @@ export default function App() {
         onHostChange={setApiHost}
         onVisionHostChange={setVisionHost}
         onShowBoundingBoxChange={(value) => updateSettings({ showBoundingBox: value })}
+        onShowGripperPanelChange={(value) => updateSettings({ showGripperPanel: value })}
         onSelectedRobotNameChange={setSelectedRobotName}
         onSelectedRtMaxRpmInputChange={setSelectedRtMaxRpmInput}
         onSelectedToolIdChange={setSelectedToolId}

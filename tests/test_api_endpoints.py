@@ -188,6 +188,14 @@ def patch_send(monkeypatch):
         "program_current_step_type": None,
         "program_loop_iteration": 0,
     }
+    accepted_run_program_loop_payload = {
+        **accepted_run_program_payload,
+        "program": {
+            **accepted_run_program_payload["program"],
+            "loop_enabled": True,
+        },
+        "program_loop_enabled": True,
+    }
     responses = {
         "STOP": (True, f"ACK,STOP,{_payload_token({**completed_motion_payload, 'state': 'aborted'})}"),
         "SAFE_POWER_UP": (True, f"ACK,SAFE_POWER_UP,{_payload_token(safe_power_up_payload)}"),
@@ -287,6 +295,10 @@ def patch_send(monkeypatch):
         "RUN_TRAJECTORY,alpha,false": (
             True,
             f"ACK,RUN_TRAJECTORY,{_payload_token(accepted_run_program_payload)}",
+        ),
+        "RUN_TRAJECTORY,alpha,false,true": (
+            True,
+            f"ACK,RUN_TRAJECTORY,{_payload_token(accepted_run_program_loop_payload)}",
         ),
     }
     no_reply_commands = {
@@ -1325,6 +1337,54 @@ def test_trajectory_run(client):
     assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false", 2.0, True)
 
 
+def test_trajectory_run_with_loop_override(client):
+    resp = client.post("/trajectory/run", json={"name": "alpha", "loop_override": True})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["program"]["loop_enabled"] is True
+    assert body["program_loop_enabled"] is True
+    assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false,true", 2.0, True)
+
+
+def test_trajectory_run_timeout_is_inferred_from_motion_status(client, monkeypatch):
+    call_log: list[tuple[str, float, bool]] = []
+
+    def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
+        call_log.append((command, timeout, expect_response))
+        if command == "GET_RUNTIME_CONFIG":
+            return True, "RUNTIME_CONFIG," + json.dumps({"active": {"mode": {"sim": False}}}, separators=(",", ":"))
+        if command == "RUN_TRAJECTORY,__planner_preview__,false":
+            return False, "No response for command 'RUN_TRAJECTORY,__planner_preview__,false'"
+        if command == "GET_MOTION_STATUS":
+            payload = {
+                "accepted": True,
+                "state": "executing",
+                "program": {
+                    "name": "__planner_preview__",
+                    "active": True,
+                    "state": "planning",
+                },
+                "program_name": "__planner_preview__",
+                "program_active": True,
+                "program_state": "planning",
+            }
+            return True, f"MOTION_STATUS,{_payload_token(payload)}"
+        return False, f"unexpected {command}"
+
+    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
+
+    resp = client.post("/trajectory/run", json={"name": "__planner_preview__"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] is True
+    assert body["ack_inferred"] is True
+    assert body["run_request_timed_out"] is True
+    assert body["run_request_detail"] == "No response for command 'RUN_TRAJECTORY,__planner_preview__,false'"
+    assert body["program_name"] == "__planner_preview__"
+    assert call_log[1] == ("RUN_TRAJECTORY,__planner_preview__,false", 2.0, True)
+    assert call_log[2] == ("GET_MOTION_STATUS", 1.0, True)
+
+
 def test_trajectory_plan_points_success(client):
     resp = client.post(
         "/trajectory/plan-points",
@@ -1350,11 +1410,132 @@ def test_trajectory_plan_points_success(client):
     assert client.command_calls[-1] == ("GET_POSITION", 1.0, True)
 
 
+def test_trajectory_plan_points_syncs_controller_joint_feedback_in_radians(client, monkeypatch):
+    captured: dict[str, object] = {"seed_joints_rad": None}
+
+    def fake_plan_preview(points, preview_name="__planner_preview__", weld_metadata=None, sections=None, pose_waypoints=None):
+        captured["seed_joints_rad"] = list(api_main.controller_utils.current_logical_joint_angles_rad)
+        return {
+            "name": preview_name,
+            "trajectory": {
+                "description": "Planned",
+                "loop": False,
+                "orientation_euler_angles_deg": None,
+                "moves": [
+                    {"command": "move", "vector": [0.1, 0.2, 0.3]},
+                ],
+            },
+            "cartesian_path": [[0.1, 0.2, 0.3]],
+            "waypoints": pose_waypoints if pose_waypoints is not None else points,
+            "file_path": "/tmp/recorded_trajectories/__planner_preview__.json",
+        }
+
+    monkeypatch.setattr(api_main.controller_command_api, "plan_preview_trajectory_points", fake_plan_preview)
+
+    resp = client.post(
+        "/trajectory/plan-points",
+        json={
+            "waypoints": [
+                {"x": 0.1, "y": 0.2, "z": 0.3, "move_type": "joint"},
+            ]
+        },
+    )
+
+    assert resp.status_code == 200
+    assert captured["seed_joints_rad"] == pytest.approx([
+        0.017453292519943295,
+        0.03490658503988659,
+        0.05235987755982989,
+        0.06981317007977318,
+        0.08726646259971647,
+        0.10471975511965978,
+    ])
+
+
+def test_trajectory_plan_points_preserves_waypoint_move_type(client):
+    resp = client.post(
+        "/trajectory/plan-points",
+        json={
+            "waypoints": [
+                {"x": 0.1, "y": 0.2, "z": 0.3, "move_type": "joint"},
+                {"x": 0.4, "y": 0.5, "z": 0.6, "moveType": "home"},
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["waypoints"][0]["move_type"] == "joint"
+    assert body["waypoints"][1]["move_type"] == "home"
+
+
 def test_trajectory_plan_points_validation(client):
     start_len = len(client.command_calls)
     resp = client.post("/trajectory/plan-points", json={"points": [{"x": 1.0}]})
     assert resp.status_code == 400
     assert len(client.command_calls) == start_len
+
+
+def test_trajectory_plan_points_failure_includes_planner_diagnostics(client, monkeypatch):
+    planner_diag = {
+        "reason_code": "IK_JUMP_REJECTED",
+        "attempt": "dense_sequential",
+        "fallback_level": 3,
+        "seed_used": "start_q",
+        "residuals": {
+            "jump_pose_index": 4.0,
+            "jump_joint_index": 6.0,
+            "jump_joint_previous_rad": 0.0,
+            "jump_joint_current_rad": 6.28305,
+            "jump_joint_raw_step_rad": 6.28305,
+            "jump_joint_wrapped_step_rad": 0.00014,
+            "jump_context": "dense_sequential:post_unwrap",
+            "step_source": "trajectory",
+            "max_joint_step_rad": 6.28305,
+        },
+        "recovery": {
+            "used": False,
+            "kind": "jump_reseed",
+            "attempts": [
+                {
+                    "strategy": "local_suffix_reseed",
+                    "suffix_start_index": 4,
+                    "reason_code": "IK_JUMP_REJECTED",
+                    "accepted": False,
+                    "raw_jump": {
+                        "jump_joint_index": 6.0,
+                        "jump_joint_raw_step_rad": 6.28305,
+                    },
+                }
+            ],
+        },
+    }
+
+    def failing_plan_preview(*args, **kwargs):
+        api_main.controller_utils.trajectory_state["last_planner_diagnostics"] = planner_diag
+        raise RuntimeError("Planning failed at waypoint #4 target=[0.8, 0.0, 0.69].")
+
+    monkeypatch.setattr(
+        api_main.controller_command_api,
+        "plan_preview_trajectory_points",
+        failing_plan_preview,
+    )
+
+    resp = client.post(
+        "/trajectory/plan-points",
+        json={"waypoints": [{"x": 0.1, "y": 0.2, "z": 0.3}]},
+    )
+    assert resp.status_code == 502
+    body = resp.json()
+    assert body["detail"]["message"].startswith("Trajectory planning failed:")
+    assert body["detail"]["planner_diagnostics"]["reason_code"] == "IK_JUMP_REJECTED"
+    assert body["detail"]["planner_diagnostics"]["residuals"]["step_source"] == "trajectory"
+    assert body["detail"]["planner_diagnostics"]["residuals"]["jump_joint_index"] == 6.0
+    assert body["detail"]["planner_diagnostics"]["residuals"]["jump_context"] == "dense_sequential:post_unwrap"
+    assert (
+        body["detail"]["planner_diagnostics"]["recovery"]["attempts"][0]["raw_jump"]["jump_joint_raw_step_rad"]
+        == 6.28305
+    )
+    assert body["detail"]["planner_diagnostics"]["recovery"]["used"] is False
 
 
 def test_trajectory_run_simulation_mode_conflict(client, monkeypatch):
@@ -1471,8 +1652,16 @@ def test_robot_program_save_list_load_for_trajectory(client):
             "kind": "trajectory",
             "name": "demo_traj",
             "waypoints": [
-                {"x": 0.1, "y": 0.2, "z": 0.3, "rollDeg": 1.0, "pitchDeg": 2.0, "yawDeg": 3.0},
-                {"x": 0.4, "y": 0.5, "z": 0.6},
+                {
+                    "x": 0.1,
+                    "y": 0.2,
+                    "z": 0.3,
+                    "rollDeg": 1.0,
+                    "pitchDeg": 2.0,
+                    "yawDeg": 3.0,
+                    "moveType": "joint",
+                },
+                {"x": 0.4, "y": 0.5, "z": 0.6, "moveType": "home"},
             ],
             "metadata": {"note": "demo"},
             "planned_trajectory": {"name": "__planner_preview__"},
@@ -1490,7 +1679,86 @@ def test_robot_program_save_list_load_for_trajectory(client):
     payload = load_resp.json()
     assert payload["kind"] == "trajectory"
     assert payload["authoring"]["waypoints"][0]["orientation_euler_deg"]["yaw"] == pytest.approx(3.0)
+    assert payload["authoring"]["waypoints"][0]["move_type"] == "joint"
+    assert payload["authoring"]["waypoints"][1]["move_type"] == "home"
     assert payload["authoring"]["metadata"]["note"] == "demo"
+
+
+def test_saved_trajectory_load_disables_cache_reuse(client, monkeypatch):
+    cache_dir = tempfile.mkdtemp(prefix="trajectory-cache-")
+    monkeypatch.setattr("gradient_os.api.main._TRAJECTORY_CACHE_DIR", cache_dir)
+    Path(cache_dir, "__planner_preview__.json").write_text('[{"type":"move","path":[[0,0,0,0,0,0]],"freq":100}]')
+
+    save_resp = client.post(
+        "/robot-program/save",
+        json={
+            "kind": "trajectory",
+            "name": "cached_traj",
+            "waypoints": [
+                {
+                    "x": 0.1,
+                    "y": 0.2,
+                    "z": 0.3,
+                    "rollDeg": 1.0,
+                    "pitchDeg": 2.0,
+                    "yawDeg": 3.0,
+                    "moveType": "joint",
+                },
+                {
+                    "x": 0.4,
+                    "y": 0.5,
+                    "z": 0.6,
+                    "rollDeg": 4.0,
+                    "pitchDeg": 5.0,
+                    "yawDeg": 6.0,
+                    "moveType": "linear",
+                },
+            ],
+            "planned_trajectory": {
+                "name": "__planner_preview__",
+                "trajectory": {
+                    "description": "Planned",
+                    "loop": False,
+                    "orientation_euler_angles_deg": None,
+                    "moves": [
+                        {
+                            "command": "move",
+                            "vector": [0.1, 0.2, 0.3],
+                            "orientation_euler_deg": [1.0, 2.0, 3.0],
+                        },
+                        {
+                            "command": "move_absolute",
+                            "vector": [0.4, 0.5, 0.6],
+                            "orientation_euler_deg": [4.0, 5.0, 6.0],
+                        },
+                    ],
+                },
+                "waypoints": [
+                    {
+                        "x": 0.1,
+                        "y": 0.2,
+                        "z": 0.3,
+                        "move_type": "joint",
+                        "orientation_euler_deg": {"roll": 1.0, "pitch": 2.0, "yaw": 3.0},
+                    },
+                    {
+                        "x": 0.4,
+                        "y": 0.5,
+                        "z": 0.6,
+                        "move_type": "linear",
+                        "orientation_euler_deg": {"roll": 4.0, "pitch": 5.0, "yaw": 6.0},
+                    },
+                ],
+            },
+        },
+    )
+    assert save_resp.status_code == 200
+
+    load_resp = client.get("/robot-program/cached_traj", params={"kind": "trajectory"})
+    assert load_resp.status_code == 200
+    payload = load_resp.json()
+    assert payload["planned_trajectory"]["useCache"] is False
+    assert payload["planned_trajectory"]["isStale"] is False
 
 
 def test_preview_execute_clear(client, monkeypatch):

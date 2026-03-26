@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
-import type { PoseWaypoint, ProgramNode, ProgramTreeViewMode } from "../previewUtils";
+import type { PoseWaypoint, ProgramNode, ProgramTreeViewMode, WaypointMoveType } from "../previewUtils";
 
 type ProgramFeatureTreeProps = {
   root: ProgramNode | null;
@@ -21,6 +21,7 @@ type ProgramFeatureTreeProps = {
     axis: "x" | "y" | "z" | "rollDeg" | "pitchDeg" | "yawDeg",
     value: number,
   ) => void;
+  onWaypointMoveTypeChange: (index: number, moveType: WaypointMoveType) => void;
   onAddWaypoint: () => void;
   onRemoveWaypoint: (index: number) => void;
   onMoveWaypointUp: () => void;
@@ -124,6 +125,7 @@ export function ProgramFeatureTree({
   onSelectNode,
   onChangeViewMode,
   onWaypointChange,
+  onWaypointMoveTypeChange,
   onAddWaypoint,
   onRemoveWaypoint,
   onMoveWaypointUp,
@@ -206,8 +208,8 @@ export function ProgramFeatureTree({
                     className={`rounded border border-slate-600/70 px-1.5 py-0.5 text-[11px] text-slate-200 transition hover:border-slate-400 ${
                       !canAddWaypoint ? "opacity-60" : ""
                     }`}
-                    aria-label="Add control point"
-                    title="Add control point"
+                    aria-label="Add joint control point"
+                    title="Add joint control point"
                   >
                     +
                   </button>
@@ -297,6 +299,27 @@ export function ProgramFeatureTree({
                     }
                   />
                 ))}
+              </div>
+              <div className="mt-1">
+                <select
+                  className={`w-full rounded border border-slate-600/70 bg-slate-950/70 px-1.5 py-1 text-[12px] text-slate-100 ${
+                    !canEditWaypointValues ? "opacity-60" : ""
+                  }`}
+                  value={editableControlPoint.point.moveType}
+                  disabled={!canEditWaypointValues}
+                  onChange={(event) =>
+                    onWaypointMoveTypeChange(
+                      editableControlPoint.index,
+                      event.target.value === "joint" || event.target.value === "home"
+                        ? event.target.value
+                        : "linear",
+                    )
+                  }
+                >
+                  <option value="linear">Linear move</option>
+                  <option value="joint">Joint move</option>
+                  <option value="home">Move to home</option>
+                </select>
               </div>
               <button
                 type="button"

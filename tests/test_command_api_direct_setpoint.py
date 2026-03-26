@@ -3,6 +3,141 @@ import numpy as np
 from gradient_os.arm_controller import command_api
 
 
+def test_plan_preview_trajectory_points_prefers_live_joint_feedback(monkeypatch, tmp_path):
+    monkeypatch.setattr(command_api, "RECORDED_TRAJ_DIR", str(tmp_path / "recorded"))
+    monkeypatch.setattr(command_api.utils, "TRAJECTORY_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        command_api.utils,
+        "current_logical_joint_angles_rad",
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        raising=False,
+    )
+
+    live_q = [0.3, -0.2, 0.1, 0.4, -0.1, 0.2]
+    captured: dict[str, list[float] | None] = {"start_q": None}
+
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: list(live_q),
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver.servo_protocol,
+        "get_present_servo_ids",
+        lambda: {10, 20, 30, 40, 50, 60},
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk", lambda _q: [0.0, 0.0, 0.0])
+
+    def _fake_fk_matrix(q):
+        matrix = np.eye(4, dtype=float)
+        q_arr = np.asarray(q, dtype=float)
+        matrix[:3, 3] = np.array(
+            [
+                float(q_arr[0]) if q_arr.size > 0 else 0.0,
+                float(q_arr[1]) if q_arr.size > 1 else 0.0,
+                float(q_arr[2]) if q_arr.size > 2 else 0.0,
+            ],
+            dtype=float,
+        )
+        return matrix
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+
+    def _fake_plan_joint_move_to_pose(current_q, **kwargs):
+        captured["start_q"] = list(np.asarray(current_q, dtype=float).tolist())
+        return [list(np.asarray(current_q, dtype=float).tolist())], list(np.asarray(current_q, dtype=float).tolist())
+
+    monkeypatch.setattr(command_api, "_plan_joint_move_to_pose", _fake_plan_joint_move_to_pose)
+
+    payload = command_api.plan_preview_trajectory_points(
+        points=[[0.1, 0.2, 0.3]],
+        preview_name="__live_joint_preview__",
+        pose_waypoints=[
+            {
+                "x": 0.1,
+                "y": 0.2,
+                "z": 0.3,
+                "move_type": "joint",
+            }
+        ],
+    )
+
+    assert captured["start_q"] == live_q
+    assert payload["trajectory"]["moves"][0]["command"] == "move"
+
+
+def test_plan_preview_trajectory_points_uses_cached_controller_joints_when_local_feedback_unavailable(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(command_api, "RECORDED_TRAJ_DIR", str(tmp_path / "recorded"))
+    monkeypatch.setattr(command_api.utils, "TRAJECTORY_CACHE_DIR", str(tmp_path / "cache"))
+    cached_q = [0.3, -0.2, 0.1, 0.4, -0.1, 0.2]
+    monkeypatch.setattr(
+        command_api.utils,
+        "current_logical_joint_angles_rad",
+        list(cached_q),
+        raising=False,
+    )
+
+    live_read_calls: list[bool] = []
+    captured: dict[str, list[float] | None] = {"start_q": None}
+
+    def _no_backend():
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(command_api.backend_registry, "get_active_backend", _no_backend)
+    monkeypatch.setattr(
+        command_api.servo_driver.servo_protocol,
+        "get_present_servo_ids",
+        lambda: set(),
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: live_read_calls.append(bool(verbose)) or [0.0] * 6,
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk", lambda _q: [0.0, 0.0, 0.0])
+
+    def _fake_fk_matrix(q):
+        matrix = np.eye(4, dtype=float)
+        q_arr = np.asarray(q, dtype=float)
+        matrix[:3, 3] = np.array(
+            [
+                float(q_arr[0]) if q_arr.size > 0 else 0.0,
+                float(q_arr[1]) if q_arr.size > 1 else 0.0,
+                float(q_arr[2]) if q_arr.size > 2 else 0.0,
+            ],
+            dtype=float,
+        )
+        return matrix
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+
+    def _fake_plan_joint_move_to_pose(current_q, **kwargs):
+        captured["start_q"] = list(np.asarray(current_q, dtype=float).tolist())
+        return [list(np.asarray(current_q, dtype=float).tolist())], list(np.asarray(current_q, dtype=float).tolist())
+
+    monkeypatch.setattr(command_api, "_plan_joint_move_to_pose", _fake_plan_joint_move_to_pose)
+
+    payload = command_api.plan_preview_trajectory_points(
+        points=[[0.1, 0.2, 0.3]],
+        preview_name="__cached_joint_preview__",
+        pose_waypoints=[
+            {
+                "x": 0.1,
+                "y": 0.2,
+                "z": 0.3,
+                "move_type": "joint",
+            }
+        ],
+    )
+
+    assert captured["start_q"] == cached_q
+    assert live_read_calls == []
+    assert payload["trajectory"]["moves"][0]["command"] == "move"
+
+
 def test_handle_apply_joint_setpoint_uses_fallbacks_when_servo_defaults_missing(monkeypatch):
     calls: list[tuple[list[float], int, float]] = []
 

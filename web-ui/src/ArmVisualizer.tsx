@@ -1,8 +1,8 @@
 /*
  * ARM DISPLAY GUARDRAILS: if the robot disappears, assume it is a regression in this viewer or its
  * surrounding stage/dev-server wiring first, not "missing files." The Gradient-05 source STL files live at
- * `/home/pi/GradientOS/robots/gradient-05/stl-files/`, and the synced web-served copies live at
- * `/home/pi/GradientOS/web-ui/public/assets/robots/gradient-05/stl-files/`; the URDF served by this UI points
+ * `.../GradientOS/robots/gradient-05/stl-files/`, and the synced web-served copies live at
+ * `.../GradientOS/web-ui/public/assets/robots/gradient-05/stl-files/`; the URDF served by this UI points
  * at those STL names. Common ways to break the arm display are: unmounting/replacing `ArmVisualizer` during
  * stage/view toggles, changing `resolveRobotUrdfConfig()` or Vite public-asset serving so URDF/STLs resolve to
  * the SPA shell instead of real bytes, changing `robotId` selection/hydration, or changing camera grounding /
@@ -118,10 +118,38 @@ const WELD_ANGLE_PREVIEW_ARC_RADIUS_BASE_M = 0.018;
 const WELD_ANGLE_PREVIEW_LABEL_SCALE = 0.032;
 const WELD_ANGLE_PREVIEW_LABEL_OFFSET_M = 0.014;
 const LIVE_BOUNDS_REFRESH_INTERVAL_MS = 20;
+const PREVIEW_CP_LABEL_SCALE = 0.018;
+const PREVIEW_MOVE_LABEL_SCALE = 0.017;
+const PREVIEW_CP_LABEL_OFFSET = new THREE.Vector3(0.012, 0.006, 0.012);
+const PREVIEW_MOVE_LABEL_OFFSET = new THREE.Vector3(0.0, 0.0, 0.016);
 
 function clampNumber(value: number, min: number, max: number): number {
   const safeValue = Number.isFinite(value) ? value : 0;
   return Math.max(min, Math.min(max, safeValue));
+}
+
+function pointDistanceSquared(a: THREE.Vector3, b: THREE.Vector3): number {
+  return a.distanceToSquared(b);
+}
+
+function buildOrderedWaypointPathIndices(pathPoints: THREE.Vector3[], waypoints: THREE.Vector3[]): number[] {
+  if (pathPoints.length === 0 || waypoints.length === 0) {
+    return [];
+  }
+  let searchStart = 0;
+  return waypoints.map((waypoint) => {
+    let bestIndex = Math.max(0, Math.min(pathPoints.length - 1, searchStart));
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (let index = searchStart; index < pathPoints.length; index += 1) {
+      const distance = pointDistanceSquared(pathPoints[index], waypoint);
+      if (distance <= bestDistance) {
+        bestDistance = distance;
+        bestIndex = index;
+      }
+    }
+    searchStart = bestIndex;
+    return bestIndex;
+  });
 }
 
 function normalizeVector(
@@ -2975,6 +3003,8 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         ? highlightWaypointIndices.filter((value) => Number.isInteger(value))
         : [],
     );
+    const waypointPathIndices =
+      waypointList.length > 0 ? buildOrderedWaypointPathIndices(pathList, waypointList) : [];
 
     markerSource.forEach((point, index) => {
       const isHighlighted = highlightedWaypoints.has(index);
@@ -2991,7 +3021,57 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       marker.renderOrder = isHighlighted ? 42 : 40;
       marker.position.copy(point);
       group.add(marker);
+
+      if (waypointList.length > 0 && index < waypointList.length) {
+        const label = createAxisLabelSprite(
+          `CP${index + 1}`,
+          isHighlighted ? 0xf97316 : 0x67e8f9,
+          PREVIEW_CP_LABEL_SCALE,
+        );
+        label.position.copy(point).add(PREVIEW_CP_LABEL_OFFSET);
+        label.renderOrder = isHighlighted ? 52 : 50;
+        group.add(label);
+      }
     });
+
+    if (waypointList.length >= 2) {
+      for (let index = 0; index < waypointList.length - 1; index += 1) {
+        const startPoint = waypointList[index];
+        const endPoint = waypointList[index + 1];
+        const midpoint = startPoint.clone().lerp(endPoint, 0.5);
+        let isHighlighted = false;
+        if (highlightPathRange && pathList.length > 1 && waypointPathIndices.length > index + 1) {
+          const rawStart = waypointPathIndices[index] ?? 0;
+          const rawEnd = waypointPathIndices[index + 1] ?? rawStart;
+          let segmentStart = Math.max(0, Math.min(pathList.length - 1, rawStart));
+          let segmentEnd = Math.max(segmentStart, Math.min(pathList.length - 1, rawEnd));
+          if (pathList.length >= 2 && segmentStart === segmentEnd) {
+            if (segmentEnd < pathList.length - 1) {
+              segmentEnd += 1;
+            } else if (segmentStart > 0) {
+              segmentStart -= 1;
+            }
+          }
+          const selectedStart = Math.max(
+            0,
+            Math.min(pathList.length - 1, Math.floor(highlightPathRange.start)),
+          );
+          const selectedEnd = Math.max(
+            selectedStart,
+            Math.min(pathList.length - 1, Math.ceil(highlightPathRange.end)),
+          );
+          isHighlighted = selectedStart === segmentStart && selectedEnd === segmentEnd;
+        }
+        const moveLabel = createAxisLabelSprite(
+          `M${index + 1}`,
+          isHighlighted ? 0xf97316 : 0xfacc15,
+          PREVIEW_MOVE_LABEL_SCALE,
+        );
+        moveLabel.position.copy(midpoint).add(PREVIEW_MOVE_LABEL_OFFSET);
+        moveLabel.renderOrder = isHighlighted ? 52 : 50;
+        group.add(moveLabel);
+      }
+    }
 
     scene.add(group);
     previewGroupRef.current = group;

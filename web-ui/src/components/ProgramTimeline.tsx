@@ -125,21 +125,22 @@ export function ProgramTimeline({
                       <div
                         className={`pointer-events-none absolute left-6 right-6 top-[1.65rem] h-px bg-gradient-to-r ${style.rail}`}
                       />
-                      <div className="gradient-scrollbar flex gap-3 overflow-x-auto overflow-y-hidden pb-1">
+                      <div className="gradient-scrollbar flex gap-2 overflow-x-auto overflow-y-hidden pb-1">
                         {lane.items.map((item) => {
-                          const activeClasses = item.active ? style.active : style.item;
+                          const itemStyle = toneStyle(item.tone ?? lane.tone);
+                          const activeClasses = item.active ? itemStyle.active : itemStyle.item;
                           return (
                             <button
                               key={item.id}
                               type="button"
                               disabled={item.disabled}
                               onClick={() => onSelectItem(item.id)}
-                              className={`relative min-w-[10rem] rounded-2xl border px-3 py-3 text-left transition ${activeClasses} ${
+                              className={`relative min-w-[7.5rem] rounded-xl border px-2.5 py-2 text-left transition ${activeClasses} ${
                                 item.disabled ? "cursor-not-allowed opacity-50" : ""
                               }`}
                             >
-                              <div className="mb-2 flex items-center justify-between gap-2">
-                                <span className="text-[10px] font-semibold uppercase tracking-[0.22em] text-current/70">
+                              <div className="mb-1.5 flex items-center justify-between gap-2">
+                                <span className="text-[9px] font-semibold uppercase tracking-[0.22em] text-current/70">
                                   Block
                                 </span>
                                 {item.active ? (
@@ -148,8 +149,8 @@ export function ProgramTimeline({
                                   </span>
                                 ) : null}
                               </div>
-                              <div className="text-[13px] font-semibold text-current">{item.label}</div>
-                              <div className="mt-1 line-clamp-2 text-[11px] leading-5 text-current/72">
+                              <div className="text-[12px] font-semibold text-current">{item.label}</div>
+                              <div className="mt-1 line-clamp-2 text-[10px] leading-4 text-current/72">
                                 {item.subtitle ?? "Jump to this authoring block."}
                               </div>
                             </button>

@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+# NOTE: Do not re-enable `planned["useCache"]` for normal saved trajectories.
+# The copied preview cache stores planned steps from the robot's live start
+# state at preview time, so reusing it later from a different pose can cause
+# erratic motion. Materialize the saved trajectory file, but force fresh
+# planning on execution unless the flow is explicitly weld/cache-specific.
+
 import asyncio
 import base64
 import binascii
@@ -7,6 +13,7 @@ import datetime
 import json
 import logging
 import os
+import shutil
 import socket
 import threading
 import time
@@ -48,6 +55,8 @@ _ALLOWED_WELD_TYPES = {"fillet", "butt", "lap", "tack/spot", "custom"}
 _ALLOWED_PROGRAM_KINDS = {"trajectory", "weld"}
 _PROJECT_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 _ROBOT_PROGRAM_DIR = os.path.join(_PROJECT_ROOT_DIR, "recorded_programs")
+_RECORDED_TRAJECTORY_DIR = os.path.join(_PROJECT_ROOT_DIR, "recorded_trajectories")
+_TRAJECTORY_CACHE_DIR = os.path.join(_PROJECT_ROOT_DIR, "src", "trajectory_cache")
 _WELD_PROGRAM_DIR = os.path.join(_PROJECT_ROOT_DIR, "recorded_trajectories", "weld_programs")
 _DIAGNOSTICS_LOG_DIR = os.path.join(_PROJECT_ROOT_DIR, "logs", "diagnostics")
 _CONTROLLER_REPLY_MAX_BYTES = 65535
@@ -67,6 +76,29 @@ _DEFAULT_JOG_SESSION_LEASE_TIMEOUT_S = 0.4
 
 def _command_label(message: str) -> str:
     return message.split(",", 1)[0].strip().upper()
+
+
+def _get_last_planner_diagnostics_snapshot() -> dict[str, Any] | None:
+    state = getattr(controller_utils, "trajectory_state", None)
+    if not isinstance(state, dict):
+        return None
+    diagnostics = state.get("last_planner_diagnostics")
+    if not isinstance(diagnostics, dict):
+        return None
+    try:
+        return json.loads(json.dumps(diagnostics))
+    except Exception:
+        return dict(diagnostics)
+
+
+def _planner_failure_detail(message: str) -> str | dict[str, Any]:
+    diagnostics = _get_last_planner_diagnostics_snapshot()
+    if diagnostics is None:
+        return message
+    return {
+        "message": message,
+        "planner_diagnostics": diagnostics,
+    }
 
 
 def _record_api_command_metric(message: str, *, ok: bool, round_trip_ms: float, timed_out: bool) -> None:
@@ -438,7 +470,7 @@ def _load_robot_program_record(name: str, *, expected_kind: str | None = None) -
                 status_code=404,
                 detail=f"Saved program '{safe_name}' is of kind '{record['kind']}', not '{expected_kind}'.",
             )
-        return record
+        return _annotate_and_materialize_saved_trajectory_plan(record)
 
     if expected_kind in {None, "weld"}:
         legacy_path = os.path.join(_WELD_PROGRAM_DIR, f"{safe_name}.json")
@@ -456,11 +488,98 @@ def _load_robot_program_record(name: str, *, expected_kind: str | None = None) -
 
 def _save_robot_program_record(record: dict[str, Any]) -> dict[str, Any]:
     normalized = _normalize_robot_program_record(record)
+    normalized = _annotate_and_materialize_saved_trajectory_plan(normalized)
     _ensure_robot_program_dir()
     path = _robot_program_path(normalized["name"])
     with open(path, "w", encoding="utf-8") as f:
         json.dump(normalized, f, indent=2)
     return normalized
+
+
+def _pose_waypoints_match(
+    authoring_waypoints: list[dict[str, Any]],
+    planned_waypoints: list[dict[str, Any]],
+    *,
+    pos_tol: float = 1e-3,
+    orient_tol_deg: float = 0.5,
+) -> bool:
+    def _wrapped_angle_delta_deg(lhs: float, rhs: float) -> float:
+        return abs(((lhs - rhs + 180.0) % 360.0) - 180.0)
+
+    if len(authoring_waypoints) != len(planned_waypoints):
+        return False
+    for authored, planned in zip(authoring_waypoints, planned_waypoints):
+        authored_move_type = str(authored.get("move_type", authored.get("moveType", "linear"))).strip().lower()
+        planned_move_type = str(planned.get("move_type", planned.get("moveType", "linear"))).strip().lower()
+        if authored_move_type != planned_move_type:
+            return False
+        for axis in ("x", "y", "z"):
+            if abs(float(authored[axis]) - float(planned[axis])) > pos_tol:
+                return False
+        authored_orient = authored.get("orientation_euler_deg")
+        planned_orient = planned.get("orientation_euler_deg")
+        if isinstance(authored_orient, dict) and isinstance(planned_orient, dict):
+            for axis in ("roll", "pitch", "yaw"):
+                authored_value = authored_orient.get(axis)
+                planned_value = planned_orient.get(axis)
+                if authored_value is None or planned_value is None:
+                    return False
+                if _wrapped_angle_delta_deg(float(authored_value), float(planned_value)) > orient_tol_deg:
+                    return False
+        elif authored_orient is None and planned_orient is None:
+            continue
+        else:
+            return False
+    return True
+
+
+def _annotate_and_materialize_saved_trajectory_plan(record: dict[str, Any]) -> dict[str, Any]:
+    if record.get("kind") != "trajectory":
+        return record
+
+    planned = record.get("planned_trajectory")
+    if not isinstance(planned, dict):
+        return record
+
+    safe_name = _sanitize_program_name(record.get("name"))
+    authored_waypoints = _coerce_pose_waypoint_list(
+        (record.get("authoring") or {}).get("waypoints") if isinstance(record.get("authoring"), dict) else None
+    )
+    planned_waypoints = _coerce_pose_waypoint_list(planned.get("waypoints"))
+    is_compatible = bool(authored_waypoints) and bool(planned_waypoints) and _pose_waypoints_match(
+        authored_waypoints,
+        planned_waypoints,
+    )
+
+    source_plan_name = str(planned.get("name", "")).strip()
+    planned["name"] = safe_name
+    planned["useCache"] = False
+    planned["isStale"] = not is_compatible
+    if source_plan_name:
+        planned["sourcePlanName"] = source_plan_name
+    elif "sourcePlanName" in planned:
+        planned.pop("sourcePlanName", None)
+
+    trajectory_payload = planned.get("trajectory")
+    if not is_compatible or not isinstance(trajectory_payload, dict):
+        record["planned_trajectory"] = planned
+        return record
+
+    os.makedirs(_RECORDED_TRAJECTORY_DIR, exist_ok=True)
+    recorded_path = os.path.join(_RECORDED_TRAJECTORY_DIR, f"{safe_name}.json")
+    with open(recorded_path, "w", encoding="utf-8") as f:
+        json.dump(trajectory_payload, f, indent=2)
+
+    # Standard saved trajectory previews are start-state dependent: the planned
+    # steps cache begins at whatever live joint state was present when preview
+    # planning ran. Reusing that cache later from a different robot pose can
+    # jump straight into stale joint samples and produce erratic motion. Keep
+    # the saved trajectory payload/recorded file, but force fresh planning on
+    # each run instead of advertising cache reuse.
+    planned["useCache"] = False
+    planned["isStale"] = False
+    record["planned_trajectory"] = planned
+    return record
 
 
 def _list_robot_program_names(kind: str | None = None) -> list[str]:
@@ -1017,6 +1136,56 @@ def create_app() -> FastAPI:
         if not token:
             raise HTTPException(status_code=502, detail="Motion-status reply did not include a payload.")
         return _decode_payload_b64(token)
+
+    def _motion_status_matches_program(payload: dict[str, Any], expected_name: str) -> bool:
+        expected = str(expected_name or "").strip()
+        if not expected:
+            return False
+        program = payload.get("program") if isinstance(payload.get("program"), dict) else None
+        program_name = str(
+            (program.get("name") if program is not None else payload.get("program_name")) or ""
+        ).strip()
+        if program_name != expected:
+            return False
+        program_active = bool(
+            program.get("active") if program is not None else payload.get("program_active", False)
+        )
+        program_state = str(
+            (program.get("state") if program is not None else payload.get("program_state")) or ""
+        ).strip().lower()
+        return program_active or program_state in {"accepted", "planning", "executing"}
+
+    async def _infer_run_trajectory_timeout_acceptance(
+        *,
+        trajectory_name: str,
+        runtime_mode: str,
+        execution_mode: str,
+        timeout_detail: str,
+    ) -> dict[str, Any] | None:
+        for attempt_index in range(3):
+            try:
+                status_detail = await run_in_threadpool(
+                    _controller_call_or_503, "GET_MOTION_STATUS", timeout=1.0, expect_response=True
+                )
+                status_payload = _parse_motion_status_reply(status_detail)
+            except HTTPException:
+                status_payload = None
+                status_detail = ""
+            if status_payload and _motion_status_matches_program(status_payload, trajectory_name):
+                return {
+                    "status": "ok",
+                    "detail": status_detail,
+                    "execution_mode": execution_mode,
+                    "runtime_mode": runtime_mode,
+                    "accepted": True,
+                    "ack_inferred": True,
+                    "run_request_timed_out": True,
+                    "run_request_detail": timeout_detail,
+                    **status_payload,
+                }
+            if attempt_index < 2:
+                await asyncio.sleep(0.25)
+        return None
 
     def _parse_kinematics_error(detail: str) -> HTTPException:
         if detail.startswith("ERROR,KINEMATICS,"):
@@ -2227,11 +2396,11 @@ def create_app() -> FastAPI:
 
         def _plan():
             _sync_local_planner_runtime(timeout=1.0)
-            live_joints = _get_live_joint_angles_from_controller(timeout=1.0)
+            live_joints_rad = _get_live_joint_angles_from_controller(timeout=1.0)
             if controller_utils is not None:
-                controller_utils.current_logical_joint_angles_rad = list(live_joints)
+                controller_utils.current_logical_joint_angles_rad = list(live_joints_rad)
             if hasattr(controller_command_api, "utils"):
-                controller_command_api.utils.current_logical_joint_angles_rad = list(live_joints)
+                controller_command_api.utils.current_logical_joint_angles_rad = list(live_joints_rad)
             return controller_command_api.plan_preview_trajectory_points(
                 [[float(item["x"]), float(item["y"]), float(item["z"])] for item in pose_waypoints],
                 preview_name=preview_name,
@@ -2241,11 +2410,17 @@ def create_app() -> FastAPI:
         try:
             payload_dict = await run_in_threadpool(_plan)
         except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=f"Trajectory planning failed: {exc}") from exc
+            raise HTTPException(
+                status_code=502,
+                detail=_planner_failure_detail(f"Trajectory planning failed: {exc}"),
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Trajectory planning failed unexpectedly: {exc}") from exc
+            raise HTTPException(
+                status_code=500,
+                detail=_planner_failure_detail(f"Trajectory planning failed unexpectedly: {exc}"),
+            ) from exc
 
         payload_dict["source"] = {
             "mode": "pose_waypoints" if payload.get("waypoints") is not None else "points",
@@ -2355,11 +2530,11 @@ def create_app() -> FastAPI:
 
         def _plan():
             _sync_local_planner_runtime(timeout=1.0)
-            live_joints = _get_live_joint_angles_from_controller(timeout=1.0)
+            live_joints_rad = _get_live_joint_angles_from_controller(timeout=1.0)
             if controller_utils is not None:
-                controller_utils.current_logical_joint_angles_rad = list(live_joints)
+                controller_utils.current_logical_joint_angles_rad = list(live_joints_rad)
             if hasattr(controller_command_api, "utils"):
-                controller_command_api.utils.current_logical_joint_angles_rad = list(live_joints)
+                controller_command_api.utils.current_logical_joint_angles_rad = list(live_joints_rad)
             return controller_command_api.plan_preview_trajectory_points(
                 weld_points,
                 preview_name=preview_name,
@@ -2370,11 +2545,17 @@ def create_app() -> FastAPI:
         try:
             result = await run_in_threadpool(_plan)
         except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=f"Weld planning failed: {exc}") from exc
+            raise HTTPException(
+                status_code=502,
+                detail=_planner_failure_detail(f"Weld planning failed: {exc}"),
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Weld planning failed unexpectedly: {exc}") from exc
+            raise HTTPException(
+                status_code=500,
+                detail=_planner_failure_detail(f"Weld planning failed unexpectedly: {exc}"),
+            ) from exc
 
         result["source"] = {
             "mode": "sections" if sections else ("waypoints_override" if waypoints_override else "edge_segment"),
@@ -2451,14 +2632,28 @@ def create_app() -> FastAPI:
         elif loop_override is not None:
             parts.append(str(loop_override))
         command = "RUN_TRAJECTORY," + ",".join(parts)
-        detail = await run_in_threadpool(
-            _controller_call_or_503, command, timeout=2.0, expect_response=True
-        )
+        request_execution_mode = execution_mode or runtime_mode
+        try:
+            detail = await run_in_threadpool(
+                _controller_call_or_503, command, timeout=2.0, expect_response=True
+            )
+        except HTTPException as exc:
+            timeout_detail = exc.detail if isinstance(exc.detail, str) else ""
+            if exc.status_code == 503 and timeout_detail == f"No response for command '{command}'":
+                inferred = await _infer_run_trajectory_timeout_acceptance(
+                    trajectory_name=name.strip(),
+                    runtime_mode=runtime_mode,
+                    execution_mode=request_execution_mode,
+                    timeout_detail=timeout_detail,
+                )
+                if inferred is not None:
+                    return inferred
+            raise
         payload = _parse_controller_ack_payload(detail, "RUN_TRAJECTORY")
         return {
             "status": "ok",
             "detail": detail,
-            "execution_mode": execution_mode or runtime_mode,
+            "execution_mode": request_execution_mode,
             "runtime_mode": runtime_mode,
             **payload,
         }
@@ -2594,6 +2789,8 @@ def _coerce_pose_waypoint_list(raw_waypoints: Any) -> list[dict[str, Any]]:
             roll = float(roll_raw) if roll_raw is not None else None
             pitch = float(pitch_raw) if pitch_raw is not None else None
             yaw = float(yaw_raw) if yaw_raw is not None else None
+            move_type_raw = str(entry.get("move_type", entry.get("moveType", "linear"))).strip().lower()
+            move_type = move_type_raw if move_type_raw in {"linear", "joint", "home"} else "linear"
         except (TypeError, ValueError, KeyError) as exc:
             raise HTTPException(
                 status_code=400, detail=f"Invalid pose waypoint at index {idx}: {exc}"
@@ -2606,6 +2803,7 @@ def _coerce_pose_waypoint_list(raw_waypoints: Any) -> list[dict[str, Any]]:
                 "pitch": pitch,
                 "yaw": yaw,
             }
+        waypoint["move_type"] = move_type
         waypoints.append(waypoint)
     return waypoints
 
@@ -2641,12 +2839,14 @@ def _get_live_joint_angles_from_controller(timeout: float = 1.0) -> list[float]:
     if not ok:
         raise HTTPException(status_code=503, detail=detail)
     try:
-        joints = _parse_pose_response(detail)
+        joints_deg = _parse_pose_response(detail)
     except ValueError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    if len(joints) == 0:
+    if len(joints_deg) == 0:
         raise HTTPException(status_code=502, detail="Controller returned no joint angles in pose reply.")
-    return joints
+    # `GET_POSITION` reports joints in degrees for UI consumption; the in-process
+    # planner modules expect radians.
+    return [float(np.deg2rad(value)) for value in joints_deg]
 
 
 def _parse_joint_angles_response(detail: str) -> tuple[list[float], float | None]:

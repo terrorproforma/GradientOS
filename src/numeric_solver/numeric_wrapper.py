@@ -39,6 +39,54 @@ except ImportError as e:  # pragma: no cover – dev machines may lack the .so
 
 _NUMERIC_CACHE: dict[str, tuple[object, object]] = {}
 _ACTIVE_ROBOT_ID: str = robot_assets.get_active_robot_id()
+_TWO_PI = 2.0 * np.pi
+
+
+def _align_angle_to_reference(angle: float, reference: float) -> float:
+    if not np.isfinite(angle) or not np.isfinite(reference):
+        return float(angle)
+    return float(reference + ((angle - reference + np.pi) % _TWO_PI - np.pi))
+
+
+def _align_joint_vector_to_reference(
+    joint_vector: np.ndarray,
+    reference_vector: np.ndarray,
+) -> np.ndarray:
+    aligned = np.asarray(joint_vector, dtype=float).reshape(-1).copy()
+    reference = np.asarray(reference_vector, dtype=float).reshape(-1)
+    count = min(aligned.shape[0], reference.shape[0])
+    for idx in range(count):
+        aligned[idx] = _align_angle_to_reference(float(aligned[idx]), float(reference[idx]))
+    return aligned
+
+
+def _align_joint_path_to_seed(
+    joint_path: np.ndarray,
+    seed_q: np.ndarray,
+) -> np.ndarray:
+    aligned = np.asarray(joint_path, dtype=float)
+    if aligned.ndim != 2 or aligned.shape[0] == 0:
+        return aligned
+    out = aligned.copy()
+    reference = np.asarray(seed_q, dtype=float).reshape(-1)
+    for idx in range(out.shape[0]):
+        out[idx, :] = _align_joint_vector_to_reference(out[idx, :], reference)
+        reference = out[idx, :]
+    return out
+
+
+def _align_joint_batch_to_seeds(
+    joint_batch: np.ndarray,
+    seed_batch: np.ndarray,
+) -> np.ndarray:
+    aligned = np.asarray(joint_batch, dtype=float)
+    seeds = np.asarray(seed_batch, dtype=float)
+    if aligned.ndim != 2 or seeds.ndim != 2 or aligned.shape != seeds.shape:
+        return aligned
+    out = aligned.copy()
+    for idx in range(out.shape[0]):
+        out[idx, :] = _align_joint_vector_to_reference(out[idx, :], seeds[idx, :])
+    return out
 
 
 class _NumericIKAdapter:
@@ -47,24 +95,91 @@ class _NumericIKAdapter:
     def __init__(self, robot, solver):
         self.R = robot
         self._solver = solver
+        self._reported_path_solver = False
+        self._reported_batch_solver = False
 
     def ik(self, quat: np.ndarray, pos: np.ndarray, seed: np.ndarray):
         q_vec, e_vec, iters, br = self._solver.solve(quat, pos, seed)
         return np.asarray(q_vec, dtype=float), np.asarray(e_vec, dtype=float), int(iters), int(br)
 
     def solve_ik_path(self, poses_batch: np.ndarray, initial_joint_angles: np.ndarray):
-        out = []
-        q_seed = np.asarray(initial_joint_angles, dtype=float)
-        for pose in poses_batch:
-            px, py_, pz, *rot_flat = pose
-            rot_m = np.array(rot_flat, dtype=float).reshape(3, 3)
-            quat = Rotation.from_matrix(rot_m).as_quat()
-            q, _, _, _ = self.ik(quat, np.array([px, py_, pz], dtype=float), q_seed)
-            if q is None:
+        poses_np = np.asarray(poses_batch, dtype=float)
+        if poses_np.ndim != 2 or poses_np.shape[1] != 12:
+            raise ValueError("poses_batch must have shape (N, 12).")
+        if poses_np.shape[0] == 0:
+            dof = getattr(self.R, "dof", np.asarray(initial_joint_angles, dtype=float).reshape(-1).shape[0])
+            return np.empty((0, dof), dtype=float)
+
+        positions = poses_np[:, :3]
+        rotations = poses_np[:, 3:].reshape(-1, 3, 3)
+        quaternions = Rotation.from_matrix(rotations).as_quat()
+        quat_matrix = np.asarray(quaternions, dtype=float).T
+        pos_matrix = np.asarray(positions, dtype=float).T
+
+        q_seed = np.asarray(initial_joint_angles, dtype=float).reshape(-1)
+        if hasattr(self._solver, "solve_path"):
+            if not self._reported_path_solver:
+                print("[IK Solver] Numeric path API: native pyquik.solve_path")
+                self._reported_path_solver = True
+            q_star, _, _, _ = self._solver.solve_path(quat_matrix, pos_matrix, q_seed)
+            if q_star is None:
                 return None
-            out.append(q)
-            q_seed = q
-        return np.vstack(out)
+            return _align_joint_path_to_seed(np.asarray(q_star, dtype=float).T, q_seed)
+
+        if not self._reported_path_solver:
+            print("[IK Solver] Numeric path API: python loop fallback")
+            self._reported_path_solver = True
+        solver_solve = self._solver.solve
+        out = np.empty((poses_np.shape[0], q_seed.shape[0]), dtype=float)
+        for idx in range(poses_np.shape[0]):
+            q_vec, _, _, _ = solver_solve(quaternions[idx], positions[idx], q_seed)
+            if q_vec is None:
+                return None
+            q_seed = _align_joint_vector_to_reference(np.asarray(q_vec, dtype=float).reshape(-1), q_seed)
+            out[idx, :] = q_seed
+        return out
+
+    def solve_ik_batch(self, poses_batch: np.ndarray, seed_batch: np.ndarray):
+        poses_np = np.asarray(poses_batch, dtype=float)
+        if poses_np.ndim != 2 or poses_np.shape[1] != 12:
+            raise ValueError("poses_batch must have shape (N, 12).")
+        seed_batch_np = np.asarray(seed_batch, dtype=float)
+        if seed_batch_np.ndim != 2:
+            raise ValueError("seed_batch must have shape (N, dof).")
+        if poses_np.shape[0] != seed_batch_np.shape[0]:
+            raise ValueError("poses_batch and seed_batch must have the same length.")
+        if poses_np.shape[0] == 0:
+            return np.empty_like(seed_batch_np)
+
+        rotations = poses_np[:, 3:].reshape(-1, 3, 3)
+        quaternions = Rotation.from_matrix(rotations).as_quat()
+        quat_matrix = np.asarray(quaternions, dtype=float).T
+        pos_matrix = np.asarray(poses_np[:, :3], dtype=float).T
+        q0_batch = seed_batch_np.T
+
+        if hasattr(self._solver, "solve_batch"):
+            if not self._reported_batch_solver:
+                print("[IK Solver] Numeric batch API: native pyquik.solve_batch")
+                self._reported_batch_solver = True
+            q_star, _, _, _ = self._solver.solve_batch(quat_matrix, pos_matrix, q0_batch)
+            if q_star is None:
+                return None
+            return _align_joint_batch_to_seeds(np.asarray(q_star, dtype=float).T, seed_batch_np)
+
+        if not self._reported_batch_solver:
+            print("[IK Solver] Numeric batch API: python loop fallback")
+            self._reported_batch_solver = True
+        out = np.empty_like(seed_batch_np)
+        solver_solve = self._solver.solve
+        for idx in range(poses_np.shape[0]):
+            q_vec, _, _, _ = solver_solve(quaternions[idx], poses_np[idx, :3], seed_batch_np[idx])
+            if q_vec is None:
+                return None
+            out[idx, :] = _align_joint_vector_to_reference(
+                np.asarray(q_vec, dtype=float).reshape(-1),
+                seed_batch_np[idx],
+            )
+        return out
 
 
 def _parse_matrix4(value, field_name: str, manifest_path: str) -> np.ndarray:

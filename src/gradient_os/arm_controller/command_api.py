@@ -7,6 +7,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import threading
 import datetime
+from typing import Sequence
 
 # --- Global State for Motion Control ---
 # The motion_stopped Event has been removed to use the native trajectory_state flag.
@@ -32,6 +33,7 @@ _DIRECT_SETPOINT_FALLBACK_SPEED = 500
 _DIRECT_SETPOINT_FALLBACK_ACCELERATION_DEG_S2 = 500.0
 _SAFE_JOINT_MOVE_FREQUENCY_HZ = 100
 _SAFE_JOINT_MOVE_MIN_DURATION_S = 0.25
+_PROGRAM_JOINT_MOVE_MAX_MOTOR_RPM = 100.0
 _WAIT_FOR_IDLE_DEFAULT_TIMEOUT_S = 30.0
 _WAIT_FOR_IDLE_POLL_INTERVAL_S = 0.01
 _RTCORE_ACK_REFRESH_TIMEOUT_S = 0.15
@@ -521,6 +523,81 @@ def _update_program_status(**kwargs: object) -> None:
 def _begin_non_program_motion() -> None:
     _reset_program_status()
     utils.trajectory_state_set("stop_request_reason", None)
+
+
+def _build_bounded_joint_path(
+    current_q: Sequence[float],
+    target_q: Sequence[float],
+    *,
+    max_motor_rpm: float = _PROGRAM_JOINT_MOVE_MAX_MOTOR_RPM,
+) -> tuple[list[list[float]], float]:
+    current_q_arr = np.asarray(list(current_q), dtype=float)
+    target_q_arr = np.asarray(list(target_q), dtype=float)
+    if current_q_arr.shape != target_q_arr.shape:
+        raise ValueError("Current and target joint vectors must have matching shapes.")
+
+    try:
+        active_robot = robot_config.get_active_robot()
+        gear_ratios = list(active_robot.actuator_gear_ratios)
+    except Exception:
+        gear_ratios = []
+
+    delta_q = target_q_arr - current_q_arr
+    duration_s = _SAFE_JOINT_MOVE_MIN_DURATION_S
+    for joint_idx in range(len(target_q_arr)):
+        ratio = float(gear_ratios[joint_idx]) if joint_idx < len(gear_ratios) else 1.0
+        if not np.isfinite(ratio) or ratio <= 0.0:
+            ratio = 1.0
+        max_rate = (float(max_motor_rpm) / ratio) * (2.0 * np.pi / 60.0)
+        if max_rate > 0.0:
+            duration_s = max(duration_s, abs(float(delta_q[joint_idx])) / max_rate)
+
+    num_steps = max(2, int(np.ceil(duration_s * _SAFE_JOINT_MOVE_FREQUENCY_HZ)))
+    t = np.linspace(0.0, 1.0, num_steps)
+    smooth = (3.0 * np.square(t)) - (2.0 * np.power(t, 3))
+    joint_path = [
+        (current_q_arr + (smooth_i * delta_q)).tolist()
+        for smooth_i in smooth
+    ]
+    return joint_path, float(duration_s)
+
+
+def _plan_joint_move_to_pose(
+    current_q: Sequence[float],
+    *,
+    target_q: Sequence[float] | None = None,
+    target_pos: Sequence[float] | None = None,
+    target_orientation: np.ndarray | None = None,
+    max_motor_rpm: float = _PROGRAM_JOINT_MOVE_MAX_MOTOR_RPM,
+) -> tuple[list[list[float]] | None, list[float] | None]:
+    current_q_list = list(map(float, current_q))
+    solved_q: list[float] | None
+    if target_q is not None:
+        solved_q = list(map(float, target_q))
+    else:
+        if target_pos is None:
+            raise ValueError("target_pos is required when target_q is not provided.")
+        orientation_matrix = target_orientation
+        if orientation_matrix is None:
+            current_pose_matrix = ik_solver.get_fk_matrix(current_q_list)
+            if current_pose_matrix is None:
+                return None, None
+            orientation_matrix = np.array(current_pose_matrix[:3, :3], dtype=float)
+        solved = ik_solver.solve_ik(
+            target_position=np.asarray(target_pos, dtype=float),
+            target_orientation_matrix=orientation_matrix,
+            initial_joint_angles=current_q_list,
+        )
+        if solved is None:
+            return None, None
+        solved_q = list(map(float, np.asarray(solved, dtype=float).tolist()))
+
+    joint_path, _duration_s = _build_bounded_joint_path(
+        current_q_list,
+        solved_q,
+        max_motor_rpm=max_motor_rpm,
+    )
+    return joint_path, solved_q
 
 
 def _program_status_from_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
@@ -1411,6 +1488,41 @@ def _get_live_pose_snapshot() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return initial_angles_np, current_position, current_orientation
 
 
+def _get_best_available_joint_state() -> np.ndarray:
+    """Prefer trustworthy live feedback, but fall back to cached controller state."""
+    cached_angles_np = np.asarray(utils.current_logical_joint_angles_rad, dtype=float).reshape(-1)
+    num_joints = int(utils.NUM_LOGICAL_JOINTS or 0)
+    if cached_angles_np.size == 0 and num_joints > 0:
+        cached_angles_np = np.zeros(num_joints, dtype=float)
+
+    should_attempt_live_feedback = False
+    try:
+        active_backend = backend_registry.get_active_backend()
+        should_attempt_live_feedback = bool(
+            active_backend is not None and getattr(active_backend, "is_initialized", False)
+        )
+    except Exception:
+        should_attempt_live_feedback = False
+
+    if not should_attempt_live_feedback:
+        try:
+            # In the API process there is usually no active actuator backend, and
+            # legacy serial reads can collapse to a synthetic all-zero vector.
+            # Only trust the legacy read path when servos were actually detected.
+            should_attempt_live_feedback = len(servo_driver.servo_protocol.get_present_servo_ids()) > 0
+        except Exception:
+            should_attempt_live_feedback = False
+
+    if should_attempt_live_feedback:
+        live_angles = servo_driver.get_current_arm_state_rad(verbose=False)
+        if live_angles is not None:
+            live_angles_np = np.asarray(live_angles, dtype=float).reshape(-1)
+            if live_angles_np.size > 0:
+                return live_angles_np
+
+    return cached_angles_np
+
+
 def _execute_orientation_path(
     target_orientation: np.ndarray,
     *,
@@ -1868,7 +1980,9 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         1 for command in command_tokens if command in {"move_relative", "move_absolute", "move_arc"}
     )
     declared_pause_step_count = sum(1 for command in command_tokens if command == "pause")
-    declared_joint_move_step_count = sum(1 for command in command_tokens if command == "home")
+    declared_joint_move_step_count = sum(
+        1 for command in command_tokens if command in {"home", "move"}
+    )
     weld_meta = trajectory.get("weld") if isinstance(trajectory.get("weld"), dict) else None
     if weld_meta:
         utils.trajectory_state["current_weld_type"] = weld_meta.get("type")
@@ -1925,7 +2039,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         planned_steps = []
         
         # Start planning from the robot's current known state, not a hardcoded home position.
-        current_q = np.array(utils.current_logical_joint_angles_rad)
+        current_q = _get_best_available_joint_state()
         print(f"[Pi Trajectory] Planning will start from current state (rad): {np.round(current_q, 3)}")
         
         planning_succeeded = True
@@ -1945,12 +2059,67 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
 
             if command == "home":
                 home_q_list = [0.0] * utils.NUM_LOGICAL_JOINTS
-                speed = move_cmd.get("speed", utils.DEFAULT_SERVO_SPEED)
-                duration = move_cmd.get("duration", 2.5)
-                planned_steps.append({
-                    'type': 'joint_move', 'target_q': home_q_list, 'speed': speed, 'duration': duration
-                })
-                current_q = np.array(home_q_list)
+                joint_path, solved_q = _plan_joint_move_to_pose(
+                    current_q,
+                    target_q=home_q_list,
+                )
+                if not joint_path or solved_q is None:
+                    print("[Pi Trajectory] ERROR: Failed to plan home joint move. Aborting plan.")
+                    planning_succeeded = False
+                    planning_failure_step_index = i
+                    break
+                planned_steps.append(
+                    {
+                        "type": "move",
+                        "path": joint_path,
+                        "freq": _SAFE_JOINT_MOVE_FREQUENCY_HZ,
+                        "serialization_command": "home",
+                    }
+                )
+                current_q = np.array(solved_q, dtype=float)
+
+            elif command == "move":
+                t_start_plan = time.monotonic()
+                target_pos = np.array(move_cmd.get("vector", [0, 0, 0]), dtype=float)
+                move_orient_euler = move_cmd.get("orientation_euler_deg")
+                per_move_orientation_matrix = None
+                if move_orient_euler is not None:
+                    try:
+                        per_move_orientation_matrix = R.from_euler(
+                            "xyz",
+                            move_orient_euler,
+                            degrees=True,
+                        ).as_matrix()
+                    except Exception as e:
+                        print(f"[Pi Plan] WARNING: Invalid joint-move Euler orientation: {e}. Ignoring.")
+
+                forced_orient = (
+                    per_move_orientation_matrix
+                    if per_move_orientation_matrix is not None
+                    else target_orientation_matrix
+                )
+                joint_path, solved_q = _plan_joint_move_to_pose(
+                    current_q,
+                    target_pos=target_pos,
+                    target_orientation=forced_orient,
+                )
+                if joint_path and solved_q is not None:
+                    t_end_plan = time.monotonic()
+                    print(f"[Pi Plan] Joint-move planning complete. Took {(t_end_plan - t_start_plan) * 1000:.2f} ms")
+                    planned_steps.append(
+                        {
+                            "type": "move",
+                            "path": joint_path,
+                            "freq": _SAFE_JOINT_MOVE_FREQUENCY_HZ,
+                            "weld_active": False,
+                            "serialization_command": "move",
+                        }
+                    )
+                    current_q = np.array(solved_q, dtype=float)
+                else:
+                    planning_succeeded = False
+                    planning_failure_step_index = i
+                    break
             
             elif command == "move_relative":
                 t_start_plan = time.monotonic()
@@ -2198,9 +2367,19 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
     # --- 2. Execution Phase ---
     print("\n--- Trajectory Ready. Starting Execution in a background thread ---")
     
-    move_step_count = sum(1 for step in planned_steps if step.get("type") == "move")
+    move_step_count = sum(
+        1
+        for step in planned_steps
+        if step.get("type") == "move"
+        and str(step.get("serialization_command", "move_absolute")) not in {"home", "move"}
+    )
     pause_step_count = sum(1 for step in planned_steps if step.get("type") == "pause")
-    joint_move_step_count = sum(1 for step in planned_steps if step.get("type") == "joint_move")
+    joint_move_step_count = sum(
+        1
+        for step in planned_steps
+        if step.get("type") == "joint_move"
+        or str(step.get("serialization_command", "")) in {"home", "move"}
+    )
     rtcore_segment_execution = _backend_supports_rtcore_execution() and move_step_count > 0
     program_segment_execution_policy = (
         "rtcore_queued" if rtcore_segment_execution else "controller_open_loop"
@@ -2252,8 +2431,9 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
     # Uses similar interpolation as the reset for smoothness.
     if should_loop and len(planned_steps) > 0:
         print("[Pi Trajectory] Looping enabled. Moving to trajectory start point first.")
-        # Plan initial move from current actual position to first waypoint
-        current_q = np.array(utils.current_logical_joint_angles_rad)
+        # Re-read the live-preferred start state so cached logical joints do not
+        # send the runtime-only move-to-start wrapper toward a stale pose.
+        current_q = _get_best_available_joint_state()
         current_pose = ik_solver.get_fk_matrix(current_q)
         if current_pose is None or first_pose is None:
             print("[Pi Trajectory] Failed to get current or first pose, aborting trajectory.")
@@ -2702,35 +2882,11 @@ def handle_apply_joint_setpoint(
         current_q = servo_driver.get_current_arm_state_rad(verbose=False)
         if current_q is None:
             raise RuntimeError("Failed to read current joint state for bounded joint setpoint.")
-
-        try:
-            active_robot = robot_config.get_active_robot()
-            gear_ratios = list(active_robot.actuator_gear_ratios)
-        except Exception:
-            gear_ratios = []
-
-        target_q = np.asarray(arm_angles_rad, dtype=float)
-        current_q_arr = np.asarray(current_q[: len(target_q)], dtype=float)
-        delta_q = target_q - current_q_arr
-        max_joint_rates_rad_s: list[float] = []
-        for joint_idx in range(len(target_q)):
-            ratio = float(gear_ratios[joint_idx]) if joint_idx < len(gear_ratios) else 1.0
-            if not np.isfinite(ratio) or ratio <= 0.0:
-                ratio = 1.0
-            max_joint_rates_rad_s.append((float(max_motor_rpm) / ratio) * (2.0 * np.pi / 60.0))
-
-        duration_s = _SAFE_JOINT_MOVE_MIN_DURATION_S
-        for joint_idx, max_rate in enumerate(max_joint_rates_rad_s):
-            if max_rate > 0.0:
-                duration_s = max(duration_s, abs(float(delta_q[joint_idx])) / max_rate)
-
-        num_steps = max(2, int(np.ceil(duration_s * _SAFE_JOINT_MOVE_FREQUENCY_HZ)))
-        t = np.linspace(0.0, 1.0, num_steps)
-        smooth = (3.0 * np.square(t)) - (2.0 * np.power(t, 3))
-        joint_path = [
-            (current_q_arr + (smooth_i * delta_q)).tolist()
-            for smooth_i in smooth
-        ]
+        joint_path, duration_s = _build_bounded_joint_path(
+            current_q[: len(arm_angles_rad)],
+            arm_angles_rad,
+            max_motor_rpm=float(max_motor_rpm),
+        )
 
         executor_thread = threading.Thread(
             target=trajectory_execution._open_loop_executor_thread,
@@ -3909,7 +4065,7 @@ def _plan_preview_points_payload(
     if len(points) == 0:
         raise ValueError("At least one waypoint is required.")
 
-    current_q = np.array(utils.current_logical_joint_angles_rad, dtype=float)
+    current_q = _get_best_available_joint_state()
     trajectory_start_fk = ik_solver.get_fk(current_q.tolist())
     trajectory_start_pos = (
         np.array(trajectory_start_fk, dtype=float)
@@ -3998,6 +4154,14 @@ def _plan_preview_points_payload(
             ).as_matrix()
         except Exception:
             return None
+
+    def _waypoint_move_type(raw_waypoint) -> str:
+        if not isinstance(raw_waypoint, dict):
+            return "linear"
+        move_type_raw = str(
+            raw_waypoint.get("move_type", raw_waypoint.get("moveType", "linear"))
+        ).strip().lower()
+        return move_type_raw if move_type_raw in {"linear", "joint", "home"} else "linear"
 
     def _normalize(vec: np.ndarray, fallback: np.ndarray) -> np.ndarray:
         norm = float(np.linalg.norm(vec))
@@ -4407,21 +4571,53 @@ def _plan_preview_points_payload(
         for idx, waypoint in enumerate(points, start=1):
             target_pos = np.array(waypoint, dtype=float)
             segment_start_fk = ik_solver.get_fk(current_q.tolist())
-            forced_orientation = (
-                _coerce_orientation_matrix(standard_pose_waypoints[idx - 1])
+            authored_waypoint = (
+                standard_pose_waypoints[idx - 1]
                 if standard_pose_waypoints is not None
                 else None
             )
-            t_start = time.monotonic()
-            joint_path = trajectory_execution._plan_linear_move(
-                current_q,
-                target_pos,
-                float(plan_velocity),
-                float(plan_acceleration),
-                100,
-                True,
-                forced_orientation=forced_orientation,
+            forced_orientation = (
+                _coerce_orientation_matrix(authored_waypoint)
+                if standard_pose_waypoints is not None
+                else None
             )
+            move_type = _waypoint_move_type(authored_waypoint)
+            t_start = time.monotonic()
+            if move_type == "home":
+                joint_path, solved_q = _plan_joint_move_to_pose(
+                    current_q,
+                    target_q=[0.0] * utils.NUM_LOGICAL_JOINTS,
+                )
+                serialization_command = "home"
+                serialization_freq = _SAFE_JOINT_MOVE_FREQUENCY_HZ
+                fallback_target = (
+                    np.array(ik_solver.get_fk([0.0] * utils.NUM_LOGICAL_JOINTS), dtype=float)
+                    if ik_solver.get_fk([0.0] * utils.NUM_LOGICAL_JOINTS) is not None
+                    else target_pos
+                )
+            elif move_type == "joint":
+                joint_path, solved_q = _plan_joint_move_to_pose(
+                    current_q,
+                    target_pos=target_pos,
+                    target_orientation=forced_orientation,
+                )
+                serialization_command = "move"
+                serialization_freq = _SAFE_JOINT_MOVE_FREQUENCY_HZ
+                fallback_target = target_pos
+            else:
+                joint_path = trajectory_execution._plan_linear_move(
+                    current_q,
+                    target_pos,
+                    float(plan_velocity),
+                    float(plan_acceleration),
+                    100,
+                    True,
+                    forced_orientation=forced_orientation,
+                )
+                solved_q = list(map(float, joint_path[-1])) if joint_path else None
+                serialization_command = "move_absolute"
+                serialization_freq = 100
+                fallback_target = target_pos
             if not joint_path:
                 print(f"[Pi Trajectory] ERROR: Failed to plan waypoint #{idx} -> {np.round(target_pos, 4)}.")
                 planning_succeeded = False
@@ -4437,16 +4633,17 @@ def _plan_preview_points_payload(
             planned_step = {
                 "type": "move",
                 "path": joint_path,
-                "freq": 100,
+                "freq": serialization_freq,
+                "serialization_command": serialization_command,
             }
             planned_steps.append(planned_step)
             _append_cartesian_samples(joint_path)
-            _append_waypoint_result(joint_path, target_pos)
+            _append_waypoint_result(joint_path, fallback_target)
 
-            current_q = np.array(joint_path[-1], dtype=float)
+            current_q = np.array(solved_q if solved_q is not None else joint_path[-1], dtype=float)
             t_end = time.monotonic()
             print(
-                f"[Pi Trajectory] Planned waypoint #{idx} -> {np.round(target_pos, 4)} in {(t_end - t_start) * 1000:.2f} ms"
+                f"[Pi Trajectory] Planned waypoint #{idx} ({move_type}) -> {np.round(target_pos, 4)} in {(t_end - t_start) * 1000:.2f} ms"
             )
 
     if not planning_succeeded or len(planned_steps) == 0:
@@ -4467,9 +4664,42 @@ def _plan_preview_points_payload(
             if isinstance(residuals, dict):
                 for key in (
                     "joint_limit_margin_rad",
+                    "violating_joint_margin_rad",
                     "max_joint_step_rad",
                     "cartesian_residual_m",
                     "orientation_residual_deg",
+                ):
+                    value = residuals.get(key)
+                    try:
+                        numeric_value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(numeric_value):
+                        diag_parts.append(f"{key}={numeric_value:.5f}")
+                for key in (
+                    "violating_joint_index",
+                    "violating_pose_index",
+                    "violating_joint_count",
+                    "jump_pose_index",
+                    "jump_joint_index",
+                ):
+                    value = residuals.get(key)
+                    try:
+                        numeric_value = int(float(value))
+                    except (TypeError, ValueError):
+                        continue
+                    diag_parts.append(f"{key}={numeric_value}")
+                step_source = str(residuals.get("step_source", "")).strip()
+                if step_source:
+                    diag_parts.append(f"step_source={step_source}")
+                jump_context = str(residuals.get("jump_context", "")).strip()
+                if jump_context:
+                    diag_parts.append(f"jump_context={jump_context}")
+                for key in (
+                    "jump_joint_previous_rad",
+                    "jump_joint_current_rad",
+                    "jump_joint_raw_step_rad",
+                    "jump_joint_wrapped_step_rad",
                 ):
                     value = residuals.get(key)
                     try:
@@ -4513,11 +4743,13 @@ def _plan_preview_points_payload(
         else:
             position = [round(float(v), 4) for v in np.array(step_path[-1], dtype=float).tolist()[:3]]
             orient_payload = None
+        serialization_command = str(step.get("serialization_command", "move_absolute")).strip() or "move_absolute"
         move = {
-            "command": "move_absolute",
-            "vector": position,
+            "command": serialization_command,
         }
-        if orient_payload is not None:
+        if serialization_command in {"move_absolute", "move", "home"}:
+            move["vector"] = position
+        if orient_payload is not None and serialization_command in {"move_absolute", "move", "home"}:
             move["orientation_euler_deg"] = orient_payload
         if bool(step.get("weld_active", False)):
             move["is_weld"] = True
@@ -4565,6 +4797,11 @@ def _plan_preview_points_payload(
                     "x": round(float(item["position"][0]), 4),
                     "y": round(float(item["position"][1]), 4),
                     "z": round(float(item["position"][2]), 4),
+                    "move_type": (
+                        _waypoint_move_type(standard_pose_waypoints[index])
+                        if standard_pose_waypoints is not None and index < len(standard_pose_waypoints)
+                        else "linear"
+                    ),
                     "orientation_euler_deg": (
                         {
                             "roll": round(float(item["orientation_euler_deg"][0]), 2),
@@ -4576,7 +4813,7 @@ def _plan_preview_points_payload(
                         else None
                     ),
                 }
-                for item in waypoint_results
+                for index, item in enumerate(waypoint_results)
             ]
         ),
         "file_path": preview_path,

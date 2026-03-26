@@ -16,6 +16,7 @@ type Props = {
 	onMotionStatus?: (status: MotionStatusResponse | null) => void;
 	splitStatusSections?: boolean;
 	showStatusSections?: boolean;
+	showGripperPanel?: boolean;
 	controlsCollapsed?: boolean;
 	onToggleControlsCollapsed?: () => void;
 };
@@ -648,6 +649,7 @@ export function ControlPanel({
 	onMotionStatus,
 	splitStatusSections = false,
 	showStatusSections = true,
+	showGripperPanel = true,
 	controlsCollapsed = false,
 	onToggleControlsCollapsed,
 }: Props) {
@@ -1871,24 +1873,26 @@ export function ControlPanel({
 	const controlsBody = (
 		<>
 			{/* Removed step move blocks; unified under realtime jog below */}
-			<div className="mb-3 rounded-lg border border-slate-700/60 p-2">
-				<div className="mb-2 flex items-center justify-between text-xs text-slate-300/80">
-					<span className="font-semibold">Gripper</span>
-					<span className="tabular-nums">{grip}°</span>
+			{showGripperPanel ? (
+				<div className="mb-3 rounded-lg border border-slate-700/60 p-2">
+					<div className="mb-2 flex items-center justify-between text-xs text-slate-300/80">
+						<span className="font-semibold">Gripper</span>
+						<span className="tabular-nums">{grip}°</span>
+					</div>
+					<input
+						type="range"
+						min={0}
+						max={180}
+						value={grip}
+						onChange={(e) => handleGripChange(Number(e.target.value))}
+						className="w-full accent-cyan-400"
+					/>
+					<div className="mt-1 flex gap-2">
+						<button className="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700" onClick={() => handleGripChange(120)}>Open</button>
+						<button className="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700" onClick={() => handleGripChange(0)}>Close</button>
+					</div>
 				</div>
-				<input
-					type="range"
-					min={0}
-					max={180}
-					value={grip}
-					onChange={(e) => handleGripChange(Number(e.target.value))}
-					className="w-full accent-cyan-400"
-				/>
-				<div className="mt-1 flex gap-2">
-					<button className="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700" onClick={() => handleGripChange(120)}>Open</button>
-					<button className="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700" onClick={() => handleGripChange(0)}>Close</button>
-				</div>
-			</div>
+			) : null}
 			<div className="mb-3 rounded-lg border border-slate-700/60 p-2">
 				<div className="mb-2 flex items-center justify-between text-xs text-slate-300/80">
 					<span className="font-semibold">Speed Multiplier</span>

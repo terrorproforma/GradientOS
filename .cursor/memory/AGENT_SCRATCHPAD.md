@@ -28,6 +28,7 @@ Use this file as persistent, repo-local execution memory.
 ### Workflow & Process
 - [user] Prefer implementation over discussion; "do it, do not only explain."
 - [user] Always use and update both `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md`. Missing updates to either file is an incomplete task (blocker).
+- [user] When extending motion/program authoring, reuse the existing `command_api` command vocabulary and semantics where possible. Do not invent parallel move names if `move`, `move_absolute`, or `home` already express the intent.
 - [self] On Windows sessions in this repo, default to `.\.venv\Scripts\python -m pytest` instead of `pytest` to avoid path/environment mismatch.
 - [tool] Build and lint checks (`npm run build`, `ReadLints`) catch regressions quickly in the web-ui workflow. Run them frequently.
 - [self] For new configuration parameters, update all four layers together: UI draft type + API normalization + planner option parse + persistence (weld program save/load).
@@ -43,6 +44,7 @@ Use this file as persistent, repo-local execution memory.
 - [user] Scrollbars should feel like part of the panel, nested inside the same rounded element that defines the visual frame. Use consistent theme styling.
 - [user] Visual hierarchy should be obvious; field labels should not compete with section headings. Define and use reusable typographic tokens.
 - [self] Never place explainer popovers inside scrolling/clipped containers; use portal overlays (`createPortal(document.body)`) for any panel-help UI.
+- [user] In trajectory authoring, button labels and helper text must reflect actual motion intent. `Capture Pose` should mean linear planned move, numeric `Add Waypoint` should mean joint move, and `Move to Home` should be an explicit separate action.
 
 ### React State & Effects
 - [user] Preserve in-progress workflow context (loaded STEP + weld setup) while changing tool configuration.
@@ -54,6 +56,62 @@ Use this file as persistent, repo-local execution memory.
 ## Session Entries
 
 *(Session entries are cleared regularly. Chronological implementation logs belong in `.cursor/memory/DEVLOG.md`. Historical scratchpad entries are archived in `.cursor/memory/AGENT_SCRATCHPAD_ARCHIVE.md`)*
+
+### 2026-03-26 - Trajectory timeline semantics and selection
+- [user] In the trajectory timeline, "moves" should mean the visible motion between adjacent authored waypoints, and clicking a timeline block must highlight the corresponding point or segment in the 3D stage.
+- [self] Do not assume raw serialized preview commands are the right UX abstraction for the timeline. In this repo the preview plan can contain a first command to the first waypoint while the visible stage path is trimmed to the authored range, so the timeline should derive segment blocks from `visualWaypoints` + `visualPathPoints`, not blindly from `previewPlan.trajectory.moves`.
+- [self] When timeline selection can target synthetic segment blocks that do not exist in the program tree, keep a separate ephemeral selection id in `web-ui/src/App.tsx` and derive the active `highlightPathRange` / `highlightWaypointIndices` from that synthetic selection before falling back to tree selection.
+- [user] The 3D trajectory preview should show visible labels for major control points and moves (`CP1`, `CP2`, `M1`, `M2`, etc.), not just unlabeled dots/lines.
+- [self] Reuse the existing sprite-label helper in `web-ui/src/ArmVisualizer.tsx` for these annotations. Waypoint labels should key off authored `waypoints`, and move labels should key off adjacent waypoint segments / ordered nearest path indices so selected timeline segments can highlight the matching `M#` label too.
+- [self] Safe preview invalidation must not destroy trajectory authoring context. If `plannerPoints` no longer match `previewPlan`, it is fine to clear the runnable preview, but `web-ui/src/App.tsx` still needs a draft-backed `programTreePlan` so tree selection/editing survives move-type edits and similar draft-only changes.
+
+### 2026-03-26 - Grouped program tree should mirror move segments
+- [user] In grouped program-tree mode, control points should sit at the same hierarchy level as the move groups, and each move group should expand to the exact points for just that segment.
+- [self] Do not dump all exact path samples into one giant grouped bucket. In `web-ui/src/previewUtils.ts`, grouped mode should interleave `Control Point N` leaf nodes with `Move N` operation-group nodes built from adjacent waypoint pairs.
+- [self] Use ordered nearest-path indices to assign exact path samples to each move group, and keep the move-group node itself selectable with `focus.pathRange`, `focus.waypointIndices`, and `focus.moveIndex` so tree selection still syncs the stage and timeline.
+- [self] Wrap those interleaved grouped motion nodes in a real `op_motion` operation-group container under `Setup`. `App.tsx` already expects `op_motion` in grouped view expansion defaults, and the extra container makes the tree read as a coherent motion section instead of a flat setup list.
+
+### 2026-03-26 - Saved trajectory cache reuse can be physically unsafe
+- [tool] Controller logs for `RUN_TRAJECTORY,test-1,true,false` showed the run loading `/home/pi/GradientOS/src/trajectory_cache/test-1.json`, starting a 668-point RTCore move immediately after homing, then faulting. The first cached joint sample was far from the home joint vector, proving the cache was planned from an older live start state.
+- [self] Standard saved trajectory preview caches are start-state dependent because `plan_preview_trajectory_points()` seeds the first segment from the robot's live current joints. Do not advertise or trust `useCache` for normal saved trajectory programs loaded through `robot-program` save/load.
+- [self] Keep weld/high-fidelity cached replay separate from normal authored trajectory replay. In the frontend run path and saved trajectory hydration, default non-weld trajectories to fresh planning (`use_cache: false`) even if a preview cache file exists on disk.
+- [self] Put this warning directly at the top of `web-ui/src/App.tsx` and `src/gradient_os/api/main.py`, because future agents are likely to "optimize" cached trajectory replay unless the physical-risk rationale is visible in code before they edit the run/load paths.
+
+### 2026-03-26 - Runtime-only trajectory loop toggle
+- [user] The trajectory drawer needs a visible runtime option to loop execution, and any extra move-to-start behavior must stay outside the saved trajectory/program data.
+- [self] For runtime-only execution modifiers in this repo, prefer existing controller/API override fields before extending saved authoring schema. Here the correct path was wiring the existing `/trajectory/run` `loop_override` from `web-ui/src/App.tsx` instead of persisting loop state into `planned_trajectory` or authoring waypoints.
+- [self] When runtime motion should start from the robot's actual current pose, do not seed from `utils.current_logical_joint_angles_rad` if `_get_best_available_joint_state()` already exists. The loop-start wrapper in `src/gradient_os/arm_controller/command_api.py` should use the live-preferred helper for the same reason preview planning does.
+
+### 2026-03-25 - Trajectory move semantics correction
+- [self] I initially started serializing explicit joint-intent waypoints as a new `move_joint_absolute` command in `src/gradient_os/arm_controller/command_api.py`. That duplicated existing controller semantics instead of extending the current vocabulary cleanly.
+- [user] The correct guardrail was explicit: "the command api should have moves like this already dont reinvent the wheel". Treat that as a preflight check before adding any new trajectory/program command token.
+- [self] Corrective rule: for authored waypoint intent, map linear motion to existing `move_absolute`, map home intent to existing `home`, and map non-linear absolute IK/joint intent to the existing legacy `move` semantics before considering any new command name.
+- [tool] Fast validation loop for this kind of cross-layer change: `python -m py_compile ...`, `python -m pytest tests/test_api_endpoints.py`, `npm run build`, then `ReadLints` on touched files. This caught the missing `Sequence` import immediately.
+
+### 2026-03-25 - Trajectory button intent mapping
+- [user] The trajectory authoring drawer should use the existing button surfaces to express intent directly: `Capture Pose` for linear/planned moves, `Add Waypoint` for joint moves, plus a dedicated `Move to Home` button.
+- [self] Do not let linear placement affordances inherit the previous waypoint's `moveType`. In `web-ui/src/App.tsx`, force `Shift-click` placement and `Capture Pose` inserts to `moveType: "linear"` even when the prior waypoint was `joint` or `home`.
+- [self] Keep numeric insertion semantics consistent across entry points. If the drawer's `Add Waypoint` defaults to joint intent, mirror that in `ProgramFeatureTree` add-point behavior and labels.
+
+### 2026-03-25 - First joint waypoint seeding
+- [user] When `Add Waypoint` is used to create the first trajectory point, it must not create a fake move from base/world zero to the real start pose.
+- [self] In `web-ui/src/App.tsx`, seed the first trajectory joint/home waypoint from live `/info/pose` data instead of `buildPoseWaypoint({ x: 0, y: 0, z: 0 }, ...)`.
+- [self] Failing closed is better than silently using origin here. If the live pose fetch fails, show an error and abort the insertion instead of previewing a bogus base-to-start path.
+
+### 2026-03-25 - Preview start-state parity
+- [user] If the trajectory visualization looks offset from the live robot right after authoring the first waypoint, check for a planner start-state mismatch before chasing rendering math.
+- [self] In `src/gradient_os/arm_controller/command_api.py`, preview planning must prefer live servo feedback over `utils.current_logical_joint_angles_rad` for its starting joint state. Mixing live `/info/pose` target capture with cached start joints produces visibly wrong first-segment paths.
+- [tool] A focused regression test can lock this down cheaply: monkeypatch `servo_driver.get_current_arm_state_rad`, call `plan_preview_trajectory_points()` with a joint waypoint, and assert `_plan_joint_move_to_pose()` receives the live joint seed.
+
+### 2026-03-25 - Trajectory save semantics
+- [user] Trajectory authoring should be savable even when planning is stale or currently failing. Waypoints plus move types are valuable on their own and regeneration can happen later.
+- [self] In `web-ui/src/App.tsx`, do not block trajectory save on `previewPlanMatchesWaypoints()` or `previewPlan.isStale`. Save authored waypoints regardless, and only attach `planned_trajectory` when there is a fresh matching plan.
+- [self] On loading a saved trajectory with no computed path, restore the authored waypoints without auto-regenerating. Let regeneration stay an explicit user action.
+
+### 2026-03-25 - Stale preview execution bug
+- [user] If the stage shows new control points but the robot physically runs something else, suspect stale `previewPlan` reuse before assuming backend move execution is broken.
+- [self] In `web-ui/src/App.tsx`, current authored `plannerPoints` must invalidate any mismatched preview immediately. Do not allow `handleRunPreview()` to run unless `previewPlanMatchesWaypoints(previewPlan, plannerPoints)` is true.
+- [self] It is okay to display a matched-but-stale preview as non-runnable, but it is not okay to keep a mismatched preview alive after edits or failed replans because the timeline/controller-moves panel will lie about what will run.
 
 ### 2026-03-23 - Jog mode idle-gap regression
 - [self] In `web-ui/src/ControlPanel.tsx`, once a realtime jog session has started, do not suppress unchanged zero-velocity ticks forever. If zero keepalives stop, the controller lease can expire during the short gap between direction presses and the next hold will hit `SESSION_INACTIVE`.
@@ -1538,3 +1596,98 @@ Use this file as persistent, repo-local execution memory.
 - [self] Corrective rule: when the terminal shows `POST /trajectory/run HTTP/1.1" 503` but also shows the controller receiving `RUN_TRAJECTORY,...` and entering `Starting Trajectory Planning Phase`, treat it as an API timeout / late ACK mismatch, not a rejected run.
 - [self] Corrective rule: correlate `trajectory/run` 503s with controller-side planning/execution lines before retrying from the UI; duplicate clicks can reissue a command that already started.
 - [self] Corrective rule: repeated `GET /info/joints` 503s during planning/execution are secondary telemetry poll failures and should be triaged separately from the primary motion/planner error.
+
+### 2026-03-25 - Linear preview planning cost is dominated by dense sampled IK plus FK re-validation
+- [user] Pointed out that straight-line planning with locked orientation felt too slow and likely should be much faster.
+- [self] Corrective rule: distinguish the motion profile duration shown in `[Planner] Total time: ...` from wall-clock planning time; the former sets how many 100 Hz samples are generated, not how long the planner spent computing.
+- [self] Corrective rule: when users report slow linear planning, inspect whether the code is doing true batch IK or just a Python loop over single-pose solves. In this repo, `numeric_wrapper.solve_ik_path(...)` was still looping in Python despite the batch-style call site.
+- [self] Corrective rule: seed-align the first IK sample to the current joint state before validating path continuity; otherwise an equivalent `2pi` wrist branch on the very first sample can look like a bogus limit/jump issue.
+
+### 2026-03-25 - QuIK already had native multi-pose IK, but the pybind layer only exposed single-pose solve
+- [self] Corrective rule: before optimizing a Python wrapper around a native library, inspect the binding layer itself; the C++ `quik::IKSolver` already exposed multi-pose overloads even though `pyquik/bindings.cpp` only exported `.solve(...)`.
+- [self] Corrective rule: native batch solve is not automatically more robust for path continuity if each pose is solved independently from a fixed seed matrix. For path planning, prefer a native rolling-seed path solve in C++ over a pure independent batch solve.
+- [tool] Rebuilt `src/numeric_solver/pyquik/pyquik.cpython-311-aarch64-linux-gnu.so` successfully with CMake, but shell-side import smoke tests still fail under system `python3` because that interpreter lacks `numpy`; runtime verification must happen in the project’s actual app environment after restart.
+
+### 2026-03-25 - When users ask to "make logs visible", add explicit stage-timing prints where the work really happens
+- [user] Restarted the service and asked for the planner timing logs to be visible in the terminal.
+- [self] Corrective rule: if timing visibility is the goal, instrument both the top-level linear planner (`_plan_linear_move`) and the inner high-fidelity planner (`_plan_high_fidelity_trajectory`), otherwise the logs still hide where the time is actually spent.
+- [self] Corrective rule: if a service was restarted before new logging code was added, tell the user clearly that one more restart is required to load the new log statements.
+
+### 2026-03-25 - Git object corruption: quarantine zero-byte loose objects before refetch
+- [tool] `git status` and `git fsck --full` can fail hard on empty loose objects with `fatal: loose object ... is corrupt`, even when the matching commit still exists on `origin`.
+- [self] Corrective rule: before mutating a corrupt repo, verify the affected ref exists remotely with `git ls-remote --heads origin` and make a full `.git` backup.
+- [self] Corrective rule: prefer moving zero-byte object files to a quarantine backup directory over deleting them outright; then run `git fetch origin --prune --tags`, `git fsck --full`, and `git status --short --branch` to confirm recovery.
+- [tool] Recent kernel logs also showed `systemd-journald` reporting journal files as `corrupted or uncleanly shut down`, so if Git corruption returns, suspect abrupt power loss or storage instability before blaming Git itself.
+
+### 2026-03-25 - Jump-rejected trajectory previews need layered recovery plus structured UI diagnostics
+- [user] After the repo repair, the user still wanted the jump-recovery hardening implemented end-to-end, not just investigated.
+- [self] Corrective rule: when preview planning fails with `IK_JUMP_REJECTED`, add a bounded local reseed retry keyed off `jump_pose_index` in `src/gradient_os/arm_controller/trajectory_execution.py` before escalating to broader segment splitting.
+- [self] Corrective rule: if a whole linear move still fails after the local reseed path, split only that move into 2-4 seeded subsegments inside `_plan_linear_move(...)`; keep recursion bounded with an explicit one-level guard.
+- [self] Corrective rule: keep the human-readable planner failure text in `src/gradient_os/arm_controller/command_api.py`, but expose raw `last_planner_diagnostics` through `src/gradient_os/api/main.py` so the UI can read structured fields instead of scraping text.
+- [self] Corrective rule: for trajectory planning failures in `web-ui/src/App.tsx`, keep the global error banner but also store a local planner-failure object so stale previews can coexist with the latest failure diagnostics in the trajectory panel.
+- [tool] In this shell, validation is limited to syntax/build checks because system `python3` lacks both `pytest` and `numpy`; use the app’s real Python environment for focused planner/API test execution.
+
+### 2026-03-25 - This repo already has a working `.venv`; use it directly before reaching for stack scripts
+- [user] Clarified that starting `start-stack.sh` or `start.sh` is an easy way to get the right runtime.
+- [self] Corrective rule: for focused Python validation, prefer `source /home/pi/GradientOS/.venv/bin/activate` and run the specific test command first; do not start the whole stack unless runtime behavior, services, or browser/live API checks actually require it.
+- [tool] The repo venv contains `pytest`, `numpy`, and the needed plugins, so focused tests can pass there even when system `python3` is missing dependencies.
+
+### 2026-03-25 - Latest regenerate logs prove both recovery layers ran and still failed on the same branch-flip class of issue
+- [tool] `logs/startups/20260325-201425/api.log` shows the updated planner executing all four IK attempts, then logging `Jump recovery ... recovery_attempts=2, accepted=False` for each of them before rejecting the full 813-point segment.
+- [tool] The same log then immediately shows a second `_plan_linear_move(...)` pass with a shorter 351-point profile, confirming the bounded subsegment split fallback also ran after the first failure.
+- [tool] That shorter split segment also failed all four attempts plus both local reseed retries, so the current blocker is deeper than "fallback not invoked".
+- [self] Corrective rule: when logs show `max_joint_step_rad` almost exactly `6.283` with zero Cartesian/orientation residual and a joint-limit margin just above threshold, treat it as a persistent `2pi` branch-flip continuity problem, likely near a limit boundary, not a gross Cartesian reachability failure.
+- [self] Corrective rule: if the UI summary does not mention split fallback but the logs show a second shorter planning pass immediately after the first rejection, infer that `split_recovery` was attempted but not surfaced as a successful recovery because it also failed.
+
+### 2026-03-25 - Honor user correction on continuity scope: check active segment, not repeated authored pose
+- [user] Explicit correction: for the `follo-edge` return-home failure, the relevant continuity check is waypoint `#3 -> #4`, not waypoint `#1 -> #4`.
+- [self] Corrective rule: do not silently convert a repeated-pose authoring hint into the primary continuity rule. In `src/gradient_os/arm_controller/command_api.py`, waypoint planning should seed from the immediately previous solved joint state for the active segment unless the user explicitly asks for a nonlocal branch reference.
+- [tool] After removing the preview-time repeated-waypoint branch anchor and restarting the stack, the live `/trajectory/plan-points` repro for `follo-edge` still failed, but now `planner_diagnostics.branch_anchor_available=false`, confirming the planner is no longer using the `#1 -> #4` cross-check.
+- [tool] The live failure signature shifted to a clearer segment-local issue: `LIMIT_VIOLATION` on waypoint `#4`, with `violating_joint_index=4`, `violating_pose_index=538`, tiny `max_joint_step_rad≈0.0283`, and effectively zero Cartesian/orientation residual.
+- [tool] Direct repo-venv numeric replay with `MINI_ARM_SOLVER=numeric` still aborts inside native Eigen/QuIK before Python can surface planner diagnostics, so live API/controller validation is currently more trustworthy than standalone numeric wrapper scripts for this repro.
+
+### 2026-03-25 - Full-turn wrist joints need a narrower preview margin than generic revolute joints
+- [tool] The remaining live `follo-edge` failure was a pure planner margin rejection on J4: `joint_limit_margin_rad=0.0299666`, which is only `3.3e-05 rad` inside the generic `0.03 rad` guard while Cartesian/orientation residuals were effectively zero and the segment steps stayed tiny.
+- [self] Corrective rule: for logical joints whose configured software range is effectively a full turn or more, treat the `±2pi` window edges as wrap boundaries for preview gating rather than using the same conservative near-limit margin as non-wrapping joints.
+- [self] Corrective rule: implement joint-specific limit margins in both equivalent-angle candidate ranking and post-plan gate validation so wrap-capable wrist joints are not rejected simply for brushing the software window edge.
+- [tool] Adding `_joint_limit_margin_for_index(...)` with a `0.005 rad` preview margin for full-turn joints, then restarting the stack, changed the live `recorded_programs/follo-edge.json` repro from `502 LIMIT_VIOLATION` to `200 OK`.
+
+### 2026-03-25 - A preview run can succeed physically while `/trajectory/run` still returns a timeout error
+- [tool] The user reported `Failed to run trajectory: No response for command 'RUN_TRAJECTORY,__planner_preview__,false'` immediately after a successful preview regenerate.
+- [tool] Fresh logs in `logs/startups/20260325-213253/` showed `POST /trajectory/run` returning `503`, while the controller log simultaneously showed `Received: 'RUN_TRAJECTORY,__planner_preview__,false'`, full pre-compute planning, RTCore execution of all steps, and `Executor thread finished`.
+- [self] Corrective rule: do not treat `RUN_TRAJECTORY` timeout text as a rejected run by default. For this command, if the UDP ACK times out, immediately poll `GET_MOTION_STATUS` and infer acceptance only when the same program name is already active/planning/executing.
+- [self] Corrective rule: prefer status-confirmed timeout recovery over just increasing the HTTP timeout, because controller-side precompute duration varies with trajectory complexity and can still exceed any short fixed timeout.
+
+### 2026-03-25 - API-side preview planning must trust controller-synced joints, not local zero fallback
+- [self] `src/gradient_os/api/main.py` preview planning runs inside the API process, which often has no active actuator backend. In that process, `servo_driver.get_current_arm_state_rad()` can fall through to deprecated local serial reads and synthesize an all-zero joint vector.
+- [self] Corrective rule: in `src/gradient_os/arm_controller/command_api.py::_get_best_available_joint_state()`, only trust live reads when an actuator backend is initialized or servos were actually detected; otherwise fall back to `utils.current_logical_joint_angles_rad`, which the API route has already synced from the controller.
+- [self] Corrective rule: `src/gradient_os/api/main.py::_get_live_joint_angles_from_controller()` receives joint angles from `GET_POSITION` in degrees, so convert them to radians before writing `current_logical_joint_angles_rad` or seeding any planner state.
+- [self] Corrective rule: trajectory regenerate-overwrite requests from `web-ui/src/App.tsx` must include `kind: "trajectory"` when calling `/robot-program/save`; that route does not infer kind and will hard-fail with `400` if the field is missing.
+- [tool] Focused validation that caught and locked this down: `source /home/pi/GradientOS/.venv/bin/activate && PYTHONPATH=src python -m pytest tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py` and `npm run build` in `web-ui`.
+
+### 2026-03-26 - Trajectory preview must never overwrite the authored waypoint sequence
+- [user] Captured/recorded trajectory points must be saved sequentially exactly as authored; planning is not allowed to delete, reorder, or rewrite earlier moves.
+- [self] Corrective rule: in `web-ui/src/App.tsx`, `plannerPoints` is the authored draft source of truth. `requestPlannerPreview(...)` may refresh `previewPlan`, but must not call `setPlannerPoints(...)` with backend-derived preview waypoints.
+- [self] Corrective rule: when persisting a planned trajectory from the UI, store authored waypoints in `planned_trajectory.waypoints` for compatibility checks and reloads; keep exact execution data in `trajectory`, `cartesian_path`, and cached planned steps.
+- [tool] High-signal symptom of this bug: after each plan request the UI replaced the draft with `previewFromPlannerPayload(...).waypoints`, which made earlier recorded moves appear to vanish or mutate even though the operator was just appending another point.
+
+### 2026-03-26 - Trajectory authoring add actions must append, and stale preview responses must be cancelled
+- [user] Explicit correction: every additional trajectory point should only append to the authored list; no authoring action should insert into the middle or make an earlier point/move disappear.
+- [self] Corrective rule: in `web-ui/src/App.tsx`, `Add Waypoint`, `Move to Home`, captured pose appends, and tree-side add actions should build from the latest draft (`plannerPoints`) and append at the tail unless the user explicitly asks for insertion semantics.
+- [self] Corrective rule: preview requests for trajectory authoring need cancellation/last-request-wins behavior. Otherwise an older `/trajectory/plan-points` response can land after a newer append and visually snap the draft/preview backward.
+- [tool] A reliable hardening pattern here is `AbortController` plus `plannerPointsRef`/`previewPlanRef` so async handlers append against current draft state rather than stale render-closure snapshots.
+
+### 2026-03-26 - `Add Waypoint` must capture the live pose, not clone the last waypoint
+- [user] Explicit correction: the waypoint button should behave exactly like `Capture Pose` and only differ by `moveType`; if it uses a separate duplicate-last-point path, replace it.
+- [self] Corrective rule: in `web-ui/src/App.tsx`, `handleAddTrajectoryWaypoint()` must call the same live-pose capture helper as `handleCaptureTrajectoryPose()` and then append that returned pose with `moveType: "joint"`.
+- [self] Corrective rule: do not treat "append-only" as "copy the previous authored point"; for trajectory authoring, append means capture a new live pose and push it onto the end of the draft.
+
+### 2026-03-26 - Preview path must not visualize implicit planner prefix/suffix motion
+- [user] Explicit correction: the stage should not display an apparent return-home or other extra segment unless the operator explicitly authored that move in the trajectory sequence.
+- [self] Corrective rule: when `web-ui/src/previewUtils.ts` receives explicit authored waypoints plus a dense `cartesian_path`, trim the displayed path to the range between the first and last authored control points. Do not visualize planner-only connector motion before the first authored point or after the last authored point.
+- [tool] Direct evidence from `recorded_trajectories/__planner_preview__.json`: the saved preview contained only three authored `move` commands and no `home` command, so the phantom segment was a rendering mismatch rather than a serialized trajectory step.
+
+### 2026-03-26 - Persist UI visibility toggles instead of removing control cards outright
+- [user] Asked to hide the right-side `Gripper` control panel but keep a Settings toggle to show or hide it.
+- [self] Corrective rule: when the user wants an operational panel hidden but still available, add a persisted boolean in `web-ui/src/App.tsx` settings storage/modal and thread a dedicated visibility prop into the child component instead of deleting the feature or stripping related telemetry/state handling.
+- [tool] `ReadLints` can lag behind after a prop/type addition in this repo's large TS files; if a new prop error persists but the source shows the updated type, confirm with `npm run build` in `web-ui` before treating the diagnostic as authoritative.

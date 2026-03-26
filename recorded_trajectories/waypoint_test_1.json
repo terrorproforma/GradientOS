@@ -1,0 +1,88 @@
+{
+  "description": "Planned on 2026-03-25 23:11:35 via PLAN_TRAJECTORY_POINTS",
+  "loop": false,
+  "orientation_euler_angles_deg": null,
+  "moves": [
+    {
+      "command": "move",
+      "vector": [
+        0.807,
+        0,
+        0.6885
+      ],
+      "orientation_euler_deg": [
+        180,
+        -0.09,
+        179.99
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "move",
+      "vector": [
+        0.807,
+        0,
+        0.6885
+      ],
+      "orientation_euler_deg": [
+        180,
+        -0.09,
+        179.99
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        1.1848,
+        -0.1171,
+        0.2252
+      ],
+      "orientation_euler_deg": [
+        -151.83,
+        19.41,
+        -169.74
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        1.1847,
+        -0.117,
+        0.305
+      ],
+      "orientation_euler_deg": [
+        -151.84,
+        19.38,
+        -169.69
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "home",
+      "vector": [
+        0.8067,
+        0,
+        0.6897
+      ],
+      "orientation_euler_deg": [
+        180,
+        0,
+        180
+      ]
+    }
+  ]
+}
