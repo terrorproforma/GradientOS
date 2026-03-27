@@ -56,6 +56,15 @@ def _get_backend_config():
     return backend_registry.get_config()
 
 
+def _serial_protocol_supported() -> bool:
+    """Return whether the active backend config supports legacy serial packets."""
+    try:
+        cfg = _get_backend_config()
+    except backend_registry.BackendNotConfiguredError:
+        return True
+    return bool(getattr(cfg, "SERVO_PROTOCOL_SUPPORTED", True))
+
+
 # These are accessed as module-level constants but delegate to the backend.
 # They're populated when first accessed after backend is configured.
 def __getattr__(name):
@@ -959,6 +968,8 @@ def sync_read_positions(
         return backend.sync_read_positions(timeout_s=timeout_s)
     
     # Fallback to direct serial communication
+    if not _serial_protocol_supported():
+        return {}
     if utils.ser is None or not utils.ser.is_open:
         print("[Pi SyncRead] Serial port not initialized.")
         return {}
@@ -1115,6 +1126,8 @@ def fast_sync_read_positions(
         dict[int, int]: A dictionary mapping servo_id to its raw position. This may be a partial
                         result if some servos did not respond.
     """
+    if not _serial_protocol_supported():
+        return {}
     if utils.ser is None or not utils.ser.is_open:
         print("[Pi SyncRead] Serial port not initialized.")
         return {}
@@ -1272,6 +1285,8 @@ def sync_read_block(
         return backend.sync_read_block(servo_ids, start_address=start_address, data_len=data_len)
     
     # Fallback to direct serial communication
+    if not _serial_protocol_supported():
+        return {}
     if utils.ser is None or not utils.ser.is_open:
         print("[Pi SyncReadBlk] Serial port not initialized.")
         return {}

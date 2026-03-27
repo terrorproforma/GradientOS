@@ -6,6 +6,7 @@ The app provides:
 
 - live arm visualization in a 3D scene
 - telemetry and controller alerts
+- controller runtime mode hot switching between `LIVE` and `SIM`
 - trajectory preview and execution controls
 - STEP topology loading and weld planning tools
 - Program Tree inspection/editing for planned motion
@@ -74,12 +75,18 @@ npm run dev
 
 - filter tools by robot compatibility, tool type, and keyword
 - create/update/delete tool definitions (XYZ mm + RPY deg)
-- stage desired active tool in runtime policy and apply on controller restart
+- stage desired active tool in runtime policy and apply it live without restarting the controller
 - optional STL mesh preview in the visualizer (fallback marker is shown when no mesh is provided)
 - tools are auto-discovered from `tools/library/<tool_id>/tool.json` with per-tool local asset files
 - quick load/select flow is available directly in the left sidebar `Tool Library` drawer
 - full tool parameter editing is isolated under the `Tool Library` tab in Settings
 - mesh placement can be defined separately from TCP (`mesh.position_mm` + `mesh.rotation_deg`, relative to J6/flange anchor) to decouple visual mesh origin from tool-tip offset
+
+### Runtime Mode
+
+- the header `LIVE` / `SIM` toggle now hot-switches the controller runtime immediately after operator confirmation
+- the switch stops active motion, waits for idle, and swaps backends in-process through the controller
+- restart actions remain only for real restart-bound runtime policy changes such as robot/backend/profile differences
 
 ### Program Tree
 

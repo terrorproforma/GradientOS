@@ -1,3 +1,227 @@
+## 2026-03-26 23:20 +0000
+
+- Task summary:
+  - Fixed a false SIM-mode rejection in the live `/trajectory/run` API path where simulated trajectory execution was blocked with `409` even though the controller was already running in SIM mode.
+- Changes:
+  - Reviewed the newest startup logs and correlated the UI error with:
+    - `POST /trajectory/run HTTP/1.1` returning `409 Conflict` in `logs/startups/latest/api.log`
+    - controller startup and runtime logs clearly showing `mode=simulate` / `servo backend: simulation`
+  - Updated `src/gradient_os/api/main.py`:
+    - added `_runtime_active_snapshot(...)` to normalize raw controller runtime payloads and wrapped `/info/runtime-config` snapshots into one active-runtime view
+    - changed `_runtime_is_sim_mode(...)` to work with both shapes so `/trajectory/run` no longer falsely treats raw controller snapshots as LIVE
+  - Updated `tests/test_api_endpoints.py`:
+    - changed the SIM conflict test to use the raw controller `GET_RUNTIME_CONFIG` payload shape
+    - added a regression test proving `/trajectory/run` accepts `execution_mode: "simulate"` when the raw controller runtime snapshot reports `mode.sim=true`
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_api_endpoints.py -q -k "trajectory_run"` (passed, 5 tests)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/api/main.py tests/test_api_endpoints.py` (passed)
+  - `ReadLints` on edited files (no diagnostics)
+  - restarted the local stack and verified live behavior:
+    - `/info/runtime-config` reported `active.mode.sim=true`
+    - `POST /trajectory/run` with `{"name":"test-1","execution_mode":"simulate","use_cache":false}` returned `200 OK`
+    - the response reported `runtime_mode: "simulate"`, `execution_mode: "simulate"`, and `program_name: "test-1"`
+- Follow-up notes / risks:
+  - As in the previous restart cycle, the first launcher stop killed the supervisor but left child controller/API/web processes running; a second soft stop cleaned those orphans before the successful restart.
+
+## 2026-03-26 23:10 +0000
+
+- Task summary:
+  - Fixed SIM-mode realtime jog so it matches the current safe controller-owned jog session / lease-watchdog architecture instead of acknowledging lease updates without moving the simulated robot.
+- Changes:
+  - Reviewed `logs/startups/latest/controller.log` and confirmed the symptom:
+    - SIM jog sessions were starting/updating/stopping cleanly through `JOG_SESSION_*`
+    - the controller was running in `joint_velocity_lease` mode for SIM
+    - but the simulation backend was not advancing joint state from leased velocity commands
+  - Updated `src/gradient_os/arm_controller/backends/simulation/backend.py`:
+    - added monotonic-time lease state tracking (`last_tick`, deadline, timeout)
+    - made `get_joint_positions()`, `sync_read_positions()`, and single-actuator/raw state reads advance simulated motion up to the current time
+    - made `update_joint_velocity_lease_jog()` integrate the previous command before refreshing the backend watchdog with the new joint-velocity vector
+    - made `stop_joint_velocity_lease_jog()` clear the backend-native lease state cleanly
+    - preserved the controller-side session manager, deadman, gate, and stop semantics unchanged
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - added a deterministic regression test proving SIM lease-jog motion advances between updates and holds position after watchdog expiry
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py -q -k "simulation_backend"` (passed, 3 tests)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_command_api_direct_setpoint.py -q -k "realtime_jog_loop_uses_rtcore_joint_velocity_backend"` (passed)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/backends/simulation/backend.py tests/test_gradient05_limits_and_backends.py` (passed)
+  - `ReadLints` on edited files (no diagnostics)
+  - restarted the local stack and verified live behavior through the real API:
+    - `POST /control/jog/session/start`
+    - repeated `POST /control/jog/session/update`
+    - `POST /control/jog/session/stop`
+    - confirmed `/info/joints` changed from all-zero to non-zero joint values and `/info/pose` moved in +X while staying in SIM mode
+- Follow-up notes / risks:
+  - The first stop attempt killed the old launcher but left child controller/API/web processes running; a second soft stop cleaned those orphans before restart.
+  - The broader `tests/test_gradient05_limits_and_backends.py` file still contains unrelated pre-existing failing assertions outside the targeted `simulation_backend` subset.
+
+## 2026-03-26 22:54 +0000
+
+- Task summary:
+  - Fixed the SIM backend command-format mismatch that corrupted simulated joint state after `APPLY_JOINT_SETPOINT` / home-style open-loop execution, which then caused later relative moves to plan from an invalid mirrored pose and fail with planner limit violations.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/backends/simulation/backend.py`:
+    - changed `prepare_sync_write_commands()` to convert logical joint radians into backend-ready `(servo_id, raw_pos, speed, accel)` tuples using the robot mapping, offsets, and encoder conversion helpers
+    - kept `sync_write()` semantics unchanged so the simulation backend now matches the shared backend interface contract used by open-loop execution
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - added a regression test that exercises `prepare_sync_write_commands()` followed by `sync_write()` and verifies the logical joint positions round-trip correctly for `Gradient05`
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py -q -k "simulation_backend"` (passed, 2 tests)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/backends/simulation/backend.py tests/test_gradient05_limits_and_backends.py` (passed)
+  - `ReadLints` on edited files (no diagnostics)
+  - ad-hoc runtime check: SIM backend prepare→sync-write round-trip now preserves zero and non-zero logical joint targets within encoder quantization tolerance
+- Follow-up notes / risks:
+  - A broader run of `tests/test_gradient05_limits_and_backends.py` still shows unrelated pre-existing failures in gear-ratio and EtherCAT-axis-scaling assertions; those were not introduced by this SIM fix.
+
+## 2026-03-26 22:51 +0000
+
+- Task summary:
+  - Investigated the newest SIM-mode control failure from the current startup logs and traced the failure sequence past the controller hot-switch path into simulation state handling after a home/direct joint-setpoint action.
+- Changes:
+  - No product code changes in this pass.
+  - Reviewed `logs/startups/latest/controller.log` and `logs/startups/latest/api.log`:
+    - confirmed `SWITCH_RUNTIME_MODE,simulate` completed successfully
+    - confirmed SIM jog sessions worked
+    - confirmed the first `MOVE_LINE_RELATIVE,0.05,0,0` succeeded in SIM
+    - observed that after `APPLY_JOINT_SETPOINT` / `POST /control/home`, the next `MOVE_LINE_RELATIVE,0,0,0.05` planned to a mirrored/invalid target and failed with `LIMIT_VIOLATION`
+  - Reviewed `src/gradient_os/arm_controller/command_api.py`:
+    - confirmed relative moves derive their start pose from the controller's current joint state via `servo_driver.get_current_arm_state_rad()` and FK
+  - Reviewed `src/gradient_os/arm_controller/backends/simulation/backend.py`:
+    - identified `prepare_sync_write_commands()` / `sync_write()` as the most likely mismatch point for SIM-only corruption after open-loop joint-setpoint execution
+  - Ran a Python FK sanity check for `gradient05` at zero logical joints:
+    - verified zero-joint FK is approximately `[0.8067, 0.0, 0.9097]`, so the negative target seen in logs is not the expected home pose
+- Validation:
+  - `ReadFile` on `logs/startups/latest/controller.log`, `logs/startups/latest/api.log`, `src/gradient_os/arm_controller/command_api.py`, and `src/gradient_os/arm_controller/backends/simulation/backend.py`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -c "... ik_solver.get_fk([0.0, ...])"` (passed)
+- Follow-up notes / risks:
+  - Strong suspicion: the simulation backend is receiving joint-radian values on a sync-write path that expects raw encoder counts, which would only surface after home/direct-setpoint/open-loop actions and explains the subsequent impossible relative target and planner limit rejections.
+
+## 2026-03-26 22:34 +0000
+
+- Task summary:
+  - Updated the operator/developer documentation set so it reflects the new controller-owned LIVE/SIM hot-switch workflow instead of the old restart-based mode change flow.
+- Changes:
+  - Updated `docs/trajectory_recorder.md`:
+    - documented that operators can switch runtime mode from the header toggle or `POST /control/runtime-mode`
+    - changed the execution-mode section to describe the controller-owned hot-switch path
+    - removed the old roadmap item that said SIM/LIVE switching would relaunch the controller
+  - Updated `web-ui/README.md`:
+    - added runtime mode hot switching to the feature overview
+    - changed tool-library docs to say active tool changes apply live without restart
+    - added a dedicated runtime mode section describing the hot-switch behavior
+  - Updated `docs/README.md`:
+    - added controller-owned hot runtime switching to the top-level system overview
+    - updated the first-run operator workflow to mention the header LIVE/SIM toggle
+    - added a key behavior note that LIVE/SIM switching is controller-owned and hot-applied
+  - Updated `docs/command_api.md`:
+    - documented `GET_RUNTIME_CONFIG`, `SWITCH_RUNTIME_MODE`, `SET_ACTIVE_TOOL`, and `REQUEST_RESTART`
+  - Updated `docs/run_controller.md`:
+    - added runtime policy activation / hot-switch responsibilities to the controller overview
+- Validation:
+  - repo-wide doc search for stale restart-based SIM/LIVE wording in the updated docs (`rg`, passed: no stale matches remained in the edited doc set)
+- Follow-up notes / risks:
+  - This was a docs-only pass; no additional code/tests/build steps were needed beyond the earlier implementation validation.
+
+## 2026-03-26 22:06 +0000
+
+- Task summary:
+  - Replaced restart-only LIVE/SIM runtime mode staging with a controller-owned hot switch that stops motion, waits for idle, swaps backends in-process, and returns an updated runtime snapshot to the API/UI.
+- Changes:
+  - Updated `src/gradient_os/run_controller.py`:
+    - extracted reusable runtime activation/shutdown helpers for startup and hot switching
+    - removed normal-controller reliance on `sim_backend.activate()` during SIM runtime bring-up
+    - added `SWITCH_RUNTIME_MODE,<live|simulate>` controller command that preserves current active robot/override policy while changing only the runtime mode and persisting desired `sim_mode`
+  - Updated `src/gradient_os/runtime_config.py`:
+    - added `derive_runtime_request_from_active_runtime(...)` so hot-switch comparisons and controller runtime reconstruction can be based on the current active runtime
+    - changed `compute_restart_required(...)` to model SIM/LIVE as hot-switchable while still detecting real restart-bound robot/backend/profile changes
+  - Updated `src/gradient_os/api/main.py`:
+    - added thin `POST /control/runtime-mode` endpoint that validates `mode`, forwards one controller command, and returns a normal runtime snapshot shape
+    - updated runtime-config patch route summary to reflect hot-switchable sim mode
+  - Updated `web-ui/src/App.tsx`:
+    - changed the header LIVE/SIM toggle to confirm and call `/control/runtime-mode` directly
+    - removed SIM/LIVE restart-button behavior from the header and kept restart actions for real restart-required settings only
+    - stopped bundling `sim_mode` into general runtime-config apply requests
+  - Updated `tests/test_runtime_config.py`:
+    - added coverage for deriving runtime requests from active runtime and for restart semantics that ignore pure SIM/LIVE mismatches but still catch restart-bound live override changes
+  - Updated `tests/test_api_endpoints.py`:
+    - taught the fake controller transport to handle `SWITCH_RUNTIME_MODE`
+    - added regression coverage for the new hot-switch endpoint and for sim-mode staging no longer reporting restart-required
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/run_controller.py src/gradient_os/runtime_config.py src/gradient_os/api/main.py tests/test_runtime_config.py tests/test_api_endpoints.py tests/test_run_controller_helpers.py` (passed)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_runtime_config.py tests/test_api_endpoints.py tests/test_run_controller_helpers.py -q` (passed, 71 tests)
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on edited backend/frontend/test files (no diagnostics)
+- Follow-up notes / risks:
+  - The controller hot-switch path intentionally preserves the current active robot/override policy and only changes runtime mode, so separately staged restart-bound robot/backend changes remain pending until a real restart/apply flow is used.
+  - This pass validated the API/controller contract and the web build, but it did not exercise the new hot-switch path against real hardware or a live browser click-through.
+
+## 2026-03-26 06:22 +0000
+
+- Task summary:
+  - Fixed trajectory move-block selection so clicking a move in the shared timeline now also selects the matching move node in the program tree.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added a move-index-to-program-node lookup that prefers grouped `move_group_*` nodes in grouped tree view and `move_*` nodes in chronological view
+    - changed `handleSelectTimelineItem(...)` so move timeline clicks select the matching real program-tree node when available instead of always clearing tree selection
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - If a future timeline item is introduced without a backing `focus.moveIndex` tree node, it will still fall back to the existing synthetic timeline-only selection path.
+
+## 2026-03-26 06:17 +0000
+
+- Task summary:
+  - Converted trajectory program-tree editing into an unsaved draft workflow with automatic preview updates, undo history, and explicit bottom-of-tree save controls.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added cloned-waypoint comparison helpers plus saved-baseline and edit-history state for trajectory drafts
+    - changed trajectory tree edit handlers to update `plannerPoints` as draft changes and auto-replan the preview without persisting to disk
+    - added undo-last and undo-all draft restore handlers
+    - changed trajectory save to flush any pending draft replan before writing the file, then mark the current waypoints as the saved baseline
+    - reset saved-baseline/history on load and clear
+  - Updated `web-ui/src/components/ProgramFeatureTree.tsx`:
+    - hid the manual apply button for normal trajectory point edits and replaced it with automatic-preview guidance
+    - added a bottom draft action bar with `Undo Last`, `Undo All`, and `Save`
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/ProgramFeatureTree.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - Trajectory numeric inputs still use immediate controlled number updates, so a fast sequence of keystrokes can create several undo steps; this is acceptable for now because the preview replanning itself is debounced.
+
+## 2026-03-26 05:58 +0000
+
+- Task summary:
+  - Updated trajectory timeline copy so control points read `CP#` and each block header now shows the block type instead of the generic `Block` label.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - renamed timeline control-point labels from `P#` to `CP#`
+    - changed move detail text to use `CP# -> CP#`
+    - populated per-block type labels for control points, moves, and weld segments
+  - Updated `web-ui/src/components/ProgramTimeline.tsx`:
+    - added a per-item `metaLabel` field and rendered it in the timeline card header
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/ProgramTimeline.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - Control-point type headings currently infer `Pose Capture` from `moveType === "linear"` and `Waypoint` otherwise, because authored trajectory points do not yet store a separate creation-source flag.
+
+## 2026-03-26 05:49 +0000
+
+- Task summary:
+  - Moved trajectory move-type editing out of the control-point editor so the program tree now edits segment move types from the selected `Move N` node.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - derived a selected move editor from the active program-tree move focus, mapping each move selection to its destination waypoint where the segment `moveType` is stored
+    - passed the new move-editor state into `ProgramFeatureTree`
+  - Updated `web-ui/src/components/ProgramFeatureTree.tsx`:
+    - removed the move-type dropdown from `Edit Control Point N`
+    - added a dedicated `Edit Move N` panel with the move-type selector under the selected move node
+- Validation:
+  - `npm run build` in `web-ui` (passed)
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/ProgramFeatureTree.tsx` (no diagnostics)
+- Follow-up notes / risks:
+  - The segment move type still lives on the destination waypoint in authoring state, so any future move-editor UI should continue to resolve `Move N` to waypoint `N + 1` rather than adding duplicate move-type state.
+
 ## 2026-03-26 05:35 +0000
 
 - Task summary:
@@ -6758,3 +6982,498 @@
     - still reported a stale `showGripperPanel` prop diagnostic in `web-ui/src/App.tsx`, but the production TypeScript/Vite build succeeded with the updated prop type in place.
 - Follow-up notes / risks:
   - I did not run a live browser session against the settings modal in this pass, so the remaining check is the exact UI interaction: Settings -> General -> toggle `Show gripper panel` on/off and confirm the right-side card responds immediately.
+
+## 2026-03-26 05:46 UTC
+
+- Task summary:
+  - Investigated how to preserve local edits made inside the imported `quik` submodule.
+- Changes:
+  - No product code changed.
+  - Confirmed the superproject reports `src/numeric_solver/quik` as modified because the submodule worktree has local edits.
+  - Confirmed `src/numeric_solver/quik` is on `HEAD detached at a9ebd1f` with a modified `include/quik/Robot.hpp`.
+  - Confirmed the submodule remote currently points to upstream `https://github.com/steffanlloyd/quik.git`.
+- Validation:
+  - `git -C "/home/pi/GradientOS/src/numeric_solver/quik" status --short --branch`
+  - `git -C "/home/pi/GradientOS" submodule status -- "src/numeric_solver/quik"`
+  - `git -C "/home/pi/GradientOS/src/numeric_solver/quik" branch -a --contains HEAD`
+  - `git -C "/home/pi/GradientOS/src/numeric_solver/quik" remote -v`
+- Follow-up notes / risks:
+  - Because the submodule checkout is detached, the edits are easy to lose unless they are anchored on a branch or exported as a patch.
+  - If the team needs to share or clone this state reliably, the clean path is to fork `quik`, push the saved branch there, and then update the parent repository to reference that forked commit.
+
+## 2026-03-26 19:42 UTC
+
+- Task summary:
+  - Investigated why `Simulate Trajectory` appeared broken and clarified the trajectory drawer so the controller runtime gate is explicit.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added explicit runtime-aware execution guidance to the trajectory drawer,
+    - surfaced clearer disabled reasons for `Simulate Trajectory` and `Run Trajectory` via button titles,
+    - made disabled execution buttons show a `cursor-not-allowed` affordance instead of only dimming them.
+- Validation:
+  - Live browser repro on `http://127.0.0.1:8000/`
+    - confirmed the underlying behavior: `Simulate Trajectory` is disabled in `LIVE` mode while `Run Trajectory` is enabled
+  - `ReadLints` on `web-ui/src/App.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - This pass improves clarity only; it does not add frontend-only trajectory playback in LIVE mode.
+  - If the desired behavior is true local trajectory animation regardless of controller mode, that will need a separate implementation in the visualizer rather than another `/trajectory/run` call.
+
+## 2026-03-26 20:10 UTC
+
+- Task summary:
+  - Added a prominent top-bar SIM/LIVE runtime switch and wired desired sim mode through the runtime policy path so switching modes is now a real staged controller change.
+- Changes:
+  - Updated `src/gradient_os/runtime_config.py`:
+    - added persisted `desired.sim_mode` support,
+    - included desired sim mode in normalization, snapshot resolution, and restart-required comparisons
+  - Updated `src/gradient_os/run_controller.py`:
+    - made controller startup honor the persisted desired sim mode in addition to the existing `--sim` CLI flag,
+    - reused that effective mode for simulation backend activation
+  - Updated `web-ui/src/App.tsx`:
+    - tracked desired runtime mode in frontend state from `/info/runtime-config`,
+    - refactored runtime-config PATCH logic into a reusable helper,
+    - added a bright top-bar `LIVE` / `SIM` switch plus an `Apply + Restart` action that reflects whether the controller is already in sync
+  - Updated `tests/test_runtime_config.py` and `tests/test_api_endpoints.py`:
+    - added regression coverage for default `sim_mode` persistence and restart detection when desired sim mode changes
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_runtime_config.py tests/test_api_endpoints.py -q`
+    - passed (`64 passed`)
+  - `npm run build` in `web-ui`
+    - passed
+  - Browser snapshot on `http://127.0.0.1:8000/`
+    - confirmed the header now renders `LIVE`, `SIM`, and the mode-apply control
+- Follow-up notes / risks:
+  - Switching the staged runtime mode still requires a controller restart to take effect, because the actuator backend is chosen during controller startup.
+  - The header control stages and applies only runtime mode; broader robot/backend policy editing still lives in the existing runtime settings workflow.
+
+## 2026-03-26 23:26 UTC
+
+- Task summary:
+  - Tightened the trajectory drawer layout by moving the authoring description into the drawer header and converting `Execution Status` into a permanent compact top card with fixed height.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - removed the redundant trajectory intro card from the drawer body,
+    - expanded the trajectory drawer header content with a concise authoring subtitle,
+    - extended `MotionStatusCard` with `alwaysVisible`, `compact`, and fixed-height support,
+    - added compact state-specific summaries and clearer idle/completed/faulted color treatment for the trajectory execution card.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - I did not run a live browser pass on the trajectory drawer in this change, so the remaining check is visual: confirm the fixed-height status card feels right across idle, submitting, running, completed, and faulted states.
+
+## 2026-03-26 23:33 UTC
+
+- Task summary:
+  - Re-anchored the fallback tool/TCP arrow so its pointed tip now sits on the TCP origin instead of the shaft base.
+- Changes:
+  - Updated `web-ui/src/ArmVisualizer.tsx`:
+    - changed `_createFallbackToolMarker()` to define `bodyLength` and `tipLength`,
+    - moved the cylinder body backward from the origin,
+    - moved the cone so its point coincides with the TCP/tool-tip frame origin.
+- Validation:
+  - `ReadLints` on `web-ui/src/ArmVisualizer.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - I did not run a live browser verification for this pass, so the remaining check is visual confirmation that the fallback marker still points in the expected TCP forward direction on the active tool.
+
+## 2026-03-26 23:36 UTC
+
+- Task summary:
+  - Refined the fallback TCP marker so the cylinder now starts at the cone base instead of overlapping forward toward the tip.
+- Changes:
+  - Updated `web-ui/src/ArmVisualizer.tsx`:
+    - changed the fallback marker shaft offset from `-bodyLength * 0.5` to `-(tipLength + bodyLength * 0.5)`,
+    - kept the cone tip anchored at the TCP origin while making the shaft meet the cone at its wide end.
+- Validation:
+  - `ReadLints` on `web-ui/src/ArmVisualizer.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - Remaining verification is visual only: confirm the cone/shaft join looks clean at the current camera scale and that the marker still reads clearly as the active TCP direction.
+
+## 2026-03-27 00:19 UTC
+
+- Task summary:
+  - Stopped false `Serial port not initialized` alarms after hot-switching from SIM back to LIVE/RTCore.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/servo_protocol.py`:
+    - added a `SERVO_PROTOCOL_SUPPORTED` guard so deprecated sync-read fallbacks return empty data instead of logging serial-port errors when the active backend is non-serial (`ethercat_rtcore`)
+    - applied the guard to `sync_read_positions(...)`, `fast_sync_read_positions(...)`, and `sync_read_block(...)`
+  - Updated `src/gradient_os/run_controller.py`:
+    - moved `backend_registry.get_telemetry_blocks()` lookup inside the controller telemetry loop so long-lived telemetry threads pick up the active backend immediately after a SIM/LIVE hot switch
+  - Updated `tests/test_protocol.py`:
+    - added a regression that verifies non-serial backends do not emit legacy serial warnings for deprecated sync-read helpers
+    - made the existing packet-structure test use `servo_protocol` delegated constants instead of `utils` constants
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_protocol.py::TestServoProtocol::test_non_serial_backend_sync_reads_do_not_emit_serial_warnings tests/test_gradient05_limits_and_backends.py::test_registry_telemetry_blocks_are_optional_for_ethercat_backend -q`
+    - passed (`2 passed`)
+  - `ReadLints` on `src/gradient_os/arm_controller/servo_protocol.py`, `src/gradient_os/run_controller.py`, and `tests/test_protocol.py`
+    - no diagnostics
+- Follow-up notes / risks:
+  - A broader run of `tests/test_protocol.py::TestServoProtocol` still exposes an older unrelated legacy test/setup issue around `sync_write_goal_pos_speed_accel(...)` and `utils` constant population; it is not caused by this hot-switch telemetry fix.
+
+## 2026-03-27 00:26 UTC
+
+- Task summary:
+  - Fixed a LIVE/RTCore trajectory execution race where `Run Trajectory` could plan successfully but time out on a very short first segment without moving the robot.
+- Changes:
+  - Investigated `logs/startups/latest/controller.log` and confirmed:
+    - `RUN_TRAJECTORY,test-1,false,false` reached the controller,
+    - planning completed successfully,
+    - execution failed on step 1 with `Timed out waiting for RTCore trajectory 1 to complete`,
+    - later RTCore live moves in the same session (`traj_id=2`, `traj_id=3`) completed normally.
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - made `commit_trajectory(...)` return the submitted RTCore command sequence,
+    - threaded that `submitted_command_seq` into `execute_joint_trajectory(...)` and `wait_for_trajectory_complete(...)`,
+    - taught the waiter to accept the completion of very short trajectories that finish between polls when RTCore has already processed the submitted command and reports `motion_done` with a terminal/idle state and empty queue.
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - added a regression for the short-trajectory completion race where `active_traj_id` is never observed,
+    - updated the existing quantized RTCore trajectory test harness for the new optional waiter argument.
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_wait_for_trajectory_complete_ignores_stale_previous_completion tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_wait_for_short_trajectory_completion_without_observed_active_id tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing -q`
+    - passed (`3 passed`)
+  - `ReadLints` on `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` and `tests/test_gradient05_limits_and_backends.py`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did not restart the live stack and physically re-run `test-1` in this pass, so the remaining runtime verification is to retry the same `Run Trajectory` action after the controller reloads this backend change.
+
+## 2026-03-27 00:29 UTC
+
+- Task summary:
+  - Added a draggable splitter between the docked `Program Tree` and `Robot Control` panes in the right-side workspace column.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added a persisted `programTreeHeightPx` setting,
+    - extended the shared `activeShellDrag` model with a `rightDock` drag target,
+    - measured the right dock height with `ResizeObserver` and clamped the tree pane height against the live container,
+    - inserted a horizontal `PaneResizeHandle` between the tree card and robot controls so operators can resize that stack directly.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+    - no diagnostics
+  - `npm run build` in `web-ui`
+    - passed
+- Follow-up notes / risks:
+  - I did not run a live browser verification in this pass, so the remaining check is visual: confirm the handle spacing and min heights feel right with your normal right-dock workflow.
+
+## 2026-03-27 00:45 UTC
+
+- Task summary:
+  - Added per-move trajectory speed editing in physical units so operators can select an authored move and set its travel rate in `mm/s` or `deg/s`.
+- Changes:
+  - Updated `web-ui/src/previewUtils.ts`:
+    - extended `PoseWaypoint` with nullable `linearSpeedMmPerSec` / `rotationSpeedDegPerSec` fields,
+    - taught waypoint coercion, preview hydration, fallback trajectory parsing, and API encoding to preserve per-move speed metadata.
+  - Updated `web-ui/src/App.tsx`:
+    - added move-speed defaults and speed-mode detection for selected move segments,
+    - threaded per-move speed edits through trajectory draft updates,
+    - reset cloned waypoint speed overrides when appending a new waypoint.
+  - Updated `web-ui/src/components/ProgramFeatureTree.tsx`:
+    - extended the selected move editor with a speed input, unit label, and `Auto` reset action beside the existing move-type control.
+  - Updated `src/gradient_os/api/main.py`:
+    - accepted and persisted `linear_speed_mm_s` / `rotation_speed_deg_s` on authored trajectory waypoints,
+    - included those fields in saved-plan compatibility checks.
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added helpers to parse per-waypoint and per-move speed metadata,
+    - let joint/home moves honor explicit angular speeds,
+    - let standard linear moves honor explicit linear speeds,
+    - added an orientation-only planning path for pure-rotation linear segments using `deg/s`,
+    - serialized move speed metadata back into saved preview trajectories and planner payloads.
+  - Updated `tests/test_api_endpoints.py`:
+    - added coverage for API preservation of per-waypoint speed fields on trajectory planning and robot-program save/load.
+  - Updated `tests/test_command_api_direct_setpoint.py`:
+    - added regressions for joint angular-speed forwarding and pure-rotation orientation-only planning.
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_api_endpoints.py -q`
+    - passed (`60 passed`)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_command_api_direct_setpoint.py -q`
+    - passed (`25 passed`)
+  - `ReadLints` on the edited frontend/backend/test files
+    - stale `ProgramFeatureTree` prop diagnostic remained in `web-ui/src/App.tsx`, but the frontend production build passed with the new prop wiring.
+- Follow-up notes / risks:
+  - I did not run a live browser interaction against the trajectory editor in this pass, so the remaining runtime check is to click a move in the Program Tree, adjust the speed, regenerate/run, and confirm the motion timing feels correct on the real robot or simulator.
+  - After user review, I removed the hardcoded frontend fallback values (`80 mm/s`, `15 deg/s`) from `web-ui/src/App.tsx` and `web-ui/src/components/ProgramFeatureTree.tsx` so unset move speeds now display as `controller default` and leave fallback timing ownership entirely in the controller.
+  - Re-ran `npm run build` in `web-ui`
+    - passed
+  - Follow-up correction implemented at `2026-03-27 01:25 UTC`:
+    - updated `web-ui/src/App.tsx` and `web-ui/src/previewUtils.ts` so controller-computed move-speed metadata is merged back into editable trajectory waypoints after preview generation and on saved-trajectory load,
+    - updated `src/gradient_os/arm_controller/command_api.py` so preview payloads always serialize the resolved speed actually used for planning, including controller defaults,
+    - reran `PYTHONPATH=src python -m pytest tests/test_command_api_direct_setpoint.py -q`, `PYTHONPATH=src python -m pytest tests/test_api_endpoints.py -q`, `npm run build`, and `ReadLints`
+    - all passed.
+  - Follow-up UX correction implemented at `2026-03-27 01:40 UTC`:
+    - updated `web-ui/src/components/ProgramFeatureTree.tsx` so move-speed input now keeps a local draft, waits before committing, commits immediately on blur/Enter, and shows an inline `Recalculating trajectory preview...` status while the preview refresh is in flight,
+    - updated `web-ui/src/App.tsx` so the selected move editor remains visible during `isPlanLoading` instead of disappearing for the currently selected move,
+    - reran `npm run build` in `web-ui` and `ReadLints`
+    - both passed.
+  - Follow-up UX correction implemented at `2026-03-27 01:44 UTC`:
+    - updated `web-ui/src/App.tsx` selection cleanup effects so `selectedProgramNodeId` and `selectedTimelineSyntheticId` are no longer cleared while `isPlanLoading` is true,
+    - this prevents the highlighted move editor from disappearing mid-recalculation when the rebuilt program tree briefly lacks the selected node,
+    - reran `npm run build` in `web-ui` and `ReadLints`
+    - both passed.
+
+## 2026-03-27 01:53 UTC
+
+- Task summary:
+  - Fixed per-move trajectory linear speed overrides so higher entered `mm/s` values actually produce faster planned motion instead of getting stuck behind a fixed low acceleration profile.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - made `_resolve_profile_params_for_speed_multiplier(...)` use safe base-profile fallbacks,
+    - added `_resolve_profile_params_for_linear_speed_m_s(...)` so absolute speed overrides map onto the same velocity/acceleration scaling family as the controller speed-multiplier path,
+    - switched runtime `move_absolute` execution to use the absolute-speed resolver when `linear_speed_mm_s` is present,
+    - switched preview trajectory planning to use the same resolver so preview and execution timing semantics stay aligned,
+    - serialized the resolved runtime move speed back from the actual velocity used for planning.
+  - Updated `tests/test_command_api_direct_setpoint.py`:
+    - added a direct regression for absolute linear-speed acceleration scaling,
+    - added a preview-planning regression that verifies a `400 mm/s` override is forwarded as `0.4 m/s` with scaled `0.8 m/s^2` acceleration.
+- Validation:
+  - `python -m pytest tests/test_command_api_direct_setpoint.py`
+    - passed (`27 passed`)
+  - `ReadLints` on `src/gradient_os/arm_controller/command_api.py` and `tests/test_command_api_direct_setpoint.py`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did not physically rerun the edited trajectory on hardware in this pass, so the remaining runtime check is to retry the same move and confirm the faster value now shortens the move duration as expected.
+
+## 2026-03-27 02:04 UTC
+
+- Task summary:
+  - Added saved per-segment linear acceleration for trajectory moves and made the controller default unset line acceleration to roughly a one-second ramp to commanded speed.
+- Changes:
+  - Updated `web-ui/src/previewUtils.ts`:
+    - extended `PoseWaypoint` / `TrajectoryMove` with `linearAccelerationMmPerSec2` / `linear_acceleration_mm_s2`,
+    - preserved linear acceleration through preview hydration, saved-trajectory parsing, motion-metadata merging, and API encoding.
+  - Updated `web-ui/src/App.tsx`:
+    - extended `EditableProgramMove` with acceleration editor metadata,
+    - compared per-waypoint linear acceleration in trajectory draft equality checks,
+    - added linear-acceleration draft update/reset callbacks,
+    - cleared stored linear speed/acceleration when a move is switched away from `linear`,
+    - passed the new acceleration handlers into `ProgramFeatureTree`.
+  - Updated `web-ui/src/components/ProgramFeatureTree.tsx`:
+    - added a debounced `Acceleration` input for true linear segments only,
+    - kept the same blur/Enter commit behavior and `Auto` reset pattern as move speed,
+    - surfaced the controller default policy in the helper copy (`about 1 second` to full speed when unset).
+  - Updated `src/gradient_os/api/main.py`:
+    - accepted `linear_acceleration_mm_s2` on authored pose waypoints,
+    - included linear acceleration in waypoint compatibility checks.
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added linear-acceleration extractors for authored waypoints and serialized move steps,
+    - changed `_resolve_profile_params_for_linear_speed_m_s(...)` to support explicit acceleration overrides and otherwise default authored line moves to `velocity / 1.0s`,
+    - serialized resolved linear acceleration into preview trajectories, preview waypoints, and runtime planned steps.
+  - Updated `tests/test_command_api_direct_setpoint.py`:
+    - changed the absolute-speed regression to the new one-second-ramp default,
+    - added coverage for explicit linear acceleration overrides.
+  - Updated `tests/test_api_endpoints.py`:
+    - added coverage for preserving `linear_acceleration_mm_s2` through trajectory planning and trajectory program save/load.
+- Validation:
+  - `python -m pytest tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py -q`
+    - passed (`89 passed`)
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on the edited frontend/backend/test files
+    - no diagnostics
+- Follow-up notes / risks:
+  - I have not yet done a live runtime verification on hardware or in the browser for the new acceleration editor, so the remaining operator check is to tune a linear segment, save it, reload it, and confirm the move timing/feel matches the edited `mm/s^2` value.
+
+## 2026-03-27 02:28 UTC
+
+- Task summary:
+  - Added a live speed-profile visualization below `Edit Move` so operators can see where a linear segment accelerates, cruises, and decelerates, including when the line is too short to reach the requested set speed.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - extended `EditableProgramMove` with the selected segment's linear distance in `mm`,
+    - factored the waypoint translation-distance helper so the move editor can pass real move length into the profile graph.
+  - Updated `web-ui/src/components/ProgramFeatureTree.tsx`:
+    - added a lightweight trapezoidal-profile calculator for the selected linear move,
+    - rendered a dark inline SVG chart below the move speed/acceleration controls,
+    - overlaid the requested set-speed guide and the actual reachable profile so short moves visibly collapse to a triangular profile,
+    - added compact stats for line length, target/peak speed, accel-cruise-decel distances, and estimated total move time,
+    - kept the graph responsive to the current input drafts so the visualization updates while the operator edits,
+    - showed an explanatory note instead of a fake chart for joint, home, and pure-rotation moves.
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/ProgramFeatureTree.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I have not yet done a live browser pass to inspect the visual proportions of the chart inside the right dock, so the remaining UX check is to confirm the graph reads well at your normal panel size and that the distance markers feel useful in practice.
+
+## 2026-03-27 02:34 UTC
+
+- Task summary:
+  - Fixed the new move profile chart so it actually appears directly below `Edit Move` for linear moves that are still using controller-default acceleration.
+- Changes:
+  - Updated `web-ui/src/components/ProgramFeatureTree.tsx`:
+    - changed the chart input resolution so when acceleration is unset it falls back to the controller's default linear-acceleration policy (`about 1 second` to reach the current line speed) instead of resolving to `null`,
+    - added a small fallback message for the remaining case where a linear move still lacks any resolved line speed and therefore cannot be graphed yet.
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/components/ProgramFeatureTree.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I still have not done a live browser pass in the dock, so the remaining UX check is to confirm the chart is now visible in the expected slot and that its height feels right with your normal right-panel layout.
+
+## 2026-03-27 02:41 UTC
+
+- Task summary:
+  - Hardened the `Edit Move` panel so it stays visible during trajectory recalculation instead of disappearing while the same move remains selected.
+- Changes:
+  - Updated `web-ui/src/components/ProgramFeatureTree.tsx`:
+    - added an internal `lastEditableMoveRef` fallback,
+    - render the last known selected move while `isTrajectoryRecalculating` is true if the incoming `editableMove` prop briefly drops to `null`,
+    - switched the move editor controls, graph inputs, and fallback messages to use that visible/sticky move instance consistently.
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/components/ProgramFeatureTree.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I still have not done a live browser pass, so the remaining runtime UX check is to confirm the move panel now stays mounted all the way through the recalculation spinner for the same selected move.
+
+## 2026-03-27 02:44 UTC
+
+- Task summary:
+  - Populated the move editor's acceleration field with the actual effective acceleration number for linear moves instead of leaving it blank on controller-default acceleration.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - changed `selectedProgramMove` so `accelerationValue` now resolves to the segment's effective linear acceleration,
+    - prefer the explicit `linearAccelerationMmPerSec2` returned by the planner when present,
+    - otherwise fall back to the current resolved line speed under the controller's one-second-ramp default so the acceleration input shows a concrete number while `Auto` still indicates whether a custom override exists.
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/ProgramFeatureTree.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - This frontend fallback matches the current controller default policy (`a = v / 1s`), so if that controller default changes later, the display fallback should be updated or removed once the running backend always echoes resolved acceleration in the preview payload.
+
+## 2026-03-27 02:51 UTC
+
+- Task summary:
+  - Fixed the remaining `Edit Move` disappearance bug by keeping the parent-selected move sticky through the edit-to-recalculate gap, not only during active `isPlanLoading`.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - changed the parent `lastSelectedProgramMoveRef` cleanup so it now clears only when the actual selection key changes or selection is fully cleared,
+    - removed the `isPlanLoading` gate from `visibleSelectedProgramMove` so the same selected move remains available to the editor through debounce/start-of-recalc races as well as active recalculation.
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/components/ProgramFeatureTree.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I still have not done a live browser interaction pass, so the remaining runtime UX check is to confirm the `Edit Move` card now remains continuously visible from the moment you edit a field through the whole recalculation cycle for the same selected move.
+
+## 2026-03-27 03:20 UTC
+
+- Task summary:
+  - Made the trajectory run UI explicitly tell operators that the controller is recalculating the runnable path from the robot's current pose before motion starts.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - changed the trajectory `MotionStatusCard` submitting label from a generic submit message to a run-preparation recalculation message,
+    - replaced the draft-summary run message with a clearer two-line explanation,
+    - added a persistent execution note that standard trajectory starts rebuild the runnable path from current robot state,
+    - added a visible in-panel `Recalculating Path` notice while the run request is in flight.
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/App.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did not run a live browser/controller interaction, so the remaining runtime check is to confirm the recalculation notice is prominent enough during the actual delay window on hardware.
+
+## 2026-03-27 03:31 UTC
+
+- Task summary:
+  - Moved the trajectory recalculation notice out of the left drawer and into the main stage as a transient overlay that only appears after `Run Trajectory` is clicked.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - added a small overlay state scoped to standard live trajectory runs,
+    - removed the persistent recalculation copy from the trajectory drawer,
+    - added a centered stage banner with a spinner and recalculation message that clears in the run request `finally` block once the controller responds.
+- Validation:
+  - `npm run build` in `web-ui`
+    - passed
+  - `ReadLints` on `web-ui/src/App.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I still have not done a live browser/controller pass, so the remaining check is whether the `top-16` banner placement feels right relative to alerts and the stage header badges on your normal screen/layout.
+
+## 2026-03-27 03:34 UTC
+
+- Task summary:
+  - Replaced the hardcoded one-second pauses between authored trajectory moves with an explicit per-move pause value that operators can edit in the Program Tree.
+- Changes:
+  - Updated `web-ui/src/previewUtils.ts`:
+    - added `pauseAfterSeconds` to `PoseWaypoint`,
+    - preserved pause metadata when coercing waypoints, rebuilding preview plans, deriving waypoints from saved trajectory files, and encoding authoring payloads back to the API,
+    - annotated grouped move subtitles with the authored pause when a following move exists.
+  - Updated `web-ui/src/App.tsx`:
+    - added pause metadata to waypoint construction and waypoint equality checks,
+    - surfaced pause timing on selected move state,
+    - added trajectory draft handlers to set/reset per-move pause values,
+    - threaded the new callbacks into `ProgramFeatureTree`,
+    - appended pause timing to the shared timeline detail text for authored move segments.
+  - Updated `web-ui/src/components/ProgramFeatureTree.tsx`:
+    - added a `Pause After Move` numeric editor with debounce/blur commit behavior and a `None` reset action.
+  - Updated `src/gradient_os/api/main.py`:
+    - taught `_coerce_pose_waypoint_list(...)` and `_pose_waypoints_match(...)` to preserve and compare `pause_after_s`.
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added authored pause extraction,
+    - stopped auto-inserting unconditional `1.0 s` pauses between standard planned moves,
+    - removed the legacy recorder path's unconditional `1.0 s` pauses between saved recorded poses,
+    - interleaved explicit pause steps into preview trajectory serialization and the cached runtime planned-steps file only when authored,
+    - echoed `pause_after_s` back in preview waypoint payloads.
+  - Updated `tests/test_command_api_direct_setpoint.py`:
+    - added coverage that an explicit authored pause becomes a serialized `pause` command between the correct planned moves and is echoed in preview waypoint metadata.
+  - Updated `tests/test_api_endpoints.py`:
+    - added coverage that `/trajectory/plan-points` preserves `pause_after_s`,
+    - added coverage that trajectory program save/load preserves authored pause metadata.
+- Validation:
+  - `source /home/pi/GradientOS/.venv/bin/activate && PYTHONPATH=src python -m pytest tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py -q`
+    - passed (`90 passed`)
+  - `npm run build` in `web-ui`
+    - passed
+  - `npm exec tsc --noEmit` in `web-ui`
+    - still fails on pre-existing unrelated errors in `src/ControlPanel.tsx`, `src/TelemetryCharts.tsx`, and `src/TelemetryWorkspace.tsx`
+    - no remaining typecheck failures were reported in the touched trajectory pause files after fixing `src/previewUtils.ts`
+  - `ReadLints` on the touched files
+    - still reports a stale `ProgramFeatureTree` prop diagnostic in `web-ui/src/App.tsx` even though the prop exists in source and the Vite build succeeds
+- Follow-up notes / risks:
+  - I have not yet done a live browser/controller interaction pass to confirm the new pause editor feels right in the dock and that setting `0.0`-equivalent behavior via blank/`None` produces the exact continuous motion you want on hardware.
+
+## 2026-03-27 03:43 UTC
+
+- Task summary:
+  - Investigated why `0.1s` authored pauses still felt like `~1s` on hardware, confirmed from logs that the dwell itself was correct, and reduced remaining boundary hesitation by collapsing non-looping standard trajectory execution into one streamed joint path with explicit hold samples for pauses.
+- Changes:
+  - Investigated `logs/startups/latest/controller.log` and confirmed:
+    - older run at `03:37:41` still had no pause commands in the 5-step preview,
+    - newer run at `03:39:33` planned `8` runtime steps with `pause` commands and logged `Pausing for 0.1 seconds.` at each authored dwell,
+    - the user-visible hesitation therefore came from executing many discrete `move` / `pause` runtime steps rather than a stale `1.0s` dwell value.
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - added `_collapse_runtime_move_pause_steps(...)` to flatten standard `move` + `pause` runtime plans into one `move` step with repeated hold samples for pauses,
+    - applied the collapse for non-looping non-weld trajectory runs and logged when the runtime steps are condensed into one streamed path,
+    - kept authored program counts/status metadata based on the original logical steps while changing the execution policy string to `*_compound_path`.
+  - Updated `src/gradient_os/arm_controller/trajectory_execution.py`:
+    - let a runtime step carry `logical_step_count` so compound execution still reports the expected completed-step count on success.
+  - Updated `tests/test_command_api_direct_setpoint.py`:
+    - added coverage for compiling `move` + `pause` + `move` into one streamed path with the expected repeated hold samples.
+  - Updated `tests/test_trajectory_execution_backends.py`:
+    - added coverage that compound execution steps can contribute multiple logical completed steps to program status.
+- Validation:
+  - `source /home/pi/GradientOS/.venv/bin/activate && PYTHONPATH=src python -m pytest tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py tests/test_trajectory_execution_backends.py -q`
+    - passed (`99 passed`)
+  - `ReadLints` on the touched backend/test files
+    - no diagnostics
+- Follow-up notes / risks:
+  - The currently running stack is still `./start-stack.sh`, so this backend fix will not change live behavior until the controller/API process is restarted.
+  - I did not perform a fresh hardware run after the code change, so the remaining runtime check is to restart the stack, run the same preview trajectory again, and confirm the stop-start feel is reduced while the authored `0.1s` dwell is still visible in the controller log.

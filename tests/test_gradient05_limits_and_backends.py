@@ -20,7 +20,11 @@ from gradient_os.arm_controller.backends.ethercat_rtcore.backend import (
     _ShmHeader,
     _AxisConfig,
 )
-from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import RTCORE_EXEC_STATE_COMPLETED
+from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import (
+    RTCORE_EXEC_STATE_COMPLETED,
+    RTCORE_EXEC_STATE_IDLE,
+)
+from gradient_os.arm_controller.backends.simulation import backend as sim_backend_module
 from gradient_os.arm_controller.backends.simulation.backend import SimulationBackend
 from gradient_os.arm_controller.robots.gradient05.config import Gradient05Config
 from gradient_os import ik_solver
@@ -77,6 +81,48 @@ def test_simulation_backend_accepts_gradient05_robot_config():
     commanded = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6]
     backend.set_joint_positions(commanded, speed=500, acceleration=0)
     assert backend.get_joint_positions() == commanded
+
+
+def test_simulation_backend_sync_write_round_trips_logical_positions():
+    cfg_dict = Gradient05Config().get_config_dict()
+    backend = SimulationBackend(robot_config=cfg_dict)
+
+    commanded = [0.15, -0.35, 0.45, -0.25, 0.55, -0.65]
+    commands = backend.prepare_sync_write_commands(commanded, speed=500, accel=0)
+
+    backend.sync_write(commands)
+
+    actual = backend.get_joint_positions()
+    assert actual == pytest.approx(commanded, abs=2e-3)
+
+
+def test_simulation_backend_joint_velocity_lease_jog_advances_and_expires(monkeypatch):
+    cfg_dict = Gradient05Config().get_config_dict()
+    backend = SimulationBackend(robot_config=cfg_dict)
+    clock = {"now": 100.0}
+
+    monkeypatch.setattr(sim_backend_module.time, "monotonic", lambda: clock["now"])
+
+    backend.start_joint_velocity_lease_jog(timeout_s=0.2)
+    backend.update_joint_velocity_lease_jog([0.5, 0.0, 0.0, 0.0, 0.0, 0.0], timeout_s=0.2)
+
+    clock["now"] = 100.1
+    assert backend.get_joint_positions()[0] == pytest.approx(0.05, abs=2e-3)
+
+    backend.update_joint_velocity_lease_jog([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], timeout_s=0.2)
+
+    clock["now"] = 100.2
+    assert backend.get_joint_positions()[0] == pytest.approx(0.15, abs=2e-3)
+
+    clock["now"] = 100.35
+    assert backend.get_joint_positions()[0] == pytest.approx(0.25, abs=2e-3)
+
+    clock["now"] = 100.6
+    held_position = backend.get_joint_positions()[0]
+    assert held_position == pytest.approx(0.25, abs=2e-3)
+
+    clock["now"] = 101.0
+    assert backend.get_joint_positions()[0] == pytest.approx(held_position, abs=2e-3)
 
 
 def test_sync_script_main_dry_run_and_write(tmp_path):
@@ -376,8 +422,8 @@ def test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing(monkeyp
     def _commit_trajectory(traj_id):
         captured["commit"] = traj_id
 
-    def _wait_for_trajectory_complete(traj_id, *, timeout_s):
-        captured["wait"] = (traj_id, timeout_s)
+    def _wait_for_trajectory_complete(traj_id, *, timeout_s, submitted_command_seq=None):
+        captured["wait"] = (traj_id, timeout_s, submitted_command_seq)
         return status
 
     monkeypatch.setattr(backend, "begin_trajectory", _begin_trajectory)
@@ -414,9 +460,10 @@ def test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing(monkeyp
         assert point["flags"] == _TRAJ_POINTF_HAS_VELOCITY
         assert point["t_from_start_ns"] == idx * 4_000_000
         assert point["qd"] == pytest.approx([25.0, 25.0, 0.0, 0.0, 0.0, 0.0])
-    wait_traj_id, wait_timeout_s = captured["wait"]
+    wait_traj_id, wait_timeout_s, wait_submitted_command_seq = captured["wait"]
     assert wait_traj_id == 55
     assert wait_timeout_s == pytest.approx(5.012)
+    assert wait_submitted_command_seq is None
     assert backend.get_last_trajectory_timing() == {
         "requested_frequency_hz": 333,
         "effective_frequency_hz": 250,
@@ -628,6 +675,63 @@ def test_ethercat_backend_wait_for_trajectory_complete_ignores_stale_previous_co
 
     assert result.active_traj_id == 2
     assert result.state_name == "completed"
+
+
+def test_ethercat_backend_wait_for_short_trajectory_completion_without_observed_active_id(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+
+    statuses = iter(
+        [
+            RTCoreExecutionStatus(
+                active_mode=0,
+                active_mode_name="idle",
+                state=RTCORE_EXEC_STATE_IDLE,
+                state_name="idle",
+                active_traj_id=0,
+                current_point_index=None,
+                queue_depth=0,
+                queue_capacity=4096,
+                last_event_code=0,
+                underrun_count=0,
+                stale_command=False,
+                motion_done=True,
+                capability_flags=0,
+                active_command_seq=200,
+                last_update_ns=1000,
+            ),
+            RTCoreExecutionStatus(
+                active_mode=0,
+                active_mode_name="idle",
+                state=RTCORE_EXEC_STATE_IDLE,
+                state_name="idle",
+                active_traj_id=0,
+                current_point_index=None,
+                queue_depth=0,
+                queue_capacity=4096,
+                last_event_code=291,
+                underrun_count=0,
+                stale_command=False,
+                motion_done=True,
+                capability_flags=0,
+                active_command_seq=205,
+                last_update_ns=1100,
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(backend, "get_execution_status", lambda: next(statuses))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    result = backend.wait_for_trajectory_complete(
+        3,
+        timeout_s=0.1,
+        submitted_command_seq=205,
+    )
+
+    assert result.active_traj_id == 0
+    assert result.state_name == "idle"
+    assert result.active_command_seq == 205
 
 
 def test_ethercat_backend_sends_realtime_jog_command(monkeypatch, tmp_path):

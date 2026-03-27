@@ -4,12 +4,16 @@ import os
 
 from gradient_os.arm_controller import servo_protocol
 from gradient_os.arm_controller import utils
+from gradient_os.arm_controller.backends import registry as backend_registry
 
 class TestServoProtocol(unittest.TestCase):
     """
     Unit tests for the low-level servo protocol functions.
     These tests do not require a hardware connection.
     """
+
+    def setUp(self) -> None:
+        backend_registry.set_active_backend("feetech")
 
     def test_calculate_checksum(self) -> None:
         """
@@ -53,9 +57,9 @@ class TestServoProtocol(unittest.TestCase):
         checksum_data = bytearray([
             0xFE, # Broadcast ID
             20,   # Packet Length (L)
-            utils.SERVO_INSTRUCTION_SYNC_WRITE, # Instruction
-            utils.SYNC_WRITE_START_ADDRESS,     # Start Address
-            utils.SYNC_WRITE_DATA_LEN_PER_SERVO, # Len per servo
+            servo_protocol.SERVO_INSTRUCTION_SYNC_WRITE, # Instruction
+            servo_protocol.SYNC_WRITE_START_ADDRESS,     # Start Address
+            servo_protocol.SYNC_WRITE_DATA_LEN_PER_SERVO, # Len per servo
             10, 1, 0xE8, 0x03, 0x00, 0x00, 0x64, 0x00, # Servo 10 data
             20, 2, 0xD0, 0x07, 0x00, 0x00, 0xC8, 0x00, # Servo 20 data
         ])
@@ -72,6 +76,28 @@ class TestServoProtocol(unittest.TestCase):
             # Get the actual packet that was written
             actual_packet = mock_serial.write.call_args[0][0]
             self.assertEqual(actual_packet, expected_packet)
+
+    def test_non_serial_backend_sync_reads_do_not_emit_serial_warnings(self) -> None:
+        original_ser = utils.ser
+        try:
+            utils.ser = None
+            backend_registry.set_active_backend("ethercat_rtcore")
+
+            with unittest.mock.patch("builtins.print") as mock_print:
+                self.assertEqual(servo_protocol.sync_read_positions([0, 1]), {})
+                self.assertEqual(servo_protocol.fast_sync_read_positions([0, 1]), {})
+                self.assertEqual(
+                    servo_protocol.sync_read_block([0, 1], start_address=0x38, data_len=8),
+                    {},
+                )
+
+            printed = "\n".join(
+                str(call.args[0]) for call in mock_print.call_args_list if call.args
+            )
+            self.assertNotIn("Serial port not initialized", printed)
+        finally:
+            utils.ser = original_ser
+            backend_registry.set_active_backend("feetech")
 
 
 if __name__ == '__main__':

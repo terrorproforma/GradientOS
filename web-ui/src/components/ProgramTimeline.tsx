@@ -3,6 +3,7 @@ export type ProgramTimelineTone = "cyan" | "amber" | "emerald" | "violet" | "sla
 export type ProgramTimelineItem = {
   id: string;
   label: string;
+  metaLabel?: string;
   subtitle?: string;
   tone?: ProgramTimelineTone;
   active?: boolean;
@@ -141,7 +142,7 @@ export function ProgramTimeline({
                             >
                               <div className="mb-1.5 flex items-center justify-between gap-2">
                                 <span className="text-[9px] font-semibold uppercase tracking-[0.22em] text-current/70">
-                                  Block
+                                  {item.metaLabel ?? "Block"}
                                 </span>
                                 {item.active ? (
                                   <span className="rounded-full border border-current/20 bg-black/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.18em] text-current">

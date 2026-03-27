@@ -14,6 +14,7 @@ This file is the starting point for new contributors and operators.
 - Web UI with 3D scene visualization, telemetry, and program inspection
 - Program Tree tooling to inspect exact execution path samples and edit control points
 - Global Tool Library for end-effector definitions (offsets + optional meshes)
+- Controller-owned hot runtime switching between `LIVE` and `SIM`
 - Optional vision pipeline for camera streaming and image/AI processing
 
 ## How The System Works
@@ -191,9 +192,10 @@ the latest `api.log`, `web.log`, and `controller.log`.
 3. Load/import a STEP model for topology extraction.
 4. Select edges, configure weld options, and plan preview.
 5. Inspect execution details in Program Tree.
-6. Select desired active tool in Settings > Tool Library (if needed) and apply runtime config.
-7. Run preview trajectory/weld program.
-8. Save/load weld programs as needed.
+6. Use the header `LIVE` / `SIM` toggle if you need to hot-switch runtime mode before execution.
+7. Select desired active tool in Settings > Tool Library (if needed) and apply runtime config.
+8. Run preview trajectory/weld program.
+9. Save/load weld programs as needed.
 
 ## Key Motion And Weld Behavior
 
@@ -202,6 +204,7 @@ the latest `api.log`, `web.log`, and `controller.log`.
 - `return_to_start` for weld runs resolves from the run-time pre-weld start pose.
 - Realtime jog and trajectory playback include runtime guards to avoid controller contention.
 - Weld work/travel angles are interpreted as torch-target angles and compensated by the active tool definition.
+- `LIVE` / `SIM` switching is controller-owned and hot-applied; the API and UI are thin wrappers around that controller command.
 
 Tool library storage is folder-based so definitions are drop-in discoverable:
 

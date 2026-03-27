@@ -48,6 +48,7 @@ def _empty_runtime_config() -> dict[str, Any]:
         "version": 1,
         "desired": {
             "robot": _default_robot_name(),
+            "sim_mode": False,
             "active_tool_id": None,
             "allow_unsafe_overrides": False,
             "overrides": {
@@ -145,6 +146,9 @@ def _normalize_runtime_config(raw: Any) -> dict[str, Any]:
         "version": 1,
         "desired": {
             "robot": _normalize_robot_name(desired_obj.get("robot", defaults["desired"]["robot"])),
+            "sim_mode": bool(
+                desired_obj.get("sim_mode", defaults["desired"]["sim_mode"])
+            ),
             "active_tool_id": _normalize_tool_id(
                 desired_obj.get("active_tool_id", defaults["desired"]["active_tool_id"])
             ),
@@ -191,7 +195,7 @@ def get_runtime_config_snapshot() -> dict[str, Any]:
     overrides = desired.get("overrides", {}) if isinstance(desired, dict) else {}
     active_runtime = resolve_effective_runtime(
         robot_name=_normalize_robot_name(desired.get("robot")),
-        sim_mode=False,
+        sim_mode=bool(desired.get("sim_mode", False)),
         requested_ik_solver_backend=overrides.get("ik_solver_backend"),
         requested_servo_backend=overrides.get("servo_backend"),
         requested_drive_profile=overrides.get("drive_profile"),
@@ -235,6 +239,9 @@ def update_runtime_config_desired(
 
     if "robot" in patch:
         desired["robot"] = _normalize_robot_name(patch.get("robot"), strict=True)
+
+    if "sim_mode" in patch:
+        desired["sim_mode"] = bool(patch.get("sim_mode"))
 
     if "allow_unsafe_overrides" in patch:
         desired["allow_unsafe_overrides"] = bool(patch.get("allow_unsafe_overrides"))
@@ -450,10 +457,79 @@ def _active_fields(
     )
 
 
+def derive_runtime_request_from_active_runtime(active_runtime: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(active_runtime, dict):
+        raise ValueError("active_runtime must be a dictionary.")
+
+    robot_block = active_runtime.get("robot", {})
+    if not isinstance(robot_block, dict):
+        raise ValueError("active_runtime.robot must be a dictionary.")
+    robot_name = _normalize_robot_name(robot_block.get("name"), strict=True)
+
+    mode_block = active_runtime.get("mode", {})
+    active_mode_sim = bool(mode_block.get("sim", False)) if isinstance(mode_block, dict) else False
+    allow_unsafe_overrides = bool(active_runtime.get("allow_unsafe_overrides", False))
+
+    ik_block = active_runtime.get("ik_solver", {})
+    requested_ik_solver_backend = None
+    if allow_unsafe_overrides and isinstance(ik_block, dict):
+        ik_source = str(ik_block.get("source", "") or "").strip().lower()
+        if ik_source in {"dev_override", "runtime_fallback"}:
+            requested_ik_solver_backend = _normalize_ik_backend(
+                ik_block.get("requested_backend", ik_block.get("effective_backend"))
+            )
+
+    servo_block = active_runtime.get("servo_backend", {})
+    requested_servo_backend = None
+    if allow_unsafe_overrides and isinstance(servo_block, dict):
+        servo_source = str(servo_block.get("source", "") or "").strip().lower()
+        if servo_source == "dev_override":
+            requested_servo_backend = _normalize_servo_backend(
+                servo_block.get("override_backend", servo_block.get("effective_backend"))
+            )
+
+    drive_block = active_runtime.get("drive_profile", {})
+    requested_drive_profile = None
+    if allow_unsafe_overrides and isinstance(drive_block, dict):
+        drive_source = str(
+            drive_block.get("configured_source", drive_block.get("source", "")) or ""
+        ).strip().lower()
+        if drive_source == "dev_override":
+            requested_drive_profile = _normalize_drive_profile(
+                drive_block.get(
+                    "override_profile",
+                    drive_block.get("configured_profile", drive_block.get("effective_profile")),
+                )
+            )
+
+    rtcore_block = active_runtime.get("rtcore", {})
+    requested_rt_max_rpm = None
+    if isinstance(rtcore_block, dict):
+        requested_rt_max_rpm = _normalize_rt_max_rpm(
+            rtcore_block.get("configured_max_rpm", rtcore_block.get("effective_max_rpm"))
+        )
+
+    tool_block = active_runtime.get("tool", {})
+    requested_active_tool_id = None
+    if isinstance(tool_block, dict):
+        requested_active_tool_id = _normalize_tool_id(tool_block.get("active_tool_id"))
+
+    return {
+        "robot_name": robot_name,
+        "sim_mode": active_mode_sim,
+        "requested_ik_solver_backend": requested_ik_solver_backend,
+        "requested_servo_backend": requested_servo_backend,
+        "requested_drive_profile": requested_drive_profile,
+        "requested_rt_max_rpm": requested_rt_max_rpm,
+        "requested_active_tool_id": requested_active_tool_id,
+        "allow_unsafe_overrides": allow_unsafe_overrides,
+    }
+
+
 def compute_restart_required(active_runtime: dict[str, Any] | None, desired_config: dict[str, Any]) -> bool:
     active_robot, active_ik, active_servo, active_drive_profile, active_rt_max_rpm, _active_tool_id = _active_fields(active_runtime)
-    active_mode = active_runtime.get("mode", {}) if isinstance(active_runtime, dict) else {}
     desired_obj = desired_config.get("desired", {}) if isinstance(desired_config, dict) else {}
+    desired_sim_mode = bool(desired_obj.get("sim_mode", False))
     desired_robot_name = _normalize_robot_name(desired_obj.get("robot"))
     desired_overrides = desired_obj.get("overrides", {}) if isinstance(desired_obj.get("overrides"), dict) else {}
     desired_allow_unsafe = resolve_allow_unsafe_overrides(
@@ -462,7 +538,7 @@ def compute_restart_required(active_runtime: dict[str, Any] | None, desired_conf
     )
     desired_runtime = resolve_effective_runtime(
         robot_name=desired_robot_name,
-        sim_mode=bool(active_mode.get("sim", False)) if isinstance(active_mode, dict) else False,
+        sim_mode=desired_sim_mode,
         requested_ik_solver_backend=desired_overrides.get("ik_solver_backend"),
         requested_servo_backend=desired_overrides.get("servo_backend"),
         requested_drive_profile=desired_overrides.get("drive_profile"),
@@ -477,11 +553,27 @@ def compute_restart_required(active_runtime: dict[str, Any] | None, desired_conf
     desired_rt_max_rpm = float(desired_rt_max_rpm_raw) if desired_rt_max_rpm_raw is not None else None
     if active_robot is None:
         return False
+    hot_switch_runtime = desired_runtime
+    if isinstance(active_runtime, dict):
+        active_request = derive_runtime_request_from_active_runtime(active_runtime)
+        hot_switch_runtime = resolve_effective_runtime(
+            robot_name=active_request["robot_name"],
+            sim_mode=desired_sim_mode,
+            requested_ik_solver_backend=active_request["requested_ik_solver_backend"],
+            requested_servo_backend=active_request["requested_servo_backend"],
+            requested_drive_profile=active_request["requested_drive_profile"],
+            requested_rt_max_rpm=active_request["requested_rt_max_rpm"],
+            requested_active_tool_id=active_request["requested_active_tool_id"],
+            allow_unsafe_overrides=bool(active_request["allow_unsafe_overrides"]),
+        )
+    hot_robot, hot_ik, hot_servo, hot_drive_profile, hot_rt_max_rpm, _hot_tool_id = _active_fields(
+        hot_switch_runtime
+    )
     return (
-        active_robot != desired_robot_name
-        or active_ik != desired_ik
-        or active_servo != desired_servo
-        or active_drive_profile != desired_drive_profile
-        or active_rt_max_rpm != desired_rt_max_rpm
+        hot_robot != desired_robot_name
+        or hot_ik != desired_ik
+        or hot_servo != desired_servo
+        or hot_drive_profile != desired_drive_profile
+        or hot_rt_max_rpm != desired_rt_max_rpm
     )
 

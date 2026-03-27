@@ -7,6 +7,10 @@ export type PoseWaypoint = Point3 & {
   pitchDeg: number | null;
   yawDeg: number | null;
   moveType: WaypointMoveType;
+  linearSpeedMmPerSec: number | null;
+  linearAccelerationMmPerSec2: number | null;
+  rotationSpeedDegPerSec: number | null;
+  pauseAfterSeconds: number | null;
 };
 
 export type RobotProgramKind = "trajectory" | "weld";
@@ -24,6 +28,9 @@ export type TrajectoryMove = {
   command: string;
   vector?: number[] | null;
   orientation_euler_deg?: number[] | null;
+  linear_speed_mm_s?: number | null;
+  linear_acceleration_mm_s2?: number | null;
+  rotation_speed_deg_s?: number | null;
   [key: string]: unknown;
 };
 
@@ -46,6 +53,27 @@ export type PreviewPlan = {
   isStale?: boolean;
   sourcePlanName?: string;
 };
+
+export function mergePoseWaypointMotionMetadata(
+  authoredWaypoints: PoseWaypoint[],
+  plannedWaypoints: PoseWaypoint[],
+): PoseWaypoint[] {
+  if (authoredWaypoints.length === 0) {
+    return plannedWaypoints.map((waypoint) => ({ ...waypoint }));
+  }
+  return authoredWaypoints.map((waypoint, index) => {
+    const planned = plannedWaypoints[index];
+    return {
+      ...waypoint,
+      linearSpeedMmPerSec: planned?.linearSpeedMmPerSec ?? waypoint.linearSpeedMmPerSec ?? null,
+      linearAccelerationMmPerSec2:
+        planned?.linearAccelerationMmPerSec2 ?? waypoint.linearAccelerationMmPerSec2 ?? null,
+      rotationSpeedDegPerSec:
+        planned?.rotationSpeedDegPerSec ?? waypoint.rotationSpeedDegPerSec ?? null,
+      pauseAfterSeconds: planned?.pauseAfterSeconds ?? waypoint.pauseAfterSeconds ?? null,
+    };
+  });
+}
 
 export type PlannerDiagnosticsResiduals = {
   maxJointStepRad?: number;
@@ -167,6 +195,13 @@ function poseSubtitle(point: PoseWaypoint): string {
     return `${xyz} | ${moveLabel} | pose inherited`;
   }
   return `${xyz} | ${moveLabel} | R ${point.rollDeg.toFixed(1)} P ${point.pitchDeg.toFixed(1)} Y ${point.yawDeg.toFixed(1)}`;
+}
+
+function pauseSubtitle(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds) || seconds <= 0) {
+    return "";
+  }
+  return ` | ${Number(seconds.toFixed(seconds >= 10 ? 0 : 1))}s pause`;
 }
 
 function toPoint3(value: unknown): Point3 | null {
@@ -295,6 +330,11 @@ function coerceOrientationDeg(value: unknown): {
   };
 }
 
+function coercePositiveSpeed(value: unknown): number | null {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
 function toPoseWaypoint(value: unknown): PoseWaypoint | null {
   const point = toPoint3(value);
   if (!point) {
@@ -319,10 +359,51 @@ function toPoseWaypoint(value: unknown): PoseWaypoint | null {
     record?.motionType;
   const moveType: WaypointMoveType =
     moveTypeRaw === "joint" || moveTypeRaw === "home" ? moveTypeRaw : "linear";
+  const linearSpeedMmPerSec = coercePositiveSpeed(
+    record?.linear_speed_mm_s ??
+      record?.linearSpeedMmS ??
+      record?.linear_speed_mm_per_s ??
+      record?.linearSpeedMmPerSec ??
+      record?.speed_mm_s ??
+      record?.speedMmS,
+  );
+  const linearAccelerationMmPerSec2 = coercePositiveSpeed(
+    record?.linear_acceleration_mm_s2 ??
+      record?.linearAccelerationMmS2 ??
+      record?.linear_acceleration_mm_per_s2 ??
+      record?.linearAccelerationMmPerSec2 ??
+      record?.acceleration_mm_s2 ??
+      record?.accelerationMmS2,
+  );
+  const rotationSpeedDegPerSec = coercePositiveSpeed(
+    record?.rotation_speed_deg_s ??
+      record?.rotationSpeedDegS ??
+      record?.rotation_speed_deg_per_s ??
+      record?.rotationSpeedDegPerSec ??
+      record?.speed_deg_s ??
+      record?.speedDegS,
+  );
+  const pauseAfterSeconds = coercePositiveSpeed(
+    record?.pause_after_s ??
+      record?.pauseAfterS ??
+      record?.pause_after_sec ??
+      record?.pauseAfterSec ??
+      record?.pause_after_seconds ??
+      record?.pauseAfterSeconds ??
+      record?.pause_duration_s ??
+      record?.pauseDurationS ??
+      record?.dwell_s ??
+      record?.dwellSec ??
+      record?.dwellSeconds,
+  );
   return {
     ...point,
     ...orientation,
     moveType,
+    linearSpeedMmPerSec,
+    linearAccelerationMmPerSec2,
+    rotationSpeedDegPerSec,
+    pauseAfterSeconds,
   };
 }
 
@@ -588,7 +669,16 @@ function deriveWaypointsFromTrajectory(trajectory: TrajectoryFile): PoseWaypoint
     return [];
   }
   const points: PoseWaypoint[] = [];
-  trajectory.moves.forEach((move) => {
+  trajectory.moves.forEach((move, moveIndex) => {
+    const pauseAfterSeconds =
+      moveIndex < trajectory.moves.length - 1 &&
+      String(trajectory.moves[moveIndex + 1]?.command ?? "").trim().toLowerCase() === "pause"
+        ? coercePositiveSpeed(
+            trajectory.moves[moveIndex + 1]?.duration ??
+              trajectory.moves[moveIndex + 1]?.pause_after_s ??
+              trajectory.moves[moveIndex + 1]?.pauseAfterS,
+          )
+        : null;
     if (move?.command === "move_absolute" || move?.command === "move") {
       const point = toPoint3(move.vector ?? null);
       if (point) {
@@ -597,6 +687,14 @@ function deriveWaypointsFromTrajectory(trajectory: TrajectoryFile): PoseWaypoint
           ...point,
           ...orientation,
           moveType: move.command === "move" ? "joint" : "linear",
+          linearSpeedMmPerSec: coercePositiveSpeed(move.linear_speed_mm_s ?? move.speed_mm_s),
+          linearAccelerationMmPerSec2: coercePositiveSpeed(
+            move.linear_acceleration_mm_s2 ?? move.acceleration_mm_s2,
+          ),
+          rotationSpeedDegPerSec: coercePositiveSpeed(
+            move.rotation_speed_deg_s ?? move.speed_deg_s,
+          ),
+          pauseAfterSeconds,
         });
       }
     } else if (move?.command === "home") {
@@ -607,6 +705,14 @@ function deriveWaypointsFromTrajectory(trajectory: TrajectoryFile): PoseWaypoint
         pitchDeg: null,
         yawDeg: null,
         moveType: "home",
+        linearSpeedMmPerSec: coercePositiveSpeed(move.linear_speed_mm_s ?? move.speed_mm_s),
+        linearAccelerationMmPerSec2: coercePositiveSpeed(
+          move.linear_acceleration_mm_s2 ?? move.acceleration_mm_s2,
+        ),
+        rotationSpeedDegPerSec: coercePositiveSpeed(
+          move.rotation_speed_deg_s ?? move.speed_deg_s,
+        ),
+        pauseAfterSeconds,
       });
     }
   });
@@ -625,7 +731,7 @@ function buildPreviewPlan(
   const explicitWaypointsList = coercePoseWaypointList(explicitWaypoints);
   const waypoints =
     explicitWaypointsList.length > 0
-      ? explicitWaypointsList
+      ? mergePoseWaypointMotionMetadata(explicitWaypointsList, fallbackWaypoints)
       : fallbackWaypoints;
   const cartesianPath = trimCartesianPathToAuthoredRange(
     coercePointList(explicitPath),
@@ -645,12 +751,28 @@ function buildPreviewPlan(
     trajectory,
     pathPoints: pathPoints.map(({ x, y, z }) => transformToScenePoint({ x, y, z })),
     waypoints: (waypoints.length > 0 ? waypoints : fallbackWaypoints).map(
-      ({ x, y, z, rollDeg, pitchDeg, yawDeg, moveType }) => ({
+      ({
+        x,
+        y,
+        z,
+        rollDeg,
+        pitchDeg,
+        yawDeg,
+        moveType,
+        linearSpeedMmPerSec,
+        linearAccelerationMmPerSec2,
+        rotationSpeedDegPerSec,
+        pauseAfterSeconds,
+      }) => ({
         ...transformToScenePoint({ x, y, z }),
         rollDeg,
         pitchDeg,
         yawDeg,
         moveType,
+        linearSpeedMmPerSec,
+        linearAccelerationMmPerSec2,
+        rotationSpeedDegPerSec,
+        pauseAfterSeconds,
       }),
     ),
     planningWarnings,
@@ -761,7 +883,15 @@ export function buildProgramTree({
           id: `move_${moveIndex}_endpoint`,
           type: "waypoint",
           label: "Move Endpoint",
-          subtitle: poseSubtitle({ ...movePoint, ...moveOrientation, moveType: "linear" }),
+          subtitle: poseSubtitle({
+            ...movePoint,
+            ...moveOrientation,
+            moveType: "linear",
+            linearSpeedMmPerSec: null,
+            linearAccelerationMmPerSec2: null,
+            rotationSpeedDegPerSec: null,
+            pauseAfterSeconds: null,
+          }),
           focus: {
             openPanel: defaultFocusPanel,
             moveIndex,
@@ -781,6 +911,10 @@ export function buildProgramTree({
             ...movePoint,
             ...moveOrientation,
             moveType: command === "home" ? "home" : "joint",
+            linearSpeedMmPerSec: null,
+            linearAccelerationMmPerSec2: null,
+            rotationSpeedDegPerSec: null,
+            pauseAfterSeconds: null,
           }),
           focus: {
             openPanel: defaultFocusPanel,
@@ -860,7 +994,13 @@ export function buildProgramTree({
         id: `move_group_${segmentIndex}`,
         type: "operationGroup",
         label: `Move ${segmentIndex + 1}`,
-        subtitle: `P${segmentIndex + 1} -> P${segmentIndex + 2} | ${endControlPoint.moveType} move${commandLabel ? ` | ${commandLabel}` : ""}`,
+        subtitle: `P${segmentIndex + 1} -> P${segmentIndex + 2} | ${endControlPoint.moveType} move${
+          commandLabel ? ` | ${commandLabel}` : ""
+        }${
+          segmentIndex < controlPoints.length - 2
+            ? pauseSubtitle(endControlPoint.pauseAfterSeconds)
+            : ""
+        }`,
         badge:
           pathSampleNodes.length > 0
             ? `${pathSampleNodes.length}`
@@ -1014,6 +1154,24 @@ export function encodePoseWaypointsForApi(waypoints: PoseWaypoint[]): any[] {
       };
     }
     payload.move_type = waypoint.moveType;
+    if (waypoint.linearSpeedMmPerSec !== null && Number.isFinite(waypoint.linearSpeedMmPerSec)) {
+      payload.linear_speed_mm_s = Number(waypoint.linearSpeedMmPerSec);
+    }
+    if (
+      waypoint.linearAccelerationMmPerSec2 !== null &&
+      Number.isFinite(waypoint.linearAccelerationMmPerSec2)
+    ) {
+      payload.linear_acceleration_mm_s2 = Number(waypoint.linearAccelerationMmPerSec2);
+    }
+    if (
+      waypoint.rotationSpeedDegPerSec !== null &&
+      Number.isFinite(waypoint.rotationSpeedDegPerSec)
+    ) {
+      payload.rotation_speed_deg_s = Number(waypoint.rotationSpeedDegPerSec);
+    }
+    if (waypoint.pauseAfterSeconds !== null && Number.isFinite(waypoint.pauseAfterSeconds)) {
+      payload.pause_after_s = Number(waypoint.pauseAfterSeconds);
+    }
     return payload;
   });
 }

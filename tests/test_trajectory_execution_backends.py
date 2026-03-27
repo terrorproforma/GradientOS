@@ -244,6 +244,46 @@ def test_trajectory_executor_records_program_completion(monkeypatch):
     assert program["completed_loop_count"] == 0
 
 
+def test_trajectory_executor_counts_compound_move_logical_steps(monkeypatch):
+    monkeypatch.setattr(trajectory_execution, "_get_backend", lambda: None)
+    monkeypatch.setattr(trajectory_execution, "_execute_joint_path", lambda _path, _freq: None)
+    monkeypatch.setattr(trajectory_execution.time, "sleep", lambda _seconds: None)
+
+    utils.program_status_reset(
+        name="compound",
+        active=True,
+        state="accepted",
+        step_count=3,
+        move_steps=2,
+        pause_steps=1,
+    )
+    utils.trajectory_state.update(
+        {
+            "should_stop": False,
+            "stop_request_reason": None,
+            "is_running": True,
+            "thread": None,
+            "active_program_name": "compound",
+        }
+    )
+
+    trajectory_execution._trajectory_executor_thread(
+        [
+            {
+                "type": "move",
+                "path": [[0.0, 0.0], [0.1, 0.0], [0.1, 0.0], [0.2, 0.0]],
+                "freq": 100,
+                "logical_step_count": 3,
+            }
+        ],
+        should_loop=False,
+    )
+
+    program = utils.program_status_snapshot()
+    assert program["state"] == "completed"
+    assert program["completed_step_count"] == 3
+
+
 def test_trajectory_executor_records_rtcore_fault_terminal_reason(monkeypatch):
     class _FaultBackend:
         is_initialized = True

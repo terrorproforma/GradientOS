@@ -506,12 +506,29 @@ def _pose_waypoints_match(
     def _wrapped_angle_delta_deg(lhs: float, rhs: float) -> float:
         return abs(((lhs - rhs + 180.0) % 360.0) - 180.0)
 
+    def _speed_matches(lhs: dict[str, Any], rhs: dict[str, Any], key: str, tol: float = 1e-3) -> bool:
+        left_value = lhs.get(key)
+        right_value = rhs.get(key)
+        if left_value is None and right_value is None:
+            return True
+        if left_value is None or right_value is None:
+            return False
+        return abs(float(left_value) - float(right_value)) <= tol
+
     if len(authoring_waypoints) != len(planned_waypoints):
         return False
     for authored, planned in zip(authoring_waypoints, planned_waypoints):
         authored_move_type = str(authored.get("move_type", authored.get("moveType", "linear"))).strip().lower()
         planned_move_type = str(planned.get("move_type", planned.get("moveType", "linear"))).strip().lower()
         if authored_move_type != planned_move_type:
+            return False
+        if not _speed_matches(authored, planned, "linear_speed_mm_s"):
+            return False
+        if not _speed_matches(authored, planned, "linear_acceleration_mm_s2"):
+            return False
+        if not _speed_matches(authored, planned, "rotation_speed_deg_s"):
+            return False
+        if not _speed_matches(authored, planned, "pause_after_s"):
             return False
         for axis in ("x", "y", "z"):
             if abs(float(authored[axis]) - float(planned[axis])) > pos_tol:
@@ -1277,9 +1294,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=502, detail="Runtime-config payload must be a JSON object.")
         return payload
 
-    def _runtime_is_sim_mode(runtime_snapshot: dict[str, Any]) -> bool:
+    def _runtime_active_snapshot(runtime_snapshot: dict[str, Any]) -> dict[str, Any]:
         active = runtime_snapshot.get("active")
-        if not isinstance(active, dict):
+        if isinstance(active, dict):
+            return active
+        return runtime_snapshot if isinstance(runtime_snapshot, dict) else {}
+
+    def _runtime_is_sim_mode(runtime_snapshot: dict[str, Any]) -> bool:
+        active = _runtime_active_snapshot(runtime_snapshot)
+        if not active:
             return False
         mode = active.get("mode")
         if isinstance(mode, dict) and bool(mode.get("sim")):
@@ -1442,6 +1465,47 @@ def create_app() -> FastAPI:
             "detail": detail,
             "restart_requested": True,
             "reason": reason,
+        }
+
+    @api.post(
+        "/control/runtime-mode",
+        summary="Hot-switch controller runtime mode between LIVE and SIM without restart",
+    )
+    async def control_runtime_mode(payload: dict[str, Any] | None = None):
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object.")
+        mode = str(payload.get("mode", "") or "").strip().lower()
+        if mode not in {"live", "simulate"}:
+            raise HTTPException(status_code=400, detail="mode must be 'live' or 'simulate'")
+
+        detail, structured = await run_in_threadpool(
+            _controller_structured_call,
+            f"SWITCH_RUNTIME_MODE,{mode}",
+            "SWITCH_RUNTIME_MODE",
+            timeout=20.0,
+        )
+        active_runtime = structured.get("runtime")
+        if not isinstance(active_runtime, dict):
+            active_runtime = await run_in_threadpool(_controller_runtime_config_call, 2.0)
+        desired_config = runtime_config.load_runtime_config()
+        restart_required = runtime_config.compute_restart_required(
+            active_runtime=active_runtime,
+            desired_config=desired_config,
+        )
+        return {
+            "status": "ok",
+            "detail": detail,
+            "requested_mode": structured.get("requested_mode"),
+            "active_mode": structured.get("active_mode"),
+            "mode_changed": bool(structured.get("mode_changed", False)),
+            "waited_for_idle": bool(structured.get("waited_for_idle", False)),
+            "idle": structured.get("idle"),
+            "active": active_runtime,
+            "active_error": None,
+            "desired": desired_config.get("desired", {}),
+            "meta": desired_config.get("meta", {}),
+            "restart_required": restart_required,
+            "runtime_config_path": runtime_config.get_runtime_config_path(),
         }
 
     @api.post("/control/wait-for-idle", summary="Block until planner/trajectory motion completes")
@@ -1965,7 +2029,10 @@ def create_app() -> FastAPI:
             "runtime_config_path": runtime_config.get_runtime_config_path(),
         }
 
-    @api.patch("/info/runtime-config", summary="Stage desired runtime config (tool applies live; robot/backend changes require restart)")
+    @api.patch(
+        "/info/runtime-config",
+        summary="Stage desired runtime config (tool applies live; sim mode hot-switches; robot/backend changes require restart)",
+    )
     async def patch_runtime_config(payload: dict[str, Any]):
         if not isinstance(payload, dict):
             raise HTTPException(status_code=400, detail="JSON body required.")
@@ -2768,6 +2835,11 @@ def _coerce_pose_waypoint_list(raw_waypoints: Any) -> list[dict[str, Any]]:
     if not isinstance(raw_waypoints, list):
         return []
     waypoints: list[dict[str, Any]] = []
+    def _coerce_optional_positive_speed(raw_value: Any) -> float | None:
+        if raw_value is None:
+            return None
+        value = float(raw_value)
+        return value if np.isfinite(value) and value > 0 else None
     for idx, entry in enumerate(raw_waypoints):
         try:
             if not isinstance(entry, dict):
@@ -2791,6 +2863,57 @@ def _coerce_pose_waypoint_list(raw_waypoints: Any) -> list[dict[str, Any]]:
             yaw = float(yaw_raw) if yaw_raw is not None else None
             move_type_raw = str(entry.get("move_type", entry.get("moveType", "linear"))).strip().lower()
             move_type = move_type_raw if move_type_raw in {"linear", "joint", "home"} else "linear"
+            linear_speed_mm_s = _coerce_optional_positive_speed(
+                entry.get(
+                    "linear_speed_mm_s",
+                    entry.get(
+                        "linearSpeedMmS",
+                        entry.get("linear_speed_mm_per_s", entry.get("linearSpeedMmPerSec")),
+                    ),
+                )
+            )
+            linear_acceleration_mm_s2 = _coerce_optional_positive_speed(
+                entry.get(
+                    "linear_acceleration_mm_s2",
+                    entry.get(
+                        "linearAccelerationMmS2",
+                        entry.get("linear_acceleration_mm_per_s2", entry.get("linearAccelerationMmPerSec2")),
+                    ),
+                )
+            )
+            rotation_speed_deg_s = _coerce_optional_positive_speed(
+                entry.get(
+                    "rotation_speed_deg_s",
+                    entry.get(
+                        "rotationSpeedDegS",
+                        entry.get("rotation_speed_deg_per_s", entry.get("rotationSpeedDegPerSec")),
+                    ),
+                )
+            )
+            pause_after_s = _coerce_optional_positive_speed(
+                entry.get(
+                    "pause_after_s",
+                    entry.get(
+                        "pauseAfterS",
+                        entry.get(
+                            "pause_after_sec",
+                            entry.get(
+                                "pauseAfterSec",
+                                entry.get(
+                                    "pause_after_seconds",
+                                    entry.get(
+                                        "pauseAfterSeconds",
+                                        entry.get(
+                                            "pause_duration_s",
+                                            entry.get("pauseDurationS"),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+            )
         except (TypeError, ValueError, KeyError) as exc:
             raise HTTPException(
                 status_code=400, detail=f"Invalid pose waypoint at index {idx}: {exc}"
@@ -2804,6 +2927,14 @@ def _coerce_pose_waypoint_list(raw_waypoints: Any) -> list[dict[str, Any]]:
                 "yaw": yaw,
             }
         waypoint["move_type"] = move_type
+        if linear_speed_mm_s is not None:
+            waypoint["linear_speed_mm_s"] = linear_speed_mm_s
+        if linear_acceleration_mm_s2 is not None:
+            waypoint["linear_acceleration_mm_s2"] = linear_acceleration_mm_s2
+        if rotation_speed_deg_s is not None:
+            waypoint["rotation_speed_deg_s"] = rotation_speed_deg_s
+        if pause_after_s is not None:
+            waypoint["pause_after_s"] = pause_after_s
         waypoints.append(waypoint)
     return waypoints
 

@@ -1,0 +1,122 @@
+{
+  "description": "Planned on 2026-03-25 05:13:30 via PLAN_TRAJECTORY_POINTS",
+  "loop": false,
+  "orientation_euler_angles_deg": null,
+  "moves": [
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.8069,
+        0,
+        0.689
+      ],
+      "orientation_euler_deg": [
+        -180,
+        -0.05,
+        180
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.8861,
+        0.2394,
+        0.2282
+      ],
+      "orientation_euler_deg": [
+        180,
+        -0.19,
+        179.57
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.887,
+        0.2393,
+        0.2307
+      ],
+      "orientation_euler_deg": [
+        -147.48,
+        -4.21,
+        -146.13
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        1.2215,
+        -0.0915,
+        0.2249
+      ],
+      "orientation_euler_deg": [
+        -147.78,
+        -4.48,
+        -146.04
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        1.2237,
+        -0.0893,
+        0.2726
+      ],
+      "orientation_euler_deg": [
+        -174.4,
+        -1.74,
+        -148.46
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        1.2237,
+        -0.0893,
+        0.2726
+      ],
+      "orientation_euler_deg": [
+        -174.4,
+        -1.74,
+        -148.47
+      ]
+    },
+    {
+      "command": "pause",
+      "duration": 1
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.8067,
+        0,
+        0.6897
+      ],
+      "orientation_euler_deg": [
+        180,
+        0,
+        180
+      ]
+    }
+  ]
+}

@@ -138,6 +138,372 @@ def test_plan_preview_trajectory_points_uses_cached_controller_joints_when_local
     assert payload["trajectory"]["moves"][0]["command"] == "move"
 
 
+def test_plan_preview_trajectory_points_passes_joint_rotation_speed_and_serializes_it(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(command_api, "RECORDED_TRAJ_DIR", str(tmp_path / "recorded"))
+    monkeypatch.setattr(command_api.utils, "TRAJECTORY_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        command_api.utils,
+        "current_logical_joint_angles_rad",
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: [0.0] * 6,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver.servo_protocol,
+        "get_present_servo_ids",
+        lambda: {10, 20, 30, 40, 50, 60},
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk", lambda _q: [0.0, 0.0, 0.0])
+
+    def _fake_fk_matrix(q):
+        matrix = np.eye(4, dtype=float)
+        q_arr = np.asarray(q, dtype=float)
+        matrix[:3, 3] = np.array(
+            [
+                float(q_arr[0]) if q_arr.size > 0 else 0.0,
+                float(q_arr[1]) if q_arr.size > 1 else 0.0,
+                float(q_arr[2]) if q_arr.size > 2 else 0.0,
+            ],
+            dtype=float,
+        )
+        return matrix
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+    captured: dict[str, float | None] = {"max_joint_deg_s": None}
+
+    def _fake_plan_joint_move_to_pose(current_q, **kwargs):
+        captured["max_joint_deg_s"] = kwargs.get("max_joint_deg_s")
+        return [[0.0] * 6, [0.1, 0.2, 0.3, 0.0, 0.0, 0.0]], [0.1, 0.2, 0.3, 0.0, 0.0, 0.0]
+
+    monkeypatch.setattr(command_api, "_plan_joint_move_to_pose", _fake_plan_joint_move_to_pose)
+
+    payload = command_api.plan_preview_trajectory_points(
+        points=[[0.1, 0.2, 0.3]],
+        preview_name="__joint_speed_preview__",
+        pose_waypoints=[
+            {
+                "x": 0.1,
+                "y": 0.2,
+                "z": 0.3,
+                "move_type": "joint",
+                "rotation_speed_deg_s": 12.5,
+            }
+        ],
+    )
+
+    assert captured["max_joint_deg_s"] == 12.5
+    assert payload["trajectory"]["moves"][0]["command"] == "move"
+    assert payload["trajectory"]["moves"][0]["rotation_speed_deg_s"] == 12.5
+    assert payload["waypoints"][0]["rotation_speed_deg_s"] == 12.5
+
+
+def test_plan_preview_trajectory_points_uses_orientation_only_speed_for_pure_rotation(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(command_api, "RECORDED_TRAJ_DIR", str(tmp_path / "recorded"))
+    monkeypatch.setattr(command_api.utils, "TRAJECTORY_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        command_api.utils,
+        "current_logical_joint_angles_rad",
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: [0.0] * 6,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver.servo_protocol,
+        "get_present_servo_ids",
+        lambda: {10, 20, 30, 40, 50, 60},
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk", lambda _q: [0.0, 0.0, 0.0])
+
+    def _fake_fk_matrix(q):
+        matrix = np.eye(4, dtype=float)
+        q_arr = np.asarray(q, dtype=float)
+        if q_arr.size > 0 and abs(float(q_arr[0]) - 0.1) < 1e-9:
+            matrix[:3, :3] = command_api.R.from_euler("z", 45.0, degrees=True).as_matrix()
+        return matrix
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_plan_linear_move",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("linear planner should not run")),
+    )
+    captured: dict[str, float | None] = {"angular_speed_deg_s": None}
+
+    def _fake_plan_orientation_only_move(current_q, **kwargs):
+        captured["angular_speed_deg_s"] = kwargs.get("angular_speed_deg_s")
+        return [[0.0] * 6, [0.1, 0.0, 0.0, 0.0, 0.0, 0.0]]
+
+    monkeypatch.setattr(command_api, "_plan_orientation_only_move", _fake_plan_orientation_only_move)
+
+    payload = command_api.plan_preview_trajectory_points(
+        points=[[0.0, 0.0, 0.0]],
+        preview_name="__pure_rotation_preview__",
+        pose_waypoints=[
+            {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "move_type": "linear",
+                "orientation_euler_deg": {"roll": 0.0, "pitch": 0.0, "yaw": 45.0},
+                "rotation_speed_deg_s": 20.0,
+            }
+        ],
+    )
+
+    assert captured["angular_speed_deg_s"] == 20.0
+    assert payload["trajectory"]["moves"][0]["command"] == "move_absolute"
+    assert payload["trajectory"]["moves"][0]["rotation_speed_deg_s"] == 20.0
+    assert payload["waypoints"][0]["rotation_speed_deg_s"] == 20.0
+
+
+def test_resolve_profile_params_for_linear_speed_defaults_to_one_second_ramp(monkeypatch):
+    monkeypatch.setattr(command_api.utils, "DEFAULT_PROFILE_VELOCITY", 0.1)
+    monkeypatch.setattr(command_api.utils, "DEFAULT_PROFILE_ACCELERATION", 0.05)
+
+    multiplier, velocity, acceleration = command_api._resolve_profile_params_for_linear_speed_m_s(0.4)
+
+    assert multiplier == 4.0
+    assert velocity == 0.4
+    assert acceleration == 0.4
+
+
+def test_resolve_profile_params_for_linear_speed_uses_explicit_acceleration_override(monkeypatch):
+    monkeypatch.setattr(command_api.utils, "DEFAULT_PROFILE_VELOCITY", 0.1)
+    monkeypatch.setattr(command_api.utils, "DEFAULT_PROFILE_ACCELERATION", 0.05)
+
+    multiplier, velocity, acceleration = command_api._resolve_profile_params_for_linear_speed_m_s(0.4, 0.9)
+
+    assert multiplier == 4.0
+    assert velocity == 0.4
+    assert acceleration == 0.9
+
+
+def test_plan_preview_trajectory_points_defaults_linear_acceleration_to_one_second_ramp(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(command_api, "RECORDED_TRAJ_DIR", str(tmp_path / "recorded"))
+    monkeypatch.setattr(command_api.utils, "TRAJECTORY_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(command_api.utils, "DEFAULT_PROFILE_VELOCITY", 0.1)
+    monkeypatch.setattr(command_api.utils, "DEFAULT_PROFILE_ACCELERATION", 0.05)
+    monkeypatch.setattr(
+        command_api.utils,
+        "current_logical_joint_angles_rad",
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: [0.0] * 6,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver.servo_protocol,
+        "get_present_servo_ids",
+        lambda: {10, 20, 30, 40, 50, 60},
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk", lambda _q: [0.0, 0.0, 0.0])
+
+    def _fake_fk_matrix(_q):
+        return np.eye(4, dtype=float)
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+    captured: dict[str, float | None] = {"velocity": None, "acceleration": None}
+
+    def _fake_plan_linear_move(current_q, target_pos, velocity, acceleration, *args, **kwargs):
+        captured["velocity"] = float(velocity)
+        captured["acceleration"] = float(acceleration)
+        return [list(np.asarray(current_q, dtype=float).tolist()), [0.1, 0.0, 0.0, 0.0, 0.0, 0.0]]
+
+    monkeypatch.setattr(command_api.trajectory_execution, "_plan_linear_move", _fake_plan_linear_move)
+
+    payload = command_api.plan_preview_trajectory_points(
+        points=[[0.1, 0.0, 0.0]],
+        preview_name="__linear_speed_override_preview__",
+        pose_waypoints=[
+            {
+                "x": 0.1,
+                "y": 0.0,
+                "z": 0.0,
+                "move_type": "linear",
+                "linear_speed_mm_s": 400.0,
+            }
+        ],
+    )
+
+    assert captured["velocity"] == 0.4
+    assert captured["acceleration"] == 0.4
+    assert payload["trajectory"]["moves"][0]["linear_speed_mm_s"] == 400.0
+    assert payload["trajectory"]["moves"][0]["linear_acceleration_mm_s2"] == 400.0
+    assert payload["waypoints"][0]["linear_speed_mm_s"] == 400.0
+    assert payload["waypoints"][0]["linear_acceleration_mm_s2"] == 400.0
+
+
+def test_plan_preview_trajectory_points_passes_explicit_linear_acceleration_override(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(command_api, "RECORDED_TRAJ_DIR", str(tmp_path / "recorded"))
+    monkeypatch.setattr(command_api.utils, "TRAJECTORY_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(command_api.utils, "DEFAULT_PROFILE_VELOCITY", 0.1)
+    monkeypatch.setattr(command_api.utils, "DEFAULT_PROFILE_ACCELERATION", 0.05)
+    monkeypatch.setattr(
+        command_api.utils,
+        "current_logical_joint_angles_rad",
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: [0.0] * 6,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver.servo_protocol,
+        "get_present_servo_ids",
+        lambda: {10, 20, 30, 40, 50, 60},
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk", lambda _q: [0.0, 0.0, 0.0])
+
+    def _fake_fk_matrix(_q):
+        return np.eye(4, dtype=float)
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+    captured: dict[str, float | None] = {"velocity": None, "acceleration": None}
+
+    def _fake_plan_linear_move(current_q, target_pos, velocity, acceleration, *args, **kwargs):
+        captured["velocity"] = float(velocity)
+        captured["acceleration"] = float(acceleration)
+        return [list(np.asarray(current_q, dtype=float).tolist()), [0.1, 0.0, 0.0, 0.0, 0.0, 0.0]]
+
+    monkeypatch.setattr(command_api.trajectory_execution, "_plan_linear_move", _fake_plan_linear_move)
+
+    payload = command_api.plan_preview_trajectory_points(
+        points=[[0.1, 0.0, 0.0]],
+        preview_name="__linear_acceleration_override_preview__",
+        pose_waypoints=[
+            {
+                "x": 0.1,
+                "y": 0.0,
+                "z": 0.0,
+                "move_type": "linear",
+                "linear_speed_mm_s": 400.0,
+                "linear_acceleration_mm_s2": 900.0,
+            }
+        ],
+    )
+
+    assert captured["velocity"] == 0.4
+    assert captured["acceleration"] == 0.9
+    assert payload["trajectory"]["moves"][0]["linear_speed_mm_s"] == 400.0
+    assert payload["trajectory"]["moves"][0]["linear_acceleration_mm_s2"] == 900.0
+    assert payload["waypoints"][0]["linear_speed_mm_s"] == 400.0
+    assert payload["waypoints"][0]["linear_acceleration_mm_s2"] == 900.0
+
+
+def test_plan_preview_trajectory_points_serializes_explicit_pause_between_authored_moves(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(command_api, "RECORDED_TRAJ_DIR", str(tmp_path / "recorded"))
+    monkeypatch.setattr(command_api.utils, "TRAJECTORY_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        command_api.utils,
+        "current_logical_joint_angles_rad",
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: [0.0] * 6,
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver.servo_protocol,
+        "get_present_servo_ids",
+        lambda: {10, 20, 30, 40, 50, 60},
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk", lambda _q: [0.0, 0.0, 0.0])
+
+    def _fake_fk_matrix(q):
+        matrix = np.eye(4, dtype=float)
+        q_arr = np.asarray(q, dtype=float)
+        matrix[:3, 3] = np.array(
+            [
+                float(q_arr[0]) if q_arr.size > 0 else 0.0,
+                float(q_arr[1]) if q_arr.size > 1 else 0.0,
+                float(q_arr[2]) if q_arr.size > 2 else 0.0,
+            ],
+            dtype=float,
+        )
+        return matrix
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+    call_index = {"value": 0}
+
+    def _fake_plan_linear_move(current_q, target_pos, velocity, acceleration, *args, **kwargs):
+        call_index["value"] += 1
+        planned_q = [float(call_index["value"]), 0.0, 0.0, 0.0, 0.0, 0.0]
+        return [list(np.asarray(current_q, dtype=float).tolist()), planned_q]
+
+    monkeypatch.setattr(command_api.trajectory_execution, "_plan_linear_move", _fake_plan_linear_move)
+
+    payload = command_api.plan_preview_trajectory_points(
+        points=[[0.1, 0.0, 0.0], [0.2, 0.0, 0.0], [0.3, 0.0, 0.0]],
+        preview_name="__pause_preview__",
+        pose_waypoints=[
+            {"x": 0.1, "y": 0.0, "z": 0.0, "move_type": "linear"},
+            {"x": 0.2, "y": 0.0, "z": 0.0, "move_type": "linear", "pause_after_s": 0.75},
+            {"x": 0.3, "y": 0.0, "z": 0.0, "move_type": "linear"},
+        ],
+    )
+
+    assert [move["command"] for move in payload["trajectory"]["moves"]] == [
+        "move_absolute",
+        "move_absolute",
+        "pause",
+        "move_absolute",
+    ]
+    assert payload["trajectory"]["moves"][2]["duration"] == 0.75
+    assert payload["waypoints"][1]["pause_after_s"] == 0.75
+
+
+def test_collapse_runtime_move_pause_steps_compiles_holds_into_single_path():
+    collapsed = command_api._collapse_runtime_move_pause_steps(
+        [
+            {"type": "move", "path": [[0.0, 0.0], [0.1, 0.0]], "freq": 100},
+            {"type": "pause", "duration": 0.1},
+            {"type": "move", "path": [[0.1, 0.0], [0.2, 0.0]], "freq": 100},
+        ]
+    )
+
+    assert collapsed is not None
+    assert len(collapsed) == 1
+    step = collapsed[0]
+    assert step["type"] == "move"
+    assert step["freq"] == 100
+    assert step["logical_step_count"] == 3
+    assert len(step["path"]) == 13
+    assert step["path"][0] == [0.0, 0.0]
+    assert step["path"][1] == [0.1, 0.0]
+    assert step["path"][2:12] == [[0.1, 0.0]] * 10
+    assert step["path"][12] == [0.2, 0.0]
+
+
 def test_handle_apply_joint_setpoint_uses_fallbacks_when_servo_defaults_missing(monkeypatch):
     calls: list[tuple[list[float], int, float]] = []
 

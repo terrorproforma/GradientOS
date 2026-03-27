@@ -138,6 +138,26 @@ SET_ORIENTATION,0,30,0,1.5,true
     -   `power_transition_blocker_details`: structured blocker metadata suitable for UI/operator display
     -   mirrored copies of those fields under `execution`
 
+#### `GET_RUNTIME_CONFIG`
+-   **Syntax:** `GET_RUNTIME_CONFIG`
+-   **Description:** Returns the controller's active runtime snapshot, including selected robot, runtime mode, active tool, IK backend, servo backend, drive profile, RTCore clamp settings, and controller PID metadata.
+-   **Reply behavior:** Returns `RUNTIME_CONFIG,<json>` where the JSON body is the current active runtime state. This is the controller-side source used by the API `/info/runtime-config` route.
+
+#### `SWITCH_RUNTIME_MODE`
+-   **Syntax:** `SWITCH_RUNTIME_MODE,<live|simulate>`
+-   **Description:** Controller-owned hot switch between `LIVE` and `SIM`. The controller stops active motion, waits for idle, tears down the active backend, creates and initializes the target backend in-process, persists desired `sim_mode`, and returns the refreshed runtime snapshot.
+-   **Reply behavior:** Returns `ACK,SWITCH_RUNTIME_MODE,<payload_b64>` with fields such as `requested_mode`, `active_mode`, `mode_changed`, `waited_for_idle`, optional `idle` wait metadata, and nested `runtime` containing the refreshed active runtime snapshot.
+
+#### `SET_ACTIVE_TOOL`
+-   **Syntax:** `SET_ACTIVE_TOOL[,tool_id]`
+-   **Description:** Waits for motion idle and updates the controller's active tool definition live. Empty `tool_id` falls back to the identity/default tool for the active robot.
+-   **Reply behavior:** Returns `ACK,SET_ACTIVE_TOOL,<active_tool_id>` on success. API callers typically pair this with a fresh `GET_RUNTIME_CONFIG` read to surface the updated tool block.
+
+#### `REQUEST_RESTART`
+-   **Syntax:** `REQUEST_RESTART[,reason]`
+-   **Description:** Requests a graceful controller exit so an external supervisor can restart the process. This is reserved for restart-bound runtime policy changes that cannot be hot-applied.
+-   **Reply behavior:** Returns `ACK,REQUEST_RESTART,<reason>` before the controller begins stop/idle shutdown sequencing and exits.
+
 #### `SAFE_POWER_UP`
 -   **Syntax:** `SAFE_POWER_UP`
 -   **Description:** Explicitly arms/enables the active actuator backend only after verifying the runtime is neutral, fault-free, and synchronized to live feedback.

@@ -31,6 +31,7 @@ The web trajectory editor is the main production authoring path. It lets you:
 6. Execute with an explicit intent:
    - `Simulate Trajectory` when the controller runtime is in `SIM`
    - `Run Trajectory` when the controller runtime is in `LIVE`
+7. Switch the controller between `SIM` and `LIVE` directly from the header toggle or via `POST /control/runtime-mode` when the wrong runtime is active.
 
 ---
 
@@ -118,6 +119,13 @@ The planner:
 - `simulate` requires the controller runtime to be in `SIM`
 - `live` requires the controller runtime to be in `LIVE`
 
+When the controller is in the wrong runtime mode, operators can hot-switch it first:
+
+- UI: use the header `LIVE` / `SIM` toggle and confirm the switch
+- API: call `POST /control/runtime-mode` with `{ "mode": "simulate" | "live" }`
+
+The controller owns that switch end-to-end: it stops motion, waits for idle, swaps the active backend in-process, updates desired `sim_mode`, and returns the refreshed runtime snapshot.
+
 The response echoes both `execution_mode` and `runtime_mode` so the UI can show exactly what happened.
 
 ---
@@ -173,6 +181,5 @@ See `command_api._recording_state` and the three handlers:
 ---
 
 ## Roadmap
-* Runtime switching workflow that can deliberately relaunch the controller between SIM and LIVE from the UI.
 * Richer waypoint operations such as multi-select edits and bulk retiming.
 * GUI teach-pendant shortcuts for the legacy recorder path. 

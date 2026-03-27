@@ -959,9 +959,11 @@ function _resolveToolAssetPath(rawPath: string): string {
 function _createFallbackToolMarker(): THREE.Group {
   const group = new THREE.Group();
   group.name = "active-tool-fallback";
+  const bodyLength = 0.12;
+  const tipLength = 0.03;
 
   const body = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.008, 0.008, 0.12, 20),
+    new THREE.CylinderGeometry(0.008, 0.008, bodyLength, 20),
     new THREE.MeshStandardMaterial({
       color: 0xf97316,
       metalness: 0.15,
@@ -971,13 +973,14 @@ function _createFallbackToolMarker(): THREE.Group {
     }),
   );
   body.rotation.x = Math.PI / 2;
-  body.position.z = 0.06;
+  // Keep the TCP/tool-tip at the cone point and let the shaft start at the cone base.
+  body.position.z = -(tipLength + bodyLength * 0.5);
   body.castShadow = true;
   body.receiveShadow = true;
   group.add(body);
 
   const tip = new THREE.Mesh(
-    new THREE.ConeGeometry(0.011, 0.03, 24),
+    new THREE.ConeGeometry(0.011, tipLength, 24),
     new THREE.MeshStandardMaterial({
       color: 0xfacc15,
       metalness: 0.2,
@@ -985,7 +988,7 @@ function _createFallbackToolMarker(): THREE.Group {
     }),
   );
   tip.rotation.x = Math.PI / 2;
-  tip.position.z = 0.135;
+  tip.position.z = -tipLength * 0.5;
   tip.castShadow = true;
   tip.receiveShadow = true;
   group.add(tip);

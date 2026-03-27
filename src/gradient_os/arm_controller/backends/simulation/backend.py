@@ -5,6 +5,8 @@
 
 from typing import Optional, TYPE_CHECKING
 import math
+import threading
+import time
 import numpy as np
 
 from ..registry import get_encoder_resolution
@@ -81,9 +83,12 @@ class SimulationBackend(ActuatorBackend):
         self._positions = [0.0] * self._num_joints
         self._gripper_position = 0.0
         self._raw_positions: dict[int, int] = {}
+        self._state_lock = threading.RLock()
         self._lease_jog_active = False
         self._lease_jog_timeout_s = 0.0
         self._lease_jog_vector = [0.0] * self._num_joints
+        self._lease_jog_deadline_monotonic: float | None = None
+        self._lease_jog_last_tick_monotonic: float | None = None
 
         if self._robot_config:
             self._actuator_ids = list(self._robot_config.get("actuator_ids", []))
@@ -142,13 +147,18 @@ class SimulationBackend(ActuatorBackend):
     ) -> None:
         if len(positions_rad) != self._num_joints:
             raise ValueError(f"Expected {self._num_joints} positions, got {len(positions_rad)}")
-        self._positions = list(positions_rad)
-        self._update_raw_from_logical()
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            self._positions = list(positions_rad)
+            self._update_raw_from_logical()
     
     def get_joint_positions(self, verbose: bool = False) -> list[float]:
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            positions = list(self._positions)
         if verbose:
-            print(f"[Sim] Current positions: {np.round(self._positions, 3)}")
-        return list(self._positions)
+            print(f"[Sim] Current positions: {np.round(positions, 3)}")
+        return positions
     
     def prepare_sync_write_commands(
         self,
@@ -156,48 +166,63 @@ class SimulationBackend(ActuatorBackend):
         speed: int = 4095,
         accel: int = 0,
     ) -> list[tuple]:
-        # In simulation, just return the positions as-is
-        return [(i, pos, speed, accel) for i, pos in enumerate(positions_rad)]
+        if len(positions_rad) != self._num_joints:
+            raise ValueError(f"Expected {self._num_joints} positions, got {len(positions_rad)}")
+
+        commands: list[tuple] = []
+        for logical_idx, logical_angle in enumerate(positions_rad):
+            physical_indices = self._logical_to_physical.get(logical_idx, [logical_idx])
+            physical_angle = float(logical_angle) + self._master_offset_for_joint(logical_idx)
+            for phys_idx in physical_indices:
+                if 0 <= int(phys_idx) < len(self._actuator_ids):
+                    servo_id = self._actuator_ids[int(phys_idx)]
+                    raw_pos = self._angle_to_raw(physical_angle, servo_id)
+                    commands.append((servo_id, raw_pos, speed, accel))
+        return commands
     
     def sync_write(self, commands: list[tuple]) -> None:
         # Update positions from the commands
         # Commands are in format [(servo_id, raw_pos, speed, accel), ...]
         # We keep raw actuator values exactly as commanded, then derive logical
         # joint angles from those raw values using robot mapping metadata.
-        for servo_id_or_idx, raw_pos, _, _ in commands:
-            servo_id = int(servo_id_or_idx)
-            clamped_raw = max(0, min(self._encoder_resolution, int(raw_pos)))
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            for servo_id_or_idx, raw_pos, _, _ in commands:
+                servo_id = int(servo_id_or_idx)
+                clamped_raw = max(0, min(self._encoder_resolution, int(raw_pos)))
 
-            # Normal case: caller sends actuator IDs directly.
-            if servo_id in self._actuator_ids:
+                # Normal case: caller sends actuator IDs directly.
+                if servo_id in self._actuator_ids:
+                    self._raw_positions[servo_id] = clamped_raw
+                    continue
+
+                # Backward-compat: allow actuator index addressing.
+                if 0 <= servo_id < len(self._actuator_ids):
+                    mapped_servo_id = self._actuator_ids[servo_id]
+                    self._raw_positions[mapped_servo_id] = clamped_raw
+                    continue
+
+                # Unknown actuator ID; keep a best-effort cache.
                 self._raw_positions[servo_id] = clamped_raw
-                continue
 
-            # Backward-compat: allow actuator index addressing.
-            if 0 <= servo_id < len(self._actuator_ids):
-                mapped_servo_id = self._actuator_ids[servo_id]
-                self._raw_positions[mapped_servo_id] = clamped_raw
-                continue
-
-            # Unknown actuator ID; keep a best-effort cache.
-            self._raw_positions[servo_id] = clamped_raw
-
-        self._update_logical_positions_from_raw()
+            self._update_logical_positions_from_raw()
     
     def sync_read_positions(self, servo_ids: list[int] = None, timeout_s: Optional[float] = None) -> dict[int, int]:
         # Return cached raw values for requested actuator IDs.
-        result = {}
-        target_ids = servo_ids if servo_ids else list(self._actuator_ids)
-        for servo_id in target_ids:
-            sid = int(servo_id)
-            if sid in self._raw_positions:
-                result[sid] = self._raw_positions[sid]
-            elif 0 <= sid < len(self._actuator_ids):
-                mapped = self._actuator_ids[sid]
-                result[sid] = self._raw_positions.get(mapped, self._encoder_center)
-            else:
-                result[sid] = self._encoder_center
-        return result
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            result = {}
+            target_ids = servo_ids if servo_ids else list(self._actuator_ids)
+            for servo_id in target_ids:
+                sid = int(servo_id)
+                if sid in self._raw_positions:
+                    result[sid] = self._raw_positions[sid]
+                elif 0 <= sid < len(self._actuator_ids):
+                    mapped = self._actuator_ids[sid]
+                    result[sid] = self._raw_positions.get(mapped, self._encoder_center)
+                else:
+                    result[sid] = self._encoder_center
+            return result
 
     def sync_read_block(
         self,
@@ -224,14 +249,16 @@ class SimulationBackend(ActuatorBackend):
     def raw_to_joint_positions(self, raw_positions: dict[int, int]) -> list[float]:
         if not raw_positions:
             return [0.0] * self._num_joints
-        for sid, raw in raw_positions.items():
-            sid_int = int(sid)
-            if sid_int in self._actuator_ids:
-                self._raw_positions[sid_int] = int(raw)
-            elif 0 <= sid_int < len(self._actuator_ids):
-                self._raw_positions[self._actuator_ids[sid_int]] = int(raw)
-        self._update_logical_positions_from_raw()
-        return list(self._positions)
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            for sid, raw in raw_positions.items():
+                sid_int = int(sid)
+                if sid_int in self._actuator_ids:
+                    self._raw_positions[sid_int] = int(raw)
+                elif 0 <= sid_int < len(self._actuator_ids):
+                    self._raw_positions[self._actuator_ids[sid_int]] = int(raw)
+            self._update_logical_positions_from_raw()
+            return list(self._positions)
     
     def set_single_actuator_position(
         self,
@@ -240,27 +267,31 @@ class SimulationBackend(ActuatorBackend):
         speed: int,
         accel: int,
     ) -> None:
-        if actuator_id == self._gripper_id and self._has_gripper:
-            self._gripper_position = position_rad
-            self._raw_positions[actuator_id] = self._angle_to_raw(position_rad, actuator_id)
-            return
-        
-        # Map servo ID to joint index
-        joint_idx = self._servo_id_to_joint_index(actuator_id)
-        if joint_idx is not None and 0 <= joint_idx < self._num_joints:
-            self._positions[joint_idx] = position_rad
-            physical_angle = position_rad + self._master_offset_for_joint(joint_idx)
-            self._raw_positions[actuator_id] = self._angle_to_raw(physical_angle, actuator_id)
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            if actuator_id == self._gripper_id and self._has_gripper:
+                self._gripper_position = position_rad
+                self._raw_positions[actuator_id] = self._angle_to_raw(position_rad, actuator_id)
+                return
+            
+            # Map servo ID to joint index
+            joint_idx = self._servo_id_to_joint_index(actuator_id)
+            if joint_idx is not None and 0 <= joint_idx < self._num_joints:
+                self._positions[joint_idx] = position_rad
+                physical_angle = position_rad + self._master_offset_for_joint(joint_idx)
+                self._raw_positions[actuator_id] = self._angle_to_raw(physical_angle, actuator_id)
     
     def read_single_actuator_position(self, actuator_id: int) -> Optional[int]:
-        if actuator_id is None:
-            return None
-        if actuator_id in self._raw_positions:
-            return self._raw_positions[actuator_id]
-        if 0 <= actuator_id < len(self._actuator_ids):
-            mapped = self._actuator_ids[actuator_id]
-            return self._raw_positions.get(mapped, self._encoder_center)
-        return self._encoder_center
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            if actuator_id is None:
+                return None
+            if actuator_id in self._raw_positions:
+                return self._raw_positions[actuator_id]
+            if 0 <= actuator_id < len(self._actuator_ids):
+                mapped = self._actuator_ids[actuator_id]
+                return self._raw_positions.get(mapped, self._encoder_center)
+            return self._encoder_center
     
     def _servo_id_to_joint_index(self, servo_id: int) -> Optional[int]:
         """Map a servo ID to its logical joint index."""
@@ -311,9 +342,9 @@ class SimulationBackend(ActuatorBackend):
         }
 
     def start_joint_velocity_lease_jog(self, timeout_s: float) -> None:
-        self._lease_jog_active = True
-        self._lease_jog_timeout_s = max(0.0, float(timeout_s))
-        self._lease_jog_vector = [0.0] * self._num_joints
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            self._set_lease_jog_command_locked([0.0] * self._num_joints, timeout_s)
 
     def update_joint_velocity_lease_jog(
         self,
@@ -324,15 +355,15 @@ class SimulationBackend(ActuatorBackend):
             raise ValueError(
                 f"Expected {self._num_joints} joint velocities, got {len(joint_velocities_rad_s)}"
             )
-        self._lease_jog_active = True
-        self._lease_jog_timeout_s = max(0.0, float(timeout_s))
-        self._lease_jog_vector = [float(value) for value in joint_velocities_rad_s]
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            self._set_lease_jog_command_locked(joint_velocities_rad_s, timeout_s)
 
     def stop_joint_velocity_lease_jog(self, *, quick_stop: bool = False) -> None:
         _ = quick_stop
-        self._lease_jog_active = False
-        self._lease_jog_timeout_s = 0.0
-        self._lease_jog_vector = [0.0] * self._num_joints
+        with self._state_lock:
+            self._advance_lease_jog_state_locked()
+            self._clear_lease_jog_locked(now=time.monotonic())
     
     def get_present_actuator_ids(self) -> set[int]:
         ids = set(self._actuator_ids)
@@ -349,6 +380,47 @@ class SimulationBackend(ActuatorBackend):
             self._raw_positions[int(servo_id)] = self._encoder_center
         if self._has_gripper and self._gripper_id is not None:
             self._raw_positions[int(self._gripper_id)] = self._encoder_center
+
+    def _set_lease_jog_command_locked(self, joint_velocities_rad_s: list[float], timeout_s: float) -> None:
+        now = time.monotonic()
+        self._lease_jog_active = True
+        self._lease_jog_timeout_s = max(0.0, float(timeout_s))
+        self._lease_jog_vector = [float(value) for value in joint_velocities_rad_s]
+        self._lease_jog_deadline_monotonic = (
+            now + self._lease_jog_timeout_s if self._lease_jog_timeout_s > 0.0 else now
+        )
+        self._lease_jog_last_tick_monotonic = now
+
+    def _clear_lease_jog_locked(self, *, now: float | None = None) -> None:
+        now_value = time.monotonic() if now is None else float(now)
+        self._lease_jog_active = False
+        self._lease_jog_timeout_s = 0.0
+        self._lease_jog_vector = [0.0] * self._num_joints
+        self._lease_jog_deadline_monotonic = None
+        self._lease_jog_last_tick_monotonic = now_value
+
+    def _advance_lease_jog_state_locked(self, now: float | None = None) -> None:
+        if not self._lease_jog_active:
+            return
+
+        now_value = time.monotonic() if now is None else float(now)
+        last_tick = float(self._lease_jog_last_tick_monotonic or now_value)
+        deadline = self._lease_jog_deadline_monotonic
+        advance_until = now_value
+        if isinstance(deadline, (int, float)) and deadline > 0.0:
+            advance_until = min(now_value, float(deadline))
+
+        dt = max(0.0, advance_until - last_tick)
+        if dt > 0.0:
+            self._positions = [
+                float(position) + float(velocity) * dt
+                for position, velocity in zip(self._positions, self._lease_jog_vector)
+            ]
+            self._update_raw_from_logical()
+            self._lease_jog_last_tick_monotonic = advance_until
+
+        if isinstance(deadline, (int, float)) and now_value >= float(deadline):
+            self._clear_lease_jog_locked(now=now_value)
 
     def _master_offset_for_joint(self, logical_joint_idx: int) -> float:
         if 0 <= logical_joint_idx < len(self._master_offsets):

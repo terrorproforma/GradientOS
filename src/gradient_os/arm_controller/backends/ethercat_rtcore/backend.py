@@ -738,13 +738,14 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 ),
             )
 
-    def commit_trajectory(self, traj_id: int) -> None:
-        self._cmd_ring_write(
+    def commit_trajectory(self, traj_id: int) -> int:
+        cmd_seq = self._cmd_ring_write(
             _MSG_CMD_TRAJECTORY_COMMIT,
             _CMD_TRAJECTORY_CONTROL_STRUCT.pack(int(traj_id), 0, 0),
         )
         with self._status_lock:
             self._last_submitted_traj_id = int(traj_id)
+        return int(cmd_seq)
 
     def abort_trajectory(self, traj_id: Optional[int] = None) -> None:
         self._cmd_ring_write(
@@ -789,7 +790,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 }
             )
         self.enqueue_trajectory_points(traj_id, points)
-        self.commit_trajectory(traj_id)
+        submitted_command_seq = self.commit_trajectory(traj_id)
 
         wait_timeout_s = timeout_s
         if wait_timeout_s is None:
@@ -798,13 +799,27 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 _TRAJECTORY_WAIT_SETTLE_MARGIN_S,
                 duration_s + _TRAJECTORY_WAIT_SETTLE_MARGIN_S,
             )
-        return self.wait_for_trajectory_complete(traj_id, timeout_s=wait_timeout_s)
+        return self.wait_for_trajectory_complete(
+            traj_id,
+            timeout_s=wait_timeout_s,
+            submitted_command_seq=submitted_command_seq,
+        )
 
-    def wait_for_trajectory_complete(self, traj_id: int, *, timeout_s: float) -> RTCoreExecutionStatus:
+    def wait_for_trajectory_complete(
+        self,
+        traj_id: int,
+        *,
+        timeout_s: float,
+        submitted_command_seq: Optional[int] = None,
+    ) -> RTCoreExecutionStatus:
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         saw_target_trajectory = False
+        terminal_state_names = {"idle", "completed", "aborted", "faulted", "underrun"}
         while time.monotonic() <= deadline:
             status = self.get_execution_status()
+            state_name = str(getattr(status, "state_name", "idle") or "idle").strip().lower() or "idle"
+            queue_depth = int(getattr(status, "queue_depth", 0) or 0)
+            active_command_seq = int(getattr(status, "active_command_seq", 0) or 0)
             if status.active_traj_id == int(traj_id):
                 saw_target_trajectory = True
                 if status.state in (
@@ -816,6 +831,17 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     return status
             elif saw_target_trajectory and status.motion_done and status.last_update_ns > 0:
                 # A newer trajectory or stop/abort command superseded this one.
+                return status
+            elif (
+                not saw_target_trajectory
+                and submitted_command_seq is not None
+                and active_command_seq >= int(submitted_command_seq)
+                and status.motion_done
+                and queue_depth == 0
+                and state_name in terminal_state_names
+            ):
+                # Very short trajectories can fully execute between polls, leaving no
+                # observable window where active_traj_id == traj_id.
                 return status
             time.sleep(0.01)
         raise TimeoutError(f"Timed out waiting for RTCore trajectory {traj_id} to complete")
@@ -1309,7 +1335,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         ring_entries_off = ring_hdr_off + _align_up(_RING_HEADER_STRUCT.size, 8)
         return ring_hdr_off, ring_entries_off
 
-    def _cmd_ring_write(self, msg_type: int, payload: bytes) -> None:
+    def _cmd_ring_write(self, msg_type: int, payload: bytes) -> int:
         if self._cmd_shm is None or self._cmd_hdr is None:
             raise RuntimeError("cmd_shm not mapped")
 
@@ -1336,11 +1362,12 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         # Construct message: header + payload + zero padding to msg_bytes.
         time_ns = _now_monotonic_ns()
+        msg_seq = int(self._cmd_seq)
         header = _MSG_HEADER_STRUCT.pack(
             int(msg_type) & 0xFFFF,
             0,
             _MSG_HEADER_STRUCT.size + len(payload),
-            int(self._cmd_seq),
+            msg_seq,
             int(time_ns),
         )
         self._cmd_seq += 1
@@ -1361,6 +1388,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 os.write(self._cmd_eventfd, struct.pack("<Q", 1))
             except Exception:
                 pass
+        return msg_seq
 
     def _send_cmd_arm(self, arm: bool) -> None:
         self._cmd_ring_write(_MSG_CMD_ARM, _CMD_ARM_STRUCT.pack(1 if arm else 0, 0))

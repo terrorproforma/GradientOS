@@ -1808,7 +1808,11 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
                     execution_loop_active = False
                     break
 
-                completed_step_count += 1
+                logical_step_count = step.get("logical_step_count", 1)
+                try:
+                    completed_step_count += max(1, int(logical_step_count))
+                except Exception:
+                    completed_step_count += 1
                 utils.program_status_update(completed_step_count=completed_step_count)
 
             if not execution_loop_active:

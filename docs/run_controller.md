@@ -7,9 +7,10 @@
 This script is the highest-level application script and serves as the sole entry point for running the robot arm. It is responsible for:
 1.  **Environment Setup:** It modifies the system path to ensure the `arm_controller` package can be imported correctly.
 2.  **Module Imports:** It imports all the necessary sub-modules from the `arm_controller` package (`command_api`, `servo_driver`, etc.).
-3.  **Hardware Initialization:** It calls the functions required to open the serial port to the servos and set their initial configurations (PID gains, angle limits).
-4.  **State Synchronization:** It performs an initial read of all servo positions to ensure the software's internal understanding of the arm's state matches reality. This is a critical safety feature to prevent unexpected motion on startup.
-5.  **UDP Server Loop:** It starts the infinite `while` loop that listens for incoming UDP packets on the specified port.
+3.  **Runtime Policy Activation:** It resolves the effective runtime from robot policy, desired runtime config, and allowed development overrides, then applies the selected robot, tool, IK backend, and servo backend.
+4.  **Hardware / Backend Initialization:** It creates and initializes the active actuator backend, configuring serial or RTCore paths as required by the resolved runtime.
+5.  **State Synchronization:** It performs an initial read of joint and gripper state so the software's internal understanding of the arm matches reality. This is a critical safety feature to prevent unexpected motion on startup.
+6.  **UDP Server Loop:** It starts the infinite `while` loop that listens for incoming UDP packets on the specified port.
 
 ### `main()` Function Logic
 
@@ -21,6 +22,15 @@ The logic within the `main()` function is designed to be a simple, robust dispat
 4.  **Command Parsing:** When a message is received, it's parsed into a command and its arguments.
 5.  **Dispatching:** A series of `if/elif` statements checks the command and calls the appropriate handler function from the `command_api.py` module. This keeps the main loop clean and delegates all complex logic to the API module.
 6.  **Graceful Shutdown:** The entire process is wrapped in `try...finally` blocks to ensure that if the script is stopped for any reason (e.g., Ctrl+C), the UDP socket is closed and the serial port is properly released. 
+
+### Runtime Mode Switching
+
+The controller now owns `LIVE` / `SIM` switching end-to-end:
+
+- Startup and hot-switches both go through the same runtime activation path.
+- `SWITCH_RUNTIME_MODE,<live|simulate>` stops motion, waits for idle, shuts down the active backend, creates the target backend, refreshes runtime state, and persists desired `sim_mode`.
+- The API and web UI should stay thin wrappers around this command. They should not orchestrate backend teardown or startup themselves.
+- Real restart-bound changes still use `REQUEST_RESTART`; only the runtime mode itself is hot-switched.
 
 ### Selecting the Serial Port
 

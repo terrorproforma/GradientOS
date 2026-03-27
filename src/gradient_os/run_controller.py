@@ -747,6 +747,11 @@ def main():
     restart_requested = False
     restart_reason = ""
     active_runtime_config: dict[str, object] | None = None
+    selected_robot: RobotConfig | None = None
+    active_backend = None
+    backend_ready = False
+    servo_backend = ""
+    controller_sim_mode = False
     _install_shutdown_signal_handlers()
 
     # Get list of available robots for help text
@@ -849,6 +854,7 @@ Examples:
     desired_runtime = runtime_config.load_runtime_config()
     desired_obj = desired_runtime.get("desired", {}) if isinstance(desired_runtime, dict) else {}
     desired_robot = str(desired_obj.get("robot", "")).strip()
+    desired_sim_mode = bool(desired_obj.get("sim_mode", False))
     desired_active_tool_id = desired_obj.get("active_tool_id")
     desired_allow_unsafe = bool(desired_obj.get("allow_unsafe_overrides", False))
     desired_overrides = desired_obj.get("overrides", {})
@@ -858,27 +864,17 @@ Examples:
         desired_flag=desired_allow_unsafe,
     )
 
-    requested_robot_name = args.robot or desired_robot or default_robot_name
-    if requested_robot_name not in available_robots:
-        print(
-            f"[Controller] WARNING: Requested robot '{requested_robot_name}' is unavailable. "
-            f"Falling back to policy default '{default_robot_name}'."
-        )
-        requested_robot_name = default_robot_name
+    def _runtime_mode_label(sim_mode: bool) -> str:
+        return "simulate" if bool(sim_mode) else "live"
 
-    # ==========================================================================
-    # Initialize Robot Configuration
-    # ==========================================================================
-    print(f"[Controller] Loading robot configuration: {requested_robot_name}")
-    try:
-        selected_robot = get_robot_config(requested_robot_name)
-        print(f"[Controller] Robot: {selected_robot.name} v{selected_robot.version}")
-        print(f"[Controller]   - {selected_robot.num_logical_joints} logical joints")
-        print(f"[Controller]   - {selected_robot.num_physical_actuators} physical actuators")
-        print(f"[Controller]   - Gripper: {'Yes' if selected_robot.has_gripper else 'No'}")
-
-        # Update the global robot configuration
-        robot_config.set_active_robot(selected_robot)
+    def _build_startup_runtime_request() -> dict[str, object]:
+        requested_robot_name = args.robot or desired_robot or default_robot_name
+        if requested_robot_name not in available_robots:
+            print(
+                f"[Controller] WARNING: Requested robot '{requested_robot_name}' is unavailable. "
+                f"Falling back to policy default '{default_robot_name}'."
+            )
+            requested_robot_name = default_robot_name
 
         requested_ik_backend = None
         if allow_unsafe_overrides:
@@ -924,189 +920,249 @@ Examples:
         if isinstance(desired_overrides, dict):
             requested_rt_max_rpm = desired_overrides.get("rt_max_rpm")
 
-        active_runtime_config = runtime_config.resolve_effective_runtime(
-            robot_name=requested_robot_name,
-            sim_mode=bool(args.sim),
-            requested_ik_solver_backend=requested_ik_backend,
-            requested_servo_backend=requested_servo_backend,
-            requested_drive_profile=requested_drive_profile,
-            requested_rt_max_rpm=requested_rt_max_rpm,
-            requested_active_tool_id=str(desired_active_tool_id) if desired_active_tool_id is not None else None,
-            allow_unsafe_overrides=allow_unsafe_overrides,
+        return {
+            "robot_name": requested_robot_name,
+            "sim_mode": bool(args.sim or desired_sim_mode),
+            "requested_ik_solver_backend": requested_ik_backend,
+            "requested_servo_backend": requested_servo_backend,
+            "requested_drive_profile": requested_drive_profile,
+            "requested_rt_max_rpm": requested_rt_max_rpm,
+            "requested_active_tool_id": (
+                str(desired_active_tool_id) if desired_active_tool_id is not None else None
+            ),
+            "allow_unsafe_overrides": allow_unsafe_overrides,
+        }
+
+    def _log_selected_robot(robot: RobotConfig) -> None:
+        print(f"[Controller] Loading robot configuration: {robot.name}")
+        print(f"[Controller] Robot: {robot.name} v{robot.version}")
+        print(f"[Controller]   - {robot.num_logical_joints} logical joints")
+        print(f"[Controller]   - {robot.num_physical_actuators} physical actuators")
+        print(f"[Controller]   - Gripper: {'Yes' if robot.has_gripper else 'No'}")
+
+    def _apply_active_tool_definition(active_runtime: dict[str, object]) -> None:
+        tool_block = active_runtime.get("tool", {})
+        if not isinstance(tool_block, dict):
+            return
+        try:
+            kinematics_runtime.set_active_tool_definition(
+                tool_block,
+                expected_revision=None,
+                motion_state="IDLE",
+                reset_runtime_trim=True,
+            )
+        except Exception as tool_error:
+            print(f"[Controller] WARNING: Failed to apply active tool definition: {tool_error}")
+        print(
+            "[Controller] Active tool: "
+            f"{tool_block.get('display_name', tool_block.get('active_tool_id', 'unknown'))} "
+            f"(id={tool_block.get('active_tool_id', 'identity')}, source={tool_block.get('source', 'unknown')})"
         )
 
-        # Keep asset resolution deterministic for the selected robot.
-        os.environ["GRADIENT_ROBOT_ID"] = selected_robot.robot_id
+    def _sync_joint_and_gripper_state(
+        *,
+        selected_robot_local: RobotConfig,
+        servo_backend_local: str,
+        active_backend_local,
+        backend_ready_local: bool,
+    ) -> None:
+        if servo_backend_local == "ethercat_rtcore":
+            print("[Controller] EtherCAT RTCore backend active; skipping legacy serial servo initialization.")
+            if backend_ready_local and active_backend_local is not None and active_backend_local.is_initialized:
+                try:
+                    utils.current_logical_joint_angles_rad = servo_driver.get_current_arm_state_rad(
+                        verbose=False
+                    )
+                except Exception:
+                    utils.current_logical_joint_angles_rad = [0.0] * selected_robot_local.num_logical_joints
+            else:
+                utils.current_logical_joint_angles_rad = [0.0] * selected_robot_local.num_logical_joints
+            utils.gripper_present = False
+            utils.current_gripper_angle_rad = 0.0
+            return
+
+        servo_driver.initialize_servos()
+        if servo_backend_local == "feetech":
+            servo_driver.set_servo_angle_limits_from_urdf()
+        else:
+            print(f"[Controller] Skipping URDF angle limit writes for backend: {servo_backend_local}")
+
+        utils.current_logical_joint_angles_rad = servo_driver.get_current_arm_state_rad()
+        if not utils.gripper_present:
+            return
+
+        raw_pos = servo_driver.read_single_servo_position(utils.SERVO_ID_GRIPPER)
+        if raw_pos is None:
+            return
+        try:
+            gripper_config_index = utils.SERVO_IDS.index(utils.SERVO_ID_GRIPPER)
+            utils.current_gripper_angle_rad = servo_driver.raw_to_angle_rad(
+                raw_pos, gripper_config_index
+            )
+            print(
+                "[Controller] Initial gripper angle: "
+                f"{np.rad2deg(utils.current_gripper_angle_rad):.1f} degrees"
+            )
+        except (ValueError, IndexError):
+            print("[Controller] WARNING: Could not determine initial gripper angle.")
+
+    def _build_runtime_payload() -> dict[str, object]:
+        if active_runtime_config is None:
+            raise RuntimeError("Runtime config is unavailable.")
+        _sync_live_rtcore_drive_profile(active_runtime_config, active_backend)
+        payload = dict(active_runtime_config)
+        payload["controller"] = {
+            "pid": os.getpid(),
+        }
+        return payload
+
+    def _shutdown_active_runtime_backend() -> None:
+        nonlocal active_backend, backend_ready
+        try:
+            backend_registry.shutdown_backend()
+        except Exception as shutdown_error:
+            print(f"[Controller] Backend shutdown error: {shutdown_error}")
+        active_backend = None
+        backend_ready = False
+        if utils.ser and utils.ser.is_open:
+            try:
+                utils.ser.close()
+                print("[Controller] Serial port closed.")
+            except Exception as serial_error:
+                print(f"[Controller] Serial port close error: {serial_error}")
+        utils.ser = None
+
+    def _activate_runtime(runtime_request: dict[str, object], *, reason: str) -> None:
+        nonlocal active_runtime_config, selected_robot, active_backend, backend_ready, servo_backend, controller_sim_mode
+
+        requested_robot_name = str(runtime_request.get("robot_name", "") or "").strip()
+        if not requested_robot_name:
+            requested_robot_name = default_robot_name
+        if requested_robot_name not in available_robots:
+            raise ValueError(f"Unknown robot '{requested_robot_name}'.")
+
+        target_sim_mode = bool(runtime_request.get("sim_mode", False))
+        print(
+            "[Controller] Activating runtime "
+            f"(reason={reason}, robot={requested_robot_name}, mode={_runtime_mode_label(target_sim_mode)})"
+        )
+
+        selected_robot_local = get_robot_config(requested_robot_name)
+        _log_selected_robot(selected_robot_local)
+        robot_config.set_active_robot(selected_robot_local)
+
+        active_runtime_local = runtime_config.resolve_effective_runtime(
+            robot_name=requested_robot_name,
+            sim_mode=target_sim_mode,
+            requested_ik_solver_backend=runtime_request.get("requested_ik_solver_backend"),
+            requested_servo_backend=runtime_request.get("requested_servo_backend"),
+            requested_drive_profile=runtime_request.get("requested_drive_profile"),
+            requested_rt_max_rpm=runtime_request.get("requested_rt_max_rpm"),
+            requested_active_tool_id=runtime_request.get("requested_active_tool_id"),
+            allow_unsafe_overrides=bool(runtime_request.get("allow_unsafe_overrides", False)),
+        )
+
+        os.environ["GRADIENT_ROBOT_ID"] = selected_robot_local.robot_id
         ik_runtime = ik_solver.configure(
-            robot_id=selected_robot.robot_id,
+            robot_id=selected_robot_local.robot_id,
             backend_name=str(
-                active_runtime_config.get("ik_solver", {}).get("effective_backend", "")
+                active_runtime_local.get("ik_solver", {}).get("effective_backend", "")
             ),
         )
         actual_ik_backend = str(ik_runtime.get("backend_name", "")).strip().lower()
         if actual_ik_backend and actual_ik_backend != str(
-            active_runtime_config.get("ik_solver", {}).get("effective_backend", "")
+            active_runtime_local.get("ik_solver", {}).get("effective_backend", "")
         ).strip().lower():
-            active_runtime_config["ik_solver"]["requested_backend"] = active_runtime_config["ik_solver"][
+            active_runtime_local["ik_solver"]["requested_backend"] = active_runtime_local["ik_solver"][
                 "effective_backend"
             ]
-            active_runtime_config["ik_solver"]["effective_backend"] = actual_ik_backend
-            active_runtime_config["ik_solver"]["source"] = "runtime_fallback"
+            active_runtime_local["ik_solver"]["effective_backend"] = actual_ik_backend
+            active_runtime_local["ik_solver"]["source"] = "runtime_fallback"
         print(
             "[Controller] IK backend: "
-            f"{active_runtime_config['ik_solver']['effective_backend']} "
-            f"(source={active_runtime_config['ik_solver']['source']})"
+            f"{active_runtime_local['ik_solver']['effective_backend']} "
+            f"(source={active_runtime_local['ik_solver']['source']})"
         )
-        tool_block = active_runtime_config.get("tool", {})
-        if isinstance(tool_block, dict):
-            try:
-                kinematics_runtime.set_active_tool_definition(
-                    tool_block,
-                    expected_revision=None,
-                    motion_state="IDLE",
-                    reset_runtime_trim=True,
-                )
-            except Exception as tool_error:
-                print(f"[Controller] WARNING: Failed to apply active tool definition: {tool_error}")
-            print(
-                "[Controller] Active tool: "
-                f"{tool_block.get('display_name', tool_block.get('active_tool_id', 'unknown'))} "
-                f"(id={tool_block.get('active_tool_id', 'identity')}, source={tool_block.get('source', 'unknown')})"
-            )
-    except Exception as e:
-        print(f"[Controller] Error loading robot configuration '{requested_robot_name}': {e}")
-        sys.exit(1)
+        _apply_active_tool_definition(active_runtime_local)
 
-    # ==========================================================================
-    # Configure Serial Port
-    # ==========================================================================
-    # Priority: command-line arg > robot config default
-    if args.serial_port:
-        utils.SERIAL_PORT = args.serial_port
-        print(f"[Controller] Serial port (from command line): {utils.SERIAL_PORT}")
-    else:
-        utils.SERIAL_PORT = selected_robot.default_serial_port
-        print(f"[Controller] Serial port (from robot config): {utils.SERIAL_PORT}")
+        if args.serial_port:
+            utils.SERIAL_PORT = args.serial_port
+            print(f"[Controller] Serial port (from command line): {utils.SERIAL_PORT}")
+        else:
+            utils.SERIAL_PORT = selected_robot_local.default_serial_port
+            print(f"[Controller] Serial port (from robot config): {utils.SERIAL_PORT}")
 
-    # ==========================================================================
-    # Configure Servo Backend (MUST be done before using any servo-dependent modules)
-    # ==========================================================================
-    if bool(active_runtime_config and active_runtime_config.get("mode", {}).get("sim")):
-        print("[Controller] Running in SIMULATION mode (no hardware)")
-    servo_backend = str(
-        active_runtime_config.get("servo_backend", {}).get("effective_backend", selected_robot.default_servo_backend)
-    )
-    drive_profile = active_runtime_config.get("drive_profile", {}).get("effective_profile")
-    print(
-        f"[Controller] Servo backend: {servo_backend} "
-        f"(source={active_runtime_config['servo_backend']['source']})"
-    )
-    if drive_profile:
+        if bool(active_runtime_local.get("mode", {}).get("sim")):
+            print("[Controller] Running in SIMULATION mode (no hardware)")
+        servo_backend_local = str(
+            active_runtime_local.get(
+                "servo_backend", {}
+            ).get("effective_backend", selected_robot_local.default_servo_backend)
+        )
+        drive_profile = active_runtime_local.get("drive_profile", {}).get("effective_profile")
         print(
-            f"[Controller] Drive profile: {drive_profile} "
-            f"(source={active_runtime_config.get('drive_profile', {}).get('source', 'unknown')})"
+            f"[Controller] Servo backend: {servo_backend_local} "
+            f"(source={active_runtime_local['servo_backend']['source']})"
+        )
+        if drive_profile:
+            print(
+                f"[Controller] Drive profile: {drive_profile} "
+                f"(source={active_runtime_local.get('drive_profile', {}).get('source', 'unknown')})"
+            )
+
+        if servo_backend_local == "ethercat_rtcore" and not target_sim_mode:
+            _ensure_ethercat_rtcore_available()
+            _wait_for_ethercat_rtcore_ready(selected_robot_local.num_physical_actuators)
+
+        backend_registry.set_active_backend(servo_backend_local)
+        utils._populate_servo_constants()
+        robot_config.BAUD_RATE = backend_registry.get_default_baud_rate()
+
+        print(f"[Controller] Creating {servo_backend_local} backend instance...")
+        robot_config_dict = selected_robot_local.get_config_dict()
+        active_backend_local = None
+        backend_ready_local = False
+        try:
+            active_backend_local = backend_registry.create_backend(
+                backend_name=servo_backend_local,
+                robot_config=robot_config_dict,
+                serial_port=utils.SERIAL_PORT,
+            )
+            backend_registry.set_active_backend_instance(active_backend_local)
+            backend_ready_local = bool(active_backend_local.initialize())
+            if not backend_ready_local:
+                print("[Controller] WARNING: Backend initialization returned False")
+            _sync_live_rtcore_drive_profile(active_runtime_local, active_backend_local)
+        except Exception as backend_error:
+            print(f"[Controller] Error creating backend: {backend_error}")
+            backend_ready_local = False
+            if servo_backend_local == "ethercat_rtcore":
+                print(
+                    "[Controller] EtherCAT RTCore backend selected; "
+                    "skipping legacy serial init (motion unavailable)."
+                )
+            else:
+                print("[Controller] Falling back to legacy initialization...")
+
+        _sync_joint_and_gripper_state(
+            selected_robot_local=selected_robot_local,
+            servo_backend_local=servo_backend_local,
+            active_backend_local=active_backend_local,
+            backend_ready_local=backend_ready_local,
         )
 
-    if servo_backend == "ethercat_rtcore" and not bool(active_runtime_config and active_runtime_config.get("mode", {}).get("sim")):
-        _ensure_ethercat_rtcore_available()
-        _wait_for_ethercat_rtcore_ready(selected_robot.num_physical_actuators)
-    
-    # Set active backend CONFIG (loads constants like encoder resolution, register addresses).
-    # Simulation now has its own config module (compatible constants/parsers) so
-    # runtime state/logs correctly reflect "simulation".
-    backend_registry.set_active_backend(servo_backend)
-    
-    # Populate utils with servo-specific constants from the active backend
-    utils._populate_servo_constants()
-    
-    # Now that backend is configured, update robot_config's BAUD_RATE
-    robot_config.BAUD_RATE = backend_registry.get_default_baud_rate()
-    
-    # ==========================================================================
-    # Create and Initialize Backend Instance
-    # ==========================================================================
-    # This creates the actual ActuatorBackend object that performs I/O operations.
-    # The backend is created from the robot config and handles all hardware communication.
-    print(f"[Controller] Creating {servo_backend} backend instance...")
-    robot_config_dict = selected_robot.get_config_dict()
-    
-    active_backend = None
-    backend_ready = False
+        selected_robot = selected_robot_local
+        active_runtime_config = active_runtime_local
+        active_backend = active_backend_local
+        backend_ready = backend_ready_local
+        servo_backend = servo_backend_local
+        controller_sim_mode = target_sim_mode
+
     try:
-        active_backend = backend_registry.create_backend(
-            backend_name=servo_backend,
-            robot_config=robot_config_dict,
-            serial_port=utils.SERIAL_PORT,
-        )
-        
-        # Set as active backend BEFORE initialization (in case other modules query it)
-        backend_registry.set_active_backend_instance(active_backend)
-        
-        # Initialize the backend (opens serial port, pings servos, sets PID gains)
-        backend_ready = bool(active_backend.initialize())
-        if not backend_ready:
-            print("[Controller] WARNING: Backend initialization returned False")
-        _sync_live_rtcore_drive_profile(active_runtime_config, active_backend)
-        
+        _activate_runtime(_build_startup_runtime_request(), reason="startup")
     except Exception as e:
-        print(f"[Controller] Error creating backend: {e}")
-        backend_ready = False
-        if servo_backend == "ethercat_rtcore":
-            # Critical migration rule: do NOT fall back to serial initialization when EtherCAT RTCore
-            # backend is selected. Keep the controller alive but treat motion as unavailable.
-            print("[Controller] EtherCAT RTCore backend selected; skipping legacy serial init (motion unavailable).")
-        else:
-            print("[Controller] Falling back to legacy initialization...")
-            # For backward compatibility during migration, if backend creation fails,
-            # we continue with legacy initialization
-
-    # ==========================================================================
-    # Legacy Initialization (to be migrated in Phase 2)
-    # ==========================================================================
-    # For now, we still use servo_driver which uses servo_protocol directly.
-    # Once Phase 2 is complete, this will be replaced with:
-    #   active_backend.initialize()
-    #   active_backend.apply_joint_limits()
-    if servo_backend == "ethercat_rtcore":
-        print("[Controller] EtherCAT RTCore backend active; skipping legacy serial servo initialization.")
-        # Best-effort state sync (no serial). If RTCore is connected, servo_driver will read via backend.
-        if backend_ready and active_backend is not None and active_backend.is_initialized:
-            try:
-                utils.current_logical_joint_angles_rad = servo_driver.get_current_arm_state_rad(verbose=False)
-            except Exception:
-                utils.current_logical_joint_angles_rad = [0.0] * selected_robot.num_logical_joints
-        else:
-            utils.current_logical_joint_angles_rad = [0.0] * selected_robot.num_logical_joints
-        # Tool/gripper I/O is handled via EtherCAT I/O later (not serial gripper servo).
-        utils.gripper_present = False
-        utils.current_gripper_angle_rad = 0.0
-    else:
-        if args.sim:
-            from .arm_controller import sim_backend
-            sim_backend.activate()
-
-        # Initialize the hardware using legacy servo_driver
-        servo_driver.initialize_servos()
-        # Angle limit writes are serial-servo specific (EEPROM registers). Skip for non-serial backends.
-        if servo_backend == "feetech":
-            servo_driver.set_servo_angle_limits_from_urdf()
-        else:
-            print(f"[Controller] Skipping URDF angle limit writes for backend: {servo_backend}")
-
-        # Homing Routine: Read servo positions to synchronize our internal state.
-        # This prevents dangerous movements if the arm isn't at zero when the script starts.
-        utils.current_logical_joint_angles_rad = servo_driver.get_current_arm_state_rad()
-        # If gripper is present, also get its initial state
-        if utils.gripper_present:
-            # Read gripper position via servo_driver (uses backend if available)
-            raw_pos = servo_driver.read_single_servo_position(utils.SERVO_ID_GRIPPER)
-            if raw_pos is not None:
-                try:
-                    gripper_config_index = utils.SERVO_IDS.index(utils.SERVO_ID_GRIPPER)
-                    utils.current_gripper_angle_rad = servo_driver.raw_to_angle_rad(raw_pos, gripper_config_index)
-                    print(f"[Controller] Initial gripper angle: {np.rad2deg(utils.current_gripper_angle_rad):.1f} degrees")
-                except (ValueError, IndexError):
-                    print("[Controller] WARNING: Could not determine initial gripper angle.")
+        print(f"[Controller] Error loading startup runtime configuration: {e}")
+        sys.exit(1)
 
     # --- UDP Server Setup ---
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1153,9 +1209,6 @@ Examples:
             last_extra_ts = 0.0  # throttle extended servo telemetry to ~2 Hz
             last_motion_status_ts = 0.0
             cached_motion_status: dict[str, object] | None = None
-            
-            # Get telemetry block configuration from the active backend
-            telemetry_blocks = backend_registry.get_telemetry_blocks()
             
             while not telemetry_stop_event.is_set():
                 try:
@@ -1222,6 +1275,7 @@ Examples:
                                 present_ids = list(utils.SERVO_IDS)
                             
                             if present_ids:
+                                telemetry_blocks = backend_registry.get_telemetry_blocks()
                                 # Read telemetry blocks using backend-defined addresses
                                 block_data = []
                                 for addr, length in telemetry_blocks:
@@ -1576,18 +1630,59 @@ Examples:
 
                 elif command == "GET_RUNTIME_CONFIG":
                     try:
-                        if active_runtime_config is None:
-                            raise RuntimeError("Runtime config is unavailable.")
-                        _sync_live_rtcore_drive_profile(active_runtime_config, active_backend)
-                        payload = dict(active_runtime_config)
-                        payload["controller"] = {
-                            "pid": os.getpid(),
-                        }
+                        payload = _build_runtime_payload()
                         reply = "RUNTIME_CONFIG," + json.dumps(payload, separators=(",", ":"))
                         sock.sendto(reply.encode("utf-8"), addr)
                     except Exception as e:
                         msg = str(e).replace(",", ";")
                         sock.sendto(f"ERROR,RUNTIME_CONFIG,{msg}".encode("utf-8"), addr)
+
+                elif command == "SWITCH_RUNTIME_MODE":
+                    mode_token = parts[1].strip().lower() if len(parts) > 1 else ""
+                    if mode_token not in {"live", "simulate"}:
+                        sock.sendto(
+                            "ERROR,SWITCH_RUNTIME_MODE,Mode must be 'live' or 'simulate'.".encode(
+                                "utf-8"
+                            ),
+                            addr,
+                        )
+                        continue
+                    try:
+                        if active_runtime_config is None:
+                            raise RuntimeError("Runtime config is unavailable.")
+                        target_sim_mode = mode_token == "simulate"
+                        current_sim_mode = bool(active_runtime_config.get("mode", {}).get("sim", False))
+                        waited_for_idle = False
+                        idle_payload: dict[str, object] | None = None
+                        if current_sim_mode != target_sim_mode:
+                            command_api.handle_stop_command()
+                            idle_payload = command_api.handle_wait_for_idle()
+                            waited_for_idle = True
+                            runtime_request = runtime_config.derive_runtime_request_from_active_runtime(
+                                active_runtime_config
+                            )
+                            runtime_request["sim_mode"] = target_sim_mode
+                            _shutdown_active_runtime_backend()
+                            _activate_runtime(runtime_request, reason=f"hot-switch:{mode_token}")
+
+                        updated_runtime = runtime_config.update_runtime_config_desired(
+                            {"sim_mode": target_sim_mode},
+                            actor="controller-runtime-switch",
+                        )
+                        payload = {
+                            "requested_mode": mode_token,
+                            "active_mode": _runtime_mode_label(target_sim_mode),
+                            "mode_changed": bool(current_sim_mode != target_sim_mode),
+                            "waited_for_idle": waited_for_idle,
+                            "idle": idle_payload,
+                            "desired": updated_runtime.get("desired", {}) if isinstance(updated_runtime, dict) else {},
+                            "meta": updated_runtime.get("meta", {}) if isinstance(updated_runtime, dict) else {},
+                            "runtime": _build_runtime_payload(),
+                        }
+                        _send_controller_ack(sock, addr, "SWITCH_RUNTIME_MODE", payload)
+                    except Exception as e:
+                        msg = str(e).replace(",", ";")
+                        sock.sendto(f"ERROR,SWITCH_RUNTIME_MODE,{msg}".encode("utf-8"), addr)
 
                 elif command == "SET_ACTIVE_TOOL":
                     requested_tool_id_raw = parts[1].strip() if len(parts) > 1 else ""

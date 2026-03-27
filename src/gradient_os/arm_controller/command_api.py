@@ -530,6 +530,7 @@ def _build_bounded_joint_path(
     target_q: Sequence[float],
     *,
     max_motor_rpm: float = _PROGRAM_JOINT_MOVE_MAX_MOTOR_RPM,
+    max_joint_deg_s: float | None = None,
 ) -> tuple[list[list[float]], float]:
     current_q_arr = np.asarray(list(current_q), dtype=float)
     target_q_arr = np.asarray(list(target_q), dtype=float)
@@ -544,13 +545,18 @@ def _build_bounded_joint_path(
 
     delta_q = target_q_arr - current_q_arr
     duration_s = _SAFE_JOINT_MOVE_MIN_DURATION_S
-    for joint_idx in range(len(target_q_arr)):
-        ratio = float(gear_ratios[joint_idx]) if joint_idx < len(gear_ratios) else 1.0
-        if not np.isfinite(ratio) or ratio <= 0.0:
-            ratio = 1.0
-        max_rate = (float(max_motor_rpm) / ratio) * (2.0 * np.pi / 60.0)
-        if max_rate > 0.0:
-            duration_s = max(duration_s, abs(float(delta_q[joint_idx])) / max_rate)
+    if max_joint_deg_s is not None and np.isfinite(max_joint_deg_s) and float(max_joint_deg_s) > 0.0:
+        max_joint_rad_s = float(np.deg2rad(max_joint_deg_s))
+        for joint_idx in range(len(target_q_arr)):
+            duration_s = max(duration_s, abs(float(delta_q[joint_idx])) / max_joint_rad_s)
+    else:
+        for joint_idx in range(len(target_q_arr)):
+            ratio = float(gear_ratios[joint_idx]) if joint_idx < len(gear_ratios) else 1.0
+            if not np.isfinite(ratio) or ratio <= 0.0:
+                ratio = 1.0
+            max_rate = (float(max_motor_rpm) / ratio) * (2.0 * np.pi / 60.0)
+            if max_rate > 0.0:
+                duration_s = max(duration_s, abs(float(delta_q[joint_idx])) / max_rate)
 
     num_steps = max(2, int(np.ceil(duration_s * _SAFE_JOINT_MOVE_FREQUENCY_HZ)))
     t = np.linspace(0.0, 1.0, num_steps)
@@ -569,6 +575,7 @@ def _plan_joint_move_to_pose(
     target_pos: Sequence[float] | None = None,
     target_orientation: np.ndarray | None = None,
     max_motor_rpm: float = _PROGRAM_JOINT_MOVE_MAX_MOTOR_RPM,
+    max_joint_deg_s: float | None = None,
 ) -> tuple[list[list[float]] | None, list[float] | None]:
     current_q_list = list(map(float, current_q))
     solved_q: list[float] | None
@@ -596,8 +603,285 @@ def _plan_joint_move_to_pose(
         current_q_list,
         solved_q,
         max_motor_rpm=max_motor_rpm,
+        max_joint_deg_s=max_joint_deg_s,
     )
     return joint_path, solved_q
+
+
+def _coerce_optional_positive_speed(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(numeric) or numeric <= 0.0:
+        return None
+    return float(numeric)
+
+
+def _extract_waypoint_linear_speed_m_s(raw_waypoint: dict | None) -> float | None:
+    if not isinstance(raw_waypoint, dict):
+        return None
+    raw_value = raw_waypoint.get(
+        "linear_speed_mm_s",
+        raw_waypoint.get(
+            "linearSpeedMmS",
+            raw_waypoint.get("linear_speed_mm_per_s", raw_waypoint.get("linearSpeedMmPerSec")),
+        ),
+    )
+    speed_mm_s = _coerce_optional_positive_speed(raw_value)
+    return None if speed_mm_s is None else float(speed_mm_s / 1000.0)
+
+
+def _extract_waypoint_linear_acceleration_m_s2(raw_waypoint: dict | None) -> float | None:
+    if not isinstance(raw_waypoint, dict):
+        return None
+    acceleration_mm_s2 = _coerce_optional_positive_speed(
+        raw_waypoint.get(
+            "linear_acceleration_mm_s2",
+            raw_waypoint.get(
+                "linearAccelerationMmS2",
+                raw_waypoint.get(
+                    "linear_acceleration_mm_per_s2",
+                    raw_waypoint.get("linearAccelerationMmPerSec2"),
+                ),
+            ),
+        )
+    )
+    return None if acceleration_mm_s2 is None else float(acceleration_mm_s2 / 1000.0)
+
+
+def _extract_waypoint_rotation_speed_deg_s(raw_waypoint: dict | None) -> float | None:
+    if not isinstance(raw_waypoint, dict):
+        return None
+    return _coerce_optional_positive_speed(
+        raw_waypoint.get(
+            "rotation_speed_deg_s",
+            raw_waypoint.get(
+                "rotationSpeedDegS",
+                raw_waypoint.get("rotation_speed_deg_per_s", raw_waypoint.get("rotationSpeedDegPerSec")),
+            ),
+        )
+    )
+
+
+def _extract_waypoint_pause_after_s(raw_waypoint: dict | None) -> float | None:
+    if not isinstance(raw_waypoint, dict):
+        return None
+    return _coerce_optional_positive_speed(
+        raw_waypoint.get(
+            "pause_after_s",
+            raw_waypoint.get(
+                "pauseAfterS",
+                raw_waypoint.get(
+                    "pause_after_sec",
+                    raw_waypoint.get(
+                        "pauseAfterSec",
+                        raw_waypoint.get(
+                            "pause_after_seconds",
+                            raw_waypoint.get(
+                                "pauseAfterSeconds",
+                                raw_waypoint.get(
+                                    "pause_duration_s",
+                                    raw_waypoint.get("pauseDurationS"),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+
+
+def _extract_move_linear_speed_m_s(move_cmd: dict | None) -> float | None:
+    if not isinstance(move_cmd, dict):
+        return None
+    speed_mm_s = _coerce_optional_positive_speed(
+        move_cmd.get(
+            "linear_speed_mm_s",
+            move_cmd.get(
+                "linearSpeedMmS",
+                move_cmd.get("linear_speed_mm_per_s", move_cmd.get("linearSpeedMmPerSec")),
+            ),
+        )
+    )
+    return None if speed_mm_s is None else float(speed_mm_s / 1000.0)
+
+
+def _extract_move_linear_acceleration_m_s2(move_cmd: dict | None) -> float | None:
+    if not isinstance(move_cmd, dict):
+        return None
+    acceleration_mm_s2 = _coerce_optional_positive_speed(
+        move_cmd.get(
+            "linear_acceleration_mm_s2",
+            move_cmd.get(
+                "linearAccelerationMmS2",
+                move_cmd.get(
+                    "linear_acceleration_mm_per_s2",
+                    move_cmd.get("linearAccelerationMmPerSec2"),
+                ),
+            ),
+        )
+    )
+    return None if acceleration_mm_s2 is None else float(acceleration_mm_s2 / 1000.0)
+
+
+def _extract_move_rotation_speed_deg_s(move_cmd: dict | None) -> float | None:
+    if not isinstance(move_cmd, dict):
+        return None
+    return _coerce_optional_positive_speed(
+        move_cmd.get(
+            "rotation_speed_deg_s",
+            move_cmd.get(
+                "rotationSpeedDegS",
+                move_cmd.get("rotation_speed_deg_per_s", move_cmd.get("rotationSpeedDegPerSec")),
+            ),
+        )
+    )
+
+
+def _collapse_runtime_move_pause_steps(
+    planned_steps: list[dict],
+    *,
+    position_tolerance_rad: float = 1e-9,
+) -> list[dict] | None:
+    if not isinstance(planned_steps, list) or len(planned_steps) == 0:
+        return None
+
+    shared_freq: int | None = None
+    combined_path: list[list[float]] = []
+    logical_step_count = 0
+
+    for step in planned_steps:
+        if not isinstance(step, dict):
+            return None
+        step_type = str(step.get("type", "")).strip().lower()
+        if step_type == "move":
+            path = step.get("path")
+            if not isinstance(path, list) or len(path) == 0:
+                return None
+            try:
+                step_freq = int(step.get("freq"))
+            except Exception:
+                return None
+            if step_freq <= 0:
+                return None
+            if shared_freq is None:
+                shared_freq = step_freq
+            elif step_freq != shared_freq:
+                return None
+
+            normalized_path = [
+                [float(value) for value in sample]
+                for sample in path
+                if isinstance(sample, (list, tuple))
+            ]
+            if len(normalized_path) == 0:
+                return None
+
+            if not combined_path:
+                combined_path.extend(normalized_path)
+            else:
+                first_sample = normalized_path[0]
+                last_sample = combined_path[-1]
+                same_start = (
+                    len(first_sample) == len(last_sample)
+                    and all(
+                        abs(float(lhs) - float(rhs)) <= position_tolerance_rad
+                        for lhs, rhs in zip(first_sample, last_sample)
+                    )
+                )
+                combined_path.extend(normalized_path[1:] if same_start else normalized_path)
+        elif step_type == "pause":
+            if shared_freq is None or len(combined_path) == 0:
+                return None
+            duration_s = _coerce_optional_positive_speed(step.get("duration"))
+            if duration_s is not None:
+                hold_samples = max(1, int(round(float(duration_s) * float(shared_freq))))
+                hold_pose = list(combined_path[-1])
+                combined_path.extend([list(hold_pose) for _ in range(hold_samples)])
+        else:
+            return None
+        logical_step_count += 1
+
+    if shared_freq is None or len(combined_path) == 0:
+        return None
+
+    return [
+        {
+            "type": "move",
+            "path": combined_path,
+            "freq": shared_freq,
+            "logical_step_count": logical_step_count,
+        }
+    ]
+
+
+def _plan_orientation_only_move(
+    current_q: Sequence[float],
+    *,
+    target_pos: Sequence[float],
+    target_orientation: np.ndarray,
+    angular_speed_deg_s: float,
+    frequency_hz: int = 100,
+) -> list[list[float]] | None:
+    current_q_list = list(map(float, current_q))
+    current_pose_matrix = ik_solver.get_fk_matrix(current_q_list)
+    if current_pose_matrix is None:
+        return None
+    start_orientation = np.asarray(current_pose_matrix[:3, :3], dtype=float)
+    target_orientation_matrix = np.asarray(target_orientation, dtype=float).reshape(3, 3)
+    rotation_delta = R.from_matrix(start_orientation).inv() * R.from_matrix(target_orientation_matrix)
+    angle_deg = abs(float(np.rad2deg(rotation_delta.magnitude())))
+    if angle_deg <= 1e-6:
+        return [current_q_list, current_q_list]
+    speed_deg_s = max(0.1, float(angular_speed_deg_s))
+    duration_s = max(_SAFE_JOINT_MOVE_MIN_DURATION_S, angle_deg / speed_deg_s)
+    num_steps = max(2, int(np.ceil(duration_s * max(1, int(frequency_hz)))))
+    t_values = np.linspace(0.0, 1.0, num_steps)
+    slerp = Slerp(
+        [0.0, 1.0],
+        R.concatenate([R.from_matrix(start_orientation), R.from_matrix(target_orientation_matrix)]),
+    )
+    orientations = [rotation.as_matrix() for rotation in slerp(t_values)]
+    positions = [np.asarray(target_pos, dtype=float).reshape(3) for _ in t_values]
+    joint_path = ik_solver.solve_ik_path_batch(
+        path_points=positions,
+        initial_joint_angles=current_q_list,
+        target_orientations=orientations,
+    )
+    if joint_path is None:
+        return None
+    return [list(map(float, np.asarray(sample, dtype=float).tolist())) for sample in joint_path]
+
+
+def _estimate_joint_path_rotation_speed_deg_s(
+    start_q: Sequence[float],
+    joint_path: list[list[float]] | None,
+    *,
+    frequency_hz: int,
+) -> float | None:
+    if not joint_path:
+        return None
+    start_q_arr = np.asarray(list(start_q), dtype=float)
+    end_q_arr = np.asarray(joint_path[-1], dtype=float)
+    if start_q_arr.shape != end_q_arr.shape:
+        return None
+    duration_s = max(1.0 / max(1, int(frequency_hz)), (max(1, len(joint_path)) - 1) / max(1, int(frequency_hz)))
+    if duration_s <= 0.0:
+        return None
+    delta_deg = np.abs(np.rad2deg(end_q_arr - start_q_arr))
+    return float(np.max(delta_deg) / duration_s)
+
+
+def _resolve_default_orientation_speed_deg_s(angle_deg: float) -> float:
+    magnitude = abs(float(angle_deg))
+    if magnitude <= 1e-6:
+        return 90.0
+    duration_s = max(0.12, min(0.75, magnitude / 90.0))
+    return float(magnitude / duration_s)
 
 
 def _program_status_from_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
@@ -1415,9 +1699,69 @@ def _resolve_profile_params_for_speed_multiplier(speed_multiplier: float | int |
     # Match UI slider semantics (0.1x .. 10x) while keeping backend-safe bounds.
     multiplier = float(np.clip(multiplier, 0.1, 10.0))
 
-    velocity = float(utils.DEFAULT_PROFILE_VELOCITY * multiplier)
-    acceleration = float(utils.DEFAULT_PROFILE_ACCELERATION * (multiplier ** 2))
+    base_velocity = (
+        float(utils.DEFAULT_PROFILE_VELOCITY)
+        if utils.DEFAULT_PROFILE_VELOCITY is not None
+        and np.isfinite(utils.DEFAULT_PROFILE_VELOCITY)
+        and float(utils.DEFAULT_PROFILE_VELOCITY) > 0.0
+        else 0.08
+    )
+    base_acceleration = (
+        float(utils.DEFAULT_PROFILE_ACCELERATION)
+        if utils.DEFAULT_PROFILE_ACCELERATION is not None
+        and np.isfinite(utils.DEFAULT_PROFILE_ACCELERATION)
+        and float(utils.DEFAULT_PROFILE_ACCELERATION) > 0.0
+        else 0.2
+    )
+    velocity = float(base_velocity * multiplier)
+    acceleration = float(base_acceleration * (multiplier ** 2))
     return multiplier, velocity, acceleration
+
+
+def _resolve_profile_params_for_linear_speed_m_s(
+    requested_velocity_m_s: float | int | str | None,
+    requested_acceleration_m_s2: float | int | str | None = None,
+) -> tuple[float, float, float]:
+    """
+    Resolve an absolute linear speed in m/s plus optional acceleration in m/s^2.
+
+    For authored trajectory segments we use direct physical motion semantics:
+    - velocity comes from the requested line speed (or controller default)
+    - acceleration comes from the requested line acceleration when provided
+    - otherwise the controller defaults to reaching the commanded speed in
+      about one second
+
+    Returning the normalized multiplier as the first tuple element preserves the
+    existing helper shape for callers and diagnostics.
+
+    Returns:
+        tuple[float, float, float]: (normalized_multiplier, velocity_m_s, acceleration_m_s2)
+    """
+    base_velocity = (
+        float(utils.DEFAULT_PROFILE_VELOCITY)
+        if utils.DEFAULT_PROFILE_VELOCITY is not None
+        and np.isfinite(utils.DEFAULT_PROFILE_VELOCITY)
+        and float(utils.DEFAULT_PROFILE_VELOCITY) > 0.0
+        else 0.08
+    )
+    try:
+        requested_velocity = float(requested_velocity_m_s) if requested_velocity_m_s is not None else base_velocity
+    except (TypeError, ValueError):
+        requested_velocity = base_velocity
+    if not np.isfinite(requested_velocity) or requested_velocity <= 0.0:
+        requested_velocity = base_velocity
+    try:
+        requested_acceleration = (
+            float(requested_acceleration_m_s2)
+            if requested_acceleration_m_s2 is not None
+            else (requested_velocity / 1.0)
+        )
+    except (TypeError, ValueError):
+        requested_acceleration = requested_velocity / 1.0
+    if not np.isfinite(requested_acceleration) or requested_acceleration <= 0.0:
+        requested_acceleration = requested_velocity / 1.0
+    normalized_multiplier = float(requested_velocity / base_velocity) if base_velocity > 0.0 else 1.0
+    return normalized_multiplier, requested_velocity, requested_acceleration
 
 def handle_translate_command(dx: float, dy: float, dz: float):
     """
@@ -2058,10 +2402,12 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
             print(f"[Pi Plan] Planning Command {i+1}/{len(moves)}: {command}...")
 
             if command == "home":
+                move_rotation_speed_deg_s = _extract_move_rotation_speed_deg_s(move_cmd)
                 home_q_list = [0.0] * utils.NUM_LOGICAL_JOINTS
                 joint_path, solved_q = _plan_joint_move_to_pose(
                     current_q,
                     target_q=home_q_list,
+                    max_joint_deg_s=move_rotation_speed_deg_s,
                 )
                 if not joint_path or solved_q is None:
                     print("[Pi Trajectory] ERROR: Failed to plan home joint move. Aborting plan.")
@@ -2074,6 +2420,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                         "path": joint_path,
                         "freq": _SAFE_JOINT_MOVE_FREQUENCY_HZ,
                         "serialization_command": "home",
+                            "rotation_speed_deg_s": move_rotation_speed_deg_s,
                     }
                 )
                 current_q = np.array(solved_q, dtype=float)
@@ -2081,6 +2428,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
             elif command == "move":
                 t_start_plan = time.monotonic()
                 target_pos = np.array(move_cmd.get("vector", [0, 0, 0]), dtype=float)
+                move_rotation_speed_deg_s = _extract_move_rotation_speed_deg_s(move_cmd)
                 move_orient_euler = move_cmd.get("orientation_euler_deg")
                 per_move_orientation_matrix = None
                 if move_orient_euler is not None:
@@ -2102,6 +2450,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                     current_q,
                     target_pos=target_pos,
                     target_orientation=forced_orient,
+                    max_joint_deg_s=move_rotation_speed_deg_s,
                 )
                 if joint_path and solved_q is not None:
                     t_end_plan = time.monotonic()
@@ -2113,6 +2462,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                             "freq": _SAFE_JOINT_MOVE_FREQUENCY_HZ,
                             "weld_active": False,
                             "serialization_command": "move",
+                            "rotation_speed_deg_s": move_rotation_speed_deg_s,
                         }
                     )
                     current_q = np.array(solved_q, dtype=float)
@@ -2172,8 +2522,16 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
             elif command == "move_absolute":
                 t_start_plan = time.monotonic()
                 target_pos = np.array(move_cmd.get("vector", [0,0,0]))
+                move_linear_speed_m_s = _extract_move_linear_speed_m_s(move_cmd)
+                move_linear_acceleration_m_s2 = _extract_move_linear_acceleration_m_s2(move_cmd)
+                move_rotation_speed_deg_s = _extract_move_rotation_speed_deg_s(move_cmd)
                 speed_mult = move_cmd.get("speed_multiplier", 1.0)
                 _, move_velocity, move_acceleration = _resolve_profile_params_for_speed_multiplier(speed_mult)
+                if move_linear_speed_m_s is not None or move_linear_acceleration_m_s2 is not None:
+                    _, move_velocity, move_acceleration = _resolve_profile_params_for_linear_speed_m_s(
+                        move_linear_speed_m_s,
+                        move_linear_acceleration_m_s2,
+                    )
                 is_weld_move = bool(move_cmd.get("is_weld", False))
 
                 move_orient_euler = move_cmd.get("orientation_euler_deg")
@@ -2185,11 +2543,26 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                         print(f"[Pi Plan] WARNING: Invalid per-move Euler orientation: {e}. Ignoring.")
 
                 forced_orient = per_move_orientation_matrix if per_move_orientation_matrix is not None else target_orientation_matrix
-
-                joint_path = trajectory_execution._plan_linear_move(
-                    current_q, target_pos, move_velocity, move_acceleration, 100, True,
-                    forced_orientation=forced_orient
+                current_pos = ik_solver.get_fk(current_q.tolist())
+                is_pure_rotation = (
+                    current_pos is not None
+                    and forced_orient is not None
+                    and np.linalg.norm(np.array(current_pos, dtype=float) - target_pos) <= 1e-5
+                    and move_rotation_speed_deg_s is not None
                 )
+                if is_pure_rotation:
+                    joint_path = _plan_orientation_only_move(
+                        current_q,
+                        target_pos=target_pos,
+                        target_orientation=forced_orient,
+                        angular_speed_deg_s=move_rotation_speed_deg_s,
+                        frequency_hz=100,
+                    )
+                else:
+                    joint_path = trajectory_execution._plan_linear_move(
+                        current_q, target_pos, move_velocity, move_acceleration, 100, True,
+                        forced_orientation=forced_orient
+                    )
                     
                 if joint_path:
                     t_end_plan = time.monotonic()
@@ -2200,6 +2573,17 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
                             'path': joint_path,
                             'freq': 100,
                             'weld_active': is_weld_move,
+                            'linear_speed_mm_s': (
+                                round(float(move_velocity * 1000.0), 3)
+                                if move_linear_speed_m_s is not None
+                                else None
+                            ),
+                            'linear_acceleration_mm_s2': (
+                                round(float(move_acceleration * 1000.0), 3)
+                                if move_linear_speed_m_s is not None or move_linear_acceleration_m_s2 is not None
+                                else None
+                            ),
+                            'rotation_speed_deg_s': move_rotation_speed_deg_s,
                         }
                     )
                     current_q = np.array(joint_path[-1])
@@ -2384,6 +2768,19 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
     program_segment_execution_policy = (
         "rtcore_queued" if rtcore_segment_execution else "controller_open_loop"
     )
+    execution_steps = planned_steps
+    if not should_loop and weld_meta is None:
+        collapsed_steps = _collapse_runtime_move_pause_steps(planned_steps)
+        if collapsed_steps is not None:
+            execution_steps = collapsed_steps
+            program_segment_execution_policy = (
+                "rtcore_compound_path" if rtcore_segment_execution else "controller_compound_path"
+            )
+            print(
+                f"[Pi Trajectory] Collapsed {len(planned_steps)} planned steps into "
+                f"{len(execution_steps[0].get('path', []))} streamed samples "
+                f"with explicit hold segments for authored pauses."
+            )
 
     utils.trajectory_state_update(
         is_running=True,
@@ -2552,7 +2949,7 @@ def handle_run_trajectory(trajectory_name: str, use_cache: bool = False, loop_ov
         # Non-looping case (unchanged)
         executor_thread = threading.Thread(
             target=trajectory_execution._trajectory_executor_thread,
-            args=(planned_steps, should_loop)
+            args=(execution_steps, should_loop)
         )
     utils.trajectory_state["thread"] = executor_thread
     executor_thread.start()
@@ -4023,7 +4420,7 @@ def handle_end_trajectory(traj_name: str):
     if os.path.exists(file_path):
         print(f"[Recorder] WARNING: File {file_path} already exists – it will be overwritten.")
 
-    # Build moves list – for now we store as move_absolute steps with 1 s pauses between
+    # Build moves list from the recorded poses without inserting implicit dwell.
     moves = []
     for i, p in enumerate(_recording_state["points"]):
         moves.append({
@@ -4031,8 +4428,6 @@ def handle_end_trajectory(traj_name: str):
             "vector": p["position"],
             "orientation_euler_deg": p["orientation_euler_deg"],
         })
-        if i < len(_recording_state["points"]) - 1:
-            moves.append({"command": "pause", "duration": 1.0})
 
     traj_dict = {
         "description": f"Recorded on {_recording_state['start_time'].strftime('%Y-%m-%d %H:%M:%S')}",
@@ -4571,6 +4966,7 @@ def _plan_preview_points_payload(
         for idx, waypoint in enumerate(points, start=1):
             target_pos = np.array(waypoint, dtype=float)
             segment_start_fk = ik_solver.get_fk(current_q.tolist())
+            start_q_for_step = np.array(current_q, dtype=float)
             authored_waypoint = (
                 standard_pose_waypoints[idx - 1]
                 if standard_pose_waypoints is not None
@@ -4582,11 +4978,31 @@ def _plan_preview_points_payload(
                 else None
             )
             move_type = _waypoint_move_type(authored_waypoint)
+            linear_speed_m_s = _extract_waypoint_linear_speed_m_s(authored_waypoint)
+            linear_acceleration_m_s2 = _extract_waypoint_linear_acceleration_m_s2(authored_waypoint)
+            rotation_speed_deg_s = _extract_waypoint_rotation_speed_deg_s(authored_waypoint)
+            _, resolved_linear_speed_m_s, resolved_linear_acceleration_m_s2 = (
+                _resolve_profile_params_for_linear_speed_m_s(
+                    linear_speed_m_s if linear_speed_m_s is not None else plan_velocity,
+                    linear_acceleration_m_s2,
+                )
+            )
+            actual_rotation_speed_deg_s: float | None = None
             t_start = time.monotonic()
             if move_type == "home":
                 joint_path, solved_q = _plan_joint_move_to_pose(
                     current_q,
                     target_q=[0.0] * utils.NUM_LOGICAL_JOINTS,
+                    max_joint_deg_s=rotation_speed_deg_s,
+                )
+                actual_rotation_speed_deg_s = (
+                    float(rotation_speed_deg_s)
+                    if rotation_speed_deg_s is not None
+                    else _estimate_joint_path_rotation_speed_deg_s(
+                        start_q_for_step,
+                        joint_path,
+                        frequency_hz=_SAFE_JOINT_MOVE_FREQUENCY_HZ,
+                    )
                 )
                 serialization_command = "home"
                 serialization_freq = _SAFE_JOINT_MOVE_FREQUENCY_HZ
@@ -4600,20 +5016,64 @@ def _plan_preview_points_payload(
                     current_q,
                     target_pos=target_pos,
                     target_orientation=forced_orientation,
+                    max_joint_deg_s=rotation_speed_deg_s,
+                )
+                actual_rotation_speed_deg_s = (
+                    float(rotation_speed_deg_s)
+                    if rotation_speed_deg_s is not None
+                    else _estimate_joint_path_rotation_speed_deg_s(
+                        start_q_for_step,
+                        joint_path,
+                        frequency_hz=_SAFE_JOINT_MOVE_FREQUENCY_HZ,
+                    )
                 )
                 serialization_command = "move"
                 serialization_freq = _SAFE_JOINT_MOVE_FREQUENCY_HZ
                 fallback_target = target_pos
             else:
-                joint_path = trajectory_execution._plan_linear_move(
-                    current_q,
-                    target_pos,
-                    float(plan_velocity),
-                    float(plan_acceleration),
-                    100,
-                    True,
-                    forced_orientation=forced_orientation,
+                current_position = (
+                    np.array(segment_start_fk, dtype=float) if segment_start_fk is not None else None
                 )
+                is_pure_rotation = (
+                    current_position is not None
+                    and forced_orientation is not None
+                    and np.linalg.norm(current_position - target_pos) <= 1e-5
+                )
+                if is_pure_rotation and forced_orientation is not None:
+                    current_pose_matrix = ik_solver.get_fk_matrix(current_q.tolist())
+                    current_orientation = (
+                        np.asarray(current_pose_matrix[:3, :3], dtype=float)
+                        if current_pose_matrix is not None
+                        else None
+                    )
+                    angle_deg = 0.0
+                    if current_orientation is not None:
+                        rotation_delta = (
+                            R.from_matrix(current_orientation).inv() * R.from_matrix(forced_orientation)
+                        )
+                        angle_deg = abs(float(np.rad2deg(rotation_delta.magnitude())))
+                    actual_rotation_speed_deg_s = (
+                        float(rotation_speed_deg_s)
+                        if rotation_speed_deg_s is not None
+                        else _resolve_default_orientation_speed_deg_s(angle_deg)
+                    )
+                    joint_path = _plan_orientation_only_move(
+                        current_q,
+                        target_pos=target_pos,
+                        target_orientation=forced_orientation,
+                        angular_speed_deg_s=actual_rotation_speed_deg_s,
+                        frequency_hz=100,
+                    )
+                else:
+                    joint_path = trajectory_execution._plan_linear_move(
+                        current_q,
+                        target_pos,
+                        resolved_linear_speed_m_s,
+                        resolved_linear_acceleration_m_s2,
+                        100,
+                        True,
+                        forced_orientation=forced_orientation,
+                    )
                 solved_q = list(map(float, joint_path[-1])) if joint_path else None
                 serialization_command = "move_absolute"
                 serialization_freq = 100
@@ -4636,6 +5096,14 @@ def _plan_preview_points_payload(
                 "freq": serialization_freq,
                 "serialization_command": serialization_command,
             }
+            if serialization_command == "move_absolute":
+                planned_step["linear_speed_mm_s"] = round(float(resolved_linear_speed_m_s * 1000.0), 3)
+                planned_step["linear_acceleration_mm_s2"] = round(
+                    float(resolved_linear_acceleration_m_s2 * 1000.0),
+                    3,
+                )
+            if actual_rotation_speed_deg_s is not None:
+                planned_step["rotation_speed_deg_s"] = round(float(actual_rotation_speed_deg_s), 3)
             planned_steps.append(planned_step)
             _append_cartesian_samples(joint_path)
             _append_waypoint_result(joint_path, fallback_target)
@@ -4723,10 +5191,27 @@ def _plan_preview_points_payload(
             )
         raise RuntimeError(f"Planning failed for one or more waypoints.{planner_diag_suffix}")
 
+    runtime_planned_steps = list(planned_steps)
+    if standard_pose_waypoints is not None and not weld_metadata:
+        runtime_planned_steps = []
+        for index, step in enumerate(planned_steps):
+            runtime_planned_steps.append(step)
+            if step.get("type") != "move":
+                continue
+            pause_after_s = (
+                _extract_waypoint_pause_after_s(standard_pose_waypoints[index])
+                if index < len(standard_pose_waypoints)
+                else None
+            )
+            if pause_after_s is not None and index < len(planned_steps) - 1:
+                runtime_planned_steps.append(
+                    {"type": "pause", "duration": round(float(pause_after_s), 3)}
+                )
+
     # Build recorded trajectory representation from planned steps.
     moves = []
     move_counter = 0
-    for step in planned_steps:
+    for step in runtime_planned_steps:
         if step.get("type") == "pause":
             moves.append({"command": "pause", "duration": float(step.get("duration", 1.0))})
             continue
@@ -4751,14 +5236,21 @@ def _plan_preview_points_payload(
             move["vector"] = position
         if orient_payload is not None and serialization_command in {"move_absolute", "move", "home"}:
             move["orientation_euler_deg"] = orient_payload
+        linear_speed_mm_s = _coerce_optional_positive_speed(step.get("linear_speed_mm_s"))
+        if linear_speed_mm_s is not None:
+            move["linear_speed_mm_s"] = round(float(linear_speed_mm_s), 3)
+        linear_acceleration_mm_s2 = _coerce_optional_positive_speed(step.get("linear_acceleration_mm_s2"))
+        if linear_acceleration_mm_s2 is not None:
+            move["linear_acceleration_mm_s2"] = round(float(linear_acceleration_mm_s2), 3)
+        rotation_speed_deg_s = _coerce_optional_positive_speed(step.get("rotation_speed_deg_s"))
+        if rotation_speed_deg_s is not None:
+            move["rotation_speed_deg_s"] = round(float(rotation_speed_deg_s), 3)
         if bool(step.get("weld_active", False)):
             move["is_weld"] = True
             if weld_metadata:
                 move["weld_type"] = weld_metadata.get("type")
         moves.append(move)
         move_counter += 1
-        if weld_metadata is None and move_counter < len(planned_steps):
-            moves.append({"command": "pause", "duration": 1.0})
 
     traj_dict = {
         "description": description,
@@ -4780,7 +5272,7 @@ def _plan_preview_points_payload(
         os.makedirs(utils.TRAJECTORY_CACHE_DIR, exist_ok=True)
         cache_path = os.path.join(utils.TRAJECTORY_CACHE_DIR, f"{preview_name}.json")
         with open(cache_path, "w") as f:
-            json.dump(utils._convert_numpy_to_list(planned_steps), f, indent=2)
+            json.dump(utils._convert_numpy_to_list(runtime_planned_steps), f, indent=2)
         print(f"[Pi Trajectory] Preview planned-steps cache saved to {cache_path}")
     except Exception as e:
         print(f"[Pi Trajectory] WARNING: Failed to save preview planned-steps cache: {e}")
@@ -4802,6 +5294,61 @@ def _plan_preview_points_payload(
                         if standard_pose_waypoints is not None and index < len(standard_pose_waypoints)
                         else "linear"
                     ),
+                    "linear_speed_mm_s": (
+                        round(
+                            float(
+                                _coerce_optional_positive_speed(
+                                    planned_steps[index].get("linear_speed_mm_s") if index < len(planned_steps) else None
+                                )
+                            ),
+                            3,
+                        )
+                        if index < len(planned_steps)
+                        and _coerce_optional_positive_speed(planned_steps[index].get("linear_speed_mm_s")) is not None
+                        else None
+                    ),
+                    "linear_acceleration_mm_s2": (
+                        round(
+                            float(
+                                _coerce_optional_positive_speed(
+                                    planned_steps[index].get("linear_acceleration_mm_s2")
+                                    if index < len(planned_steps)
+                                    else None
+                                )
+                            ),
+                            3,
+                        )
+                        if index < len(planned_steps)
+                        and _coerce_optional_positive_speed(
+                            planned_steps[index].get("linear_acceleration_mm_s2")
+                        ) is not None
+                        else None
+                    ),
+                    "rotation_speed_deg_s": (
+                        round(
+                            float(
+                                _coerce_optional_positive_speed(
+                                    planned_steps[index].get("rotation_speed_deg_s") if index < len(planned_steps) else None
+                                )
+                            ),
+                            3,
+                        )
+                        if index < len(planned_steps)
+                        and _coerce_optional_positive_speed(planned_steps[index].get("rotation_speed_deg_s")) is not None
+                        else None
+                    ),
+                    "pause_after_s": (
+                        round(
+                            float(
+                                _extract_waypoint_pause_after_s(standard_pose_waypoints[index])
+                            ),
+                            3,
+                        )
+                        if standard_pose_waypoints is not None
+                        and index < len(standard_pose_waypoints)
+                        and _extract_waypoint_pause_after_s(standard_pose_waypoints[index]) is not None
+                        else None
+                    ),
                     "orientation_euler_deg": (
                         {
                             "roll": round(float(item["orientation_euler_deg"][0]), 2),
@@ -4819,7 +5366,7 @@ def _plan_preview_points_payload(
         "file_path": preview_path,
         "step_summaries": [
             {"type": step.get("type"), "freq": step.get("freq"), "points": len(step.get("path", []))}
-            for step in planned_steps
+            for step in runtime_planned_steps
         ],
     }
     planner_diag = utils.trajectory_state.get("last_planner_diagnostics")

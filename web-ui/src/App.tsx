@@ -50,6 +50,7 @@ import {
   encodePointsForApi,
   encodePoseWaypointsForApi,
   coercePoseWaypointList,
+  mergePoseWaypointMotionMetadata,
   previewFromPlannerPayload,
   previewFromTrajectoryDetail,
   type PlannerDiagnostics,
@@ -240,6 +241,29 @@ type PlannerFailureState = {
   plannerDiagnostics?: PlannerDiagnostics;
 };
 
+type EditableProgramMove = {
+  moveIndex: number;
+  waypointIndex: number;
+  moveType: WaypointMoveType;
+  startWaypointIndex: number;
+  endWaypointIndex: number;
+  moveDistanceMm: number;
+  speedMode: "linear" | "angular";
+  speedValue: number | null;
+  speedUnitLabel: string;
+  speedStep: number;
+  hasCustomSpeed: boolean;
+  supportsAccelerationEdit: boolean;
+  accelerationValue: number | null;
+  accelerationUnitLabel: string;
+  accelerationStep: number;
+  hasCustomAcceleration: boolean;
+  supportsPauseEdit: boolean;
+  pauseAfterSeconds: number | null;
+  pauseStep: number;
+  hasCustomPause: boolean;
+};
+
 function parseApiErrorPayload(rawBody: string, fallbackMessage: string): PlannerFailureState {
   const trimmedBody = rawBody.trim();
   if (!trimmedBody) {
@@ -283,6 +307,7 @@ async function readApiErrorResponse(response: Response): Promise<PlannerFailureS
 
 const LIVE_JOINT_FALLBACK_MAX_AGE_S = LIVE_MONITOR_STALE_MS / 1000;
 const TERMINAL_MOTION_STATES = new Set(["idle", "completed", "aborted", "faulted", "underrun", "timeout"]);
+const FAILED_MOTION_STATES = new Set(["aborted", "faulted", "underrun", "timeout"]);
 
 function areJointArraysClose(a: number[] | undefined, b: number[]): boolean {
   if (!Array.isArray(a) || a.length !== b.length) {
@@ -353,25 +378,13 @@ type ShellPaneLayout = Pick<
   "leftPaneWidthPx" | "rightPaneWidthPx" | "timelineHeightPx"
 >;
 
-type ActiveShellDrag =
-  | {
-      kind: "left";
-      startX: number;
-      startY: number;
-      initialLayout: ShellPaneLayout;
-    }
-  | {
-      kind: "right";
-      startX: number;
-      startY: number;
-      initialLayout: ShellPaneLayout;
-    }
-  | {
-      kind: "timeline";
-      startX: number;
-      startY: number;
-      initialLayout: ShellPaneLayout;
-    };
+type ActiveShellDrag = {
+  kind: "left" | "right" | "timeline" | "rightDock";
+  startX: number;
+  startY: number;
+  initialLayout: ShellPaneLayout;
+  initialProgramTreeHeightPx: number;
+};
 
 type ToolOffsetMm = {
   position_mm: Axis3;
@@ -478,6 +491,7 @@ type RuntimeConfigSnapshot = {
   active_error?: string | null;
   desired: {
     robot: string;
+    sim_mode?: boolean;
     active_tool_id?: string | null;
     allow_unsafe_overrides?: boolean;
     overrides?: {
@@ -511,6 +525,7 @@ type PersistedSettings = {
   leftPaneWidthPx: number;
   rightPaneWidthPx: number;
   timelineHeightPx: number;
+  programTreeHeightPx: number;
 };
 
 type SidebarPanelId = "step" | "trajectory" | "tools" | "weld" | "telemetry";
@@ -630,6 +645,8 @@ const WELD_META_TEXT_CLASS = DRAWER_META_TEXT_CLASS;
 const WELD_SECTION_TITLE_CLASS = DRAWER_SECTION_TITLE_CLASS;
 const WORK_ANGLE_HELP_LIMIT_DEG = 80;
 const TRAVEL_ANGLE_HELP_LIMIT_DEG = 60;
+const TRAJECTORY_MOVE_POSITION_EPS_M = 1e-5;
+const TRAJECTORY_MOVE_ROTATION_EPS_DEG = 1e-2;
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -712,6 +729,9 @@ type MotionStatusCardProps = {
   motionStatus: MotionStatusResponse | null;
   isSubmitting?: boolean;
   submittingLabel?: string;
+  alwaysVisible?: boolean;
+  compact?: boolean;
+  fixedHeightClassName?: string;
 };
 
 function MotionStatusCard({
@@ -719,39 +739,28 @@ function MotionStatusCard({
   motionStatus,
   isSubmitting = false,
   submittingLabel = "Submitting motion request…",
+  alwaysVisible = false,
+  compact = false,
+  fixedHeightClassName = "",
 }: MotionStatusCardProps) {
-  if (!isSubmitting && !shouldShowMotionStatus(motionStatus)) {
+  if (!alwaysVisible && !isSubmitting && !shouldShowMotionStatus(motionStatus)) {
     return null;
   }
-
-  if (isSubmitting) {
-    return (
-      <div className="rounded border border-cyan-400/30 bg-cyan-500/10 px-2 py-2">
-        <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-200/90">
-          {title}
-        </div>
-        <div className="text-[12px] leading-5 text-cyan-100/90">{submittingLabel}</div>
-      </div>
-    );
-  }
-
-  if (!motionStatus) {
-    return null;
-  }
-
-  const state = normalizeMotionState(motionStatus);
-  const trajectoryId = resolveMotionTrajectoryId(motionStatus);
-  const queueDepth = motionStatus.execution?.queue_depth;
-  const queueCapacity = motionStatus.execution?.queue_capacity;
-  const source = motionStatus.source_of_truth ?? "controller";
-  const scope = motionStatus.completion_scope ?? "unknown";
-  const program = motionStatus.program;
-  const toneClasses = isMotionActive(motionStatus)
+  const state = isSubmitting ? "submitting" : (motionStatus ? normalizeMotionState(motionStatus) : "idle");
+  const trajectoryId = motionStatus ? resolveMotionTrajectoryId(motionStatus) : null;
+  const queueDepth = motionStatus?.execution?.queue_depth;
+  const queueCapacity = motionStatus?.execution?.queue_capacity;
+  const source = motionStatus?.source_of_truth ?? "controller";
+  const scope = motionStatus?.completion_scope ?? "unknown";
+  const program = motionStatus?.program;
+  const motionActive = isSubmitting || isMotionActive(motionStatus);
+  const toneClasses = motionActive
     ? {
         wrapper: "border-cyan-400/30 bg-cyan-500/10",
         title: "text-cyan-200/90",
         text: "text-cyan-100/90",
         badge: "border-cyan-300/40 bg-cyan-400/15 text-cyan-100",
+        meta: "border-cyan-300/20 bg-cyan-400/10 text-cyan-100/80",
       }
     : state === "completed"
       ? {
@@ -759,18 +768,36 @@ function MotionStatusCard({
           title: "text-emerald-200/90",
           text: "text-emerald-100/90",
           badge: "border-emerald-300/40 bg-emerald-400/15 text-emerald-100",
+          meta: "border-emerald-300/20 bg-emerald-400/10 text-emerald-100/80",
         }
-      : {
-          wrapper: "border-amber-400/30 bg-amber-500/10",
-          title: "text-amber-200/90",
-          text: "text-amber-100/90",
-          badge: "border-amber-300/40 bg-amber-400/15 text-amber-100",
-        };
+      : state === "idle"
+        ? {
+            wrapper: "border-slate-700/60 bg-slate-950/45",
+            title: "text-slate-300/90",
+            text: "text-slate-200/90",
+            badge: "border-slate-600/70 bg-slate-900/70 text-slate-200",
+            meta: "border-slate-700/60 bg-slate-900/55 text-slate-300/85",
+          }
+        : FAILED_MOTION_STATES.has(state)
+          ? {
+              wrapper: "border-rose-400/30 bg-rose-500/10",
+              title: "text-rose-200/90",
+              text: "text-rose-100/90",
+              badge: "border-rose-300/40 bg-rose-400/15 text-rose-100",
+              meta: "border-rose-300/20 bg-rose-400/10 text-rose-100/80",
+            }
+          : {
+              wrapper: "border-amber-400/30 bg-amber-500/10",
+              title: "text-amber-200/90",
+              text: "text-amber-100/90",
+              badge: "border-amber-300/40 bg-amber-400/15 text-amber-100",
+              meta: "border-amber-300/20 bg-amber-400/10 text-amber-100/80",
+            };
   const detailParts = [`source ${source}`, `scope ${scope}`];
-  if (motionStatus.runtime_mode) {
+  if (motionStatus?.runtime_mode) {
     detailParts.push(`runtime ${motionStatus.runtime_mode}`);
   }
-  if (motionStatus.execution_mode) {
+  if (motionStatus?.execution_mode) {
     detailParts.push(`request ${motionStatus.execution_mode}`);
   }
   if (typeof queueDepth === "number" && Number.isFinite(queueDepth)) {
@@ -780,7 +807,7 @@ function MotionStatusCard({
         : `queue ${queueDepth}`,
     );
   }
-  if (motionStatus.execution?.controller_motion_state) {
+  if (motionStatus?.execution?.controller_motion_state) {
     detailParts.push(`controller ${motionStatus.execution.controller_motion_state}`);
   }
   if (program?.name) {
@@ -790,7 +817,7 @@ function MotionStatusCard({
     detailParts.push(`program path ${program.segment_execution_policy}`);
   }
   const detailMessage =
-    typeof motionStatus.detail === "string" && motionStatus.detail.trim()
+    typeof motionStatus?.detail === "string" && motionStatus.detail.trim()
       ? motionStatus.detail.trim()
       : "";
 
@@ -830,6 +857,89 @@ function MotionStatusCard({
     }
   }
 
+  const stateLabel = state.replace(/_/g, " ");
+  const summaryText = isSubmitting
+    ? submittingLabel
+    : motionActive
+      ? (program?.name ? `${program.name} is currently executing.` : "Controller is executing the latest motion request.")
+      : state === "completed"
+        ? (program?.name ? `${program.name} completed successfully.` : "Latest motion request completed.")
+        : state === "idle"
+          ? "No controller execution in progress."
+          : detailMessage || `Latest motion request ended in ${stateLabel}.`;
+  const runtimeValue = motionStatus?.runtime_mode?.trim().toUpperCase()
+    || motionStatus?.execution?.active_mode_name?.trim().toUpperCase()
+    || "READY";
+  const requestValue = motionStatus?.execution_mode?.trim().toUpperCase()
+    || (isSubmitting ? "PENDING" : "IDLE");
+  const progressValue = (
+    typeof program?.current_step_index === "number" &&
+    typeof program?.step_count === "number" &&
+    program.step_count > 0
+  )
+    ? `${program.current_step_index + 1}/${program.step_count}`
+    : (
+        typeof program?.completed_step_count === "number" &&
+        typeof program?.step_count === "number" &&
+        program.step_count > 0
+      )
+      ? `${program.completed_step_count}/${program.step_count}`
+      : (typeof queueDepth === "number" && Number.isFinite(queueDepth))
+        ? (typeof queueCapacity === "number" && Number.isFinite(queueCapacity) && queueCapacity > 0
+            ? `${queueDepth}/${queueCapacity}`
+            : `${queueDepth}`)
+        : state === "completed"
+          ? "done"
+          : state === "idle"
+            ? "waiting"
+            : stateLabel;
+  const compactMeta = [
+    { label: "Runtime", value: runtimeValue },
+    { label: "Request", value: requestValue },
+    { label: trajectoryId !== null ? "Traj" : "Program", value: trajectoryId !== null ? String(trajectoryId) : (program?.name?.trim() || "none") },
+    { label: "Progress", value: progressValue },
+  ];
+  const compactDetail = detailMessage || programSummaryParts.join(" | ") || detailParts.join(" | ");
+
+  if (compact) {
+    return (
+      <div className={`flex flex-col rounded-xl border px-3 py-2.5 ${toneClasses.wrapper} ${fixedHeightClassName}`.trim()}>
+        <div className="flex items-start justify-between gap-2">
+          <div className={`text-[10px] font-semibold uppercase tracking-[0.16em] ${toneClasses.title}`}>
+            {title}
+          </div>
+          <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] ${toneClasses.badge}`}>
+            {stateLabel}
+          </span>
+        </div>
+        <div className={`mt-2 text-[12px] font-medium leading-4 ${toneClasses.text}`}>
+          {summaryText}
+        </div>
+        <div
+          className={`mt-1 truncate text-[10px] leading-4 ${toneClasses.text} opacity-80`}
+          title={compactDetail || undefined}
+        >
+          {compactDetail || "Awaiting the next trajectory execution request."}
+        </div>
+        <div className="mt-auto grid grid-cols-4 gap-1.5 pt-2">
+          {compactMeta.map((item) => (
+            <div
+              key={`${title}-${item.label}`}
+              className={`min-w-0 rounded-md border px-1.5 py-1 ${toneClasses.meta}`}
+            >
+              <div className="truncate text-[8px] font-semibold uppercase tracking-[0.16em] opacity-75">
+                {item.label}
+              </div>
+              <div className="truncate text-[10px] font-semibold">
+                {item.value}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`rounded border px-2 py-2 ${toneClasses.wrapper}`}>
       <div className={`mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${toneClasses.title}`}>
@@ -837,7 +947,7 @@ function MotionStatusCard({
       </div>
       <div className="mb-1 flex items-center gap-2">
         <span className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] ${toneClasses.badge}`}>
-          {state}
+          {stateLabel}
         </span>
         {trajectoryId !== null ? (
           <span className={`text-[11px] font-semibold ${toneClasses.text}`}>traj {trajectoryId}</span>
@@ -875,12 +985,15 @@ const SETTINGS_STORAGE_KEY = "gradient-ui:settings";
 const DEFAULT_LEFT_PANE_WIDTH_PX = 368;
 const DEFAULT_RIGHT_PANE_WIDTH_PX = 384;
 const DEFAULT_TIMELINE_HEIGHT_PX = 188;
+const DEFAULT_PROGRAM_TREE_HEIGHT_PX = 320;
 const MIN_LEFT_PANE_WIDTH_PX = 220;
 const MAX_LEFT_PANE_WIDTH_PX = 640;
 const MIN_RIGHT_PANE_WIDTH_PX = 220;
 const MAX_RIGHT_PANE_WIDTH_PX = 560;
 const MIN_TIMELINE_HEIGHT_PX = 72;
 const MAX_TIMELINE_HEIGHT_PX = 520;
+const MIN_PROGRAM_TREE_HEIGHT_PX = 180;
+const MIN_ROBOT_CONTROL_HEIGHT_PX = 220;
 const MIN_CENTER_STAGE_WIDTH_PX = 320;
 const SHELL_SPLITTER_SIZE_PX = 8;
 const SHELL_WIDTH_CHROME_PX = 120;
@@ -1028,6 +1141,22 @@ function sameShellPaneLayout(a: ShellPaneLayout, b: ShellPaneLayout): boolean {
   );
 }
 
+function clampProgramTreePaneHeight(value: unknown, containerHeight: number): number {
+  const safeContainerHeight =
+    Number.isFinite(containerHeight) && containerHeight > 0
+      ? containerHeight
+      : DEFAULT_PROGRAM_TREE_HEIGHT_PX + MIN_ROBOT_CONTROL_HEIGHT_PX + SHELL_SPLITTER_SIZE_PX;
+  const maxProgramTreeHeight = Math.max(
+    MIN_PROGRAM_TREE_HEIGHT_PX,
+    safeContainerHeight - MIN_ROBOT_CONTROL_HEIGHT_PX - SHELL_SPLITTER_SIZE_PX,
+  );
+  return clamp(
+    coercePaneSize(value, DEFAULT_PROGRAM_TREE_HEIGHT_PX),
+    MIN_PROGRAM_TREE_HEIGHT_PX,
+    maxProgramTreeHeight,
+  );
+}
+
 function loadPersistedSettings(): PersistedSettings {
   const defaults: PersistedSettings = {
     showBoundingBox: true,
@@ -1045,6 +1174,7 @@ function loadPersistedSettings(): PersistedSettings {
     leftPaneWidthPx: DEFAULT_LEFT_PANE_WIDTH_PX,
     rightPaneWidthPx: DEFAULT_RIGHT_PANE_WIDTH_PX,
     timelineHeightPx: DEFAULT_TIMELINE_HEIGHT_PX,
+    programTreeHeightPx: DEFAULT_PROGRAM_TREE_HEIGHT_PX,
   };
   if (typeof window === "undefined") {
     return defaults;
@@ -1115,6 +1245,10 @@ function loadPersistedSettings(): PersistedSettings {
         leftPaneWidthPx: coercePaneSize(parsed.leftPaneWidthPx, defaults.leftPaneWidthPx),
         rightPaneWidthPx: coercePaneSize(parsed.rightPaneWidthPx, defaults.rightPaneWidthPx),
         timelineHeightPx: coercePaneSize(parsed.timelineHeightPx, defaults.timelineHeightPx),
+        programTreeHeightPx: coercePaneSize(
+          parsed.programTreeHeightPx,
+          defaults.programTreeHeightPx,
+        ),
       };
     }
   } catch {
@@ -1527,7 +1661,19 @@ function normalizeWeldDraftRecord(
 
 function buildPoseWaypoint(
   point: Point3,
-  orientation?: Partial<Pick<PoseWaypoint, "rollDeg" | "pitchDeg" | "yawDeg" | "moveType">> | null,
+  orientation?: Partial<
+    Pick<
+      PoseWaypoint,
+      | "rollDeg"
+      | "pitchDeg"
+      | "yawDeg"
+      | "moveType"
+      | "linearSpeedMmPerSec"
+      | "linearAccelerationMmPerSec2"
+      | "rotationSpeedDegPerSec"
+      | "pauseAfterSeconds"
+    >
+  > | null,
 ): PoseWaypoint {
   return {
     x: Number(point.x),
@@ -1540,7 +1686,71 @@ function buildPoseWaypoint(
       orientation?.moveType === "joint" || orientation?.moveType === "home"
         ? orientation.moveType
         : "linear",
+    linearSpeedMmPerSec:
+      Number.isFinite(Number(orientation?.linearSpeedMmPerSec)) && Number(orientation?.linearSpeedMmPerSec) > 0
+        ? Number(orientation?.linearSpeedMmPerSec)
+        : null,
+    linearAccelerationMmPerSec2:
+      Number.isFinite(Number(orientation?.linearAccelerationMmPerSec2)) &&
+      Number(orientation?.linearAccelerationMmPerSec2) > 0
+        ? Number(orientation?.linearAccelerationMmPerSec2)
+        : null,
+    rotationSpeedDegPerSec:
+      Number.isFinite(Number(orientation?.rotationSpeedDegPerSec)) && Number(orientation?.rotationSpeedDegPerSec) > 0
+        ? Number(orientation?.rotationSpeedDegPerSec)
+        : null,
+    pauseAfterSeconds:
+      Number.isFinite(Number(orientation?.pauseAfterSeconds)) && Number(orientation?.pauseAfterSeconds) > 0
+        ? Number(orientation?.pauseAfterSeconds)
+        : null,
   };
+}
+
+function wrappedAngleDeltaDeg(left: number, right: number): number {
+  return Math.abs((((left - right) % 360) + 540) % 360 - 180);
+}
+
+function poseWaypointRotationDeltaDeg(start: PoseWaypoint | null | undefined, end: PoseWaypoint): number {
+  if (
+    !start ||
+    start.rollDeg === null ||
+    start.pitchDeg === null ||
+    start.yawDeg === null ||
+    end.rollDeg === null ||
+    end.pitchDeg === null ||
+    end.yawDeg === null
+  ) {
+    return 0;
+  }
+  return Math.max(
+    wrappedAngleDeltaDeg(end.rollDeg, start.rollDeg),
+    wrappedAngleDeltaDeg(end.pitchDeg, start.pitchDeg),
+    wrappedAngleDeltaDeg(end.yawDeg, start.yawDeg),
+  );
+}
+
+function poseWaypointTranslationDistanceM(start: PoseWaypoint | null | undefined, end: PoseWaypoint): number {
+  if (!start) {
+    return 0;
+  }
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  const dz = end.z - start.z;
+  return Math.sqrt((dx * dx) + (dy * dy) + (dz * dz));
+}
+
+function shouldUseAngularMoveSpeed(start: PoseWaypoint | null | undefined, end: PoseWaypoint): boolean {
+  if (end.moveType === "joint" || end.moveType === "home") {
+    return true;
+  }
+  if (!start) {
+    return false;
+  }
+  const translationDistance = poseWaypointTranslationDistanceM(start, end);
+  return (
+    translationDistance <= TRAJECTORY_MOVE_POSITION_EPS_M &&
+    poseWaypointRotationDeltaDeg(start, end) > TRAJECTORY_MOVE_ROTATION_EPS_DEG
+  );
 }
 
 function poseOrientationSummary(waypoint: PoseWaypoint): string {
@@ -1557,17 +1767,18 @@ function poseOrientationSummary(waypoint: PoseWaypoint): string {
   return `${moveSummary}, R ${Number(waypoint.rollDeg).toFixed(1)} deg, P ${Number(waypoint.pitchDeg).toFixed(1)} deg, Y ${Number(waypoint.yawDeg).toFixed(1)} deg`;
 }
 
-function previewPlanMatchesWaypoints(plan: PreviewPlan | null, waypoints: PoseWaypoint[]): boolean {
-  if (!plan || plan.waypoints.length !== waypoints.length) {
+function clonePoseWaypointList(waypoints: PoseWaypoint[]): PoseWaypoint[] {
+  return waypoints.map((waypoint) => ({ ...waypoint }));
+}
+
+function poseWaypointListsMatch(left: PoseWaypoint[], right: PoseWaypoint[]): boolean {
+  if (left.length !== right.length) {
     return false;
   }
   const posTolerance = 1e-4;
   const orientToleranceDeg = 0.5;
-  return waypoints.every((waypoint, index) => {
-    const planned = plan.waypoints[index];
-    if (!planned) {
-      return false;
-    }
+  return left.every((waypoint, index) => {
+    const planned = right[index];
     const positionMatches =
       Math.abs(planned.x - waypoint.x) <= posTolerance &&
       Math.abs(planned.y - waypoint.y) <= posTolerance &&
@@ -1576,6 +1787,18 @@ function previewPlanMatchesWaypoints(plan: PreviewPlan | null, waypoints: PoseWa
       return false;
     }
     if ((waypoint.moveType ?? "linear") !== (planned.moveType ?? "linear")) {
+      return false;
+    }
+    if ((waypoint.linearSpeedMmPerSec ?? null) !== (planned.linearSpeedMmPerSec ?? null)) {
+      return false;
+    }
+    if ((waypoint.linearAccelerationMmPerSec2 ?? null) !== (planned.linearAccelerationMmPerSec2 ?? null)) {
+      return false;
+    }
+    if ((waypoint.rotationSpeedDegPerSec ?? null) !== (planned.rotationSpeedDegPerSec ?? null)) {
+      return false;
+    }
+    if ((waypoint.pauseAfterSeconds ?? null) !== (planned.pauseAfterSeconds ?? null)) {
       return false;
     }
     const authoredValues = [waypoint.rollDeg, waypoint.pitchDeg, waypoint.yawDeg];
@@ -1594,6 +1817,13 @@ function previewPlanMatchesWaypoints(plan: PreviewPlan | null, waypoints: PoseWa
   });
 }
 
+function previewPlanMatchesWaypoints(plan: PreviewPlan | null, waypoints: PoseWaypoint[]): boolean {
+  if (!plan) {
+    return false;
+  }
+  return poseWaypointListsMatch(plan.waypoints, waypoints);
+}
+
 function pointDistanceSquared(a: Point3, b: Point3): number {
   const dx = a.x - b.x;
   const dy = a.y - b.y;
@@ -1602,7 +1832,15 @@ function pointDistanceSquared(a: Point3, b: Point3): number {
 }
 
 function describeWaypointMoveType(moveType: WaypointMoveType): string {
-  return moveType === "joint" ? "joint move" : moveType === "home" ? "home move" : "linear move";
+  return moveType === "joint" ? "Joint move" : moveType === "home" ? "Move to home" : "Linear move";
+}
+
+function formatPauseAfterSecondsLabel(seconds: number): string {
+  return `${Number(seconds.toFixed(seconds >= 10 ? 0 : 1))}s pause`;
+}
+
+function describeTrajectoryControlPointKind(moveType: WaypointMoveType): string {
+  return moveType === "linear" ? "Pose Capture" : "Waypoint";
 }
 
 function buildOrderedWaypointPathIndices(pathPoints: Point3[], waypoints: Point3[]): number[] {
@@ -1827,10 +2065,12 @@ function TelemetryPanel({ latest }: { latest: TelemetryEvent | null }) {
 function PaneResizeHandle({
   orientation,
   active = false,
+  ariaLabel,
   onPointerDown,
 }: {
   orientation: "vertical" | "horizontal";
   active?: boolean;
+  ariaLabel?: string;
   onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => void;
 }) {
   const isVertical = orientation === "vertical";
@@ -1842,7 +2082,7 @@ function PaneResizeHandle({
     >
       <button
         type="button"
-        aria-label={isVertical ? "Resize side panes" : "Resize timeline height"}
+        aria-label={ariaLabel ?? (isVertical ? "Resize side panes" : "Resize timeline height")}
         onPointerDown={onPointerDown}
         className={`group relative flex items-center justify-center rounded-full border border-slate-800/80 bg-slate-950/88 transition ${
           isVertical
@@ -2080,6 +2320,33 @@ function TrajectoryPanel({
   const canRunLive = runtimeMode === "live" && hasRunnablePreview;
   const hasDraftWaypoints = plannerPoints.length > 0;
   const interactionLocked = isPlanLoading || isSubmittingRun || isMotionActive;
+  const runtimeModeLabel = runtimeMode === "simulate" ? "SIM" : runtimeMode === "live" ? "LIVE" : "UNKNOWN";
+  const executionGuidance =
+    runtimeMode === "simulate"
+      ? "Simulated execution is available while the controller is running in SIM mode."
+      : runtimeMode === "live"
+        ? "Simulated execution is disabled while the controller is in LIVE mode. Use Run Trajectory for the real robot, or switch the controller to SIM."
+        : "Connect to the controller to resolve whether SIM or LIVE execution is currently available.";
+  const simulateDisabledReason =
+    interactionLocked
+      ? "Execution is temporarily locked while planning or another motion is active."
+      : !hasRunnablePreview
+        ? "Create or regenerate a fresh trajectory preview before simulating."
+        : runtimeMode === "live"
+          ? "Simulated execution is only available while the controller is in SIM mode."
+          : runtimeMode === null
+            ? "Connect to the controller to resolve the active runtime mode."
+            : null;
+  const runDisabledReason =
+    interactionLocked
+      ? "Execution is temporarily locked while planning or another motion is active."
+      : !hasRunnablePreview
+        ? "Create or regenerate a fresh trajectory preview before running."
+        : runtimeMode === "simulate"
+          ? "Live execution is unavailable while the controller is in SIM mode."
+          : runtimeMode === null
+            ? "Connect to the controller to resolve the active runtime mode."
+            : null;
   const savedPlanIsStale = Boolean(preview?.isStale);
   const planningWarnings = preview?.planningWarnings ?? [];
   const activePlannerDiagnostics = plannerFailure?.plannerDiagnostics ?? preview?.plannerDiagnostics;
@@ -2178,43 +2445,16 @@ function TrajectoryPanel({
       return parts.join(" | ");
     },
   );
-  const statusLabel = isPlanLoading
-    ? "Planning"
-    : isSubmittingRun
-      ? "Submitting"
-      : isPlanning
-        ? "Editing"
-        : preview
-          ? "Ready"
-          : "Idle";
-
   return (
     <div className="pointer-events-auto w-full">
-      <div className="mb-3 rounded-xl border border-slate-700/60 bg-slate-950/45 px-3 py-3">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200/80">
-              Trajectory Authoring
-            </div>
-            <div className="mt-1 text-[13px] leading-5 text-slate-300/90">
-              Build waypoint-based robot motion with pose capture, IK-planned interpolation, and explicit SIM/LIVE execution.
-            </div>
-          </div>
-          <div className="flex flex-col items-end gap-1">
-            <span className="rounded border border-slate-700/70 bg-slate-900/70 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200">
-              {statusLabel}
-            </span>
-            <span className="rounded border border-slate-700/70 bg-slate-900/70 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-200">
-              {runtimeMode === "simulate" ? "SIM" : runtimeMode === "live" ? "LIVE" : "UNKNOWN"}
-            </span>
-          </div>
-        </div>
-      </div>
       <MotionStatusCard
         title="Execution Status"
         motionStatus={motionStatus}
         isSubmitting={isSubmittingRun}
         submittingLabel="Submitting trajectory run..."
+        alwaysVisible
+        compact
+        fixedHeightClassName="h-[112px]"
       />
       <div className="mt-3 rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-3">
         <div className="mb-2 flex items-center justify-between">
@@ -2360,13 +2600,16 @@ function TrajectoryPanel({
       <div className="mt-3 rounded-xl border border-slate-700/60 bg-slate-950/40 px-3 py-3">
         <div className="mb-2 flex items-center justify-between">
           <span className={DRAWER_SECTION_TITLE_CLASS}>Execution</span>
-          <span className={DRAWER_META_TEXT_CLASS}>preview draws path locally</span>
+          <span className={DRAWER_META_TEXT_CLASS}>path preview is local</span>
         </div>
         <div className="mb-3 rounded-lg border border-slate-700/60 bg-slate-900/35 px-2.5 py-2 text-[12px] leading-5 text-slate-300/90">
-          Only <span className="font-semibold text-slate-100">Simulate Trajectory</span> is allowed in SIM mode.
-          <span className="block">
-            <span className="font-semibold text-slate-100">Run Trajectory</span> is only enabled in LIVE mode.
-          </span>
+          <div className="mb-1 flex items-center gap-2">
+            <span className="rounded border border-slate-700/70 bg-slate-900/60 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-200">
+              Runtime {runtimeModeLabel}
+            </span>
+          </div>
+          <div>Preview path is already drawn locally in the authoring stage.</div>
+          <div className="mt-1">{executionGuidance}</div>
         </div>
         <label
           className={`mb-3 flex cursor-pointer items-start gap-3 rounded-lg border border-slate-700/60 bg-slate-900/35 px-2.5 py-2 ${
@@ -2392,8 +2635,9 @@ function TrajectoryPanel({
             type="button"
             onClick={onSimulate}
             disabled={!canSimulate || interactionLocked}
+            title={simulateDisabledReason ?? "Send the planned path to the controller running in SIM mode."}
             className={`rounded-xl border border-cyan-500/50 bg-cyan-500/10 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-cyan-100 transition hover:border-cyan-300 hover:text-cyan-50 ${
-              !canSimulate || interactionLocked ? "opacity-60" : ""
+              !canSimulate || interactionLocked ? "cursor-not-allowed opacity-60" : ""
             }`}
           >
             Simulate Trajectory
@@ -2402,8 +2646,9 @@ function TrajectoryPanel({
             type="button"
             onClick={onRunLive}
             disabled={!canRunLive || interactionLocked}
+            title={runDisabledReason ?? "Execute the planned path on the current LIVE controller."}
             className={`rounded-xl border border-rose-500/50 bg-rose-500/10 px-3 py-2 ${DRAWER_ACTION_TEXT_CLASS} text-rose-100 transition hover:border-rose-300 hover:text-rose-50 ${
-              !canRunLive || interactionLocked ? "opacity-60" : ""
+              !canRunLive || interactionLocked ? "cursor-not-allowed opacity-60" : ""
             }`}
           >
             Run Trajectory
@@ -4525,6 +4770,7 @@ export default function App() {
   const [robotOptions, setRobotOptions] = useState<RobotPolicyOption[]>([]);
   const [runtimeConfigSnapshot, setRuntimeConfigSnapshot] = useState<RuntimeConfigSnapshot | null>(null);
   const [selectedRobotName, setSelectedRobotName] = useState("");
+  const [selectedRuntimeMode, setSelectedRuntimeMode] = useState<RuntimeExecutionMode>("live");
   const [selectedRtMaxRpmInput, setSelectedRtMaxRpmInput] = useState("6000");
   const [toolLibrary, setToolLibrary] = useState<ToolDefinition[]>([]);
   const [selectedToolId, setSelectedToolId] = useState("identity");
@@ -4555,6 +4801,7 @@ export default function App() {
   const [isPlanning, setIsPlanning] = useState(false);
   const [isPlanLoading, setIsPlanLoading] = useState(false);
   const [isRunningPreview, setIsRunningPreview] = useState(false);
+  const [showTrajectoryRunPreparationOverlay, setShowTrajectoryRunPreparationOverlay] = useState(false);
   const [motionStatus, setMotionStatus] = useState<MotionStatusResponse | null>(null);
   const [savedTrajectories, setSavedTrajectories] = useState<string[]>([]);
   const [isTrajectoryListLoading, setIsTrajectoryListLoading] = useState(false);
@@ -4564,6 +4811,8 @@ export default function App() {
   const [trajectoryProgramName, setTrajectoryProgramName] = useState("trajectory_program");
   const [isSavingTrajectoryProgram, setIsSavingTrajectoryProgram] = useState(false);
   const [loadedTrajectoryMetadata, setLoadedTrajectoryMetadata] = useState<Record<string, unknown> | null>(null);
+  const [savedTrajectoryWaypoints, setSavedTrajectoryWaypoints] = useState<PoseWaypoint[]>([]);
+  const [trajectoryDraftHistory, setTrajectoryDraftHistory] = useState<PoseWaypoint[][]>([]);
   const [selectedTimelineSyntheticId, setSelectedTimelineSyntheticId] = useState<string | null>(null);
   const [isHoming, setIsHoming] = useState(false);
   const [alerts, setAlerts] = useState<Alert[]>([]);
@@ -4609,6 +4858,7 @@ export default function App() {
   const plannerPointsRef = useRef<PoseWaypoint[]>(plannerPoints);
   const previewPlanRef = useRef<PreviewPlan | null>(previewPlan);
   const trajectoryPreviewAbortRef = useRef<AbortController | null>(null);
+  const trajectoryPreviewDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const normalizedApiHost = useMemo(() => normaliseApiHost(apiHost), [apiHost]);
   const motionStatusActive = useMemo(() => isMotionActive(motionStatus), [motionStatus]);
   const normalisedVisionHost = useMemo(
@@ -4645,6 +4895,21 @@ export default function App() {
     trajectoryPreviewAbortRef.current = null;
   }, []);
 
+  const clearTrajectoryPreviewDebounce = useCallback(() => {
+    if (!trajectoryPreviewDebounceRef.current) {
+      return;
+    }
+    clearTimeout(trajectoryPreviewDebounceRef.current);
+    trajectoryPreviewDebounceRef.current = null;
+  }, []);
+
+  useEffect(
+    () => () => {
+      clearTrajectoryPreviewDebounce();
+    },
+    [clearTrajectoryPreviewDebounce],
+  );
+
   const getLatestTrajectoryDraftWaypoints = useCallback((): PoseWaypoint[] => {
     const current = plannerPointsRef.current;
     return current.length > 0 ? current : previewPlanRef.current?.waypoints ?? [];
@@ -4671,10 +4936,45 @@ export default function App() {
   );
   const [activeShellDrag, setActiveShellDrag] = useState<ActiveShellDrag | null>(null);
   const shellPaneLayoutRef = useRef<ShellPaneLayout>(shellPaneLayout);
+  const rightDockContainerRef = useRef<HTMLDivElement | null>(null);
+  const [rightDockHeightPx, setRightDockHeightPx] = useState(0);
+  const [programTreeHeightPx, setProgramTreeHeightPx] = useState(() =>
+    clampProgramTreePaneHeight(settings.programTreeHeightPx, 0),
+  );
+  const programTreeHeightRef = useRef(programTreeHeightPx);
+  const rightDockHeightRef = useRef(rightDockHeightPx);
 
   useEffect(() => {
     shellPaneLayoutRef.current = shellPaneLayout;
   }, [shellPaneLayout]);
+
+  useEffect(() => {
+    programTreeHeightRef.current = programTreeHeightPx;
+  }, [programTreeHeightPx]);
+
+  useEffect(() => {
+    rightDockHeightRef.current = rightDockHeightPx;
+  }, [rightDockHeightPx]);
+
+  useEffect(() => {
+    const node = rightDockContainerRef.current;
+    if (!node) {
+      return;
+    }
+    const updateHeight = () => {
+      const measured = node.getBoundingClientRect().height;
+      setRightDockHeightPx((prev) => (Math.abs(prev - measured) < 1 ? prev : measured));
+    };
+    updateHeight();
+    const resizeObserver = new ResizeObserver(() => updateHeight());
+    resizeObserver.observe(node);
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const nextHeight = clampProgramTreePaneHeight(settings.programTreeHeightPx, rightDockHeightPx);
+    setProgramTreeHeightPx((prev) => (Math.abs(prev - nextHeight) < 1 ? prev : nextHeight));
+  }, [rightDockHeightPx, settings.programTreeHeightPx]);
 
   useEffect(() => {
     const handleViewportResize = () => {
@@ -4695,13 +4995,24 @@ export default function App() {
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
     document.body.style.cursor =
-      activeShellDrag.kind === "timeline" ? "row-resize" : "col-resize";
+      activeShellDrag.kind === "timeline" || activeShellDrag.kind === "rightDock"
+        ? "row-resize"
+        : "col-resize";
     document.body.style.userSelect = "none";
 
     const onPointerMove = (event: PointerEvent) => {
       const deltaX = event.clientX - activeShellDrag.startX;
       const deltaY = event.clientY - activeShellDrag.startY;
       const base = activeShellDrag.initialLayout;
+      if (activeShellDrag.kind === "rightDock") {
+        const nextProgramTreeHeight = clampProgramTreePaneHeight(
+          activeShellDrag.initialProgramTreeHeightPx + deltaY,
+          rightDockHeightRef.current,
+        );
+        programTreeHeightRef.current = nextProgramTreeHeight;
+        setProgramTreeHeightPx(nextProgramTreeHeight);
+        return;
+      }
       const next =
         activeShellDrag.kind === "left"
           ? {
@@ -4723,6 +5034,18 @@ export default function App() {
     };
 
     const stopDragging = () => {
+      if (activeShellDrag.kind === "rightDock") {
+        const finalProgramTreeHeight = clampProgramTreePaneHeight(
+          programTreeHeightRef.current,
+          rightDockHeightRef.current,
+        );
+        setProgramTreeHeightPx(finalProgramTreeHeight);
+        updateSettings({ programTreeHeightPx: finalProgramTreeHeight });
+        setActiveShellDrag(null);
+        document.body.style.cursor = previousCursor;
+        document.body.style.userSelect = previousUserSelect;
+        return;
+      }
       const finalLayout = clampShellPaneLayout(
         shellPaneLayoutRef.current,
         window.innerWidth,
@@ -4755,6 +5078,7 @@ export default function App() {
         startX: event.clientX,
         startY: event.clientY,
         initialLayout: shellPaneLayoutRef.current,
+        initialProgramTreeHeightPx: programTreeHeightRef.current,
       });
     },
     [],
@@ -4931,6 +5255,7 @@ export default function App() {
     setRobotOptions(nextRobots);
     setRuntimeConfigSnapshot(runtimePayload);
     const desiredRobot = runtimePayload?.desired?.robot;
+    const desiredSimMode = runtimePayload?.desired?.sim_mode;
     const desiredTool = runtimePayload?.desired?.active_tool_id;
     const desiredRtMaxRpm = runtimePayload?.desired?.overrides?.rt_max_rpm;
     const activeRtMaxRpm = runtimePayload?.active?.rtcore?.effective_max_rpm;
@@ -4948,6 +5273,17 @@ export default function App() {
         return desiredTool;
       }
       return previous || "identity";
+    });
+    setSelectedRuntimeMode((previous) => {
+      if (typeof desiredSimMode === "boolean") {
+        return desiredSimMode ? "simulate" : "live";
+      }
+      const activeMode = runtimePayload?.active?.mode?.sim ||
+        runtimePayload?.active?.servo_backend?.effective_backend === "simulation";
+      if (runtimePayload?.active) {
+        return activeMode ? "simulate" : "live";
+      }
+      return previous;
     });
     setSelectedRtMaxRpmInput(() => {
       if (typeof desiredRtMaxRpm === "number" && Number.isFinite(desiredRtMaxRpm)) {
@@ -5199,27 +5535,14 @@ export default function App() {
     }
   }, [fetchToolLibrarySnapshot, normalizedApiHost, toolDraft.tool_id]);
 
-  const handleApplyRuntimeConfig = useCallback(async () => {
-    if (!selectedRobotName) {
-      return;
-    }
-    const trimmedRtMaxRpm = selectedRtMaxRpmInput.trim();
-    const parsedRtMaxRpm = trimmedRtMaxRpm.length === 0 ? 6000 : Number(trimmedRtMaxRpm);
-    if (!Number.isFinite(parsedRtMaxRpm) || parsedRtMaxRpm < 0) {
-      setRuntimeConfigError("RTCore max RPM must be a number greater than or equal to 0.");
-      return;
-    }
+  const patchRuntimeConfig = useCallback(async (patch: Record<string, unknown>) => {
     setIsRuntimeConfigBusy(true);
     try {
       const response = await fetch(`${normalizedApiHost}/info/runtime-config`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          robot: selectedRobotName,
-          active_tool_id: selectedToolId || null,
-          overrides: {
-            rt_max_rpm: parsedRtMaxRpm,
-          },
+          ...patch,
           actor: "web-ui",
         }),
       });
@@ -5231,33 +5554,98 @@ export default function App() {
             : response.statusText || "Failed to update runtime config.";
         throw new Error(message);
       }
-      setRuntimeConfigSnapshot(payload as RuntimeConfigSnapshot);
+      const snapshot = payload as RuntimeConfigSnapshot;
+      setRuntimeConfigSnapshot(snapshot);
+      setSelectedRuntimeMode(snapshot?.desired?.sim_mode ? "simulate" : "live");
       setRuntimeConfigError(null);
+      return snapshot;
     } catch (err) {
       setRuntimeConfigError((err as Error).message);
       await fetchRuntimeConfigSnapshot().catch(() => undefined);
+      return null;
     } finally {
       setIsRuntimeConfigBusy(false);
     }
-  }, [fetchRuntimeConfigSnapshot, normalizedApiHost, selectedRobotName, selectedRtMaxRpmInput, selectedToolId]);
+  }, [fetchRuntimeConfigSnapshot, normalizedApiHost]);
 
-  const handleRestartController = useCallback(async () => {
-    if (!runtimeConfigSnapshot?.restart_required) {
+  const handleApplyRuntimeConfig = useCallback(async () => {
+    if (!selectedRobotName) {
       return;
     }
+    const trimmedRtMaxRpm = selectedRtMaxRpmInput.trim();
+    const parsedRtMaxRpm = trimmedRtMaxRpm.length === 0 ? 6000 : Number(trimmedRtMaxRpm);
+    if (!Number.isFinite(parsedRtMaxRpm) || parsedRtMaxRpm < 0) {
+      setRuntimeConfigError("RTCore max RPM must be a number greater than or equal to 0.");
+      return;
+    }
+    await patchRuntimeConfig({
+      robot: selectedRobotName,
+      active_tool_id: selectedToolId || null,
+      overrides: {
+        rt_max_rpm: parsedRtMaxRpm,
+      },
+    });
+  }, [patchRuntimeConfig, selectedRobotName, selectedRtMaxRpmInput, selectedToolId]);
+
+  const switchRuntimeMode = useCallback(async (nextMode: RuntimeExecutionMode) => {
+    const desiredMode: RuntimeExecutionMode | null =
+      runtimeConfigSnapshot?.desired?.sim_mode === true
+        ? "simulate"
+        : runtimeConfigSnapshot?.desired?.sim_mode === false
+          ? "live"
+          : runtimeMode;
+    if (desiredMode === nextMode && runtimeMode === nextMode) {
+      setSelectedRuntimeMode(nextMode);
+      return true;
+    }
+
     const confirmed = window.confirm(
-      "Request controller restart now? An external supervisor should restart it automatically.",
+      nextMode === "simulate"
+        ? "Switch controller into SIM mode now? The controller will stop active motion, wait for idle, and hot-swap to the simulation backend without restarting."
+        : "Switch controller into LIVE mode now? The controller will stop active motion, wait for idle, and hot-swap back to the hardware backend without restarting.",
     );
     if (!confirmed) {
-      return;
+      return false;
     }
+
+    setIsRuntimeConfigBusy(true);
+    setRuntimeConfigError(null);
+    try {
+      const response = await fetch(`${normalizedApiHost}/control/runtime-mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: nextMode }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        const message =
+          typeof payload?.detail === "string"
+            ? payload.detail
+            : response.statusText || "Failed to switch runtime mode.";
+        throw new Error(message);
+      }
+      const snapshot = payload as RuntimeConfigSnapshot;
+      setRuntimeConfigSnapshot(snapshot);
+      setSelectedRuntimeMode(snapshot?.desired?.sim_mode ? "simulate" : "live");
+      setRuntimeConfigError(null);
+      return true;
+    } catch (err) {
+      setRuntimeConfigError((err as Error).message);
+      await fetchRuntimeConfigSnapshot().catch(() => undefined);
+      return false;
+    } finally {
+      setIsRuntimeConfigBusy(false);
+    }
+  }, [fetchRuntimeConfigSnapshot, normalizedApiHost, runtimeConfigSnapshot?.desired?.sim_mode, runtimeMode]);
+
+  const requestControllerRestart = useCallback(async (reason: string) => {
     setIsRestartingController(true);
     setRuntimeConfigError(null);
     try {
       const response = await fetch(`${normalizedApiHost}/control/restart-controller`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ reason: "runtime-config-change" }),
+        body: JSON.stringify({ reason }),
       });
       const payload = await response.json();
       if (!response.ok) {
@@ -5269,12 +5657,31 @@ export default function App() {
       }
       await new Promise((resolve) => window.setTimeout(resolve, 1250));
       await fetchRuntimeConfigSnapshot();
+      return true;
     } catch (err) {
       setRuntimeConfigError((err as Error).message);
+      return false;
     } finally {
       setIsRestartingController(false);
     }
-  }, [fetchRuntimeConfigSnapshot, normalizedApiHost, runtimeConfigSnapshot?.restart_required]);
+  }, [fetchRuntimeConfigSnapshot, normalizedApiHost]);
+
+  const handleSelectRuntimeMode = useCallback(async (nextMode: RuntimeExecutionMode) => {
+    await switchRuntimeMode(nextMode);
+  }, [switchRuntimeMode]);
+
+  const handleRestartController = useCallback(async () => {
+    if (!runtimeConfigSnapshot?.restart_required) {
+      return;
+    }
+    const confirmed = window.confirm(
+      "Request controller restart now? An external supervisor should restart it automatically.",
+    );
+    if (!confirmed) {
+      return;
+    }
+    await requestControllerRestart("runtime-config-change");
+  }, [requestControllerRestart, runtimeConfigSnapshot?.restart_required]);
   const visionStreamUrl = useMemo(
     () => `${normalisedVisionHost}/stream.mjpg`,
     [normalisedVisionHost],
@@ -5422,6 +5829,33 @@ export default function App() {
     () => indexProgramNodes(programTreeRoot),
     [programTreeRoot],
   );
+  const programMoveNodeIdByIndex = useMemo(() => {
+    const preferredByIndex = new Map<number, string>();
+    const fallbackByIndex = new Map<number, string>();
+    programNodeById.forEach((node, nodeId) => {
+      const moveIndex = node.focus?.moveIndex;
+      if (typeof moveIndex !== "number" || !Number.isInteger(moveIndex)) {
+        return;
+      }
+      if (
+        !fallbackByIndex.has(moveIndex) &&
+        (node.type === "move" || node.type === "operationGroup")
+      ) {
+        fallbackByIndex.set(moveIndex, nodeId);
+      }
+      const isPreferredNode =
+        programTreeViewMode === "grouped"
+          ? node.type === "operationGroup" && node.id.startsWith("move_group_")
+          : node.type === "move";
+      if (isPreferredNode && !preferredByIndex.has(moveIndex)) {
+        preferredByIndex.set(moveIndex, nodeId);
+      }
+    });
+    const combined = new Map<number, string>();
+    fallbackByIndex.forEach((nodeId, moveIndex) => combined.set(moveIndex, nodeId));
+    preferredByIndex.forEach((nodeId, moveIndex) => combined.set(moveIndex, nodeId));
+    return combined;
+  }, [programNodeById, programTreeViewMode]);
   const selectedProgramNode = useMemo(
     () =>
       selectedProgramNodeId
@@ -5466,7 +5900,11 @@ export default function App() {
       return {
         id: `timeline_segment_${index}`,
         label: `M${index + 1}`,
-        detail: `P${index + 1} -> P${index + 2} • ${describeWaypointMoveType(nextPoint.moveType)}`,
+        detail: `CP${index + 1} -> CP${index + 2} • ${describeWaypointMoveType(nextPoint.moveType)}${
+          nextPoint.pauseAfterSeconds !== null && index < visualWaypoints.length - 2
+            ? ` • ${formatPauseAfterSecondsLabel(nextPoint.pauseAfterSeconds)}`
+            : ""
+        }`,
         openPanel: "trajectory",
         pathRange,
         waypointIndices: [index, index + 1],
@@ -5558,6 +5996,120 @@ export default function App() {
       point,
     };
   }, [selectedProgramControlPointIndex, treeEditableWaypoints]);
+  const selectedProgramMove = useMemo<EditableProgramMove | null>(() => {
+    if (weldDraft) {
+      return null;
+    }
+    const directFocus = selectedProgramNode?.focus;
+    let moveIndex =
+      typeof directFocus?.moveIndex === "number" && Number.isInteger(directFocus.moveIndex)
+        ? directFocus.moveIndex
+        : null;
+    let waypointIndex =
+      Array.isArray(directFocus?.waypointIndices) && directFocus.waypointIndices.length > 1
+        ? directFocus.waypointIndices[1]
+        : null;
+    if (
+      moveIndex === null &&
+      typeof selectedProgramMoveTimelineFocus?.relatedMoveIndex === "number" &&
+      Number.isInteger(selectedProgramMoveTimelineFocus.relatedMoveIndex)
+    ) {
+      moveIndex = selectedProgramMoveTimelineFocus.relatedMoveIndex;
+    }
+    if (
+      (typeof waypointIndex !== "number" || !Number.isInteger(waypointIndex)) &&
+      Array.isArray(selectedProgramMoveTimelineFocus?.waypointIndices) &&
+      selectedProgramMoveTimelineFocus.waypointIndices.length > 1
+    ) {
+      waypointIndex = selectedProgramMoveTimelineFocus.waypointIndices[1];
+    }
+    if (
+      typeof moveIndex !== "number" ||
+      !Number.isInteger(moveIndex) ||
+      typeof waypointIndex !== "number" ||
+      !Number.isInteger(waypointIndex) ||
+      waypointIndex <= 0 ||
+      waypointIndex >= treeEditableWaypoints.length
+    ) {
+      return null;
+    }
+    const startPoint = treeEditableWaypoints[waypointIndex - 1] ?? null;
+    const point = treeEditableWaypoints[waypointIndex];
+    if (!point) {
+      return null;
+    }
+    const usesAngularSpeed = shouldUseAngularMoveSpeed(startPoint, point);
+    const translationDistanceMm = poseWaypointTranslationDistanceM(startPoint, point) * 1000;
+    const supportsAccelerationEdit = point.moveType === "linear" && !usesAngularSpeed;
+    const supportsPauseEdit = waypointIndex < treeEditableWaypoints.length - 1;
+    const resolvedAccelerationMmPerSec2 =
+      supportsAccelerationEdit
+        ? point.linearAccelerationMmPerSec2 ?? point.linearSpeedMmPerSec ?? null
+        : null;
+    return {
+      moveIndex,
+      waypointIndex,
+      moveType: point.moveType,
+      startWaypointIndex: waypointIndex - 1,
+      endWaypointIndex: waypointIndex,
+      moveDistanceMm: translationDistanceMm,
+      speedMode: usesAngularSpeed ? ("angular" as const) : ("linear" as const),
+      speedValue: usesAngularSpeed ? point.rotationSpeedDegPerSec : point.linearSpeedMmPerSec,
+      speedUnitLabel: usesAngularSpeed ? "deg/s" : "mm/s",
+      speedStep: usesAngularSpeed ? 0.5 : 1,
+      hasCustomSpeed: usesAngularSpeed
+        ? point.rotationSpeedDegPerSec !== null
+        : point.linearSpeedMmPerSec !== null,
+      supportsAccelerationEdit,
+      accelerationValue: resolvedAccelerationMmPerSec2,
+      accelerationUnitLabel: "mm/s^2",
+      accelerationStep: 1,
+      hasCustomAcceleration: supportsAccelerationEdit ? point.linearAccelerationMmPerSec2 !== null : false,
+      supportsPauseEdit,
+      pauseAfterSeconds: supportsPauseEdit ? point.pauseAfterSeconds : null,
+      pauseStep: 0.1,
+      hasCustomPause: supportsPauseEdit ? point.pauseAfterSeconds !== null : false,
+    };
+  }, [selectedProgramMoveTimelineFocus, selectedProgramNode, treeEditableWaypoints, weldDraft]);
+  const selectedMoveEditorSelectionKey = `${selectedProgramNodeId ?? ""}|${selectedTimelineSyntheticId ?? ""}`;
+  const lastSelectedProgramMoveRef = useRef<{
+    selectionKey: string;
+    move: EditableProgramMove;
+  } | null>(null);
+  useEffect(() => {
+    if (selectedProgramMove) {
+      lastSelectedProgramMoveRef.current = {
+        selectionKey: selectedMoveEditorSelectionKey,
+        move: selectedProgramMove,
+      };
+      return;
+    }
+    if (
+      lastSelectedProgramMoveRef.current &&
+      lastSelectedProgramMoveRef.current.selectionKey !== selectedMoveEditorSelectionKey
+    ) {
+      lastSelectedProgramMoveRef.current = null;
+      return;
+    }
+    if (!selectedProgramNodeId && !selectedTimelineSyntheticId) {
+      lastSelectedProgramMoveRef.current = null;
+    }
+  }, [
+    selectedMoveEditorSelectionKey,
+    selectedProgramMove,
+    selectedProgramNodeId,
+    selectedTimelineSyntheticId,
+  ]);
+  const visibleSelectedProgramMove =
+    selectedProgramMove ??
+    (lastSelectedProgramMoveRef.current?.selectionKey === selectedMoveEditorSelectionKey
+      ? lastSelectedProgramMoveRef.current.move
+      : null);
+  const trajectoryDraftName = trajectoryProgramName.trim() || selectedTrajectory.trim() || "trajectory_program";
+  const hasTrajectoryUnsavedChanges = useMemo(
+    () => !weldDraft && !poseWaypointListsMatch(plannerPoints, savedTrajectoryWaypoints),
+    [plannerPoints, savedTrajectoryWaypoints, weldDraft],
+  );
   const canTreeWaypointValueEdit = !isPlanningWeld && !isRunningPreview && !motionStatusActive;
   const minRemainingWaypoints = weldDraft ? 2 : 1;
   const canTreeWaypointAdd = canTreeWaypointValueEdit;
@@ -5579,6 +6131,20 @@ export default function App() {
   const canTreeWaypointApply =
     canTreeWaypointValueEdit &&
     (weldDraft ? weldEditableWaypoints.length > 1 : treeEditableWaypoints.length > 0);
+  const canUndoTrajectoryDraftEdit = Boolean(
+    !weldDraft && trajectoryDraftHistory.length > 0 && canTreeWaypointValueEdit,
+  );
+  const canRevertTrajectoryDraft = Boolean(
+    !weldDraft && hasTrajectoryUnsavedChanges && canTreeWaypointValueEdit,
+  );
+  const canSaveTrajectoryDraft = Boolean(
+    !weldDraft &&
+      plannerPoints.length > 0 &&
+      !isSavingTrajectoryProgram &&
+      !isLoadingSavedTrajectory &&
+      !isRunningPreview &&
+      !motionStatusActive,
+  );
   const activePanelTitle = activePanel === "step"
     ? "STEP Import"
     : activePanel === "trajectory"
@@ -5612,7 +6178,8 @@ export default function App() {
         const nodeId = `control_point_${index}`;
         trajectoryItems.push({
           id: nodeId,
-          label: `P${index + 1}`,
+          label: `CP${index + 1}`,
+          metaLabel: describeTrajectoryControlPointKind(point.moveType),
           subtitle: `${point.x.toFixed(3)}, ${point.y.toFixed(3)}, ${point.z.toFixed(3)} m`,
           tone: "cyan",
           active:
@@ -5625,6 +6192,10 @@ export default function App() {
           trajectoryItems.push({
             id: moveSelection.id,
             label: moveSelection.label,
+            metaLabel:
+              visualWaypoints[index + 1]
+                ? describeWaypointMoveType(visualWaypoints[index + 1].moveType)
+                : "Move",
             subtitle: moveSelection.detail,
             tone: "amber",
             active:
@@ -5653,6 +6224,7 @@ export default function App() {
           return {
             id: nodeId ?? `weld-segment-${index}`,
             label: `Segment ${index + 1}`,
+            metaLabel: "Weld Segment",
             subtitle: `${segment.weldType} • ${segment.edgeId}`,
             tone: "emerald" as const,
             active:
@@ -5683,6 +6255,9 @@ export default function App() {
   } as const;
   const workspaceColumnsStyle = {
     gridTemplateColumns: `${leftPaneWidthPx}px ${SHELL_SPLITTER_SIZE_PX}px minmax(0,1fr)`,
+  } as const;
+  const rightDockStyle = {
+    gridTemplateRows: `${clampProgramTreePaneHeight(programTreeHeightPx, rightDockHeightPx)}px ${SHELL_SPLITTER_SIZE_PX}px minmax(0,1fr)`,
   } as const;
   const sidebarItems = useMemo<SidebarItem[]>(
     () => [
@@ -6210,7 +6785,7 @@ export default function App() {
         persistProgramName?: string;
         persistMetadata?: Record<string, unknown> | null;
       },
-    ) => {
+    ): Promise<PreviewPlan | null> => {
       cancelTrajectoryPreviewRequest();
       if (waypoints.length === 0) {
         setIsPlanLoading(false);
@@ -6219,7 +6794,7 @@ export default function App() {
         setPlannerPoints([]);
         setWeldPreviewGhostJoints(null);
         setWeldPreviewCacheReady(false);
-        return;
+        return null;
       }
       const abortController = new AbortController();
       trajectoryPreviewAbortRef.current = abortController;
@@ -6240,11 +6815,12 @@ export default function App() {
         }
         const data = await response.json();
         const { plan } = previewFromPlannerPayload(data);
+        const mergedWaypoints = mergePoseWaypointMotionMetadata(waypoints, plan.waypoints);
         const authoredPlan: PreviewPlan = {
           ...plan,
-          // Keep authored control points as the source of truth. The preview path
-          // is derived state and must not overwrite or reorder recorded waypoints.
-          waypoints: waypoints.map((waypoint) => ({ ...waypoint })),
+          // Keep authored control points as the source of truth for pose/order, but
+          // merge controller-computed motion metadata like resolved move speeds back in.
+          waypoints: mergedWaypoints.map((waypoint) => ({ ...waypoint })),
         };
         if (options?.persistProgramName) {
           const persistResponse = await fetch(`${normalizedApiHost}/robot-program/save`, {
@@ -6255,7 +6831,7 @@ export default function App() {
               kind: "trajectory",
               name: options.persistProgramName,
               authoring: {
-                waypoints: encodePoseWaypointsForApi(waypoints),
+                waypoints: encodePoseWaypointsForApi(mergedWaypoints),
                 metadata: options.persistMetadata ?? {},
               },
               planned_trajectory: authoredPlan,
@@ -6269,18 +6845,23 @@ export default function App() {
           }
         }
         if (trajectoryPreviewAbortRef.current !== abortController) {
-          return;
+          return null;
         }
         setPreviewPlan(authoredPlan);
+        setPlannerPoints((current) =>
+          poseWaypointListsMatch(current, mergedWaypoints) ? current : clonePoseWaypointList(mergedWaypoints),
+        );
         setTrajectoryPlannerFailure(null);
         setWeldPreviewGhostJoints(null);
         setWeldPreviewCacheReady(false);
+        return authoredPlan;
       } catch (err) {
         if (abortController.signal.aborted) {
-          return;
+          return null;
         }
         setError(`Failed to plan trajectory: ${(err as Error).message}`);
         setWeldPreviewGhostJoints(null);
+        return null;
       } finally {
         if (trajectoryPreviewAbortRef.current === abortController) {
           trajectoryPreviewAbortRef.current = null;
@@ -6290,6 +6871,83 @@ export default function App() {
     },
     [cancelTrajectoryPreviewRequest, normalizedApiHost],
   );
+
+  const queueTrajectoryPreview = useCallback(
+    (waypoints: PoseWaypoint[], delayMs = 220) => {
+      clearTrajectoryPreviewDebounce();
+      const nextWaypoints = clonePoseWaypointList(waypoints);
+      trajectoryPreviewDebounceRef.current = setTimeout(() => {
+        trajectoryPreviewDebounceRef.current = null;
+        void requestPlannerPreview(nextWaypoints);
+      }, delayMs);
+    },
+    [clearTrajectoryPreviewDebounce, requestPlannerPreview],
+  );
+
+  const ensureTrajectoryPreview = useCallback(
+    async (waypoints: PoseWaypoint[]): Promise<PreviewPlan | null> => {
+      clearTrajectoryPreviewDebounce();
+      if (waypoints.length === 0) {
+        cancelTrajectoryPreviewRequest();
+        setPreviewPlan(null);
+        setTrajectoryPlannerFailure(null);
+        return null;
+      }
+      const currentPreview = previewPlanRef.current;
+      if (currentPreview && previewPlanMatchesWaypoints(currentPreview, waypoints) && !currentPreview.isStale) {
+        return currentPreview;
+      }
+      return requestPlannerPreview(waypoints);
+    },
+    [cancelTrajectoryPreviewRequest, clearTrajectoryPreviewDebounce, requestPlannerPreview],
+  );
+
+  const commitTrajectoryDraftEdit = useCallback(
+    (
+      nextWaypointsInput: PoseWaypoint[] | ((current: PoseWaypoint[]) => PoseWaypoint[]),
+      options?: {
+        previewMode?: "debounced" | "immediate" | "none";
+        recordHistory?: boolean;
+      },
+    ): PoseWaypoint[] => {
+      const currentWaypoints = clonePoseWaypointList(getLatestTrajectoryDraftWaypoints());
+      const resolvedWaypoints =
+        typeof nextWaypointsInput === "function"
+          ? nextWaypointsInput(currentWaypoints)
+          : nextWaypointsInput;
+      const nextWaypoints = clonePoseWaypointList(resolvedWaypoints);
+      if (poseWaypointListsMatch(currentWaypoints, nextWaypoints)) {
+        return currentWaypoints;
+      }
+      if (options?.recordHistory !== false) {
+        setTrajectoryDraftHistory((currentHistory) => [
+          ...currentHistory.slice(-49),
+          currentWaypoints,
+        ]);
+      }
+      setError(null);
+      setTrajectoryPlannerFailure(null);
+      setPlannerPoints(nextWaypoints);
+      if ((options?.previewMode ?? "debounced") === "immediate") {
+        clearTrajectoryPreviewDebounce();
+        void requestPlannerPreview(nextWaypoints);
+      } else if ((options?.previewMode ?? "debounced") === "debounced") {
+        queueTrajectoryPreview(nextWaypoints);
+      }
+      return nextWaypoints;
+    },
+    [
+      clearTrajectoryPreviewDebounce,
+      getLatestTrajectoryDraftWaypoints,
+      queueTrajectoryPreview,
+      requestPlannerPreview,
+    ],
+  );
+
+  const markTrajectoryDraftSaved = useCallback((waypoints: PoseWaypoint[]) => {
+    setSavedTrajectoryWaypoints(clonePoseWaypointList(waypoints));
+    setTrajectoryDraftHistory([]);
+  }, []);
 
   const handlePlanToggle = useCallback(() => {
     if (isPlanLoading || isRunningPreview || motionStatusActive) {
@@ -6352,15 +7010,14 @@ export default function App() {
       return;
     }
     setIsPlanning(true);
-    setPlannerPoints(nextPoints);
-    await requestPlannerPreview(nextPoints);
+    commitTrajectoryDraftEdit(nextPoints, { previewMode: "immediate" });
   }, [
+    commitTrajectoryDraftEdit,
     getLatestTrajectoryDraftWaypoints,
     isPlanLoading,
     isRunningPreview,
     motionStatusActive,
     fetchLiveTrajectoryPoseWaypoint,
-    requestPlannerPreview,
   ]);
 
   const handleAddTrajectoryHomeWaypoint = useCallback(async () => {
@@ -6382,15 +7039,14 @@ export default function App() {
       updateSettings({ selectedProgramNodeId: `control_point_${nextPoints.length - 1}` });
     }
     setIsPlanning(true);
-    setPlannerPoints(nextPoints);
-    await requestPlannerPreview(nextPoints);
+    commitTrajectoryDraftEdit(nextPoints, { previewMode: "immediate" });
   }, [
+    commitTrajectoryDraftEdit,
     getLatestTrajectoryDraftWaypoints,
     isPlanLoading,
     isRunningPreview,
     motionStatusActive,
     fetchLiveTrajectoryPoseWaypoint,
-    requestPlannerPreview,
     updateSettings,
   ]);
 
@@ -6410,10 +7066,9 @@ export default function App() {
           moveType: "linear",
         }),
       ];
-      setPlannerPoints(nextPoints);
-      await requestPlannerPreview(nextPoints);
+      commitTrajectoryDraftEdit(nextPoints, { previewMode: "immediate" });
     },
-    [getLatestTrajectoryDraftWaypoints, isPlanning, isPlanLoading, requestPlannerPreview],
+    [commitTrajectoryDraftEdit, getLatestTrajectoryDraftWaypoints, isPlanning, isPlanLoading],
   );
 
   const handleUndoPoint = useCallback(async () => {
@@ -6422,27 +7077,39 @@ export default function App() {
       return;
     }
     const nextPoints = currentPoints.slice(0, -1);
-    setPlannerPoints(nextPoints);
     if (nextPoints.length === 0) {
+      clearTrajectoryPreviewDebounce();
+      cancelTrajectoryPreviewRequest();
       setPreviewPlan(null);
+      setTrajectoryPlannerFailure(null);
+      setPlannerPoints([]);
       setWeldPreviewGhostJoints(null);
       return;
     }
-    await requestPlannerPreview(nextPoints);
-  }, [getLatestTrajectoryDraftWaypoints, isPlanLoading, requestPlannerPreview]);
+    commitTrajectoryDraftEdit(nextPoints, { previewMode: "immediate" });
+  }, [
+    cancelTrajectoryPreviewRequest,
+    clearTrajectoryPreviewDebounce,
+    commitTrajectoryDraftEdit,
+    getLatestTrajectoryDraftWaypoints,
+    isPlanLoading,
+  ]);
 
   const handleClearPreview = useCallback(() => {
+    clearTrajectoryPreviewDebounce();
     cancelTrajectoryPreviewRequest();
     setError(null);
     setPreviewPlan(null);
     setTrajectoryPlannerFailure(null);
     setPlannerPoints([]);
+    setSavedTrajectoryWaypoints([]);
+    setTrajectoryDraftHistory([]);
     setWeldEditableWaypoints([]);
     setWeldPreviewGhostJoints(null);
     setWeldPreviewCacheReady(false);
     setIsPlanning(false);
     setIsPlanLoading(false);
-  }, [cancelTrajectoryPreviewRequest]);
+  }, [cancelTrajectoryPreviewRequest, clearTrajectoryPreviewDebounce]);
 
   const requestWeldPreview = useCallback(
     async (draft: WeldDraft, waypointsOverride?: Point3[]): Promise<PreviewPlan | null> => {
@@ -6601,6 +7268,7 @@ export default function App() {
         Boolean(trajectoryMeta) &&
         typeof trajectoryMeta.weld === "object" &&
         trajectoryMeta.weld !== null;
+      setShowTrajectoryRunPreparationOverlay(executionMode === "live" && !isWeldPreview);
       let runName = previewPlan.name;
       let useCache = false;
       if (isWeldPreview) {
@@ -6642,6 +7310,7 @@ export default function App() {
     } catch (err) {
       setError(`Failed to ${executionMode === "simulate" ? "simulate" : "run"} trajectory: ${(err as Error).message}`);
     } finally {
+      setShowTrajectoryRunPreparationOverlay(false);
       setIsRunningPreview(false);
     }
   }, [
@@ -6727,18 +7396,20 @@ export default function App() {
         setWeldPreviewCacheReady(false);
         return;
       }
-      setPlannerPoints((current) =>
-        current.map((point, pointIndex) =>
-          pointIndex === index
-            ? {
-                ...point,
-                [axis]: Number.isFinite(value) ? value : point[axis],
-              }
-            : point,
-        ),
+      commitTrajectoryDraftEdit(
+        (current) =>
+          current.map((point, pointIndex) =>
+            pointIndex === index
+              ? {
+                  ...point,
+                  [axis]: Number.isFinite(value) ? value : point[axis],
+                }
+              : point,
+          ),
+        { previewMode: "debounced" },
       );
     },
-    [weldDraft],
+    [commitTrajectoryDraftEdit, weldDraft],
   );
 
   const handleTreeWaypointMoveTypeChange = useCallback(
@@ -6746,18 +7417,168 @@ export default function App() {
       if (weldDraft) {
         return;
       }
-      setPlannerPoints((current) =>
-        current.map((point, pointIndex) =>
-          pointIndex === index
-            ? {
-                ...point,
-                moveType,
-              }
-            : point,
-        ),
+      commitTrajectoryDraftEdit(
+        (current) =>
+          current.map((point, pointIndex) =>
+            pointIndex === index
+              ? {
+                  ...point,
+                  moveType,
+                  ...(moveType === "linear"
+                    ? {}
+                    : {
+                        linearSpeedMmPerSec: null,
+                        linearAccelerationMmPerSec2: null,
+                      }),
+                }
+              : point,
+          ),
+        { previewMode: "debounced" },
       );
     },
-    [weldDraft],
+    [commitTrajectoryDraftEdit, weldDraft],
+  );
+
+  const handleTreeWaypointSpeedChange = useCallback(
+    (index: number, speedMode: "linear" | "angular", value: number) => {
+      if (weldDraft) {
+        return;
+      }
+      const normalized = Number(value);
+      if (!Number.isFinite(normalized) || normalized <= 0) {
+        return;
+      }
+      commitTrajectoryDraftEdit(
+        (current) =>
+          current.map((point, pointIndex) =>
+            pointIndex === index
+              ? {
+                  ...point,
+                  ...(speedMode === "angular"
+                    ? { rotationSpeedDegPerSec: normalized }
+                    : { linearSpeedMmPerSec: normalized }),
+                }
+              : point,
+          ),
+        { previewMode: "debounced" },
+      );
+    },
+    [commitTrajectoryDraftEdit, weldDraft],
+  );
+
+  const handleTreeWaypointSpeedReset = useCallback(
+    (index: number, speedMode: "linear" | "angular") => {
+      if (weldDraft) {
+        return;
+      }
+      commitTrajectoryDraftEdit(
+        (current) =>
+          current.map((point, pointIndex) =>
+            pointIndex === index
+              ? {
+                  ...point,
+                  ...(speedMode === "angular"
+                    ? { rotationSpeedDegPerSec: null }
+                    : { linearSpeedMmPerSec: null }),
+                }
+              : point,
+          ),
+        { previewMode: "debounced" },
+      );
+    },
+    [commitTrajectoryDraftEdit, weldDraft],
+  );
+
+  const handleTreeWaypointAccelerationChange = useCallback(
+    (index: number, value: number) => {
+      if (weldDraft) {
+        return;
+      }
+      const normalized = Number(value);
+      if (!Number.isFinite(normalized) || normalized <= 0) {
+        return;
+      }
+      commitTrajectoryDraftEdit(
+        (current) =>
+          current.map((point, pointIndex) =>
+            pointIndex === index
+              ? {
+                  ...point,
+                  linearAccelerationMmPerSec2: normalized,
+                }
+              : point,
+          ),
+        { previewMode: "debounced" },
+      );
+    },
+    [commitTrajectoryDraftEdit, weldDraft],
+  );
+
+  const handleTreeWaypointAccelerationReset = useCallback(
+    (index: number) => {
+      if (weldDraft) {
+        return;
+      }
+      commitTrajectoryDraftEdit(
+        (current) =>
+          current.map((point, pointIndex) =>
+            pointIndex === index
+              ? {
+                  ...point,
+                  linearAccelerationMmPerSec2: null,
+                }
+              : point,
+          ),
+        { previewMode: "debounced" },
+      );
+    },
+    [commitTrajectoryDraftEdit, weldDraft],
+  );
+
+  const handleTreeWaypointPauseChange = useCallback(
+    (index: number, value: number) => {
+      if (weldDraft) {
+        return;
+      }
+      const normalized = Number(value);
+      if (!Number.isFinite(normalized) || normalized <= 0) {
+        return;
+      }
+      commitTrajectoryDraftEdit(
+        (current) =>
+          current.map((point, pointIndex) =>
+            pointIndex === index
+              ? {
+                  ...point,
+                  pauseAfterSeconds: normalized,
+                }
+              : point,
+          ),
+        { previewMode: "debounced" },
+      );
+    },
+    [commitTrajectoryDraftEdit, weldDraft],
+  );
+
+  const handleTreeWaypointPauseReset = useCallback(
+    (index: number) => {
+      if (weldDraft) {
+        return;
+      }
+      commitTrajectoryDraftEdit(
+        (current) =>
+          current.map((point, pointIndex) =>
+            pointIndex === index
+              ? {
+                  ...point,
+                  pauseAfterSeconds: null,
+                }
+              : point,
+          ),
+        { previewMode: "debounced" },
+      );
+    },
+    [commitTrajectoryDraftEdit, weldDraft],
   );
 
   const handleTreeAddWaypoint = useCallback(() => {
@@ -6787,10 +7608,26 @@ export default function App() {
     const nextPoints: PoseWaypoint[] =
       currentPoints.length === 0
         ? [buildPoseWaypoint({ x: 0, y: 0, z: 0 }, { moveType: "joint" })]
-        : [...currentPoints, { ...currentPoints[currentPoints.length - 1], moveType: "joint" as const }];
-    setPlannerPoints(nextPoints);
+        : [
+            ...currentPoints,
+            {
+              ...currentPoints[currentPoints.length - 1],
+              moveType: "joint" as const,
+              linearSpeedMmPerSec: null,
+              linearAccelerationMmPerSec2: null,
+              rotationSpeedDegPerSec: null,
+              pauseAfterSeconds: null,
+            },
+          ];
+    commitTrajectoryDraftEdit(nextPoints, { previewMode: "immediate" });
     updateSettings({ selectedProgramNodeId: `control_point_${nextPoints.length - 1}` });
-  }, [getLatestTrajectoryDraftWaypoints, selectedProgramControlPointIndex, updateSettings, weldDraft]);
+  }, [
+    commitTrajectoryDraftEdit,
+    getLatestTrajectoryDraftWaypoints,
+    selectedProgramControlPointIndex,
+    updateSettings,
+    weldDraft,
+  ]);
 
   const handleTreeRemoveWaypoint = useCallback((index: number) => {
     if (weldDraft) {
@@ -6802,12 +7639,14 @@ export default function App() {
       setWeldPreviewCacheReady(false);
       return;
     }
-    setPlannerPoints((current) =>
-      current.length <= 1
-        ? current
-        : current.filter((_, pointIndex) => pointIndex !== index),
+    commitTrajectoryDraftEdit(
+      (current) =>
+        current.length <= 1
+          ? current
+          : current.filter((_, pointIndex) => pointIndex !== index),
+      { previewMode: "immediate" },
     );
-  }, [weldDraft]);
+  }, [commitTrajectoryDraftEdit, weldDraft]);
 
   const handleTreeMoveWaypoint = useCallback(
     (direction: -1 | 1) => {
@@ -6829,15 +7668,21 @@ export default function App() {
         updateSettings({ selectedProgramNodeId: `control_point_${nextIndex}` });
         return;
       }
-      setPlannerPoints((current) => {
+      commitTrajectoryDraftEdit((current) => {
         const next = [...current];
         const [moved] = next.splice(selectedProgramControlPointIndex, 1);
         next.splice(nextIndex, 0, moved);
         return next;
-      });
+      }, { previewMode: "immediate" });
       updateSettings({ selectedProgramNodeId: `control_point_${nextIndex}` });
     },
-    [selectedProgramControlPointIndex, treeEditableWaypoints.length, updateSettings, weldDraft],
+    [
+      commitTrajectoryDraftEdit,
+      selectedProgramControlPointIndex,
+      treeEditableWaypoints.length,
+      updateSettings,
+      weldDraft,
+    ],
   );
 
   const handleApplyTreeWaypointEdits = useCallback(async () => {
@@ -6845,15 +7690,62 @@ export default function App() {
       await handleApplyWeldWaypointEdits();
       return;
     }
-    if (treeEditableWaypoints.length === 0) {
-      return;
-    }
-    await requestPlannerPreview(treeEditableWaypoints);
+    await ensureTrajectoryPreview(treeEditableWaypoints);
   }, [
+    ensureTrajectoryPreview,
     weldDraft,
     handleApplyWeldWaypointEdits,
-    requestPlannerPreview,
     treeEditableWaypoints,
+  ]);
+
+  const handleUndoTrajectoryDraftEdit = useCallback(async () => {
+    if (weldDraft || trajectoryDraftHistory.length === 0) {
+      return;
+    }
+    const previousSnapshot = clonePoseWaypointList(trajectoryDraftHistory[trajectoryDraftHistory.length - 1] ?? []);
+    setTrajectoryDraftHistory((currentHistory) => currentHistory.slice(0, -1));
+    clearTrajectoryPreviewDebounce();
+    setError(null);
+    setTrajectoryPlannerFailure(null);
+    setPlannerPoints(previousSnapshot);
+    if (previousSnapshot.length === 0) {
+      cancelTrajectoryPreviewRequest();
+      setPreviewPlan(null);
+      setWeldPreviewGhostJoints(null);
+      return;
+    }
+    await requestPlannerPreview(previousSnapshot);
+  }, [
+    cancelTrajectoryPreviewRequest,
+    clearTrajectoryPreviewDebounce,
+    requestPlannerPreview,
+    trajectoryDraftHistory,
+    weldDraft,
+  ]);
+
+  const handleRevertTrajectoryDraft = useCallback(async () => {
+    if (weldDraft) {
+      return;
+    }
+    const baselineSnapshot = clonePoseWaypointList(savedTrajectoryWaypoints);
+    setTrajectoryDraftHistory([]);
+    clearTrajectoryPreviewDebounce();
+    setError(null);
+    setTrajectoryPlannerFailure(null);
+    setPlannerPoints(baselineSnapshot);
+    if (baselineSnapshot.length === 0) {
+      cancelTrajectoryPreviewRequest();
+      setPreviewPlan(null);
+      setWeldPreviewGhostJoints(null);
+      return;
+    }
+    await requestPlannerPreview(baselineSnapshot);
+  }, [
+    cancelTrajectoryPreviewRequest,
+    clearTrajectoryPreviewDebounce,
+    requestPlannerPreview,
+    savedTrajectoryWaypoints,
+    weldDraft,
   ]);
 
   const handleCaptureTrajectoryPose = useCallback(async () => {
@@ -7086,13 +7978,11 @@ export default function App() {
       setError("Program name is required.");
       return;
     }
-    const plannedTrajectoryForSave =
-      previewPlan && previewPlanMatchesWaypoints(previewPlan, plannerPoints) && !previewPlan.isStale
-        ? previewPlan
-        : null;
     setIsSavingTrajectoryProgram(true);
     setError(null);
     try {
+      const plannedTrajectoryForSave = await ensureTrajectoryPreview(plannerPoints);
+      const authoringWaypoints = plannedTrajectoryForSave?.waypoints ?? plannerPoints;
       const response = await fetch(`${normalizedApiHost}/robot-program/save`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -7100,7 +7990,7 @@ export default function App() {
           kind: "trajectory",
           name: programName,
           authoring: {
-            waypoints: plannerPoints,
+            waypoints: authoringWaypoints,
             metadata: {
               source: "trajectory_editor",
             },
@@ -7115,12 +8005,20 @@ export default function App() {
       await refreshTrajectoryList();
       setSelectedTrajectory(programName);
       setLoadedTrajectoryMetadata({ source: "trajectory_editor" });
+      markTrajectoryDraftSaved(authoringWaypoints);
     } catch (err) {
       setError(`Failed to save trajectory program: ${(err as Error).message}`);
     } finally {
       setIsSavingTrajectoryProgram(false);
     }
-  }, [normalizedApiHost, plannerPoints, previewPlan, refreshTrajectoryList, trajectoryProgramName]);
+  }, [
+    ensureTrajectoryPreview,
+    markTrajectoryDraftSaved,
+    normalizedApiHost,
+    plannerPoints,
+    refreshTrajectoryList,
+    trajectoryProgramName,
+  ]);
 
   const handleSelectTrajectory = useCallback((value: string) => {
     setSelectedTrajectory(value);
@@ -7130,6 +8028,7 @@ export default function App() {
     if (plannerPoints.length === 0 || isPlanLoading || isRunningPreview || motionStatusActive) {
       return;
     }
+    clearTrajectoryPreviewDebounce();
     setError(null);
     const persistProgramName =
       selectedTrajectory && trajectoryProgramName.trim() === selectedTrajectory
@@ -7140,6 +8039,7 @@ export default function App() {
       persistMetadata: persistProgramName ? loadedTrajectoryMetadata : null,
     });
   }, [
+    clearTrajectoryPreviewDebounce,
     plannerPoints,
     isPlanLoading,
     isRunningPreview,
@@ -7170,11 +8070,18 @@ export default function App() {
       if (!record) {
         throw new Error("Saved trajectory program is invalid.");
       }
-      const waypoints = coercePoseWaypointList(record.authoring.waypoints);
+      const savedPlan = record.planned_trajectory ?? null;
+      const planWaypoints =
+        savedPlan?.trajectory
+          ? previewFromTrajectoryDetail(record.name, savedPlan.trajectory).waypoints
+          : [];
+      const waypoints = mergePoseWaypointMotionMetadata(
+        coercePoseWaypointList(record.authoring.waypoints),
+        savedPlan?.waypoints ?? planWaypoints,
+      );
       if (waypoints.length === 0) {
         throw new Error("Saved trajectory program has no waypoints.");
       }
-      const savedPlan = record.planned_trajectory ?? null;
       const savedPlanMatches = previewPlanMatchesWaypoints(savedPlan, waypoints);
       const hydratedSavedPlan = savedPlan
         ? {
@@ -7185,10 +8092,12 @@ export default function App() {
             sourcePlanName: savedPlan.sourcePlanName ?? savedPlan.name,
           }
         : null;
+      clearTrajectoryPreviewDebounce();
       setPlannerPoints(waypoints);
       setPreviewPlan(hydratedSavedPlan);
       setTrajectoryProgramName(record.name);
       setLoadedTrajectoryMetadata(record.authoring?.metadata ?? null);
+      markTrajectoryDraftSaved(waypoints);
       setWeldDraft(null);
       setWeldEditableWaypoints([]);
       setWeldPreviewGhostJoints(null);
@@ -7203,7 +8112,14 @@ export default function App() {
     } finally {
       setIsLoadingSavedTrajectory(false);
     }
-  }, [cancelTrajectoryPreviewRequest, selectedTrajectory, isLoadingSavedTrajectory, normalizedApiHost]);
+  }, [
+    cancelTrajectoryPreviewRequest,
+    clearTrajectoryPreviewDebounce,
+    isLoadingSavedTrajectory,
+    markTrajectoryDraftSaved,
+    normalizedApiHost,
+    selectedTrajectory,
+  ]);
 
   const issueStop = useCallback(async () => {
     if (isStopping) {
@@ -7380,11 +8296,14 @@ export default function App() {
     if (!selectedProgramNodeId) {
       return;
     }
+    if (isPlanLoading) {
+      return;
+    }
     if (programNodeById.has(selectedProgramNodeId)) {
       return;
     }
     updateSettings({ selectedProgramNodeId: null });
-  }, [selectedProgramNodeId, programNodeById, updateSettings]);
+  }, [isPlanLoading, selectedProgramNodeId, programNodeById, updateSettings]);
 
   useEffect(() => {
     if (!selectedProgramNodeId) {
@@ -7397,11 +8316,14 @@ export default function App() {
     if (!selectedTimelineSyntheticId) {
       return;
     }
+    if (isPlanLoading) {
+      return;
+    }
     if (trajectoryMoveTimelineSelections.some((item) => item.id === selectedTimelineSyntheticId)) {
       return;
     }
     setSelectedTimelineSyntheticId(null);
-  }, [selectedTimelineSyntheticId, trajectoryMoveTimelineSelections]);
+  }, [isPlanLoading, selectedTimelineSyntheticId, trajectoryMoveTimelineSelections]);
 
   useEffect(() => {
     if (panelSelectionOriginRef.current !== "tree") {
@@ -7549,17 +8471,27 @@ export default function App() {
         if (!selectedSegment) {
           return;
         }
-        setSelectedTimelineSyntheticId(itemId);
+        const matchingMoveNodeId =
+          typeof selectedSegment.relatedMoveIndex === "number"
+            ? (programMoveNodeIdByIndex.get(selectedSegment.relatedMoveIndex) ?? null)
+            : null;
+        setSelectedTimelineSyntheticId(matchingMoveNodeId ? null : itemId);
         panelSelectionOriginRef.current = null;
         updateSettings({
-          selectedProgramNodeId: null,
+          selectedProgramNodeId: matchingMoveNodeId,
           activePanel: selectedSegment.openPanel ?? activePanel,
         });
         return;
       }
       handleSelectProgramTreeNode(itemId);
     },
-    [activePanel, handleSelectProgramTreeNode, trajectoryMoveTimelineSelections, updateSettings],
+    [
+      activePanel,
+      handleSelectProgramTreeNode,
+      programMoveNodeIdByIndex,
+      trajectoryMoveTimelineSelections,
+      updateSettings,
+    ],
   );
   const handleChangeProgramTreeViewMode = useCallback(
     (value: ProgramTreeViewMode) => {
@@ -7598,6 +8530,12 @@ export default function App() {
   const headerAlert = [error, visionError].filter(Boolean).join(" • ");
   const hasHeaderAlert = headerAlert.length > 0;
   const alertTone = error ? "rose" : "amber";
+  const activeRuntimeModeLabel = runtimeMode === "simulate" ? "SIM" : runtimeMode === "live" ? "LIVE" : "UNKNOWN";
+  const desiredRuntimeModeLabel = selectedRuntimeMode === "simulate" ? "SIM" : "LIVE";
+  const runtimeModeChangePending = runtimeMode !== null && selectedRuntimeMode !== runtimeMode;
+  const trajectoryRunPreparationTitle = "Recalculating Trajectory Path";
+  const trajectoryRunPreparationMessage =
+    "Rebuilding the runnable path from the robot's current pose before motion starts.";
   const stageSurfaceHeading = isVisionActive
     ? "Live Camera Workspace"
     : (selectedProgramNode?.label ?? "Robot Workspace");
@@ -7629,9 +8567,14 @@ export default function App() {
       )
     : activePanel === "trajectory"
       ? (
-          <span className="text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200/80">
-            Trajectory
-          </span>
+          <div className="min-w-0">
+            <div className="text-xs font-semibold uppercase tracking-[0.25em] text-cyan-200/80">
+              Trajectory
+            </div>
+            <div className="mt-1 max-w-[18rem] text-[11px] leading-4 text-slate-300/80">
+              Waypoint authoring with live pose capture, IK-planned preview, and explicit SIM/LIVE execution.
+            </div>
+          </div>
         )
       : activePanel === "tools"
         ? (
@@ -7984,7 +8927,59 @@ export default function App() {
             </div>
           </div>
           <div className="flex h-full min-w-0 justify-center xl:pointer-events-none xl:absolute xl:inset-y-0 xl:left-1/2 xl:w-[min(52rem,calc(100%-28rem))] xl:-translate-x-1/2">
-            <div className="flex h-full min-w-0 items-stretch justify-center">
+            <div className="flex h-full min-w-0 items-stretch justify-center gap-2">
+              <div className="pointer-events-auto flex min-w-0 items-center gap-2 rounded-xl border border-slate-700/70 bg-slate-950/80 px-2 py-1 shadow-[0_0_24px_rgba(15,23,42,0.28)]">
+                <div className="hidden min-w-0 flex-col justify-center sm:flex">
+                  <div className="text-[9px] font-semibold uppercase tracking-[0.18em] text-cyan-200/75">
+                    Runtime Mode
+                  </div>
+                  <div className={`text-[10px] font-semibold ${runtimeModeChangePending ? "text-amber-200" : "text-slate-200"}`}>
+                    {runtimeModeChangePending
+                      ? `Current ${activeRuntimeModeLabel} · desired ${desiredRuntimeModeLabel}`
+                      : `${activeRuntimeModeLabel} active`}
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    Tap LIVE or SIM to hot-switch without restarting.
+                  </div>
+                </div>
+                <div className="inline-flex shrink-0 items-stretch rounded-lg border border-slate-700/80 bg-slate-950/90 p-1 shadow-inner shadow-black/30">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void handleSelectRuntimeMode("live");
+                    }}
+                    disabled={isRuntimeConfigBusy || isRestartingController}
+                    title="Switch controller into LIVE mode now without restarting."
+                    className={`rounded-md px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] transition ${
+                      selectedRuntimeMode === "live"
+                        ? "border border-rose-300/70 bg-rose-400/20 text-rose-50 shadow-[0_0_18px_rgba(251,113,133,0.24)]"
+                        : "border border-transparent text-slate-300 hover:border-slate-500/60 hover:text-slate-100"
+                    } ${(isRuntimeConfigBusy || isRestartingController) ? "cursor-not-allowed opacity-60" : ""}`}
+                  >
+                    LIVE
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void handleSelectRuntimeMode("simulate");
+                    }}
+                    disabled={isRuntimeConfigBusy || isRestartingController}
+                    title="Switch controller into SIM mode now without restarting."
+                    className={`rounded-md px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] transition ${
+                      selectedRuntimeMode === "simulate"
+                        ? "border border-cyan-300/70 bg-cyan-400/20 text-cyan-50 shadow-[0_0_18px_rgba(34,211,238,0.24)]"
+                        : "border border-transparent text-slate-300 hover:border-slate-500/60 hover:text-slate-100"
+                    } ${(isRuntimeConfigBusy || isRestartingController) ? "cursor-not-allowed opacity-60" : ""}`}
+                  >
+                    SIM
+                  </button>
+                </div>
+                {isRuntimeConfigBusy ? (
+                  <span className="hidden shrink-0 rounded-lg border border-cyan-400/40 bg-cyan-500/10 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100 lg:inline-flex">
+                    Switching...
+                  </span>
+                ) : null}
+              </div>
               <ControlPanelRuntimeHeader
                 apiHost={normalizedApiHost}
                 driveFaults={latest?.drive_faults ?? null}
@@ -8338,6 +9333,25 @@ export default function App() {
                   ) : null}
                 </div>
               </div>
+              {showTrajectoryRunPreparationOverlay ? (
+                <div className="pointer-events-none absolute inset-x-0 top-16 z-20 flex justify-center px-6">
+                  <div className="pointer-events-auto flex w-full max-w-xl items-start gap-3 rounded-2xl border border-cyan-400/35 bg-slate-950/92 px-4 py-3 text-left shadow-xl shadow-black/30 backdrop-blur">
+                    <RefreshCcw
+                      size={16}
+                      strokeWidth={2.2}
+                      className="mt-0.5 shrink-0 animate-spin text-cyan-300"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200/90">
+                        {trajectoryRunPreparationTitle}
+                      </div>
+                      <div className="mt-1 text-sm text-slate-100">
+                        {trajectoryRunPreparationMessage}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
               <div className="pointer-events-none absolute right-4 top-4 z-20">
                 <div className="pointer-events-auto inline-flex items-center gap-1 rounded-2xl border border-slate-700/70 bg-slate-950/82 p-1.5 shadow-xl shadow-black/20 backdrop-blur">
                   <button
@@ -8394,8 +9408,8 @@ export default function App() {
             />
           </div>
           <div className="col-start-3 row-start-1 row-span-3 flex h-full min-h-0 flex-col overflow-hidden pl-2 pr-1">
-            <div className="flex min-h-0 flex-1 flex-col gap-3">
-              <div className="min-h-[17rem] shrink-0">
+            <div ref={rightDockContainerRef} className="grid min-h-0 flex-1" style={rightDockStyle}>
+              <div className="min-h-0 overflow-hidden pb-1">
                 {showProgramTree ? (
                   <ProgramFeatureTree
                     root={programTreeRoot}
@@ -8403,22 +9417,47 @@ export default function App() {
                     selectedNodeId={selectedProgramNodeId}
                     viewMode={programTreeViewMode}
                     editableControlPoint={selectedProgramControlPoint}
+                    editableMove={visibleSelectedProgramMove}
                     canEditWaypointValues={canTreeWaypointValueEdit}
+                    canEditMoveType={canTreeWaypointValueEdit}
                     canAddWaypoint={canTreeWaypointAdd}
                     canRemoveWaypoint={canTreeWaypointRemove}
                     canMoveWaypointUp={canTreeWaypointMoveUp}
                     canMoveWaypointDown={canTreeWaypointMoveDown}
                     canApplyWaypointEdits={canTreeWaypointApply}
+                    showApplyWaypointEdits={Boolean(weldDraft)}
+                    isTrajectoryRecalculating={!weldDraft && isPlanLoading}
+                    trajectoryDraftActions={
+                      weldDraft
+                        ? null
+                        : {
+                            targetName: trajectoryDraftName,
+                            hasUnsavedChanges: hasTrajectoryUnsavedChanges,
+                            canUndoLast: canUndoTrajectoryDraftEdit,
+                            canUndoAll: canRevertTrajectoryDraft,
+                            canSave: canSaveTrajectoryDraft,
+                            isSaving: isSavingTrajectoryProgram,
+                          }
+                    }
                     onToggleExpand={handleToggleProgramTreeNode}
                     onSelectNode={handleSelectProgramTreeNode}
                     onChangeViewMode={handleChangeProgramTreeViewMode}
                     onWaypointChange={handleTreeWaypointChange}
                     onWaypointMoveTypeChange={handleTreeWaypointMoveTypeChange}
+                    onWaypointSpeedChange={handleTreeWaypointSpeedChange}
+                    onWaypointSpeedReset={handleTreeWaypointSpeedReset}
+                    onWaypointAccelerationChange={handleTreeWaypointAccelerationChange}
+                    onWaypointAccelerationReset={handleTreeWaypointAccelerationReset}
+                    onWaypointPauseChange={handleTreeWaypointPauseChange}
+                    onWaypointPauseReset={handleTreeWaypointPauseReset}
                     onAddWaypoint={handleTreeAddWaypoint}
                     onRemoveWaypoint={handleTreeRemoveWaypoint}
                     onMoveWaypointUp={() => handleTreeMoveWaypoint(-1)}
                     onMoveWaypointDown={() => handleTreeMoveWaypoint(1)}
                     onApplyWaypointEdits={handleApplyTreeWaypointEdits}
+                    onUndoTrajectoryDraft={handleUndoTrajectoryDraftEdit}
+                    onRevertTrajectoryDraft={handleRevertTrajectoryDraft}
+                    onSaveTrajectoryDraft={handleSaveTrajectoryProgram}
                   />
                 ) : (
                   <section className="flex h-full min-h-0 flex-col items-center justify-center rounded-2xl border border-dashed border-slate-800/80 bg-slate-950/50 px-6 py-5 text-center">
@@ -8438,7 +9477,15 @@ export default function App() {
                   </section>
                 )}
               </div>
-              <section className="gradient-scrollbar flex min-h-0 flex-1 flex-col overflow-y-auto rounded-2xl border border-slate-800/80 bg-slate-950/72 p-4 shadow-xl shadow-black/20">
+              <div className="min-h-0">
+                <PaneResizeHandle
+                  orientation="horizontal"
+                  active={activeShellDrag?.kind === "rightDock"}
+                  ariaLabel="Resize program tree and robot controls"
+                  onPointerDown={startShellDrag("rightDock")}
+                />
+              </div>
+              <section className="gradient-scrollbar min-h-0 overflow-y-auto rounded-2xl border border-slate-800/80 bg-slate-950/72 p-4 shadow-xl shadow-black/20">
                 <div className="text-[11px] font-semibold uppercase tracking-[0.24em] text-cyan-200/80">
                   Robot Control
                 </div>

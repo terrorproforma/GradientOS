@@ -6,6 +6,7 @@ def test_load_runtime_config_defaults_to_manifest_policy(monkeypatch, tmp_path):
     monkeypatch.setenv(runtime_config.RUNTIME_CONFIG_ENV_VAR, str(cfg_path))
     loaded = runtime_config.load_runtime_config()
     assert loaded["desired"]["robot"] == "gradient05"
+    assert loaded["desired"]["sim_mode"] is False
     assert loaded["desired"]["active_tool_id"] is None
     assert loaded["desired"]["allow_unsafe_overrides"] is False
     assert loaded["desired"]["overrides"]["ik_solver_backend"] is None
@@ -59,6 +60,7 @@ def test_compute_restart_required_from_active_vs_desired():
     desired = {
         "desired": {
             "robot": "gradient05",
+            "sim_mode": False,
             "allow_unsafe_overrides": False,
             "overrides": {
                 "ik_solver_backend": None,
@@ -72,6 +74,36 @@ def test_compute_restart_required_from_active_vs_desired():
     desired["desired"]["robot"] = "gradient0"
     assert runtime_config.compute_restart_required(active_runtime=active, desired_config=desired) is True
 
+    desired["desired"]["robot"] = "gradient05"
+    desired["desired"]["sim_mode"] = True
+    assert runtime_config.compute_restart_required(active_runtime=active, desired_config=desired) is False
+
+
+def test_derive_runtime_request_from_active_runtime_preserves_live_overrides():
+    active = runtime_config.resolve_effective_runtime(
+        robot_name="gradient05",
+        sim_mode=False,
+        requested_ik_solver_backend="ikfast",
+        requested_servo_backend="feetech",
+        requested_drive_profile="cia402",
+        requested_rt_max_rpm=4500,
+        requested_active_tool_id="tig-torch-65deg",
+        allow_unsafe_overrides=True,
+    )
+
+    request = runtime_config.derive_runtime_request_from_active_runtime(active)
+
+    assert request == {
+        "robot_name": "gradient05",
+        "sim_mode": False,
+        "requested_ik_solver_backend": "ikfast",
+        "requested_servo_backend": "feetech",
+        "requested_drive_profile": "cia402",
+        "requested_rt_max_rpm": 4500.0,
+        "requested_active_tool_id": "tig-torch-65deg",
+        "allow_unsafe_overrides": True,
+    }
+
 
 def test_compute_restart_required_ignores_tool_mismatch_for_live_apply():
     active = runtime_config.resolve_effective_runtime(
@@ -83,6 +115,7 @@ def test_compute_restart_required_ignores_tool_mismatch_for_live_apply():
     desired = {
         "desired": {
             "robot": "gradient05",
+            "sim_mode": False,
             "active_tool_id": "tig-torch-65deg",
             "allow_unsafe_overrides": False,
             "overrides": {
@@ -95,6 +128,27 @@ def test_compute_restart_required_ignores_tool_mismatch_for_live_apply():
     assert runtime_config.compute_restart_required(active_runtime=active, desired_config=desired) is False
 
 
+def test_compute_restart_required_detects_live_override_beyond_mode_switch():
+    active = runtime_config.resolve_effective_runtime(
+        robot_name="gradient05",
+        sim_mode=True,
+        allow_unsafe_overrides=False,
+    )
+    desired = {
+        "desired": {
+            "robot": "gradient05",
+            "sim_mode": False,
+            "allow_unsafe_overrides": True,
+            "overrides": {
+                "ik_solver_backend": None,
+                "servo_backend": "feetech",
+                "drive_profile": None,
+            },
+        }
+    }
+    assert runtime_config.compute_restart_required(active_runtime=active, desired_config=desired) is True
+
+
 def test_compute_restart_required_detects_drive_profile_override():
     active = runtime_config.resolve_effective_runtime(
         robot_name="gradient05",
@@ -104,6 +158,7 @@ def test_compute_restart_required_detects_drive_profile_override():
     desired = {
         "desired": {
             "robot": "gradient05",
+            "sim_mode": False,
             "allow_unsafe_overrides": True,
             "overrides": {
                 "ik_solver_backend": None,
@@ -131,6 +186,7 @@ def test_attach_live_drive_profile_keeps_configured_profile_for_restart_logic():
     desired = {
         "desired": {
             "robot": "gradient05",
+            "sim_mode": False,
             "allow_unsafe_overrides": True,
             "overrides": {
                 "ik_solver_backend": None,

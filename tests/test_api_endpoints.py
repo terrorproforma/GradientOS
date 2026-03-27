@@ -541,6 +541,41 @@ def patch_send(monkeypatch):
             )
         if command == "GET_RUNTIME_CONFIG":
             return True, f"RUNTIME_CONFIG,{json.dumps(runtime_state, separators=(',', ':'))}"
+        if command.startswith("SWITCH_RUNTIME_MODE,"):
+            mode = command.split(",", 1)[1].strip().lower()
+            if mode not in {"live", "simulate"}:
+                return False, "ERROR,SWITCH_RUNTIME_MODE,Mode must be 'live' or 'simulate'."
+            sim_mode = mode == "simulate"
+            runtime_state["mode"] = {"sim": sim_mode}
+            runtime_state["servo_backend"] = {
+                "effective_backend": "simulation" if sim_mode else "ethercat_rtcore",
+                "source": "sim_mode" if sim_mode else "robot_policy",
+                "robot_default_backend": "ethercat_rtcore",
+                "override_backend": None,
+            }
+            runtime_state["drive_profile"] = {
+                "configured_profile": None if sim_mode else "a6ec_ds402",
+                "configured_source": "sim_mode" if sim_mode else "backend_default",
+                "live_profile": None,
+                "live_source": None,
+                "effective_profile": None if sim_mode else "a6ec_ds402",
+                "source": "sim_mode" if sim_mode else "backend_default",
+                "backend_default_profile": None if sim_mode else "a6ec_ds402",
+                "override_profile": None,
+            }
+            api_main.runtime_config.update_runtime_config_desired(
+                {"sim_mode": sim_mode},
+                actor="controller-runtime-switch",
+            )
+            payload = {
+                "requested_mode": mode,
+                "active_mode": mode,
+                "mode_changed": True,
+                "waited_for_idle": True,
+                "idle": dict(completed_motion_payload),
+                "runtime": dict(runtime_state),
+            }
+            return True, f"ACK,SWITCH_RUNTIME_MODE,{_payload_token(payload)}"
         if command.startswith("ROTATE,"):
             return True, f"ACK,ROTATE,{_payload_token({**completed_motion_payload, 'axis': 'x'})}"
         if command.startswith("SET_ORIENTATION,"):
@@ -1457,15 +1492,33 @@ def test_trajectory_plan_points_preserves_waypoint_move_type(client):
         "/trajectory/plan-points",
         json={
             "waypoints": [
-                {"x": 0.1, "y": 0.2, "z": 0.3, "move_type": "joint"},
-                {"x": 0.4, "y": 0.5, "z": 0.6, "moveType": "home"},
+                {
+                    "x": 0.1,
+                    "y": 0.2,
+                    "z": 0.3,
+                    "move_type": "joint",
+                    "rotation_speed_deg_s": 12.5,
+                },
+                {
+                    "x": 0.4,
+                    "y": 0.5,
+                    "z": 0.6,
+                    "moveType": "linear",
+                    "linearSpeedMmS": 240.0,
+                    "linearAccelerationMmS2": 240.0,
+                    "pauseAfterSec": 0.75,
+                },
             ]
         },
     )
     assert resp.status_code == 200
     body = resp.json()
     assert body["waypoints"][0]["move_type"] == "joint"
-    assert body["waypoints"][1]["move_type"] == "home"
+    assert body["waypoints"][1]["move_type"] == "linear"
+    assert body["waypoints"][0]["rotation_speed_deg_s"] == pytest.approx(12.5)
+    assert body["waypoints"][1]["linear_speed_mm_s"] == pytest.approx(240.0)
+    assert body["waypoints"][1]["linear_acceleration_mm_s2"] == pytest.approx(240.0)
+    assert body["waypoints"][1]["pause_after_s"] == pytest.approx(0.75)
 
 
 def test_trajectory_plan_points_validation(client):
@@ -1539,9 +1592,11 @@ def test_trajectory_plan_points_failure_includes_planner_diagnostics(client, mon
 
 
 def test_trajectory_run_simulation_mode_conflict(client, monkeypatch):
-    runtime_state = api_main.runtime_config.get_runtime_config_snapshot()
-    runtime_state["active"]["mode"]["sim"] = True
-    runtime_state["active"]["servo_backend"]["effective_backend"] = "simulation"
+    runtime_state = {
+        "robot": {"name": "gradient05"},
+        "mode": {"sim": True},
+        "servo_backend": {"effective_backend": "simulation"},
+    }
 
     def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
         if command == "GET_RUNTIME_CONFIG":
@@ -1553,6 +1608,40 @@ def test_trajectory_run_simulation_mode_conflict(client, monkeypatch):
     resp = client.post("/trajectory/run", json={"name": "alpha", "execution_mode": "live"})
     assert resp.status_code == 409
     assert "SIM mode" in resp.json()["detail"]
+
+
+def test_trajectory_run_allows_simulation_with_raw_runtime_snapshot(client, monkeypatch):
+    runtime_state = {
+        "robot": {"name": "gradient05"},
+        "mode": {"sim": True},
+        "servo_backend": {"effective_backend": "simulation"},
+    }
+    accepted_payload = {
+        "accepted": True,
+        "state": "accepted",
+        "program": {
+            "name": "alpha",
+            "active": True,
+            "state": "accepted",
+        },
+        "program_name": "alpha",
+    }
+
+    def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
+        if command == "GET_RUNTIME_CONFIG":
+            return True, "RUNTIME_CONFIG," + json.dumps(runtime_state, separators=(",", ":"))
+        if command == "RUN_TRAJECTORY,alpha,false":
+            return True, f"ACK,RUN_TRAJECTORY,{_payload_token(accepted_payload)}"
+        return False, f"unexpected {command}"
+
+    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
+
+    resp = client.post("/trajectory/run", json={"name": "alpha", "execution_mode": "simulate"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["runtime_mode"] == "simulate"
+    assert body["execution_mode"] == "simulate"
+    assert body["program"]["name"] == "alpha"
 
 
 def test_trajectory_detail(client):
@@ -1660,8 +1749,17 @@ def test_robot_program_save_list_load_for_trajectory(client):
                     "pitchDeg": 2.0,
                     "yawDeg": 3.0,
                     "moveType": "joint",
+                    "rotationSpeedDegS": 12.5,
                 },
-                {"x": 0.4, "y": 0.5, "z": 0.6, "moveType": "home"},
+                {
+                    "x": 0.4,
+                    "y": 0.5,
+                    "z": 0.6,
+                    "moveType": "linear",
+                    "linearSpeedMmS": 120.0,
+                    "linearAccelerationMmS2": 120.0,
+                    "pauseAfterSec": 0.6,
+                },
             ],
             "metadata": {"note": "demo"},
             "planned_trajectory": {"name": "__planner_preview__"},
@@ -1680,7 +1778,11 @@ def test_robot_program_save_list_load_for_trajectory(client):
     assert payload["kind"] == "trajectory"
     assert payload["authoring"]["waypoints"][0]["orientation_euler_deg"]["yaw"] == pytest.approx(3.0)
     assert payload["authoring"]["waypoints"][0]["move_type"] == "joint"
-    assert payload["authoring"]["waypoints"][1]["move_type"] == "home"
+    assert payload["authoring"]["waypoints"][0]["rotation_speed_deg_s"] == pytest.approx(12.5)
+    assert payload["authoring"]["waypoints"][1]["move_type"] == "linear"
+    assert payload["authoring"]["waypoints"][1]["linear_speed_mm_s"] == pytest.approx(120.0)
+    assert payload["authoring"]["waypoints"][1]["linear_acceleration_mm_s2"] == pytest.approx(120.0)
+    assert payload["authoring"]["waypoints"][1]["pause_after_s"] == pytest.approx(0.6)
     assert payload["authoring"]["metadata"]["note"] == "demo"
 
 
@@ -1869,15 +1971,17 @@ def test_runtime_config_get_and_patch(client):
     body = get_resp.json()
     assert body["active"]["robot"]["name"] == "gradient05"
     assert body["desired"]["robot"] == "gradient05"
+    assert body["desired"]["sim_mode"] is False
     assert body["restart_required"] is False
 
     patch_resp = client.patch(
         "/info/runtime-config",
-        json={"robot": "gradient0", "active_tool_id": "tig-torch-65deg", "actor": "pytest"},
+        json={"robot": "gradient0", "sim_mode": True, "active_tool_id": "tig-torch-65deg", "actor": "pytest"},
     )
     assert patch_resp.status_code == 200
     patch_body = patch_resp.json()
     assert patch_body["desired"]["robot"] == "gradient0"
+    assert patch_body["desired"]["sim_mode"] is True
     assert patch_body["desired"]["active_tool_id"] == "tig-torch-65deg"
     assert patch_body["restart_required"] is True
 
@@ -1894,6 +1998,34 @@ def test_runtime_config_patch_applies_tool_live_without_restart(client):
     assert patch_body["restart_required"] is False
     commands = [entry[0] for entry in client.command_calls]
     assert "SET_ACTIVE_TOOL,tig-torch-65deg" in commands
+
+
+def test_runtime_config_patch_marks_sim_mode_hot_switchable_without_restart(client):
+    patch_resp = client.patch(
+        "/info/runtime-config",
+        json={"sim_mode": True, "actor": "pytest"},
+    )
+    assert patch_resp.status_code == 200
+    patch_body = patch_resp.json()
+    assert patch_body["desired"]["sim_mode"] is True
+    assert patch_body["active"]["mode"]["sim"] is False
+    assert patch_body["restart_required"] is False
+
+
+def test_control_runtime_mode_hot_switch_returns_updated_snapshot(client):
+    resp = client.post("/control/runtime-mode", json={"mode": "simulate"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["detail"].startswith("ACK,SWITCH_RUNTIME_MODE,")
+    assert body["requested_mode"] == "simulate"
+    assert body["active_mode"] == "simulate"
+    assert body["mode_changed"] is True
+    assert body["waited_for_idle"] is True
+    assert body["active"]["mode"]["sim"] is True
+    assert body["active"]["servo_backend"]["effective_backend"] == "simulation"
+    assert body["desired"]["sim_mode"] is True
+    assert body["restart_required"] is False
+    assert client.command_calls[-1] == ("SWITCH_RUNTIME_MODE,simulate", 20.0, True)
 
 
 def test_send_controller_command_uses_large_udp_receive_buffer(monkeypatch):

@@ -2,6 +2,7 @@
   "version": 1,
   "desired": {
     "robot": "gradient05",
+    "sim_mode": false,
     "active_tool_id": "tool-1774284997294",
     "allow_unsafe_overrides": false,
     "overrides": {
@@ -12,7 +13,7 @@
     }
   },
   "meta": {
-    "updated_at": "2026-03-23T16:59:22+00:00",
-    "updated_by": "web-ui"
+    "updated_at": "2026-03-27T00:14:09+00:00",
+    "updated_by": "controller-runtime-switch"
   }
 }
