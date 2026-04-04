@@ -2468,10 +2468,10 @@ function TrajectoryPanel({
             1. Click <span className="font-semibold text-slate-100">{isPlanning ? "Stop Editing" : "Start Editing"}</span>.
           </div>
           <div>
-            2. Use <span className="font-semibold text-slate-100">Shift-click in the 3D workspace</span> or <span className="font-semibold text-slate-100">Capture Pose</span> to add a linear move.
+            2. Use <span className="font-semibold text-slate-100">Shift-click in the 3D workspace</span> or <span className="font-semibold text-slate-100">Linear Move</span> to add a linear move.
           </div>
           <div>
-            3. Use <span className="font-semibold text-slate-100">Add Waypoint</span> for a joint move or <span className="font-semibold text-slate-100">Move to Home</span> for a home return.
+            3. Use <span className="font-semibold text-slate-100">Joint Move</span> for a joint move or <span className="font-semibold text-slate-100">Move to Home</span> for a home return.
           </div>
           <div>
             4. Adjust XYZ and roll/pitch/yaw in the <span className="font-semibold text-slate-100">Program Tree</span>.
@@ -2501,9 +2501,9 @@ function TrajectoryPanel({
               interactionLocked ? "opacity-60" : ""
             }`}
           >
-            <div className={`${DRAWER_ACTION_TEXT_CLASS}`}>Capture Pose</div>
+            <div className={`${DRAWER_ACTION_TEXT_CLASS}`}>Linear Move</div>
             <div className="mt-0.5 text-[11px] text-slate-400">
-              Read the robot TCP as a linear move
+              Read the robot TCP and append a linear move
             </div>
           </button>
           <button
@@ -2516,10 +2516,10 @@ function TrajectoryPanel({
           >
             <span className={`inline-flex items-center gap-2 ${DRAWER_ACTION_TEXT_CLASS}`}>
               <Plus size={14} />
-              Add Waypoint
+              Joint Move
             </span>
             <div className="mt-0.5 text-[11px] text-slate-400">
-              Insert a numeric joint move waypoint
+              Read the robot joints and append a joint move
             </div>
           </button>
           <button

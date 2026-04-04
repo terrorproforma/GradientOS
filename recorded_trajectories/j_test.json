@@ -1,0 +1,133 @@
+{
+  "description": "Planned on 2026-03-27 04:49:10 via PLAN_TRAJECTORY_POINTS",
+  "loop": false,
+  "orientation_euler_angles_deg": null,
+  "moves": [
+    {
+      "command": "move",
+      "vector": [
+        0.8067,
+        0,
+        0.6897
+      ],
+      "orientation_euler_deg": [
+        180,
+        0,
+        180
+      ],
+      "rotation_speed_deg_s": 6.032
+    },
+    {
+      "command": "move",
+      "vector": [
+        0.8067,
+        0,
+        0.7527
+      ],
+      "orientation_euler_deg": [
+        -180,
+        0,
+        180
+      ],
+      "rotation_speed_deg_s": 6.032
+    },
+    {
+      "command": "move",
+      "vector": [
+        0.935,
+        0,
+        0.3872
+      ],
+      "orientation_euler_deg": [
+        180,
+        -0.05,
+        -180
+      ],
+      "rotation_speed_deg_s": 10.211
+    },
+    {
+      "command": "move",
+      "vector": [
+        0.9353,
+        -0.0002,
+        0.3868
+      ],
+      "orientation_euler_deg": [
+        106.75,
+        0.16,
+        -179.96
+      ],
+      "rotation_speed_deg_s": 22.226
+    },
+    {
+      "command": "move",
+      "vector": [
+        0.9356,
+        0,
+        0.3864
+      ],
+      "orientation_euler_deg": [
+        -111.08,
+        0.01,
+        -179.91
+      ],
+      "rotation_speed_deg_s": 22.02
+    },
+    {
+      "command": "move",
+      "vector": [
+        0.9369,
+        0.0017,
+        0.3843
+      ],
+      "orientation_euler_deg": [
+        -165.5,
+        22.6,
+        -139.36
+      ],
+      "rotation_speed_deg_s": 22.373
+    },
+    {
+      "command": "move",
+      "vector": [
+        0.9364,
+        0.0016,
+        0.3841
+      ],
+      "orientation_euler_deg": [
+        -146.61,
+        40.84,
+        -43.94
+      ],
+      "rotation_speed_deg_s": 36.948
+    },
+    {
+      "command": "move",
+      "vector": [
+        0.9362,
+        0.0016,
+        0.3839
+      ],
+      "orientation_euler_deg": [
+        -146.42,
+        40.67,
+        51.06
+      ],
+      "rotation_speed_deg_s": 12.48
+    },
+    {
+      "command": "home",
+      "vector": [
+        0.8067,
+        0,
+        0.6897
+      ],
+      "orientation_euler_deg": [
+        180,
+        0,
+        180
+      ],
+      "rotation_speed_deg_s": 32.507
+    }
+  ]
+}

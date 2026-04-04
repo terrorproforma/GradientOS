@@ -962,6 +962,7 @@ def test_control_joint_jog(client):
     body = resp.json()
     assert body["joint"] == 3
     assert body["delta_deg"] == pytest.approx(2.5)
+    assert body["max_motor_rpm"] == pytest.approx(100.0)
     assert body["target_arm_deg"] == [1.0, 2.0, 5.5, 4.0, 5.0, 6.0]
     assert body["target_arm_rad"] == pytest.approx([
         0.017453292519943295,
@@ -981,6 +982,8 @@ def test_control_joint_jog(client):
     assert timeout_s == 2.0
     assert expect_response is True
     assert last_command.startswith("APPLY_JOINT_SETPOINT,")
+    payload = json.loads(base64.urlsafe_b64decode(last_command.split(",", 1)[1]).decode("utf-8"))
+    assert payload["max_motor_rpm"] == pytest.approx(100.0)
 
 
 def test_control_joint_jog_surfaces_backend_rejection(client, monkeypatch):

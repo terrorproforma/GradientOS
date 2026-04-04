@@ -90,7 +90,7 @@ class Gradient05Config(RobotConfig):
         These values come from the current Gradient-05 EtherCAT bring-up notes
         and are used by the RTCore backend to convert raw counts into radians.
         """
-        return [100.0, 100.0, 100.0, 18.0, 18.1818181818, 10.0] # the 18.18 ratio is from the pulled setup on the timing belt: 22T driving 20T after the 20:1 planetary gearbox
+        return [100.0, 100.0, 100.0, 18.0, 31.25, 10.0] # the 31.25 ratio is from the pulled setup on the timing belt: 16T driving 25T after the 20:1 planetary gearbox
 
     @property
     def actuator_position_signs(self) -> list[int]:
@@ -122,7 +122,7 @@ class Gradient05Config(RobotConfig):
             (-4.2, 1.53),  # J3
             (-6.3, 6.3),  # J4
             (-6.3, 6.3),  # J5
-            (-6.3, 6.3),  # J6
+            (-10.0, 10.0),  # J6
         ]
 
     @property

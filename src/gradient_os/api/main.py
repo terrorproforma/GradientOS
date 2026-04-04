@@ -62,7 +62,7 @@ _DIAGNOSTICS_LOG_DIR = os.path.join(_PROJECT_ROOT_DIR, "logs", "diagnostics")
 _CONTROLLER_REPLY_MAX_BYTES = 65535
 _DEFAULT_MONITOR_TELEMETRY_HZ = 50
 _DEFAULT_MOVE_LINE_CLOSED_LOOP = False
-_SAFE_HOME_REST_MAX_MOTOR_RPM = 100.0
+_SAFE_COMMISSIONING_MAX_MOTOR_RPM = 100.0
 _DEFAULT_RTCORE_METRICS_PATH = "/run/gradient-rt-motion/metrics.json"
 _API_PERF_LOCK = threading.Lock()
 _API_PERF: dict[str, Any] = {
@@ -1566,7 +1566,7 @@ def create_app() -> FastAPI:
             + _encode_payload_b64(
                 {
                     "arm_angles_rad": [0.0] * 6,
-                    "max_motor_rpm": _SAFE_HOME_REST_MAX_MOTOR_RPM,
+                    "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
                 }
             ),
             timeout=2.0,
@@ -1576,7 +1576,7 @@ def create_app() -> FastAPI:
         return {
             "status": "ok",
             "detail": detail,
-            "max_motor_rpm": _SAFE_HOME_REST_MAX_MOTOR_RPM,
+            "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
             **payload,
         }
 
@@ -1640,7 +1640,13 @@ def create_app() -> FastAPI:
         try:
             detail = await run_in_threadpool(
                 _controller_call_or_503,
-                "APPLY_JOINT_SETPOINT," + _encode_payload_b64({"arm_angles_rad": target_arm_rad}),
+                "APPLY_JOINT_SETPOINT,"
+                + _encode_payload_b64(
+                    {
+                        "arm_angles_rad": target_arm_rad,
+                        "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
+                    }
+                ),
                 timeout=2.0,
                 expect_response=True,
             )
@@ -1657,6 +1663,7 @@ def create_app() -> FastAPI:
             "target_arm_rad": target_arm_rad,
             "detail": detail,
             "command_acknowledged": command_acknowledged,
+            "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
             "wait_for_idle_requested": wait_for_idle,
             "waited_for_idle": False,
             **payload,
@@ -1670,7 +1677,7 @@ def create_app() -> FastAPI:
             + _encode_payload_b64(
                 {
                     "arm_angles_rad": list(_resolve_rest_pose()),
-                    "max_motor_rpm": _SAFE_HOME_REST_MAX_MOTOR_RPM,
+                    "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
                 }
             ),
             timeout=2.0,
@@ -1680,7 +1687,7 @@ def create_app() -> FastAPI:
         return {
             "status": "ok",
             "detail": detail,
-            "max_motor_rpm": _SAFE_HOME_REST_MAX_MOTOR_RPM,
+            "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
             **payload,
         }
 

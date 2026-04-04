@@ -1829,3 +1829,9 @@ Use this file as persistent, repo-local execution memory.
 - [tool] `logs/startups/latest/controller.log` can prove the explicit pause value is being honored even when the operator still perceives a long hesitation. In this case the log showed `Pausing for 0.1 seconds.` three times, so the remaining issue was not a stale `1.0 s` dwell.
 - [self] Corrective rule: if standard trajectory execution still feels stop-start after dwell metadata is correct, inspect whether `handle_run_trajectory(...)` is executing many separate `move`/`pause` steps. Repeated RTCore trajectory submissions can make authored boundaries feel sticky even with a tiny pause.
 - [self] Corrective rule: for non-looping standard trajectories without weld semantics, collapse `move` + `pause` runtime steps into one composite streamed joint path with repeated hold samples for pauses so the executed timing matches the authored dwell more closely.
+
+### 2026-03-27 - Trajectory action labels should name the motion type directly
+- [user] Explicit preference: the trajectory drawer buttons should say `Linear Move` and `Joint Move` instead of `Capture Pose` and `Add Waypoint`.
+- [self] Corrective rule: in `web-ui/src/App.tsx`, keep the create-trajectory helper text and primary button labels aligned so both describe motion intent directly rather than the capture mechanism.
+- [user] Commissioning moves must actually enforce the promised safety limit, not just display it in the UI.
+- [self] Corrective rule: when a commissioning or service flow depends on a hard RTCore speed ceiling, encode the cap explicitly in the command payload (for example `APPLY_JOINT_SETPOINT.max_motor_rpm`) rather than assuming the runtime default clamp matches the commissioning policy.

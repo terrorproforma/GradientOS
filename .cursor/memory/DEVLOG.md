@@ -7477,3 +7477,38 @@
 - Follow-up notes / risks:
   - The currently running stack is still `./start-stack.sh`, so this backend fix will not change live behavior until the controller/API process is restarted.
   - I did not perform a fresh hardware run after the code change, so the remaining runtime check is to restart the stack, run the same preview trajectory again, and confirm the stop-start feel is reduced while the authored `0.1s` dwell is still visible in the controller log.
+
+## 2026-03-27 04:34 UTC
+
+- Task summary:
+  - Renamed the trajectory drawer action labels so the UI says `Linear Move` and `Joint Move` directly instead of `Capture Pose` and `Add Waypoint`.
+- Changes:
+  - Updated `web-ui/src/App.tsx`:
+    - changed the create-trajectory instructions to reference `Linear Move` and `Joint Move`,
+    - renamed the two drawer action labels,
+    - adjusted the helper copy under each button to describe the appended move more explicitly.
+- Validation:
+  - `ReadLints` on `web-ui/src/App.tsx`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did not run a full frontend build because this was a text-only JSX copy change with clean lint diagnostics on the touched file.
+
+## 2026-04-04 04:30 +0000
+
+- Task summary:
+  - Fixed joint commissioning so the `joint-jog` API path now enforces the intended `100 RPM` RTCore cap instead of falling through to an unbounded direct setpoint path.
+- Changes:
+  - Updated `src/gradient_os/api/main.py`:
+    - renamed the commissioning safety constant to `_SAFE_COMMISSIONING_MAX_MOTOR_RPM`
+    - reused that constant for `/control/home` and `/control/rest`
+    - added `max_motor_rpm: 100.0` to `/control/joint-jog` `APPLY_JOINT_SETPOINT` payloads
+    - returned `max_motor_rpm` in the `/control/joint-jog` response for clearer API parity with the other commissioning actions
+  - Updated `tests/test_api_endpoints.py`:
+    - added regression coverage proving `/control/joint-jog` sends `max_motor_rpm == 100.0`
+    - asserted the endpoint response also reports the same commissioning cap
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_api_endpoints.py -q -k "control_home or control_rest or control_joint_jog"` (passed, 5 tests)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/api/main.py tests/test_api_endpoints.py` (passed)
+  - `ReadLints` on `src/gradient_os/api/main.py` and `tests/test_api_endpoints.py` (no diagnostics)
+- Follow-up notes / risks:
+  - The currently running controller/API process must be restarted before the live commissioning panel will actually use the new capped payload.
