@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...ethercat_drive_catalog import list_ethercat_drive_profiles, render_ethercat_drive_rtcore_env
+from .. import registry as backend_registry
+
 RTCORE_DRIVE_PROFILE_UNKNOWN = 0
-RTCORE_DRIVE_PROFILE_A6EC_DS402 = 1
-RTCORE_DRIVE_PROFILE_CIA402 = 2
 DEFAULT_RT_MAX_RPM = 6000.0
 
 RTCORE_MOTION_MODE_IDLE = 0
@@ -29,15 +30,6 @@ RTCORE_JOG_STOP_REASON_NONE = 0
 RTCORE_JOG_STOP_REASON_CMD_STOP = 1
 RTCORE_JOG_STOP_REASON_TIMEOUT = 2
 RTCORE_JOG_STOP_REASON_TRAJECTORY_PREEMPT = 3
-
-RTCORE_DRIVE_PROFILE_NAME_TO_ID: dict[str, int] = {
-    "a6ec_ds402": RTCORE_DRIVE_PROFILE_A6EC_DS402,
-    "cia402": RTCORE_DRIVE_PROFILE_CIA402,
-}
-
-RTCORE_DRIVE_PROFILE_ID_TO_NAME: dict[int, str] = {
-    value: key for key, value in RTCORE_DRIVE_PROFILE_NAME_TO_ID.items()
-}
 
 RTCORE_MOTION_MODE_ID_TO_NAME: dict[int, str] = {
     RTCORE_MOTION_MODE_IDLE: "idle",
@@ -65,12 +57,21 @@ RTCORE_JOG_STOP_REASON_ID_TO_NAME: dict[int, str] = {
 }
 
 
+def _rtcore_drive_profile_hash(token: str) -> int:
+    value = 0x811C9DC5
+    for ch in token:
+        value ^= ord(ch)
+        value = (value * 0x01000193) & 0xFFFFFFFF
+    return value or RTCORE_DRIVE_PROFILE_UNKNOWN
+
+
 def normalize_drive_profile_id(profile_id: object | None) -> str | None:
     token = str(profile_id or "").strip().lower()
     if not token:
         return None
-    if token.isdigit():
-        return RTCORE_DRIVE_PROFILE_ID_TO_NAME.get(int(token))
+    if token.isdigit() or token.startswith("0x"):
+        resolved = rtcore_drive_profile_id_to_name(int(token, 0))
+        return resolved
     return token
 
 
@@ -78,7 +79,7 @@ def rtcore_drive_profile_name_to_id(profile_id: object | None) -> int:
     token = normalize_drive_profile_id(profile_id)
     if not token:
         return RTCORE_DRIVE_PROFILE_UNKNOWN
-    return int(RTCORE_DRIVE_PROFILE_NAME_TO_ID.get(token, RTCORE_DRIVE_PROFILE_UNKNOWN))
+    return _rtcore_drive_profile_hash(token)
 
 
 def rtcore_drive_profile_id_to_name(profile_code: object | None) -> str | None:
@@ -86,7 +87,12 @@ def rtcore_drive_profile_id_to_name(profile_code: object | None) -> str | None:
         code = int(profile_code)
     except Exception:
         return None
-    return RTCORE_DRIVE_PROFILE_ID_TO_NAME.get(code)
+    if code == RTCORE_DRIVE_PROFILE_UNKNOWN:
+        return None
+    for candidate in list_ethercat_drive_profiles():
+        if _rtcore_drive_profile_hash(candidate) == code:
+            return candidate
+    return None
 
 
 def rtcore_motion_mode_id_to_name(mode_code: object | None) -> str | None:
@@ -139,6 +145,55 @@ def build_rtcore_axis_scaling(robot_config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_rtcore_drive_startup_config(
+    robot_config: dict[str, Any],
+    *,
+    drive_profile: str | None,
+) -> dict[str, Any]:
+    axis_scaling = build_rtcore_axis_scaling(robot_config)
+    num_axes = int(axis_scaling["num_axes"])
+    raw_entries = robot_config.get("ethercat_drive_startup_config", [])
+    if isinstance(raw_entries, list) and all(
+        isinstance(entry, dict) and not entry for entry in raw_entries
+    ):
+        raw_entries = []
+    normalized_profile = normalize_drive_profile_id(drive_profile)
+    if normalized_profile and rtcore_drive_profile_name_to_id(normalized_profile) == RTCORE_DRIVE_PROFILE_UNKNOWN:
+        raise ValueError(f"Unsupported RTCore drive profile '{drive_profile}'.")
+    startup = backend_registry.build_drive_startup_config_for_backend(
+        "ethercat_rtcore",
+        raw_entries,
+        num_axes=num_axes,
+        drive_profile_id=normalized_profile,
+    )
+    if isinstance(startup, dict):
+        return startup
+    return {"profile_id": normalized_profile, "settings": {}, "env": {}}
+
+
+def build_rtcore_drive_profile_env(
+    *,
+    drive_profile: str | None,
+) -> dict[str, str]:
+    normalized_profile = normalize_drive_profile_id(drive_profile)
+    rendered = render_ethercat_drive_rtcore_env(normalized_profile)
+    if normalized_profile and not rendered:
+        raise ValueError(
+            f"RTCore drive profile '{normalized_profile}' does not define an EtherCAT drive catalog entry."
+        )
+    rendered.setdefault("GRADIENT_RT_DRIVE_VENDOR_ID", "")
+    rendered.setdefault("GRADIENT_RT_DRIVE_PRODUCT_CODE", "")
+    rendered.setdefault("GRADIENT_RT_DRIVE_REVISION_NO", "")
+    rendered.setdefault("GRADIENT_RT_DRIVE_RX_SYNC_INDEX", "2")
+    rendered.setdefault("GRADIENT_RT_DRIVE_TX_SYNC_INDEX", "3")
+    rendered.setdefault("GRADIENT_RT_DRIVE_DC_CYCLE_MULTIPLE_NS", "0")
+    rendered.setdefault("GRADIENT_RT_DRIVE_RX_PDO", "")
+    rendered.setdefault("GRADIENT_RT_DRIVE_TX_PDO", "")
+    rendered.setdefault("GRADIENT_RT_DRIVE_RX_PDO_LAYOUT", "")
+    rendered.setdefault("GRADIENT_RT_DRIVE_TX_PDO_LAYOUT", "")
+    return rendered
+
+
 def build_rtcore_startup_env(
     *,
     robot_config: dict[str, Any],
@@ -149,11 +204,15 @@ def build_rtcore_startup_env(
     normalized_profile = normalize_drive_profile_id(drive_profile)
     if normalized_profile and rtcore_drive_profile_name_to_id(normalized_profile) == RTCORE_DRIVE_PROFILE_UNKNOWN:
         raise ValueError(f"Unsupported RTCore drive profile '{drive_profile}'.")
+    startup_config = build_rtcore_drive_startup_config(
+        robot_config,
+        drive_profile=normalized_profile,
+    )
     resolved_max_rpm = DEFAULT_RT_MAX_RPM if max_rpm is None else float(max_rpm)
     if resolved_max_rpm < 0.0:
         raise ValueError("RTCore max_rpm must be >= 0.")
 
-    return {
+    env = {
         "GRADIENT_RT_NUM_AXES": str(int(axis_scaling["num_axes"])),
         "GRADIENT_RT_COUNTS_PER_REV": ",".join(str(int(value)) for value in axis_scaling["counts_per_rev"]),
         "GRADIENT_RT_GEAR_RATIO": ",".join(f"{float(value):g}" for value in axis_scaling["gear_ratio"]),
@@ -161,6 +220,11 @@ def build_rtcore_startup_env(
         "GRADIENT_RT_DRIVE_PROFILE": normalized_profile or "",
         "GRADIENT_RT_MAX_RPM": f"{resolved_max_rpm:g}",
     }
+    env.update(build_rtcore_drive_profile_env(drive_profile=normalized_profile))
+    for key, value in (startup_config.get("env") if isinstance(startup_config, dict) else {}).items():
+        env[str(key)] = str(value)
+    env.setdefault("GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG", "")
+    return env
 
 
 def render_rtcore_systemd_env(

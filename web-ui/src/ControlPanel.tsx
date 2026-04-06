@@ -89,6 +89,11 @@ type MotionStatusResponse = {
 	backend_handled?: boolean;
 };
 
+type PowerTransitionStatusView = {
+	safe_for_power_transition?: boolean;
+	power_transition_blocker_details?: PowerTransitionBlocker[];
+};
+
 type JogCommandVector = [number, number, number, number, number, number];
 type JogStatePayload = {
 	active: boolean;
@@ -129,6 +134,23 @@ type DriveFaultDetail = {
 	name?: string;
 	class?: string | null;
 	resettable?: boolean;
+	bus_fault_code_hex?: string | null;
+	bus_fault_name?: string | null;
+	source?: string;
+};
+
+type DriveStartupConfig = {
+	profile_id?: string;
+	setting_key?: string;
+	setting_label?: string;
+	object?: string;
+	configured?: boolean;
+	commanded?: number;
+	commanded_value_label?: string;
+	readback_valid?: boolean;
+	readback?: number;
+	readback_value_label?: string;
+	verified?: boolean;
 };
 
 type DriveFaultAxis = {
@@ -137,7 +159,12 @@ type DriveFaultAxis = {
 	ds402_state: string;
 	statusword: number;
 	error_code: number;
+	error_code_hex?: string;
+	manufacturer_error_code?: number;
+	manufacturer_error_code_hex?: string;
+	startup_drive_config?: DriveStartupConfig | null;
 	fault?: DriveFaultDetail | null;
+	manufacturer_fault?: DriveFaultDetail | null;
 };
 
 type DriveFaultReference = {
@@ -162,6 +189,9 @@ type DriveFaultSnapshot = {
 	op_enabled_axes?: number;
 	num_axes?: number;
 	faulted_axes?: number;
+	startup_drive_config_configured_axes?: number;
+	startup_drive_config_verified_axes?: number;
+	startup_drive_config_mismatch_axes?: number;
 	axes?: DriveFaultAxis[];
 };
 
@@ -207,16 +237,46 @@ function formatDriveFaultDescription(axis: DriveFaultAxis): string {
 		`${formatDriveFaultAxisLabel(axis)}: ${axis.ds402_state}`,
 		`err=0x${axis.error_code.toString(16).padStart(4, "0")}`,
 	];
-	const code = axis.fault?.code?.trim();
-	const name = axis.fault?.name?.trim();
-	if (code) {
-		parts.push(code);
+	const busCode = axis.fault?.code?.trim();
+	const busName = axis.fault?.name?.trim();
+	if (busCode) {
+		parts.push(busCode);
 	}
-	if (name) {
-		parts.push(name);
+	if (busName) {
+		parts.push(busName);
+	}
+	if (typeof axis.manufacturer_error_code === "number" && axis.manufacturer_error_code !== 0) {
+		parts.push(`mfg=0x${axis.manufacturer_error_code.toString(16).padStart(8, "0")}`);
+	}
+	const manufacturerCode = axis.manufacturer_fault?.code?.trim();
+	const manufacturerName = axis.manufacturer_fault?.name?.trim();
+	if (manufacturerCode) {
+		parts.push(manufacturerCode);
+	}
+	if (manufacturerName) {
+		parts.push(manufacturerName);
 	}
 	if (axis.fault?.resettable === true) {
 		parts.push("resettable");
+	} else if (axis.manufacturer_fault?.resettable === true) {
+		parts.push("resettable");
+	}
+	const startupConfig = axis.startup_drive_config;
+	if (startupConfig?.configured) {
+		const label = startupConfig.setting_label?.trim() || startupConfig.setting_key?.trim() || "startup config";
+		const commanded = startupConfig.commanded ?? 0;
+		const commandedLabel = startupConfig.commanded_value_label?.trim() || String(commanded);
+		if (startupConfig.readback_valid) {
+			const readback = startupConfig.readback ?? 0;
+			const readbackLabel = startupConfig.readback_value_label?.trim() || String(readback);
+			parts.push(
+				startupConfig.verified
+					? `${label}: ${commandedLabel} verified`
+					: `${label}: expected ${commandedLabel}, read ${readbackLabel}`,
+			);
+		} else {
+			parts.push(`${label}: ${commandedLabel} unread`);
+		}
 	}
 	return parts.join(" | ");
 }
@@ -369,12 +429,14 @@ export function ControlPanelRuntimeHeader({
 	const isDrivePowerActive = (driveFaults?.driver_state ?? "").trim().toUpperCase() === "ACTIVE";
 	const motionStateName = (motionStatus?.state ?? motionStatus?.execution?.state_name ?? "idle").trim().toLowerCase();
 	const motionBusy = motionStateName === "accepted" || motionStateName === "queued" || motionStateName === "executing";
+	const powerTransitionStatus = motionStatus as (MotionStatusResponse & PowerTransitionStatusView) | null;
+	const powerTransitionExecution = motionStatus?.execution as (MotionExecutionPayload & PowerTransitionStatusView) | undefined;
 	const powerTransitionBlockerDetails = (
-		motionStatus?.power_transition_blocker_details
-		?? motionStatus?.execution?.power_transition_blocker_details
+		powerTransitionStatus?.power_transition_blocker_details
+		?? powerTransitionExecution?.power_transition_blocker_details
 		?? []
 	) as PowerTransitionBlocker[];
-	const powerTransitionSafe = motionStatus?.safe_for_power_transition ?? motionStatus?.execution?.safe_for_power_transition;
+	const powerTransitionSafe = powerTransitionStatus?.safe_for_power_transition ?? powerTransitionExecution?.safe_for_power_transition;
 	const powerTransitionKnown = typeof powerTransitionSafe === "boolean";
 	const powerUpBlocked =
 		activeDriveFaultAxes.length > 0
@@ -668,6 +730,7 @@ export function ControlPanel({
 	const [customJointStepInput, setCustomJointStepInput] = useState<string>("");
 	const [pendingJointAction, setPendingJointAction] = useState<string | null>(null);
 	const [pendingMotionAction, setPendingMotionAction] = useState<string | null>(null);
+	const [encoderRetentionExperimentId, setEncoderRetentionExperimentId] = useState<string | null>(null);
 	const [commissioningStatus, setCommissioningStatus] = useState<CommissioningStatus | null>(null);
 	const [commissioningExpanded, setCommissioningExpanded] = useState<boolean>(false);
 	const [localMotionStatus, setLocalMotionStatus] = useState<MotionStatusResponse | null>(null);
@@ -698,12 +761,14 @@ export function ControlPanel({
 			: null);
 	const motionBusy = motionStateName === "accepted" || motionStateName === "queued" || motionStateName === "executing";
 	const motionControlsBusy = motionBusy || pendingMotionAction !== null;
+	const powerTransitionStatus = motionStatus as (MotionStatusResponse & PowerTransitionStatusView) | null;
+	const powerTransitionExecution = motionStatus?.execution as (MotionExecutionPayload & PowerTransitionStatusView) | undefined;
 	const powerTransitionBlockerDetails = (
-		motionStatus?.power_transition_blocker_details
-		?? motionStatus?.execution?.power_transition_blocker_details
+		powerTransitionStatus?.power_transition_blocker_details
+		?? powerTransitionExecution?.power_transition_blocker_details
 		?? []
 	) as PowerTransitionBlocker[];
-	const powerTransitionSafe = motionStatus?.safe_for_power_transition ?? motionStatus?.execution?.safe_for_power_transition;
+	const powerTransitionSafe = powerTransitionStatus?.safe_for_power_transition ?? powerTransitionExecution?.safe_for_power_transition;
 	const powerTransitionKnown = typeof powerTransitionSafe === "boolean";
 	const powerUpBlocked =
 		activeDriveFaultAxes.length > 0
@@ -1438,6 +1503,54 @@ export function ControlPanel({
 		}
 	}, [pendingJointAction, jointAnglesDeg, jogEnabled, stopJog, post, refreshJointAngles]);
 
+	const handleJointNativeHome = useCallback(async (jointIndex: number) => {
+		if (pendingJointAction) {
+			return;
+		}
+		const jointNumber = jointIndex + 1;
+		const angleLabel = Number.isFinite(jointAnglesDeg[jointIndex] ?? Number.NaN)
+			? `${jointAnglesDeg[jointIndex].toFixed(2)} deg`
+			: "current feedback";
+		const confirmed = window.confirm(
+			`Capture J${jointNumber} at ${angleLabel} as the drive-native home position? This updates the drive's own offset, not the software logical zero.`,
+		);
+		if (!confirmed) {
+			return;
+		}
+		setPendingJointAction(`native-home-${jointIndex}`);
+		setCommissioningStatus({
+			tone: "info",
+			message: `Capturing J${jointNumber} at ${angleLabel} as drive-native home...`,
+		});
+		try {
+			if (jogEnabled) {
+				await stopJog();
+			}
+			const result = await post("/control/home-joint-native", { joint: jointNumber });
+			if (result) {
+				const refreshed = await refreshJointAngles(false);
+				setCommissioningStatus(
+					refreshed
+						? {
+							tone: "success",
+							message: `Requested drive-native home for J${jointNumber}. Live feedback refreshed; use Zero separately if you also want a software logical offset.`,
+						}
+						: {
+							tone: "error",
+							message: `Requested drive-native home for J${jointNumber}, but live feedback refresh did not succeed.`,
+						},
+				);
+			} else {
+				setCommissioningStatus({
+					tone: "error",
+					message: `Failed to request drive-native home for J${jointNumber}.`,
+				});
+			}
+		} finally {
+			setPendingJointAction(null);
+		}
+	}, [pendingJointAction, jointAnglesDeg, jogEnabled, stopJog, post, refreshJointAngles]);
+
 	const handleRefreshJointFeedback = useCallback(async () => {
 		setCommissioningStatus({
 			tone: "info",
@@ -1605,6 +1718,45 @@ export function ControlPanel({
 		}
 	}, [pendingJointAction, post, refreshJointAngles, setMotionStatus]);
 
+	const captureEncoderRetentionSnapshot = useCallback(async (phase: "before_power_down" | "after_power_up") => {
+		if (pendingJointAction) {
+			return;
+		}
+		setPendingJointAction(`encoder-retention-${phase}`);
+		setCommissioningStatus({
+			tone: "info",
+			message: phase === "before_power_down"
+				? "Capturing encoder retention snapshot before drive power-down..."
+				: "Capturing encoder retention snapshot after drive power-up...",
+		});
+		try {
+			const result = await post("/control/encoder-retention/capture", {
+				phase,
+				experiment_id: encoderRetentionExperimentId ?? undefined,
+			}) as Record<string, unknown> | null;
+			const nextExperimentId = typeof result?.experiment_id === "string" ? result.experiment_id : null;
+			if (nextExperimentId) {
+				setEncoderRetentionExperimentId(nextExperimentId);
+			}
+			const comparison = result?.comparison as Record<string, unknown> | undefined;
+			setCommissioningStatus({
+				tone: "success",
+				message: comparison
+					? `Captured ${phase.replaceAll("_", " ")} snapshot for experiment ${nextExperimentId ?? "unknown"} and wrote a before/after comparison artifact.`
+					: `Captured ${phase.replaceAll("_", " ")} snapshot for experiment ${nextExperimentId ?? "unknown"}.`,
+			});
+		} catch (error) {
+			setCommissioningStatus({
+				tone: "error",
+				message: error instanceof Error
+					? error.message
+					: `Failed to capture ${phase.replaceAll("_", " ")} retention snapshot.`,
+			});
+		} finally {
+			setPendingJointAction(null);
+		}
+	}, [pendingJointAction, post, encoderRetentionExperimentId]);
+
 	// ------------------------
 	// Incremental jog helpers
 	// ------------------------
@@ -1750,6 +1902,35 @@ export function ControlPanel({
 				>
 					{pendingJointAction?.startsWith("reset-faults") ? "..." : "Reset All Faults"}
 				</button>
+			</div>
+			<div className="mt-3 grid grid-cols-2 gap-2">
+				<button
+					type="button"
+					className="rounded border border-slate-600/70 bg-slate-900/70 px-2 py-2 text-[11px] font-semibold text-slate-100 transition hover:border-slate-400/70 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+					onClick={() => {
+						void captureEncoderRetentionSnapshot("before_power_down");
+					}}
+					disabled={pendingJointAction !== null}
+					title="Log the current encoder and drive state before powering the drives down"
+				>
+					{pendingJointAction === "encoder-retention-before_power_down" ? "..." : "Log Before Power Down"}
+				</button>
+				<button
+					type="button"
+					className="rounded border border-slate-600/70 bg-slate-900/70 px-2 py-2 text-[11px] font-semibold text-slate-100 transition hover:border-slate-400/70 hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
+					onClick={() => {
+						void captureEncoderRetentionSnapshot("after_power_up");
+					}}
+					disabled={pendingJointAction !== null}
+					title="Log the current encoder and drive state after powering the drives back up"
+				>
+					{pendingJointAction === "encoder-retention-after_power_up" ? "..." : "Log After Power Up"}
+				</button>
+			</div>
+			<div className="mt-2 text-[10px] text-slate-400">
+				{encoderRetentionExperimentId
+					? `Encoder retention experiment: ${encoderRetentionExperimentId}`
+					: "Encoder retention logging will create an experiment id on the first capture."}
 			</div>
 			{driveFaults ? (
 				<div
@@ -2368,7 +2549,9 @@ export function ControlPanel({
 								const jointNumber = jointIndex + 1;
 								const angleDeg = jointAnglesDeg[jointIndex];
 								const angleLabel = Number.isFinite(angleDeg) ? `${angleDeg.toFixed(2)}°` : "--";
-								const isPending = pendingJointAction === `jog-${jointIndex}` || pendingJointAction === `zero-${jointIndex}`;
+								const isPending = pendingJointAction === `jog-${jointIndex}`
+									|| pendingJointAction === `zero-${jointIndex}`
+									|| pendingJointAction === `native-home-${jointIndex}`;
 								const hasLiveFeedback = Number.isFinite(angleDeg);
 								const controlsDisabled = pendingJointAction !== null || motionBusy;
 								const jogDisabled = controlsDisabled || !hasLiveFeedback || !drivePowerReady;
@@ -2433,6 +2616,21 @@ export function ControlPanel({
 												}
 											>
 												{isPending && pendingJointAction === `zero-${jointIndex}` ? "..." : "Zero"}
+											</button>
+											<button
+												type="button"
+												className="rounded border border-cyan-500/40 bg-cyan-400/10 px-2 py-1 text-xs font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+												onClick={() => {
+													void handleJointNativeHome(jointIndex);
+												}}
+												disabled={zeroDisabled}
+												title={
+													hasLiveFeedback
+														? `Capture current J${jointNumber} position as drive-native home`
+														: `Live joint feedback is required before drive-native homing on J${jointNumber}`
+												}
+											>
+												{isPending && pendingJointAction === `native-home-${jointIndex}` ? "..." : "Drive Home"}
 											</button>
 										</div>
 									</div>

@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 from gradient_os.api import main as api_main
 from gradient_os.api.main import create_app
+from gradient_os.telemetry import encoder_retention as encoder_retention_module
 
 
 def _payload_token(payload: dict[str, object]) -> str:
@@ -206,6 +207,7 @@ def patch_send(monkeypatch):
         "RESET_FAULTS": (True, f"ACK,RESET_FAULTS,{_payload_token({**reset_faults_payload, 'joint': None})}"),
         "RESET_FAULTS,1": (True, f"ACK,RESET_FAULTS,{_payload_token({**reset_faults_payload, 'joint': 1})}"),
         "ZERO_JOINT,3": (True, "ACK,ZERO_JOINT,3"),
+        "NATIVE_HOME_JOINT,3": (True, "ACK,NATIVE_HOME_JOINT,3"),
         "GET_MOTION_STATUS": (True, f"MOTION_STATUS,{_payload_token(accepted_program_motion_payload)}"),
         "GET_STATUS": (True, "STATUS,gripper_present,True"),
         "GET_POSITION": (
@@ -954,6 +956,88 @@ def test_control_zero_joint(client):
     assert resp.json()["joint"] == 3
     assert resp.json()["detail"] == "ACK,ZERO_JOINT,3"
     assert client.command_calls[-1] == ("ZERO_JOINT,3", 5.0, True)
+
+
+def test_control_home_joint_native(client):
+    resp = client.post("/control/home-joint-native", json={"joint": 3})
+    assert resp.status_code == 200
+    assert resp.json()["joint"] == 3
+    assert resp.json()["detail"] == "ACK,NATIVE_HOME_JOINT,3"
+    assert client.command_calls[-1] == ("NATIVE_HOME_JOINT,3", 5.0, True)
+
+
+def test_control_encoder_retention_capture_writes_snapshot_and_comparison(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        encoder_retention_module,
+        "get_encoder_retention_log_dir",
+        lambda: tmp_path / "encoder-retention",
+    )
+    monkeypatch.setattr(
+        api_main,
+        "_load_rtcore_metrics_raw",
+        lambda: {
+            "num_axes": 6,
+            "armed": 0,
+            "axis_enable_mask": 0,
+            "link_up": 1,
+            "responding_slaves": 6,
+            "online_slaves": 6,
+            "operational_slaves": 6,
+            "startup_ready": 1,
+            "wkc_actual": 12,
+            "wkc_expected": 12,
+            "master_al_states": 8,
+            "axes": [
+                {"statusword": 0x1650, "error_code": 0, "manufacturer_error_code": 0, "slave_online": 1, "slave_operational": 1, "slave_al_state": 8, "pos_counts": 10},
+                {"statusword": 0x1650, "error_code": 0, "manufacturer_error_code": 0, "slave_online": 1, "slave_operational": 1, "slave_al_state": 8, "pos_counts": 20},
+                {
+                    "statusword": 0x1618,
+                    "error_code": 0x7305,
+                    "manufacturer_error_code": 0x208,
+                    "startup_drive_config": {
+                        "setting_key": "a6ec_encoder_position_tracking_mode",
+                        "setting_label": "A6-EC encoder position tracking mode",
+                        "configured": 1,
+                        "commanded": 1,
+                        "commanded_value_label": "Battery-backed limited multi-turn absolute encoder mode",
+                        "readback_valid": 1,
+                        "readback": 1,
+                        "readback_value_label": "Battery-backed limited multi-turn absolute encoder mode",
+                        "verified": 1,
+                    },
+                    "slave_online": 1,
+                    "slave_operational": 1,
+                    "slave_al_state": 8,
+                    "pos_counts": 30,
+                },
+                {"statusword": 0x1650, "error_code": 0, "manufacturer_error_code": 0, "slave_online": 1, "slave_operational": 1, "slave_al_state": 8, "pos_counts": 40},
+                {"statusword": 0x1650, "error_code": 0, "manufacturer_error_code": 0, "slave_online": 1, "slave_operational": 1, "slave_al_state": 8, "pos_counts": 50},
+                {"statusword": 0x1650, "error_code": 0, "manufacturer_error_code": 0, "slave_online": 1, "slave_operational": 1, "slave_al_state": 8, "pos_counts": 60},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        api_main,
+        "load_joint_zero_offsets_store",
+        lambda: {"version": 1, "robots": {"gradient-05": {"logical_joint_master_offsets_rad": [0.0] * 6}}},
+    )
+
+    before = client.post("/control/encoder-retention/capture", json={"phase": "before_power_down"})
+    assert before.status_code == 200
+    experiment_id = before.json()["experiment_id"]
+
+    after = client.post(
+        "/control/encoder-retention/capture",
+        json={"phase": "after_power_up", "experiment_id": experiment_id},
+    )
+    assert after.status_code == 200
+    body = after.json()
+    assert body["experiment_id"] == experiment_id
+    assert Path(body["snapshot_path"]).exists()
+    comparison = body["comparison"]
+    assert Path(comparison["comparison_path"]).exists()
+    assert Path(comparison["comparison_markdown_path"]).exists()
+    assert comparison["raw_encoder_mismatch"] is False
 
 
 def test_control_joint_jog(client):

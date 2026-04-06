@@ -7512,3 +7512,313 @@
   - `ReadLints` on `src/gradient_os/api/main.py` and `tests/test_api_endpoints.py` (no diagnostics)
 - Follow-up notes / risks:
   - The currently running controller/API process must be restarted before the live commissioning panel will actually use the new capped payload.
+
+## 2026-04-05 00:00 +0000
+
+- Task summary:
+  - Finished the A6-EC absolute encoder commissioning follow-through by adding focused REST/unit coverage for native homing and encoder-retention capture, documenting the software-zero vs drive-home split, and fixing two retention endpoint scoping bugs uncovered by the new tests.
+- Changes:
+  - Updated `tests/test_api_endpoints.py`:
+    - added coverage for `POST /control/home-joint-native`
+    - added coverage for `POST /control/encoder-retention/capture`, including before/after snapshot creation and comparison artifact generation
+  - Added `tests/test_encoder_retention.py`:
+    - added focused comparison coverage for raw-count mismatch, logical-angle mismatch, startup absolute-mode mismatch, and battery fault extraction
+  - Updated `src/gradient_os/api/main.py`:
+    - fixed `_build_encoder_retention_capture_payload(...)` to use module-safe controller calls/parsing instead of nested `create_app()` helpers that were not in scope
+  - Updated `docs/ethercat/bringup.md`:
+    - documented `Drive Home` vs `Zero Joint`
+    - documented A6-EC startup absolute-mode verification fields
+    - documented before/after retention capture workflow and generated artifacts under `logs/encoder-retention`
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_api_endpoints.py tests/test_rtcore_runtime.py tests/test_encoder_retention.py -q`
+    - passed (`69 passed`)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/api/main.py src/gradient_os/telemetry/encoder_retention.py tests/test_api_endpoints.py tests/test_encoder_retention.py`
+    - passed
+  - `ReadLints` on `src/gradient_os/api/main.py`, `tests/test_api_endpoints.py`, `tests/test_encoder_retention.py`, and `docs/ethercat/bringup.md`
+    - no diagnostics
+- Follow-up notes / risks:
+  - I did not run a live controller/browser commissioning pass in this validation round, so the remaining real-hardware check is to restart the stack and exercise `Drive Home`, `Zero Joint`, and the before/after retention buttons against the actual A6-EC drives.
+
+## 2026-04-05 00:15 +0000
+
+- Task summary:
+  - Refactored the Python-side drive startup-setting path so manufacturer-specific startup config now belongs to the selected drive profile instead of being hardcoded in generic runtime/telemetry helpers.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - added profile-owned startup-config validation/building for `a6ec_absolute_mode`
+    - added profile-owned extraction of startup verification state from RTCore axis metrics
+  - Updated `src/gradient_os/arm_controller/profiles/registry.py` and `src/gradient_os/arm_controller/backends/registry.py`:
+    - added generic registry helpers to build startup config and extract per-axis startup verification through the active drive profile
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py`:
+    - added generic `build_rtcore_drive_startup_config(...)`
+    - changed RTCore env rendering to source startup env vars from the drive profile helper
+    - kept `build_rtcore_a6ec_startup_config(...)` as a compatibility wrapper for existing callers/tests
+  - Updated `src/gradient_os/telemetry/drive_faults.py`:
+    - added generic per-axis `startup_drive_config`
+    - added generic summary counts for configured/verified/mismatch startup settings
+    - kept legacy `startup_a6ec_absolute_mode_*` fields so the current UI stays compatible
+  - Updated `tests/test_rtcore_runtime.py`:
+    - added coverage for profile-driven startup-config rendering and generic startup-drive-config telemetry
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_rtcore_runtime.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q`
+    - passed (`70 passed`)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/telemetry/drive_faults.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py src/gradient_os/arm_controller/profiles/registry.py src/gradient_os/arm_controller/backends/registry.py src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py tests/test_rtcore_runtime.py`
+    - passed
+  - `ReadLints` on the touched runtime/profile/telemetry/test files
+    - no diagnostics
+- Follow-up notes / risks:
+  - RTCore itself still exposes A6-EC-specific CLI/metric names for this setting, so the Python side is now profile-driven but the C++ ABI/CLI is not yet fully generic across arbitrary drive families.
+
+## 2026-04-05 00:35 +0000
+
+- Task summary:
+  - Separated EtherCAT drive-family defaults from robot config by introducing a consolidated drive catalog and using it to parameterize RTCore/systemd identity, PDO, and startup-policy loading.
+- Changes:
+  - Added `src/gradient_os/arm_controller/ethercat_drive_catalog.py`:
+    - centralized EtherCAT drive-family metadata for `a6ec_ds402`
+    - defined RTCore loader values (vendor id, product code, revision, PDO defaults)
+    - defined default startup-setting policy separate from the robot
+  - Updated `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - now uses the drive catalog for default startup entries and schema bounds instead of assuming robot-owned defaults
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py`:
+    - now merges drive-catalog RTCore env values into the rendered systemd env
+    - now treats all-empty robot startup override lists as `no override`
+    - now rejects RTCore drive profiles that lack an EtherCAT drive catalog entry
+  - Updated `src/gradient_os/arm_controller/robots/gradient05/config.py` and `src/gradient_os/arm_controller/robots/base.py`:
+    - removed Gradient-05 ownership of A6-EC startup defaults
+    - clarified that robot-side EtherCAT startup config is only an override hook
+  - Updated `systemd/rt-motion/gradient-rt-motion.service` and `src/gradient_rt_motion/main.cpp`:
+    - added generic RTCore loader parameters for slave vendor id and product code
+    - changed RTCore slave config and PDO registration to use those loaded values instead of hardcoded A6-EC identity constants
+    - exposed slave identity in RTCore metrics output
+  - Updated `docs/ethercat/bringup.md`:
+    - documented that drive-family defaults now live in the separate EtherCAT drive catalog
+  - Updated `tests/test_rtcore_runtime.py`:
+    - added coverage for drive-catalog env rendering and rejection of drive profiles without EtherCAT catalog entries
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_rtcore_runtime.py tests/test_runtime_config.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q`
+    - passed (`80 passed`)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/ethercat_drive_catalog.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py src/gradient_os/arm_controller/robots/gradient05/config.py src/gradient_os/arm_controller/robots/base.py tests/test_rtcore_runtime.py`
+    - passed
+  - `make -C src/gradient_rt_motion`
+    - passed
+  - `ReadLints` on the touched Python/C++/service/test files
+    - no diagnostics
+- Follow-up notes / risks:
+  - RTCore is now generic for slave identity/PDO defaults via the drive catalog, but startup SDO application/readback in C++ still uses the current A6-EC-specific absolute-mode command/metric names. Supporting Yaskawa or Beckhoff cleanly will still require a second RTCore pass to generalize startup-SDO descriptors and PDO-layout registration.
+
+### 2026-04-05 22:42 UTC - Removed remaining vendor-specific RTCore loader assumptions
+- Task summary:
+  - Finished the second RTCore pass so the EtherCAT master no longer carries hardcoded A6-EC identity, PDO tables, startup-SDO names, or profile ID enums in the C++ codepath.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/ethercat_drive_catalog.py`:
+    - expanded the EtherCAT drive catalog to describe RTCore loader details instead of only identity values
+    - added sync indices, DC cycle multiple, and semantic RX/TX PDO layouts for `a6ec_ds402`
+    - rendered generic RTCore env values for PDO layouts and sync/DC settings
+  - Updated `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - changed startup env rendering to emit generic `GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG`
+    - taught startup extraction to prefer the new generic `startup_drive_config` metrics object
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py`:
+    - switched RTCore env rendering to the generic catalog renderer
+    - removed the legacy A6-EC startup env default
+    - changed drive-profile numeric IDs to stable hashes of normalized profile tokens instead of a hardcoded vendor enum table
+  - Updated `systemd/rt-motion/gradient-rt-motion.service`:
+    - replaced the old A6-EC startup CLI/env path with generic startup-SDO, sync-index, DC-multiple, and PDO-layout loader args
+  - Updated `src/gradient_rt_motion/main.cpp` and `src/gradient_rt_motion/ipc_v1.hpp`:
+    - removed `a6ec_pdo.hpp` usage and deleted the stale header
+    - removed hardcoded A6-EC vendor/product/PDO defaults from RTCore options
+    - replaced static A6-EC PDO tables with runtime-built `ec_pdo_entry_info_t` / `ec_sync_info_t` structures from descriptor env strings
+    - replaced A6-EC-specific startup SDO write/readback logic and metrics fields with generic `startup_drive_config` handling
+    - changed drive-profile ID parsing to a stable hash so RTCore no longer carries vendor-named enum cases
+  - Updated `tests/test_rtcore_runtime.py`:
+    - refreshed assertions to the new generic env contract and generic metrics shape
+- Validation:
+  - `make -C src/gradient_rt_motion`
+    - passed
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_rtcore_runtime.py tests/test_runtime_config.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q`
+    - passed (`80 passed`)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/ethercat_drive_catalog.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py src/gradient_os/telemetry/drive_faults.py tests/test_rtcore_runtime.py`
+    - passed
+  - `ReadLints` on the touched Python/C++/service/test files
+    - no diagnostics
+- Follow-up notes / risks:
+  - The broader OS still intentionally keeps `a6ec_*` compatibility aliases in Python telemetry and UI-facing payloads so the existing frontend does not break immediately. The RTCore/master path itself is now descriptor-driven.
+
+### 2026-04-05 23:04 UTC - Removed vendor-named aliases from Python telemetry and UI contract
+- Task summary:
+  - Finished the generic cleanup in the Python controller/telemetry path so startup verification now flows through the generic `startup_drive_config` contract end to end.
+- Changes:
+  - Updated `src/gradient_os/telemetry/drive_faults.py`:
+    - removed `startup_a6ec_absolute_mode_*` axis fields and summary counters from the emitted payload
+    - kept only generic `startup_drive_config` data and generic configured/verified/mismatch counts
+  - Updated `src/gradient_os/telemetry/encoder_retention.py`:
+    - changed retention comparison output from `startup_absolute_mode_*` details sourced from A6-EC alias fields to generic `startup_drive_config_*` mismatch reporting
+  - Updated `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - dropped fallback parsing of legacy alias metrics and now consumes only the generic `startup_drive_config` object
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py`:
+    - removed the vendor-specific compatibility helper `build_rtcore_a6ec_startup_config(...)`
+    - removed vendor-named exported drive-profile hash constants from the generic runtime helper
+  - Updated `web-ui/src/liveState.tsx`, `web-ui/src/App.tsx`, and `web-ui/src/ControlPanel.tsx`:
+    - replaced `startup_a6ec_absolute_mode_*` types with a generic `startup_drive_config` object
+    - updated fault formatting to show generic startup-setting verification details
+    - added explicit power-transition type casts to silence stale TS diagnostics in the touched control panel file
+  - Updated `tests/test_rtcore_runtime.py`, `tests/test_api_endpoints.py`, and `tests/test_encoder_retention.py`:
+    - refreshed fixtures/assertions to the generic startup config payload
+  - Updated `docs/ethercat/bringup.md`:
+    - documented the generic startup config contract without mentioning legacy alias fields
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_rtcore_runtime.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q`
+    - passed (`71 passed`)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/telemetry/drive_faults.py src/gradient_os/telemetry/encoder_retention.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py tests/test_rtcore_runtime.py tests/test_api_endpoints.py tests/test_encoder_retention.py`
+    - passed
+  - `ReadLints` on touched Python/TypeScript/docs files
+    - no diagnostics after the `ControlPanel.tsx` type fix
+  - `rg "startup_a6ec_absolute_mode|build_rtcore_a6ec_startup_config|GRADIENT_RT_A6EC" src/gradient_os`
+    - no matches
+  - `rg "startup_a6ec_absolute_mode" web-ui`
+    - no matches
+- Follow-up notes / risks:
+  - Profile-specific setting keys such as `a6ec_absolute_mode` still correctly live inside the A6-EC profile/catalog layer. The generic layers now only transport/format those settings generically.
+
+### 2026-04-05 23:22 UTC - Renamed A6-EC startup mode setting for clarity and added value labels
+- Task summary:
+  - Renamed the A6-EC `C00.07` startup setting key/label to be more explicit and exposed human-readable mode labels so the intended limited multi-turn absolute default is unambiguous.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - renamed startup setting key from `a6ec_absolute_mode` to `a6ec_encoder_position_tracking_mode`
+    - renamed the setting label to `A6-EC encoder position tracking mode`
+    - added explicit mode value labels for all configured `C00.07` options
+    - now includes `commanded_value_label` / `readback_value_label` in extracted startup config telemetry
+  - Updated `src/gradient_os/arm_controller/ethercat_drive_catalog.py`:
+    - renamed the A6-EC startup default/schema key to `a6ec_encoder_position_tracking_mode`
+  - Updated `src/gradient_os/telemetry/encoder_retention.py`:
+    - now carries the descriptive commanded/readback mode labels in startup-config mismatch artifacts
+  - Updated `web-ui/src/liveState.tsx`, `web-ui/src/App.tsx`, and `web-ui/src/ControlPanel.tsx`:
+    - extended startup config typing with `commanded_value_label` / `readback_value_label`
+    - control panel fault/status text now shows descriptive mode names instead of raw integers when available
+  - Updated `tests/test_rtcore_runtime.py`, `tests/test_api_endpoints.py`, and `tests/test_encoder_retention.py`:
+    - refreshed expected keys, env payloads, and mode labels to the renamed setting
+  - Updated `docs/ethercat/bringup.md`:
+    - clarified that mode value `1` is the battery-backed limited multi-turn absolute encoder mode
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_rtcore_runtime.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q`
+    - passed (`71 passed`)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py src/gradient_os/arm_controller/ethercat_drive_catalog.py src/gradient_os/telemetry/encoder_retention.py src/gradient_os/telemetry/drive_faults.py tests/test_rtcore_runtime.py tests/test_api_endpoints.py tests/test_encoder_retention.py`
+    - passed
+  - `ReadLints` on touched Python/TypeScript/docs files
+    - no diagnostics
+  - `rg "a6ec_absolute_mode" /home/pi/GradientOS`
+    - only historical mentions remain in `DEVLOG.md`
+- Follow-up notes / risks:
+  - The numeric `C00.07` values are still drive-profile-specific by design; the generic layers now present them with descriptive labels, but additional drive families should define their own value labels rather than reusing A6-EC wording.
+
+### 2026-04-05 23:40 UTC - Updated operating-principles SOP with new EtherCAT/RTCore architecture
+- Task summary:
+  - Expanded `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` so it captures the generic EtherCAT drive-profile architecture, startup descriptor loading, startup telemetry contract, logical-zero vs native-home separation, and encoder-retention commissioning workflow added in the recent controller/RTCore work.
+- Changes:
+  - Updated `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md`:
+    - added the rule that EtherCAT drive bring-up must be descriptor-driven from the drive catalog rather than hardcoded in RTCore
+    - documented the generic `startup_drive_config` telemetry contract with descriptive mode labels
+    - documented that EtherCAT drive-family policy is a separate layer from robot config/runtime selection
+    - clarified that logical zeroing and drive-native homing are separate operations with different intended semantics
+    - added encoder-retention verification as a first-class commissioning workflow
+    - clarified that EtherCAT backend config and the EtherCAT drive catalog are separate, intentional layers
+- Validation:
+  - `ReadLints` on `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md`
+    - no diagnostics
+- Follow-up notes / risks:
+  - This was a documentation/SOP update only; no runtime code or tests were changed as part of this specific step.
+
+## 2026-04-06 20:49 +0000
+
+- Task summary:
+  - Implemented the new GradientOS skill system as a project skill corpus with a root SOP router, focused subsystem references, and a separate maintainer skill that keeps canonical updates slower than scratchpad/devlog churn.
+- Changes:
+  - Added `.cursor/skills/gradientos-sop/SKILL.md`:
+    - created the root GradientOS routing skill with trigger-rich description, anti-duplication guardrails, subsystem routing, and maintenance reminders
+  - Added `.cursor/skills/gradientos-sop/architecture-boundaries.md`
+  - Added `.cursor/skills/gradientos-sop/controller-runtime.md`
+  - Added `.cursor/skills/gradientos-sop/rtcore-ethercat.md`
+  - Added `.cursor/skills/gradientos-sop/ui-api-telemetry.md`
+  - Added `.cursor/skills/gradientos-sop/config-and-drive-profiles.md`
+  - Added `.cursor/skills/gradientos-sop/commissioning-safety.md`
+  - Added `.cursor/skills/gradientos-sop/validation-and-debugging.md`
+  - Added `.cursor/skills/gradientos-sop/skill-maintenance-policy.md`:
+    - encoded the slow-update policy so canonical skill updates happen only for architecture changes or completed validated workstreams, with user confirmation preferred for consolidation
+  - Added `.cursor/skills/gradientos-skill-maintainer/SKILL.md`:
+    - created a dedicated maintainer/update-loop skill that reads the canonical skill plus scratchpad/devlog before deciding whether new learnings should be promoted
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md`:
+    - recorded the new rule that the shared GradientOS skill should be a routed living SOP rather than a high-churn mirror of daily implementation notes
+- Validation:
+  - `ReadLints` on `/home/pi/GradientOS/.cursor/skills/gradientos-sop` and `/home/pi/GradientOS/.cursor/skills/gradientos-skill-maintainer`
+    - no diagnostics
+  - Reviewed the new skill files to confirm:
+    - the root `SKILL.md` stayed compact
+    - all references are one level deep
+    - the maintainer flow requires user confirmation before canonical consolidation unless already requested
+- Follow-up notes / risks:
+  - This change creates the shared skill structure and policy only; it does not yet automatically sync future SOP changes into the skill corpus without an explicit consolidation pass.
+
+## 2026-04-06 20:49 +0000
+
+- Task summary:
+  - Tightened the new GradientOS skill linkage so the root skill explicitly treats `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` as its canonical long-form source and registered the new skill pair in the repo's top-level agent guide.
+- Changes:
+  - Updated `.cursor/skills/gradientos-sop/SKILL.md`:
+    - added a `Canonical Source` section pointing directly to `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md`
+    - clarified that the skill is the compact routed operational layer derived from the long SOP, not a replacement for it
+  - Updated `.cursor/rules/000-project-instructions.md`:
+    - added `gradientos-sop` to the top-level skills catalog as the default shared skill for GradientOS control-stack work
+    - added `gradientos-skill-maintainer` to the top-level skills catalog for canonical skill consolidation/maintenance work
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md`:
+    - recorded the rule to keep the long SOP outside the skill folder and advertise repo-level shared skills from the main project instructions
+- Validation:
+  - `ReadLints` on `.cursor/skills/gradientos-sop/SKILL.md` and `.cursor/rules/000-project-instructions.md`
+    - no diagnostics
+  - Reviewed the updated files to confirm the canonical-source wording and top-level skills catalog entries are present
+- Follow-up notes / risks:
+  - The long SOP remains at repo root by design; if we later want to reorganize long-form docs, a `docs/` move would make more sense than moving it under `.cursor/skills/`.
+
+## 2026-04-06 21:18 +0000
+
+- Task summary:
+  - Moved the long-form GradientOS operating-principles document into the `gradientos-sop` skill folder and updated the active skill/rule references to follow the new canonical path.
+- Changes:
+  - Moved `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` to `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md`
+  - Updated `.cursor/skills/gradientos-sop/SKILL.md`:
+    - changed the canonical-source reference and first-file pointer to the new in-skill location
+  - Updated `.cursor/skills/gradientos-sop/validation-and-debugging.md`:
+    - changed the SOP reference in the first-files list to the new in-skill location
+  - Updated `.cursor/skills/gradientos-skill-maintainer/SKILL.md`:
+    - changed the maintainer read-first SOP path to the new in-skill location
+  - Updated `.cursor/rules/000-project-instructions.md`:
+    - changed the top-level skills-catalog description for `gradientos-sop` to point at the new in-skill canonical SOP path
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md`:
+    - marked the earlier “outside the skill folder” guidance as superseded and recorded the new canonical SOP location
+- Validation:
+  - `rg "RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES\\.md" /home/pi/GradientOS`
+    - active guidance files now point at `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md`; remaining old-path mentions are historical scratchpad/devlog context
+  - `ReadLints` on `.cursor/skills/gradientos-sop`, `.cursor/skills/gradientos-skill-maintainer`, and `.cursor/rules/000-project-instructions.md`
+    - no diagnostics
+- Follow-up notes / risks:
+  - Historical devlog entries still mention the old root path by design; they were not rewritten so the engineering timeline remains truthful.
+
+## 2026-04-06 22:54 +0000
+
+- Task summary:
+  - Strengthened the repo's primary always-in-context instructions so GradientOS control-stack work explicitly starts from the `gradientos-sop` skill entrypoint instead of relying only on the later skills catalog entry.
+- Changes:
+  - Updated `.cursor/rules/000-project-instructions.md`:
+    - added a top-level `Primary GradientOS architecture entrypoint` section
+    - explicitly routed control-stack tasks to `.cursor/skills/gradientos-sop/SKILL.md`
+    - explicitly pointed architecture/safety/ownership detail lookups to `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md`
+    - explicitly pointed skill-maintenance work to `.cursor/skills/gradientos-skill-maintainer/SKILL.md`
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md`:
+    - recorded the rule that the always-in-context project instructions must explicitly route GradientOS work into the shared skill entrypoint
+- Validation:
+  - `ReadLints` on `.cursor/rules/000-project-instructions.md`
+    - no diagnostics
+  - Reviewed the updated section in `.cursor/rules/000-project-instructions.md`
+    - confirmed the new explicit GradientOS entrypoint block appears above the general skills catalog
+- Follow-up notes / risks:
+  - The repo has multiple `alwaysApply` rule files, but this change updated the primary project execution guide the user identified as the top-level entrypoint.

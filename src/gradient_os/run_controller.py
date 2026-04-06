@@ -397,6 +397,12 @@ def _build_joint_state_snapshot() -> dict[str, object]:
         if isinstance(axis_error_code, list) and axis_error_code:
             snapshot["axis_error_code"] = [int(value) for value in axis_error_code[: len(axis_error_code)]]
 
+        axis_manufacturer_error_code = getattr(backend, "_axis_manufacturer_error_code", None)
+        if isinstance(axis_manufacturer_error_code, list) and axis_manufacturer_error_code:
+            snapshot["axis_manufacturer_error_code"] = [
+                int(value) for value in axis_manufacturer_error_code[: len(axis_manufacturer_error_code)]
+            ]
+
         axis_torque_raw = getattr(backend, "_axis_torque_raw", None)
         if isinstance(axis_torque_raw, list) and axis_torque_raw:
             snapshot["axis_torque_raw"] = [int(value) for value in axis_torque_raw[: len(axis_torque_raw)]]
@@ -463,6 +469,7 @@ def _build_rtcore_axis_telemetry_samples(backend: object | None) -> dict[str, di
     axis_torque_raw = getattr(backend, "_axis_torque_raw", None)
     axis_statusword = getattr(backend, "_axis_statusword", None)
     axis_error_code = getattr(backend, "_axis_error_code", None)
+    axis_manufacturer_error_code = getattr(backend, "_axis_manufacturer_error_code", None)
     axis_mode_display = getattr(backend, "_axis_mode_display", None)
     axis_ds402_state = getattr(backend, "_axis_ds402_state", None)
     axis_di_bits = getattr(backend, "_axis_di_bits", None)
@@ -496,6 +503,10 @@ def _build_rtcore_axis_telemetry_samples(backend: object | None) -> dict[str, di
             error_code = int(axis_error_code[axis_i])
             sample["error_code"] = error_code
             sample["error_code_hex"] = f"0x{error_code & 0xFFFF:04x}"
+        if isinstance(axis_manufacturer_error_code, list) and axis_i < len(axis_manufacturer_error_code):
+            manufacturer_error_code = int(axis_manufacturer_error_code[axis_i])
+            sample["manufacturer_error_code"] = manufacturer_error_code
+            sample["manufacturer_error_code_hex"] = f"0x{manufacturer_error_code & 0xFFFFFFFF:08x}"
         if isinstance(axis_mode_display, list) and axis_i < len(axis_mode_display):
             mode_display = int(axis_mode_display[axis_i])
             sample["mode_display"] = mode_display
@@ -1539,6 +1550,40 @@ Examples:
                         sock.sendto(f"ACK,ZERO_JOINT,{joint_num}".encode("utf-8"), addr)
                     except (ValueError, IndexError):
                         sock.sendto("ERROR,ZERO_JOINT,BAD_ARGS".encode("utf-8"), addr)
+
+                elif command == "NATIVE_HOME_JOINT":
+                    try:
+                        joint_num = int(parts[1])
+                        logical_joint_index = joint_num - 1
+                        if logical_joint_index < 0 or logical_joint_index >= selected_robot.num_logical_joints:
+                            sock.sendto(
+                                f"ERROR,NATIVE_HOME_JOINT,Joint number must be 1-{selected_robot.num_logical_joints}".encode(
+                                    "utf-8"
+                                ),
+                                addr,
+                            )
+                            continue
+
+                        backend = backend_registry.get_active_backend()
+                        if backend and hasattr(backend, "native_home_joint"):
+                            ok = bool(backend.native_home_joint(logical_joint_index))
+                            if ok:
+                                sock.sendto(f"ACK,NATIVE_HOME_JOINT,{joint_num}".encode("utf-8"), addr)
+                            else:
+                                sock.sendto(
+                                    f"ERROR,NATIVE_HOME_JOINT,Failed to native-home joint {joint_num}".encode(
+                                        "utf-8"
+                                    ),
+                                    addr,
+                                )
+                            continue
+
+                        sock.sendto(
+                            "ERROR,NATIVE_HOME_JOINT,Active backend does not support native homing".encode("utf-8"),
+                            addr,
+                        )
+                    except (ValueError, IndexError):
+                        sock.sendto("ERROR,NATIVE_HOME_JOINT,BAD_ARGS".encode("utf-8"), addr)
 
                 elif command == "FACTORY_RESET":
                     try:

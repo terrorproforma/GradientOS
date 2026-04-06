@@ -41,6 +41,9 @@ from .. import runtime_config
 from .. import tool_library
 from ..diagnostics.runtime_snapshot import get_runtime_diagnostics_snapshot
 from ..arm_controller.robots import get_robot_name_by_id, list_robot_metadata
+from ..joint_zero_offsets import load_joint_zero_offsets_store
+from ..telemetry.drive_faults import build_drive_fault_snapshot
+from ..telemetry.encoder_retention import capture_retention_snapshot
 
 try:
     from ..arm_controller import utils as controller_utils
@@ -164,6 +167,21 @@ def _load_rtcore_metrics_summary() -> dict[str, Any] | None:
         "motion_last_update_age_ms": raw.get("motion_last_update_age_ms"),
         "feedback_cycle_jitter_ns": raw.get("feedback_cycle_jitter_ns"),
     }
+
+
+def _load_rtcore_metrics_raw() -> dict[str, Any] | None:
+    metrics_path = os.environ.get("GRADIENT_RTCORE_METRICS", _DEFAULT_RTCORE_METRICS_PATH)
+    try:
+        with open(metrics_path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        return {"error": str(exc), "metrics_path": metrics_path}
+    if not isinstance(raw, dict):
+        return {"error": "metrics payload was not a JSON object", "metrics_path": metrics_path}
+    raw.setdefault("metrics_path", metrics_path)
+    return raw
 
 
 def _pose_history_filename(exported_at: str | None = None) -> str:
@@ -1540,6 +1558,35 @@ def create_app() -> FastAPI:
         payload = _parse_motion_status_reply(detail)
         return {"status": "ok", "detail": detail, **payload}
 
+    @api.post(
+        "/control/encoder-retention/capture",
+        summary="Capture a before/after power-cycle encoder retention snapshot",
+    )
+    async def control_encoder_retention_capture(payload: dict[str, Any]):
+        phase = payload.get("phase")
+        if phase is None:
+            raise HTTPException(status_code=400, detail="phase is required")
+        notes_raw = payload.get("notes")
+        notes = str(notes_raw).strip() if isinstance(notes_raw, str) and notes_raw.strip() else None
+        experiment_id_raw = payload.get("experiment_id")
+        experiment_id = (
+            str(experiment_id_raw).strip()
+            if isinstance(experiment_id_raw, str) and experiment_id_raw.strip()
+            else None
+        )
+        snapshot_payload = await run_in_threadpool(
+            _build_encoder_retention_capture_payload,
+            phase=str(phase),
+            notes=notes,
+        )
+        result = await run_in_threadpool(
+            capture_retention_snapshot,
+            phase=str(phase),
+            snapshot_payload=snapshot_payload,
+            experiment_id=experiment_id,
+        )
+        return {"status": "ok", **result}
+
     @api.post("/control/reset-faults", summary="Request DS402/drive fault reset")
     async def control_reset_faults(payload: dict[str, Any] | None = None):
         joint: int | None = None
@@ -1592,6 +1639,26 @@ def create_app() -> FastAPI:
         detail = await run_in_threadpool(
             _controller_call_or_503,
             f"ZERO_JOINT,{joint}",
+            timeout=5.0,
+            expect_response=True,
+        )
+        return {"status": "ok", "joint": joint, "detail": detail}
+
+    @api.post(
+        "/control/home-joint-native",
+        summary="Capture the current encoder position as a drive-native home for one joint",
+    )
+    async def control_home_joint_native(payload: dict[str, Any]):
+        raw_joint = payload.get("joint", payload.get("joint_num"))
+        try:
+            joint = int(raw_joint)
+        except Exception:
+            raise HTTPException(status_code=400, detail="joint must be an integer")
+        if joint <= 0:
+            raise HTTPException(status_code=400, detail="joint must be >= 1")
+        detail = await run_in_threadpool(
+            _controller_call_or_503,
+            f"NATIVE_HOME_JOINT,{joint}",
             timeout=5.0,
             expect_response=True,
         )
@@ -3029,6 +3096,8 @@ def _parse_joint_state_response(detail: str) -> dict[str, Any]:
         normalized["axis_statusword"] = [int(item) for item in normalized["axis_statusword"]]
     if "axis_error_code" in normalized and isinstance(normalized["axis_error_code"], list):
         normalized["axis_error_code"] = [int(item) for item in normalized["axis_error_code"]]
+    if "axis_manufacturer_error_code" in normalized and isinstance(normalized["axis_manufacturer_error_code"], list):
+        normalized["axis_manufacturer_error_code"] = [int(item) for item in normalized["axis_manufacturer_error_code"]]
     if "axis_torque_raw" in normalized and isinstance(normalized["axis_torque_raw"], list):
         normalized["axis_torque_raw"] = [int(item) for item in normalized["axis_torque_raw"]]
     if "axis_mode_display" in normalized and isinstance(normalized["axis_mode_display"], list):
@@ -3048,6 +3117,57 @@ def _parse_joint_state_response(detail: str) -> dict[str, Any]:
     if "gripper_rad" in normalized and normalized["gripper_rad"] is not None:
         normalized["gripper_rad"] = float(normalized["gripper_rad"])
     return normalized
+
+
+def _build_encoder_retention_capture_payload(*, phase: str, notes: str | None = None) -> dict[str, Any]:
+    ok, joint_state_detail = _send_controller_command("GET_JOINT_STATE", timeout=1.0, expect_response=True)
+    if not ok:
+        raise HTTPException(status_code=503, detail=joint_state_detail)
+    joint_state = _parse_joint_state_response(joint_state_detail)
+
+    ok, motion_status_detail = _send_controller_command("GET_MOTION_STATUS", timeout=1.0, expect_response=True)
+    if not ok:
+        raise HTTPException(status_code=503, detail=motion_status_detail)
+    motion_prefix = "MOTION_STATUS,"
+    if not motion_status_detail.startswith(motion_prefix):
+        raise HTTPException(status_code=502, detail=f"Malformed motion-status reply: {motion_status_detail}")
+    motion_token = motion_status_detail[len(motion_prefix) :].strip()
+    if not motion_token:
+        raise HTTPException(status_code=502, detail="Motion-status reply did not include a payload.")
+    try:
+        motion_status = json.loads(base64.urlsafe_b64decode(motion_token.encode("ascii")).decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Invalid motion-status payload: {exc}") from exc
+    if not isinstance(motion_status, dict):
+        raise HTTPException(status_code=502, detail="Motion-status payload must decode to an object.")
+
+    metrics_raw = _load_rtcore_metrics_raw()
+    desired_config = runtime_config.load_runtime_config()
+    desired = desired_config.get("desired", {}) if isinstance(desired_config, dict) else {}
+    overrides = desired.get("overrides", {}) if isinstance(desired.get("overrides"), dict) else {}
+    configured_drive_profile = str(overrides.get("drive_profile", "") or "").strip() or None
+    drive_faults = None
+    if isinstance(metrics_raw, dict):
+        drive_faults = build_drive_fault_snapshot(
+            metrics=metrics_raw,
+            servo_backend="ethercat_rtcore",
+            drive_profile=configured_drive_profile,
+            configured_drive_profile=configured_drive_profile,
+            axis_to_joint=joint_state.get("axis_to_joint") if isinstance(joint_state.get("axis_to_joint"), list) else None,
+            socket_present=True,
+        )
+
+    captured_at = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    return {
+        "captured_at": captured_at,
+        "phase": phase,
+        "notes": notes,
+        "joint_state": joint_state,
+        "motion_status": motion_status,
+        "drive_faults": drive_faults,
+        "rtcore_metrics": metrics_raw,
+        "joint_zero_offsets_store": load_joint_zero_offsets_store(),
+    }
 
 
 def _parse_performance_state_response(detail: str) -> dict[str, Any]:

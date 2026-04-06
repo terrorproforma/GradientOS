@@ -23,6 +23,17 @@ Non-negotiable workflow rule:
 - Never hand off or stop after implementation without appending both `.cursor/memory/DEVLOG.md` and `.cursor/memory/AGENT_SCRATCHPAD.md`.
 - Treat missing updates to either file as an incomplete task (blocker), even if code is correct.
 
+### Primary GradientOS architecture entrypoint
+
+For any task touching the GradientOS control stack, proactively start with:
+
+- `.cursor/skills/gradientos-sop/SKILL.md` - default routed entrypoint for controller, RTCore, EtherCAT, telemetry, API/frontend boundaries, commissioning, and config ownership work.
+- `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` - long-form canonical SOP when architecture, safety, ownership, or workflow details matter.
+
+When maintaining or consolidating the shared GradientOS skill corpus itself, also use:
+
+- `.cursor/skills/gradientos-skill-maintainer/SKILL.md`
+
 ### Skills catalog (all installed) and when to use each
 
 Use these skills proactively based on task type.
@@ -35,6 +46,8 @@ Use these skills proactively based on task type.
 - `devlog-loop` (`.cursor/skills/devlog-loop/SKILL.md`) - meaningful work logging in `.cursor/memory/DEVLOG.md` for traceability and handoff.
 - `find-skills` (`.cursor/skills/find-skills/SKILL.md`) - when user asks "is there a skill for X" or wants capability discovery/installation.
 - `frontend-design` (`.cursor/skills/frontend-design/SKILL.md`) - UI building/polish for React/web interfaces where visual quality and production finish matter.
+- `gradientos-sop` (`.cursor/skills/gradientos-sop/SKILL.md`) - primary GradientOS control-stack skill for controller, RTCore, EtherCAT, telemetry, API/frontend boundaries, commissioning, and config ownership. Use proactively for motion-stack work and read `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` as the long-form canonical source.
+- `gradientos-skill-maintainer` (`.cursor/skills/gradientos-skill-maintainer/SKILL.md`) - maintains the shared GradientOS skill corpus and decides when scratchpad/devlog learnings are stable enough to consolidate into the canonical skill set.
 - `learning-scratchpad-loop` (`.cursor/skills/learning-scratchpad-loop/SKILL.md`) - persistent execution memory updates in `.cursor/memory/AGENT_SCRATCHPAD.md`.
 - `next-best-practices` (`.cursor/skills/next-best-practices/SKILL.md`) - Next.js architecture, routing, RSC boundaries, metadata, data handling.
 - `next-cache-components` (`.cursor/skills/next-cache-components/SKILL.md`) - Next.js 16 caching strategy (`use cache`, cache tags/lifetimes, PPR patterns).

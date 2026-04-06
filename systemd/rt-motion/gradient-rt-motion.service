@@ -22,8 +22,19 @@ Environment=GRADIENT_RT_GEAR_RATIO=1
 Environment=GRADIENT_RT_SIGN=1
 Environment=GRADIENT_RT_DRIVE_PROFILE=a6ec_ds402
 Environment=GRADIENT_RT_MAX_RPM=6000
+Environment=GRADIENT_RT_DRIVE_VENDOR_ID=0x00400000
+Environment=GRADIENT_RT_DRIVE_PRODUCT_CODE=0x00000715
+Environment=GRADIENT_RT_DRIVE_REVISION_NO=0x00002EF8
+Environment=GRADIENT_RT_DRIVE_RX_SYNC_INDEX=2
+Environment=GRADIENT_RT_DRIVE_TX_SYNC_INDEX=3
+Environment=GRADIENT_RT_DRIVE_DC_CYCLE_MULTIPLE_NS=250000
+Environment=GRADIENT_RT_DRIVE_RX_PDO=0x1702
+Environment=GRADIENT_RT_DRIVE_TX_PDO=0x1B02
+Environment=GRADIENT_RT_DRIVE_RX_PDO_LAYOUT=
+Environment=GRADIENT_RT_DRIVE_TX_PDO_LAYOUT=
+Environment=GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG=
 EnvironmentFile=-/etc/default/gradient-rt-motion
-ExecStart=/usr/local/bin/gradient-rt-motion --num-axes ${GRADIENT_RT_NUM_AXES} --counts-per-rev ${GRADIENT_RT_COUNTS_PER_REV} --gear-ratio ${GRADIENT_RT_GEAR_RATIO} --sign ${GRADIENT_RT_SIGN} --drive-profile ${GRADIENT_RT_DRIVE_PROFILE} --max-rpm ${GRADIENT_RT_MAX_RPM}
+ExecStart=/usr/local/bin/gradient-rt-motion --num-axes ${GRADIENT_RT_NUM_AXES} --counts-per-rev ${GRADIENT_RT_COUNTS_PER_REV} --gear-ratio ${GRADIENT_RT_GEAR_RATIO} --sign ${GRADIENT_RT_SIGN} --drive-profile ${GRADIENT_RT_DRIVE_PROFILE} --max-rpm ${GRADIENT_RT_MAX_RPM} --slave-vendor-id ${GRADIENT_RT_DRIVE_VENDOR_ID} --slave-product-code ${GRADIENT_RT_DRIVE_PRODUCT_CODE} --slave-revision-no ${GRADIENT_RT_DRIVE_REVISION_NO} --rx-sync-index ${GRADIENT_RT_DRIVE_RX_SYNC_INDEX} --tx-sync-index ${GRADIENT_RT_DRIVE_TX_SYNC_INDEX} --dc-cycle-multiple-ns ${GRADIENT_RT_DRIVE_DC_CYCLE_MULTIPLE_NS} --rx-pdo ${GRADIENT_RT_DRIVE_RX_PDO} --tx-pdo ${GRADIENT_RT_DRIVE_TX_PDO} --rx-pdo-layout "${GRADIENT_RT_DRIVE_RX_PDO_LAYOUT}" --tx-pdo-layout "${GRADIENT_RT_DRIVE_TX_PDO_LAYOUT}" --startup-sdo-config "${GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG}"
 
 # RT scheduling + memory locking (actual thread policy is set in RTCore).
 LimitRTPRIO=95

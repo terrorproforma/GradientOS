@@ -7,9 +7,9 @@
 # This abstraction allows GradientOS to support multiple robot designs
 # by simply swapping the robot configuration module.
 
-from abc import ABC, abstractmethod
-from typing import Optional
 import math
+from abc import ABC, abstractmethod
+from typing import Any, Optional
 
 
 class RobotConfig(ABC):
@@ -380,6 +380,17 @@ class RobotConfig(ABC):
             list[float]: Offset in radians for each logical joint
         """
         pass
+
+    @property
+    def ethercat_drive_startup_config(self) -> list[dict[str, Any]]:
+        """
+        Optional per-axis EtherCAT drive startup override configuration.
+
+        Entries align with physical actuator order and can override the selected
+        drive profile's default startup settings when a specific robot build
+        needs nonstandard commissioning values.
+        """
+        return [{} for _ in range(self.num_physical_actuators)]
     
     # =========================================================================
     # Gripper Configuration
@@ -629,6 +640,7 @@ class RobotConfig(ABC):
             'actuator_counts_per_radian': self.actuator_counts_per_radian,
             'inverted_actuator_ids': self.inverted_actuator_ids,
             'logical_joint_master_offsets_rad': self.logical_joint_master_offsets_rad,
+            'ethercat_drive_startup_config': self.ethercat_drive_startup_config,
             'has_gripper': self.has_gripper,
             'gripper_actuator_id': self.gripper_actuator_id,
             'gripper_limits_rad': self.gripper_limits_rad,

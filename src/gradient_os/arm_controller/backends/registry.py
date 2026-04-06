@@ -508,6 +508,77 @@ def describe_drive_fault_code_for_backend(
     return None
 
 
+def describe_drive_manufacturer_fault_code_for_backend(
+    backend_name: Optional[str],
+    error_code: int,
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    if not backend_name:
+        return None
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.describe_drive_manufacturer_fault_code(effective_profile, int(error_code))
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    cfg = get_config_for_backend(backend_name)
+    if cfg is None:
+        return None
+    decoder = getattr(cfg, "describe_drive_manufacturer_fault_code", None)
+    if callable(decoder):
+        try:
+            payload = decoder(int(error_code))
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def build_drive_startup_config_for_backend(
+    backend_name: Optional[str],
+    raw_entries: object,
+    *,
+    num_axes: int,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.build_drive_startup_config(
+            effective_profile,
+            raw_entries,
+            num_axes=int(num_axes),
+        )
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    return None
+
+
+def extract_drive_startup_config_axis_for_backend(
+    backend_name: Optional[str],
+    axis: dict,
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.extract_drive_startup_config_axis(
+            effective_profile,
+            axis,
+        )
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    return None
+
+
 def decode_drive_statusword_for_backend(
     backend_name: Optional[str],
     statusword: int,
@@ -584,4 +655,9 @@ def get_drive_fault_reference_metadata() -> Optional[dict]:
 def describe_drive_fault_code(error_code: int) -> Optional[dict]:
     """Decode a drive fault code for the active backend."""
     return describe_drive_fault_code_for_backend(_active_backend_name, error_code)
+
+
+def describe_drive_manufacturer_fault_code(error_code: int) -> Optional[dict]:
+    """Decode a manufacturer-specific drive fault code for the active backend."""
+    return describe_drive_manufacturer_fault_code_for_backend(_active_backend_name, error_code)
 

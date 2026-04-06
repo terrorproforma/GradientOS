@@ -61,6 +61,7 @@ _MSG_CMD_AXIS_ENABLE = 0x0102
 _MSG_CMD_AXIS_DISABLE = 0x0103
 _MSG_CMD_FAULT_RESET = 0x0104
 _MSG_CMD_SET_MODE = 0x0106
+_MSG_CMD_NATIVE_HOME = 0x0108
 _MSG_CMD_TRAJECTORY_BEGIN = 0x0120
 _MSG_CMD_TRAJECTORY_POINT = 0x0121
 _MSG_CMD_TRAJECTORY_COMMIT = 0x0122
@@ -304,6 +305,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._axis_torque_raw: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_statusword: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_error_code: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_manufacturer_error_code: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_mode_display: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_ds402_state: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_di_bits: list[int] = [0] * _GRADIENT_MAX_AXES
@@ -892,6 +894,37 @@ class EthercatRTCoreBackend(ActuatorBackend):
         )
         return True
 
+    def native_home_joint(self, logical_joint_index: int) -> bool:
+        if not self._connected:
+            print("[EtherCAT RTCore] WARNING: cannot drive-home a joint while RTCore is disconnected")
+            return False
+        if self._rt_num_axes <= 0:
+            print("[EtherCAT RTCore] WARNING: cannot drive-home without any configured axes")
+            return False
+
+        joint_i = int(logical_joint_index)
+        if joint_i < 0 or joint_i >= self._num_joints:
+            print(f"[EtherCAT RTCore] WARNING: joint index out of range for native homing: {joint_i}")
+            return False
+
+        axis_mask = 0
+        for axis_i, mapped_joint in enumerate(self._axis_to_joint):
+            if mapped_joint == joint_i:
+                axis_mask |= 1 << axis_i
+        if axis_mask == 0:
+            print(
+                "[EtherCAT RTCore] WARNING: cannot drive-home joint"
+                f" {joint_i + 1}; no mapped RTCore axes"
+            )
+            return False
+
+        self._send_cmd_native_home(axis_mask=axis_mask)
+        print(
+            "[EtherCAT RTCore] Native drive-home requested:"
+            f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
+        )
+        return True
+
     def _best_effort_safe_power_down(
         self,
         *,
@@ -1405,6 +1438,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def _send_cmd_set_mode(self, axis_mask: int, mode: int) -> None:
         self._cmd_ring_write(_MSG_CMD_SET_MODE, _CMD_SET_MODE_STRUCT.pack(int(axis_mask), int(mode)))
 
+    def _send_cmd_native_home(self, axis_mask: int) -> None:
+        self._cmd_ring_write(_MSG_CMD_NATIVE_HOME, _CMD_AXIS_MASK_STRUCT.pack(int(axis_mask), 0))
+
     def _send_cmd_jog(
         self,
         *,
@@ -1801,12 +1837,12 @@ class EthercatRTCoreBackend(ActuatorBackend):
                             error_code,
                             mode_display,
                             ds402_state,
-                            _reserved0,
+                            manufacturer_error_code,
                             di_bits,
                             axis_fault_flags,
                             brake_state,
                         ) = struct.unpack_from(
-                            "<ihHHBBHxxIII",
+                            "<ihHHBBIIII",
                             payload,
                             axis_off,
                         )
@@ -1814,6 +1850,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                         self._axis_torque_raw[axis_i] = int(torque_raw)
                         self._axis_statusword[axis_i] = int(statusword)
                         self._axis_error_code[axis_i] = int(error_code)
+                        self._axis_manufacturer_error_code[axis_i] = int(manufacturer_error_code)
                         self._axis_mode_display[axis_i] = int(mode_display)
                         self._axis_ds402_state[axis_i] = int(ds402_state)
                         self._axis_di_bits[axis_i] = int(di_bits)

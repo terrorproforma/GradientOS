@@ -1835,3 +1835,55 @@ Use this file as persistent, repo-local execution memory.
 - [self] Corrective rule: in `web-ui/src/App.tsx`, keep the create-trajectory helper text and primary button labels aligned so both describe motion intent directly rather than the capture mechanism.
 - [user] Commissioning moves must actually enforce the promised safety limit, not just display it in the UI.
 - [self] Corrective rule: when a commissioning or service flow depends on a hard RTCore speed ceiling, encode the cap explicitly in the command payload (for example `APPLY_JOINT_SETPOINT.max_motor_rpm`) rather than assuming the runtime default clamp matches the commissioning policy.
+
+### 2026-04-05 - Retention helpers must not depend on `create_app()` locals
+- [self] Mistake: `src/gradient_os/api/main.py` added `_build_encoder_retention_capture_payload(...)` at module scope but called `_controller_call_or_503` and `_parse_motion_status_reply`, which only exist as nested helpers inside `create_app()`.
+- [tool] Detection: focused pytest coverage for `POST /control/encoder-retention/capture` failed with `NameError` twice, first on `_controller_call_or_503`, then on `_parse_motion_status_reply`.
+- [self] Corrective rule: when adding reusable API helpers outside `create_app()`, do not reference nested route-local helpers. Either move the helper into `create_app()` or make it fully module-scope-safe with direct `_send_controller_command(...)` and explicit parsing.
+- [user] Reinforced preference: explain the code, but also implement the fix completely rather than stopping at analysis or a plan.
+- [tool] Good validation loop for this commissioning/API path: `python -m pytest tests/test_api_endpoints.py tests/test_rtcore_runtime.py tests/test_encoder_retention.py -q`, then `python -m py_compile ...`, then `ReadLints` on the touched files.
+
+### 2026-04-05 - Drive-specific startup settings should live in drive profiles, not generic runtime helpers
+- [user] Explicit architecture preference: manufacturer-specific drive faults and drive-mode settings should come from loaded drive configs/profiles, not be hardcoded into generic OS logic.
+- [self] Corrective rule: if a setting only applies to one drive family, move its validation/extraction into `src/gradient_os/arm_controller/profiles/drive/<profile>.py` and expose it through the profile/backend registry instead of hardcoding vendor keys in `runtime.py` or `telemetry/drive_faults.py`.
+- [self] Compatibility rule: when refactoring a generic layer under an existing UI/API contract, add the new profile-driven generic field first and keep the legacy vendor-named aliases until the frontend is migrated.
+
+### 2026-04-05 - Same robot may swap EtherCAT drive families, so robot config must not own drive-family defaults
+- [user] Explicit architecture preference: the same robot may be commissioned with StepperOnline, Yaskawa, or Beckhoff EtherCAT drives, so manufacturer-specific drive config must live outside the robot config in a separate consolidated drive catalog.
+- [self] Corrective rule: keep robot config limited to mechanics/kinematics/scaling; put EtherCAT slave identity, PDO defaults, and default startup SDO policy in a separate drive catalog keyed by `drive_profile`.
+- [self] Corrective rule: when systemd renders RTCore env, merge robot scaling with drive-catalog loader values so `gradient-rt-motion` is parameterized by both the robot and the selected drive family.
+
+### 2026-04-05 - RTCore should consume descriptor contracts, not vendor tables
+- [user] Explicit architecture preference: the RTCore/EtherCAT master should have no hardcoded vendor or drive-specific items remaining; drive specifics must load from config.
+- [self] Corrective rule: in `src/gradient_rt_motion/main.cpp`, keep EtherCAT slave identity, sync indices, PDO entry layout, startup SDO writes/readback, and drive-profile IDs descriptor-driven. If a future drive needs a different object map, add it in the drive catalog/profile layer instead of adding vendor branches in RTCore.
+
+### 2026-04-05 - Generic controller telemetry must not keep vendor-named aliases
+- [user] Explicit architecture preference: the Python controller and telemetry should also be fully generic, with no hardcoded or vendor-specific items in the generic layers.
+- [self] Corrective rule: in `src/gradient_os/telemetry`, `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py`, and `web-ui/src`, expose startup verification through generic objects like `startup_drive_config` and generic summary counters only. Do not keep vendor-named compatibility aliases in the live API/UI contract once the frontend has been migrated.
+
+### 2026-04-05 - Multi-mode drive settings should use descriptive keys and value labels
+- [user] Explicit preference: mode names should be as specifically descriptive as possible so operators do not confuse limited multi-turn, single-turn, incremental, and other drive modes.
+- [self] Corrective rule: when a drive profile exposes a numeric multi-mode setting such as A6-EC `C00.07`, use a descriptive profile-local key (for example `a6ec_encoder_position_tracking_mode`) and include human-readable value labels in telemetry/UI payloads rather than only raw integers.
+
+### 2026-04-05 - Significant architecture changes should update the operating-principles doc immediately
+- [user] Explicit preference: important controller/RTCore/EtherCAT architecture, safety principles, and lessons learned should be captured in `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` so the stack has a durable SOP and future work does not reinvent unsafe or already-solved designs.
+- [self] Corrective rule: after major control-stack changes, update the operating-principles document in the relevant architectural sections with the new ownership rules, safety constraints, config/telemetry contracts, and commissioning workflows rather than leaving the knowledge only in chat history or devlog notes.
+
+### 2026-04-06 - Canonical GradientOS skill should be a routed living SOP, not a high-churn mirror
+- [user] Explicit preference: turn the operating-principles doc into a GradientOS root skill with focused subfiles so agents load only the relevant subsystem guidance and do not duplicate existing comms or telemetry paths.
+- [user] Explicit preference: keep the canonical GradientOS skill updated less frequently than scratchpad/devlog; consolidate only on architecture changes or when a workstream is fully completed and reviewed/tested, and usually ask the user before promoting new knowledge into the shared skill.
+- [self] Corrective rule: for large repo SOPs, create a thin routing `SKILL.md` plus one-level-deep reference files by subsystem instead of a monolithic skill dump.
+- [self] Corrective rule: when new learnings appear during implementation, first record them in `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md`; only promote them into `.cursor/skills/gradientos-sop/` if they pass a stability/consolidation gate.
+
+### 2026-04-06 - Keep the long SOP outside the skill folder and advertise the skill from the repo entrypoint
+- [user] Explicit preference: the new GradientOS skill should clearly reference the main SOP document and should be listed in the repo's top-level agent guidance.
+- [self] Superseded: this task originally kept `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` outside the skill folder, but the user later explicitly requested moving it under `.cursor/skills/gradientos-sop/`.
+- [self] Corrective rule: when adding a new repo-level shared skill, register it in `.cursor/rules/000-project-instructions.md` so future agents discover and apply it proactively.
+
+### 2026-04-06 - Long-form GradientOS SOP now lives inside the skill folder
+- [user] Explicit preference: move the long-form `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` file from repo root into the `gradientos-sop` skill folder.
+- [self] Corrective rule: for this repo, treat `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` as the canonical long-form GradientOS SOP path and keep the routed skill files pointing there.
+
+### 2026-04-06 - The always-in-context project instructions must explicitly point to the GradientOS skill
+- [user] Explicit preference: the primary always-in-context agent instructions should explicitly reference the top-level `gradientos-sop` entrypoint, not just mention it later in the skills catalog.
+- [self] Corrective rule: in `.cursor/rules/000-project-instructions.md`, keep an explicit top-level section that routes GradientOS control-stack tasks to `.cursor/skills/gradientos-sop/SKILL.md` and the long-form SOP path before the broader skills catalog.

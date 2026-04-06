@@ -304,6 +304,99 @@ Notes:
 - Zero joints one at a time after axis mapping/sign/scaling are confirmed with
   `scripts/rtcore_jog.py` and before aggressive PID tuning or trajectory execution.
 
+#### Drive-native home vs software zero
+
+For A6-EC absolute encoder commissioning there are now two distinct operations:
+
+- `POST /control/home-joint-native` tells RTCore to set the drive's native home by
+  rewriting the A6-EC position offset (`0x60B0`) for that axis and saving it to the
+  drive (`0x1010:01`).
+- `POST /control/zero-joint` keeps the existing GradientOS software-zero workflow by
+  storing a logical offset in `.gradient_joint_zero_offsets.json`.
+
+Recommended order:
+
+1. Verify axis mapping, sign, and scaling first.
+2. Use `Drive Home` / `/control/home-joint-native` when you want the servo drive's
+   own absolute reference updated.
+3. Use `Zero Joint` / `/control/zero-joint` only when you want to redefine the
+   robot's logical work zero without changing the drive's native reference.
+
+Example native-home call:
+
+```bash
+curl -X POST http://127.0.0.1:8000/control/home-joint-native \
+  -H "Content-Type: application/json" \
+  -d '{"joint": 5}'
+```
+
+#### A6-EC absolute multi-turn mode verification
+
+The active EtherCAT drive family is now selected through the runtime drive profile,
+not the robot config. Manufacturer-specific RTCore load details such as slave
+identity, PDO defaults, and startup-setting defaults live in the separate
+EtherCAT drive catalog under `src/gradient_os/arm_controller/ethercat_drive_catalog.py`.
+
+For the current `a6ec_ds402` profile, RTCore configures each A6-EC axis for the
+battery-backed limited multi-turn absolute encoder mode on startup via `C00.07`
+(`0x2000:08`, mode value `1`). RTCore also reads the value back and publishes
+whether the commanded mode verified successfully.
+
+To inspect the live startup verification snapshot:
+
+```bash
+curl http://127.0.0.1:8000/health/drive-faults
+```
+
+Look for:
+
+- `startup_drive_config`
+- `startup_drive_config.setting_key`
+- `startup_drive_config.commanded`
+- `startup_drive_config.readback`
+- `startup_drive_config.verified`
+- `manufacturer_error_code` / decoded `manufacturer_fault`
+
+The generic `startup_drive_config` object is now the primary telemetry contract from
+RTCore through the Python controller and UI.
+
+These fields help catch startup-mode mismatches and battery/multi-turn encoder faults
+such as `Er20.8` and `Er20.9` after power-up.
+
+#### Encoder retention experiment logging
+
+To verify that absolute multi-turn counts survive a full drive power cycle, capture a
+snapshot before power-down and another after power-up. GradientOS writes the results
+under `logs/encoder-retention/<experiment-id>/`.
+
+API examples:
+
+```bash
+curl -X POST http://127.0.0.1:8000/control/encoder-retention/capture \
+  -H "Content-Type: application/json" \
+  -d '{"phase": "before_power_down"}'
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/control/encoder-retention/capture \
+  -H "Content-Type: application/json" \
+  -d '{"phase": "after_power_up", "experiment_id": "20260405-absolute-check"}'
+```
+
+Each experiment directory contains:
+
+- `before_power_down.json`
+- `after_power_up.json`
+- `comparison.json`
+- `comparison.md`
+
+The comparison highlights:
+
+- raw encoder count mismatches,
+- logical joint-angle mismatches,
+- startup absolute-mode verification failures,
+- active battery/multi-turn faults after power-up.
+
 #### Direct RTCore jog tool (no controller)
 
 For bring-up and slave mapping, you can talk directly to RTCore without the full controller:

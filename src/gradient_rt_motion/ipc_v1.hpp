@@ -151,7 +151,7 @@ struct AxisStatusV1 {
   uint16_t error_code; // 0x603F
   uint8_t mode_display; // 0x6061
   uint8_t ds402_state;  // derived enum (RTCore-decoded)
-  uint16_t reserved0;
+  uint32_t manufacturer_error_code; // 0x203F
   uint32_t di_bits; // 0x60FD
   uint32_t axis_fault_flags;
   uint32_t brake_state; // enum BrakeStateV1
@@ -183,7 +183,7 @@ struct StatusHelloV1 {
   uint64_t topology_hash;
   uint64_t cycle_ns;
   uint32_t num_axes;
-  uint32_t drive_profile_id; // e.g. 1=a6ec_ds402
+  uint32_t drive_profile_id; // stable hash of normalized drive profile token; 0=unknown
   uint32_t wkc_expected;
   uint32_t reserved0;
 };
@@ -281,6 +281,12 @@ struct CmdFaultResetV1 {
   uint32_t reserved;
 };
 static_assert(sizeof(CmdFaultResetV1) == 8, "CmdFaultResetV1 size must match spec");
+
+struct CmdNativeHomeV1 {
+  uint32_t axis_mask;
+  uint32_t flags;
+};
+static_assert(sizeof(CmdNativeHomeV1) == 8, "CmdNativeHomeV1 size must match spec");
 
 struct CmdSetModeV1 {
   uint32_t axis_mask;
@@ -402,6 +408,7 @@ enum : uint16_t {
   MSG_CMD_SET_SOFT_LIMITS = 0x0105,
   MSG_CMD_SET_MODE = 0x0106,
   MSG_CMD_REQUEST_BUNDLE = 0x0107,
+  MSG_CMD_NATIVE_HOME = 0x0108,
   MSG_CMD_IO_WRITE = 0x0110,
   MSG_CMD_TRAJECTORY_BEGIN = 0x0120,
   MSG_CMD_TRAJECTORY_POINT = 0x0121,
@@ -455,8 +462,6 @@ enum : uint32_t {
 // StatusHelloV1.drive_profile_id values (v1).
 enum : uint32_t {
   DRIVE_PROFILE_UNKNOWN = 0,
-  DRIVE_PROFILE_A6EC_DS402 = 1,
-  DRIVE_PROFILE_CIA402 = 2,
 };
 
 // AxisStatusV1.brake_state values (v1).
@@ -466,6 +471,13 @@ enum : uint32_t {
   BRAKE_APPLIED = 2,
   BRAKE_WAIT_RELEASE_DELAY = 3,
   BRAKE_WAIT_HOLD_DELAY = 4,
+};
+
+enum : uint32_t {
+  NATIVE_HOME_STATE_IDLE = 0,
+  NATIVE_HOME_STATE_REQUESTED = 1,
+  NATIVE_HOME_STATE_SUCCEEDED = 2,
+  NATIVE_HOME_STATE_FAILED = 3,
 };
 
 // Axis "unit" typing (v1).

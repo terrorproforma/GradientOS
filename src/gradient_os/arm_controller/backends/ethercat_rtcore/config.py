@@ -57,3 +57,7 @@ def describe_drive_fault_code(error_code: int) -> Optional[dict[str, Any]]:
     return a6ec_ds402.describe_fault_code(error_code)
 
 
+def describe_drive_manufacturer_fault_code(error_code: int) -> Optional[dict[str, Any]]:
+    return a6ec_ds402.describe_manufacturer_fault_code(error_code)
+
+

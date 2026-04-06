@@ -32,7 +32,7 @@ endif
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) ipc_v1.hpp ecrt_detect.hpp ds402.hpp a6ec_pdo.hpp
+$(TARGET): $(SRCS) ipc_v1.hpp ecrt_detect.hpp ds402.hpp
 	$(CXX) $(CXXFLAGS) $(SRCS) -o $@ $(LDFLAGS)
 
 clean:

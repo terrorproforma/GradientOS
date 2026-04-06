@@ -162,12 +162,16 @@ def build_drive_fault_snapshot(
     axes_payload: list[dict[str, object]] = []
     op_enabled_axes = 0
     faulted_axes = 0
+    startup_drive_config_configured_axes = 0
+    startup_drive_config_verified_axes = 0
+    startup_drive_config_mismatch_axes = 0
 
     for axis_index, axis in enumerate(axes_raw[:num_axes]):
         if not isinstance(axis, Mapping):
             continue
         statusword = coerce_int(axis.get("statusword"), 0)
         error_code = coerce_int(axis.get("error_code"), 0)
+        manufacturer_error_code = coerce_int(axis.get("manufacturer_error_code"), 0)
         drive_state = backend_registry.decode_drive_statusword_for_backend(
             servo_backend,
             statusword,
@@ -189,6 +193,18 @@ def build_drive_fault_snapshot(
                 logical_joint = None
 
         slave_al_state = coerce_int(axis.get("slave_al_state"), 0)
+        startup_drive_config = backend_registry.extract_drive_startup_config_axis_for_backend(
+            servo_backend,
+            dict(axis),
+            drive_profile_id=resolved_drive_profile,
+        )
+        if isinstance(startup_drive_config, Mapping):
+            if bool(startup_drive_config.get("configured")):
+                startup_drive_config_configured_axes += 1
+                if bool(startup_drive_config.get("verified")):
+                    startup_drive_config_verified_axes += 1
+                else:
+                    startup_drive_config_mismatch_axes += 1
         slave_al_detail = backend_registry.decode_fieldbus_state_for_backend(
             servo_backend,
             slave_al_state,
@@ -204,6 +220,9 @@ def build_drive_fault_snapshot(
                 "statusword_hex": f"0x{statusword & 0xFFFF:04x}",
                 "error_code": error_code,
                 "error_code_hex": f"0x{error_code & 0xFFFF:04x}",
+                "manufacturer_error_code": manufacturer_error_code,
+                "manufacturer_error_code_hex": f"0x{manufacturer_error_code & 0xFFFFFFFF:08x}",
+                "startup_drive_config": startup_drive_config,
                 "slave_online": bool(coerce_int(axis.get("slave_online"), 0)),
                 "slave_operational": bool(coerce_int(axis.get("slave_operational"), 0)),
                 "slave_al_state": slave_al_state,
@@ -216,6 +235,11 @@ def build_drive_fault_snapshot(
                 "fault": backend_registry.describe_drive_fault_code_for_backend(
                     servo_backend,
                     error_code,
+                    drive_profile_id=resolved_drive_profile,
+                ),
+                "manufacturer_fault": backend_registry.describe_drive_manufacturer_fault_code_for_backend(
+                    servo_backend,
+                    manufacturer_error_code,
                     drive_profile_id=resolved_drive_profile,
                 ),
             }
@@ -283,6 +307,9 @@ def build_drive_fault_snapshot(
         "online": online,
         "operational": operational,
         "startup_ready": startup_ready,
+        "startup_drive_config_configured_axes": startup_drive_config_configured_axes,
+        "startup_drive_config_verified_axes": startup_drive_config_verified_axes,
+        "startup_drive_config_mismatch_axes": startup_drive_config_mismatch_axes,
         "wkc_actual": wkc_actual,
         "wkc_expected": wkc_expected,
         "master_al": master_al,

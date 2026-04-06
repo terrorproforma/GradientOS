@@ -24,6 +24,9 @@ export type ServoSample = {
   statusword_hex?: string;
   error_code?: number;
   error_code_hex?: string;
+  manufacturer_error_code?: number;
+  manufacturer_error_code_hex?: string;
+  startup_drive_config?: DriveStartupConfig | null;
   mode_display?: number;
   mode_display_name?: string;
   ds402_state?: string;
@@ -53,6 +56,23 @@ export type DriveFaultDetail = {
   name?: string;
   class?: string | null;
   resettable?: boolean;
+  bus_fault_code_hex?: string | null;
+  bus_fault_name?: string | null;
+  source?: string;
+};
+
+export type DriveStartupConfig = {
+  profile_id?: string;
+  setting_key?: string;
+  setting_label?: string;
+  object?: string;
+  configured?: boolean;
+  commanded?: number;
+  commanded_value_label?: string;
+  readback_valid?: boolean;
+  readback?: number;
+  readback_value_label?: string;
+  verified?: boolean;
 };
 
 export type DriveFaultAxis = {
@@ -61,12 +81,17 @@ export type DriveFaultAxis = {
   ds402_state: string;
   statusword: number;
   error_code: number;
+  error_code_hex?: string;
+  manufacturer_error_code?: number;
+  manufacturer_error_code_hex?: string;
+  startup_drive_config?: DriveStartupConfig | null;
   slave_online?: boolean;
   slave_operational?: boolean;
   slave_al_state?: number;
   slave_al_state_name?: string;
   pos_counts?: number;
   fault?: DriveFaultDetail | null;
+  manufacturer_fault?: DriveFaultDetail | null;
 };
 
 export type DriveFaultSnapshot = {
@@ -92,6 +117,9 @@ export type DriveFaultSnapshot = {
   online?: number;
   operational?: number;
   startup_ready?: number;
+  startup_drive_config_configured_axes?: number;
+  startup_drive_config_verified_axes?: number;
+  startup_drive_config_mismatch_axes?: number;
   wkc_actual?: number;
   wkc_expected?: number;
   master_al?: number;

@@ -36,6 +36,7 @@ trajectory_cache/
 closed_loop/
 open_loop/
 bash.text
+logs/
 
 # Recorded episodes (keep folder, ignore contents)
 recorded_episodes/*

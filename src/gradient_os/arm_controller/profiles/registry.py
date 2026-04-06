@@ -70,6 +70,41 @@ def describe_drive_fault_code(profile_id: str | None, error_code: int) -> dict[s
     return None
 
 
+def describe_drive_manufacturer_fault_code(profile_id: str | None, error_code: int) -> dict[str, Any] | None:
+    module = get_drive_profile(profile_id)
+    decoder = getattr(module, "describe_manufacturer_fault_code", None) if module is not None else None
+    if callable(decoder):
+        payload = decoder(int(error_code))
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def build_drive_startup_config(
+    profile_id: str | None,
+    raw_entries: object,
+    *,
+    num_axes: int,
+) -> dict[str, Any] | None:
+    module = get_drive_profile(profile_id)
+    builder = getattr(module, "build_startup_config", None) if module is not None else None
+    if callable(builder):
+        payload = builder(raw_entries, num_axes=int(num_axes))
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def extract_drive_startup_config_axis(
+    profile_id: str | None,
+    axis: dict[str, Any],
+) -> dict[str, Any] | None:
+    module = get_drive_profile(profile_id)
+    extractor = getattr(module, "extract_startup_config_axis", None) if module is not None else None
+    if callable(extractor):
+        payload = extractor(axis)
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
 def decode_fieldbus_state(profile_id: str | None, value: int) -> dict[str, Any] | None:
     module = get_fieldbus_profile(profile_id)
     decoder = getattr(module, "decode_al_state", None) if module is not None else None

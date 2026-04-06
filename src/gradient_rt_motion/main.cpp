@@ -36,7 +36,6 @@
 using gradient::ipc::v1::AxisStatusV1;
 
 #include "ecrt_detect.hpp"
-#include "a6ec_pdo.hpp"
 #include "ds402.hpp"
 
 #ifndef MFD_CLOEXEC
@@ -142,6 +141,37 @@ struct AxisConfig {
   uint32_t max_profile_vel_counts_per_s = 0;
 };
 
+struct PdoLayoutEntry {
+  std::string semantic;
+  uint16_t index = 0;
+  uint8_t subindex = 0;
+  uint8_t bits = 0;
+};
+
+enum class StartupSdoValueType : uint8_t {
+  kNone = 0,
+  kU16 = 1,
+};
+
+struct StartupSdoConfig {
+  bool valid = false;
+  std::string key;
+  StartupSdoValueType type = StartupSdoValueType::kNone;
+  uint16_t index = 0;
+  uint8_t subindex = 0;
+  std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> values{};
+};
+
+struct DrivePdoConfig {
+  std::string label = "custom";
+  uint16_t rx_pdo = 0;
+  uint16_t tx_pdo = 0;
+  uint8_t rx_sync_index = 2;
+  uint8_t tx_sync_index = 3;
+  std::vector<PdoLayoutEntry> rx_entries;
+  std::vector<PdoLayoutEntry> tx_entries;
+};
+
 struct Options {
   std::string socket_path = "/run/gradient-rt-motion/ipc.sock";
   // Filesystem group that is allowed to connect to the IPC socket (0660).
@@ -149,7 +179,13 @@ struct Options {
   std::string ipc_group = "pi";
   uint64_t cycle_ns = 1000000; // 1 kHz
   uint32_t num_axes = 6;       // default arm axes for early scaffolding
-  uint32_t drive_profile_id = gradient::ipc::v1::DRIVE_PROFILE_A6EC_DS402;
+  uint32_t drive_profile_id = gradient::ipc::v1::DRIVE_PROFILE_UNKNOWN;
+  uint32_t slave_vendor_id = 0;
+  uint32_t slave_product_code = 0;
+  uint32_t slave_revision_no = 0;
+  uint8_t rx_sync_index = 2;
+  uint8_t tx_sync_index = 3;
+  uint64_t dc_cycle_multiple_ns = 0;
 
   // Axis scaling (bring-up defaults; tuned via commissioning).
   // Per-axis lists can be provided via the CLI (comma-separated).
@@ -160,8 +196,8 @@ struct Options {
   double max_rpm = 100.0;
 
   // EtherCAT bring-up policy.
-  uint16_t rx_pdo = gradient::a6ec::kRxPdo;
-  uint16_t tx_pdo = gradient::a6ec::kTxPdo;
+  uint16_t rx_pdo = 0;
+  uint16_t tx_pdo = 0;
   bool use_dc = true;
   bool disable_output_watchdog = false;
   bool split_domains_per_axis = false;
@@ -174,19 +210,12 @@ struct Options {
   uint32_t startup_skip_domain_queue_ms = 0;
 };
 
-const char* pdo_profile_label(uint16_t rx_pdo, uint16_t tx_pdo) {
-  if (rx_pdo == 0x1701 && tx_pdo == 0x1B01) {
-    return "1701/1b01";
-  }
-  if (rx_pdo == 0x1702 && tx_pdo == 0x1B02) {
-    return "1702/1b02";
-  }
-  return "custom";
-}
-
-bool is_supported_pdo_profile(uint16_t rx_pdo, uint16_t tx_pdo) {
-  return (rx_pdo == 0x1701 && tx_pdo == 0x1B01) ||
-         (rx_pdo == 0x1702 && tx_pdo == 0x1B02);
+std::string format_pdo_profile_label(uint16_t rx_pdo, uint16_t tx_pdo) {
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "0x%04x/0x%04x",
+                static_cast<unsigned int>(rx_pdo),
+                static_cast<unsigned int>(tx_pdo));
+  return std::string(buf);
 }
 
 bool parse_u32(const char* s, uint32_t* out) {
@@ -260,6 +289,30 @@ bool parse_u16_auto(const char* s, uint16_t* out) {
   return true;
 }
 
+bool parse_u32_auto(const char* s, uint32_t* out) {
+  if (!s || !*s) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  unsigned long v = std::strtoul(s, &end, 0);
+  if (errno != 0 || end == s || *end != '\0' ||
+      v > static_cast<unsigned long>(std::numeric_limits<uint32_t>::max())) {
+    return false;
+  }
+  *out = static_cast<uint32_t>(v);
+  return true;
+}
+
+uint32_t drive_profile_token_hash(const std::string& token) {
+  uint32_t value = 0x811C9DC5u;
+  for (char c : token) {
+    value ^= static_cast<uint8_t>(c);
+    value *= 0x01000193u;
+  }
+  return value == 0 ? gradient::ipc::v1::DRIVE_PROFILE_UNKNOWN : value;
+}
+
 bool parse_drive_profile_token(const std::string& token, uint32_t* out) {
   if (!out) {
     return false;
@@ -279,20 +332,13 @@ bool parse_drive_profile_token(const std::string& token, uint32_t* out) {
       c = static_cast<char>(c - 'A' + 'a');
     }
   }
-  if (t == "a6ec_ds402" || t == "a6ec" || t == "a6ec-ds402") {
-    *out = gradient::ipc::v1::DRIVE_PROFILE_A6EC_DS402;
-    return true;
-  }
-  if (t == "cia402" || t == "cia") {
-    *out = gradient::ipc::v1::DRIVE_PROFILE_CIA402;
-    return true;
-  }
   uint32_t numeric = 0;
-  if (parse_u32(t.c_str(), &numeric)) {
+  if (parse_u32_auto(t.c_str(), &numeric)) {
     *out = numeric;
     return true;
   }
-  return false;
+  *out = drive_profile_token_hash(t);
+  return true;
 }
 
 std::string trim_ascii_ws(const std::string& s) {
@@ -323,6 +369,140 @@ std::vector<std::string> split_csv_strict(const std::string& spec) {
     start = comma + 1;
   }
   return out;
+}
+
+std::vector<std::string> split_delim_strict(const std::string& spec, char delim) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (start <= spec.size()) {
+    size_t pos = spec.find(delim, start);
+    if (pos == std::string::npos) {
+      pos = spec.size();
+    }
+    std::string tok = trim_ascii_ws(spec.substr(start, pos - start));
+    if (tok.empty()) {
+      return {};
+    }
+    out.push_back(tok);
+    if (pos >= spec.size()) {
+      break;
+    }
+    start = pos + 1;
+  }
+  return out;
+}
+
+bool parse_u32_csv_allow_zero(const std::string& spec, std::vector<uint32_t>* out) {
+  if (!out) {
+    return false;
+  }
+  out->clear();
+  const auto toks = split_csv_strict(spec);
+  if (toks.empty()) {
+    return false;
+  }
+  for (const auto& tok : toks) {
+    uint32_t v = 0;
+    if (!parse_u32_auto(tok.c_str(), &v)) {
+      return false;
+    }
+    out->push_back(v);
+  }
+  return true;
+}
+
+bool parse_pdo_layout_spec(const std::string& spec, std::vector<PdoLayoutEntry>* out) {
+  if (!out) {
+    return false;
+  }
+  out->clear();
+  if (trim_ascii_ws(spec).empty()) {
+    return false;
+  }
+  const auto entries = split_delim_strict(spec, ';');
+  if (entries.empty()) {
+    return false;
+  }
+  for (const auto& entry_spec : entries) {
+    const auto fields = split_delim_strict(entry_spec, '|');
+    if (fields.size() != 4) {
+      return false;
+    }
+    PdoLayoutEntry entry{};
+    entry.semantic = trim_ascii_ws(fields[0]);
+    uint16_t index = 0;
+    uint16_t subindex = 0;
+    uint32_t bits = 0;
+    if (entry.semantic.empty() ||
+        !parse_u16_auto(fields[1].c_str(), &index) ||
+        !parse_u16_auto(fields[2].c_str(), &subindex) ||
+        !parse_u32_auto(fields[3].c_str(), &bits) ||
+        bits == 0 || bits > 255u) {
+      return false;
+    }
+    entry.index = index;
+    entry.subindex = static_cast<uint8_t>(subindex & 0xFFu);
+    entry.bits = static_cast<uint8_t>(bits);
+    out->push_back(entry);
+  }
+  return !out->empty();
+}
+
+bool parse_startup_sdo_config_spec(const std::string& spec,
+                                   uint32_t num_axes,
+                                   StartupSdoConfig* out) {
+  if (!out) {
+    return false;
+  }
+  *out = StartupSdoConfig{};
+  const std::string trimmed = trim_ascii_ws(spec);
+  if (trimmed.empty()) {
+    return true;
+  }
+  const auto descriptors = split_delim_strict(trimmed, ';');
+  if (descriptors.size() != 1) {
+    return false;
+  }
+  const auto fields = split_delim_strict(descriptors[0], '|');
+  if (fields.size() != 5) {
+    return false;
+  }
+  StartupSdoConfig cfg{};
+  cfg.key = trim_ascii_ws(fields[0]);
+  std::string type = trim_ascii_ws(fields[1]);
+  for (char& c : type) {
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');
+    }
+  }
+  if (cfg.key.empty() || type != "u16") {
+    return false;
+  }
+  uint16_t index = 0;
+  uint16_t subindex = 0;
+  std::vector<uint32_t> values{};
+  if (!parse_u16_auto(fields[2].c_str(), &index) ||
+      !parse_u16_auto(fields[3].c_str(), &subindex) ||
+      !parse_u32_csv_allow_zero(fields[4], &values)) {
+    return false;
+  }
+  if (values.size() == 1) {
+    for (uint32_t i = 0; i < num_axes; ++i) {
+      cfg.values[i] = values[0];
+    }
+  } else if (values.size() == static_cast<size_t>(num_axes)) {
+    for (uint32_t i = 0; i < num_axes; ++i) {
+      cfg.values[i] = values[i];
+    }
+  } else {
+    return false;
+  }
+  cfg.valid = true;
+  cfg.type = StartupSdoValueType::kU16;
+  cfg.index = index;
+  cfg.subindex = static_cast<uint8_t>(subindex & 0xFFu);
+  *out = cfg;
+  return true;
 }
 
 bool parse_axis_type_token(const std::string& token, uint8_t* out) {
@@ -678,8 +858,12 @@ void print_usage(const char* argv0) {
       "Usage: %s [--socket-path PATH] [--cycle-ns NS] [--num-axes N] "
       "[--counts-per-rev N[,N..]] [--gear-ratio R[,R..]] [--sign S[,S..]] "
       "[--axis-type T[,T..]] [--lead-m-per-rev M[,M..]] [--drive-profile ID] [--max-rpm RPM] "
+      "[--startup-sdo-config SPEC] "
+      "[--slave-vendor-id VID] [--slave-product-code PID] [--slave-revision-no REV] "
+      "[--rx-sync-index N] [--tx-sync-index N] [--dc-cycle-multiple-ns NS] "
       "[--slave-positions P[,P..]] "
-      "[--rx-pdo ID] [--tx-pdo ID] [--no-dc] [--disable-output-watchdog] "
+      "[--rx-pdo ID] [--tx-pdo ID] [--rx-pdo-layout SPEC] [--tx-pdo-layout SPEC] "
+      "[--no-dc] [--disable-output-watchdog] "
       "[--split-domains-per-axis] [--queue-split-domains-round-robin] [--explicit-pdo-config] "
       "[--wait-before-safeop-ms MS] [--preop-safeop-timeout-ms MS] "
       "[--safeop-op-timeout-ms MS] [--startup-passive-ms MS] "
@@ -692,11 +876,20 @@ void print_usage(const char* argv0) {
       "  --gear-ratio   1.0\n"
       "  --sign         +1\n"
       "  --axis-type    rotary\n"
-      "  --drive-profile a6ec_ds402\n"
+      "  --drive-profile <profile-or-id>\n"
       "  --max-rpm      100\n"
+      "  --startup-sdo-config key|u16|0xINDEX|0xSUB|V[,V..]\n"
+      "  --slave-vendor-id  0x....\n"
+      "  --slave-product-code 0x....\n"
+      "  --slave-revision-no 0x....\n"
+      "  --rx-sync-index 2\n"
+      "  --tx-sync-index 3\n"
+      "  --dc-cycle-multiple-ns 0\n"
       "  --slave-positions 0,1,2,...\n"
-      "  --rx-pdo       0x1702\n"
-      "  --tx-pdo       0x1B02\n"
+      "  --rx-pdo       0x....\n"
+      "  --tx-pdo       0x....\n"
+      "  --rx-pdo-layout semantic|0xINDEX|0xSUB|BITS;...\n"
+      "  --tx-pdo-layout semantic|0xINDEX|0xSUB|BITS;...\n"
       "  --no-dc        disabled by default\n"
       "  --disable-output-watchdog off\n"
       "  --split-domains-per-axis off\n"
@@ -896,6 +1089,9 @@ int main(int argc, char** argv) {
   std::string axis_type_spec;
   std::string lead_m_per_rev_spec;
   std::string slave_positions_spec;
+  std::string rx_pdo_layout_spec;
+  std::string tx_pdo_layout_spec;
+  std::string startup_sdo_config_spec;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -944,7 +1140,7 @@ int main(int argc, char** argv) {
     }
     if (arg == "--drive-profile" && i + 1 < argc) {
       if (!parse_drive_profile_token(argv[++i], &opt.drive_profile_id)) {
-        logf("ERROR: invalid --drive-profile (expected a6ec_ds402, cia402, or numeric id)");
+        logf("ERROR: invalid --drive-profile");
         return 2;
       }
       continue;
@@ -952,6 +1148,56 @@ int main(int argc, char** argv) {
     if (arg == "--max-rpm" && i + 1 < argc) {
       if (!parse_double(argv[++i], &opt.max_rpm) || opt.max_rpm < 0.0) {
         logf("ERROR: invalid --max-rpm (must be >= 0)");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--startup-sdo-config" && i + 1 < argc) {
+      startup_sdo_config_spec = argv[++i];
+      continue;
+    }
+    if (arg == "--slave-vendor-id" && i + 1 < argc) {
+      if (!parse_u32_auto(argv[++i], &opt.slave_vendor_id)) {
+        logf("ERROR: invalid --slave-vendor-id");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--slave-product-code" && i + 1 < argc) {
+      if (!parse_u32_auto(argv[++i], &opt.slave_product_code)) {
+        logf("ERROR: invalid --slave-product-code");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--slave-revision-no" && i + 1 < argc) {
+      if (!parse_u32_auto(argv[++i], &opt.slave_revision_no)) {
+        logf("ERROR: invalid --slave-revision-no");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--rx-sync-index" && i + 1 < argc) {
+      uint32_t value = 0;
+      if (!parse_u32_auto(argv[++i], &value) || value > 255u) {
+        logf("ERROR: invalid --rx-sync-index");
+        return 2;
+      }
+      opt.rx_sync_index = static_cast<uint8_t>(value);
+      continue;
+    }
+    if (arg == "--tx-sync-index" && i + 1 < argc) {
+      uint32_t value = 0;
+      if (!parse_u32_auto(argv[++i], &value) || value > 255u) {
+        logf("ERROR: invalid --tx-sync-index");
+        return 2;
+      }
+      opt.tx_sync_index = static_cast<uint8_t>(value);
+      continue;
+    }
+    if (arg == "--dc-cycle-multiple-ns" && i + 1 < argc) {
+      if (!parse_u64(argv[++i], &opt.dc_cycle_multiple_ns)) {
+        logf("ERROR: invalid --dc-cycle-multiple-ns");
         return 2;
       }
       continue;
@@ -972,6 +1218,14 @@ int main(int argc, char** argv) {
         logf("ERROR: invalid --tx-pdo");
         return 2;
       }
+      continue;
+    }
+    if (arg == "--rx-pdo-layout" && i + 1 < argc) {
+      rx_pdo_layout_spec = argv[++i];
+      continue;
+    }
+    if (arg == "--tx-pdo-layout" && i + 1 < argc) {
+      tx_pdo_layout_spec = argv[++i];
       continue;
     }
     if (arg == "--no-dc") {
@@ -1050,23 +1304,36 @@ int main(int argc, char** argv) {
   if (!finalize_slave_positions(&opt, slave_positions_spec)) {
     return 2;
   }
-
-  if (!is_supported_pdo_profile(opt.rx_pdo, opt.tx_pdo)) {
-    logf("ERROR: unsupported PDO profile rx=0x%04x tx=0x%04x "
-         "(supported: 0x1701/0x1b01 or 0x1702/0x1b02)",
-         static_cast<unsigned int>(opt.rx_pdo),
-         static_cast<unsigned int>(opt.tx_pdo));
+  DrivePdoConfig drive_pdo{};
+  drive_pdo.rx_pdo = opt.rx_pdo;
+  drive_pdo.tx_pdo = opt.tx_pdo;
+  drive_pdo.rx_sync_index = opt.rx_sync_index;
+  drive_pdo.tx_sync_index = opt.tx_sync_index;
+  drive_pdo.label = format_pdo_profile_label(opt.rx_pdo, opt.tx_pdo);
+  if (opt.rx_pdo == 0 || opt.tx_pdo == 0 ||
+      !parse_pdo_layout_spec(rx_pdo_layout_spec, &drive_pdo.rx_entries) ||
+      !parse_pdo_layout_spec(tx_pdo_layout_spec, &drive_pdo.tx_entries)) {
+    logf("ERROR: invalid drive PDO loader config "
+         "(need non-zero --rx-pdo/--tx-pdo and valid --rx-pdo-layout/--tx-pdo-layout)");
+    return 2;
+  }
+  StartupSdoConfig startup_sdo{};
+  if (!parse_startup_sdo_config_spec(startup_sdo_config_spec, opt.num_axes, &startup_sdo)) {
+    logf("ERROR: invalid --startup-sdo-config");
+    return 2;
+  }
+  if (opt.slave_vendor_id == 0 || opt.slave_product_code == 0) {
+    logf("ERROR: EtherCAT slave identity is incomplete "
+         "(provide --slave-vendor-id and --slave-product-code)");
     return 2;
   }
 
 #if GRADIENT_HAVE_ECRT
-  // A6-EC (CiA402 over EtherCAT) uses DC/SYNC0; the sync cycle must be a multiple
-  // of 250 μs (manual ch8; otherwise the drive can raise Er74.0).
-  constexpr uint64_t kA6ecDcQuantumNs = 250000; // 250 μs
-  if (opt.use_dc && (opt.cycle_ns % kA6ecDcQuantumNs) != 0) {
-    logf("ERROR: --cycle-ns (%llu) must be a multiple of %llu ns (250 us) for A6-EC DC/SYNC0",
+  if (opt.use_dc && opt.dc_cycle_multiple_ns > 0 &&
+      (opt.cycle_ns % opt.dc_cycle_multiple_ns) != 0) {
+    logf("ERROR: --cycle-ns (%llu) must be a multiple of configured drive DC quantum %llu ns",
          static_cast<unsigned long long>(opt.cycle_ns),
-         static_cast<unsigned long long>(kA6ecDcQuantumNs));
+         static_cast<unsigned long long>(opt.dc_cycle_multiple_ns));
     return 2;
   }
 #endif
@@ -1232,10 +1499,19 @@ int main(int argc, char** argv) {
     uint8_t startup_skip_domain_queue_active = 0;
     uint32_t startup_elapsed_ms = 0;
     uint32_t startup_reset_count = 0;
+    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_configured{};
+    std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_commanded{};
+    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_readback_valid{};
+    std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_readback{};
+    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_verified{};
+    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_state{};
+    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_position_offset{};
+    std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_last_abort_code{};
     std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> pos_counts{};
     std::array<int16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> torque_raw{};
     std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> statusword{};
     std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> error_code{};
+    std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> manufacturer_error_code{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> mode_display{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ds402_state{};
     std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> di_bits{};
@@ -1294,6 +1570,9 @@ int main(int argc, char** argv) {
       gradient::ipc::v1::MOTION_CAP_JOG_COMMAND};
   std::atomic<uint64_t> motion_active_command_seq{0};
   std::atomic<uint64_t> motion_last_update_ns{0};
+#if GRADIENT_HAVE_ECRT
+  ec_master_t* shared_master = nullptr;
+#endif
 
   std::thread rt_thread([&]() {
     pthread_setname_np(pthread_self(), "rt-cycle");
@@ -1352,13 +1631,16 @@ int main(int argc, char** argv) {
 #endif
 
 #if GRADIENT_HAVE_ECRT
+    ec_master_t*& master = shared_master;
+#endif
+
+#if GRADIENT_HAVE_ECRT
     // -----------------------------------------------------------------------
-    // IgH libecrt setup (A6-EC DS402 drives, CSP mode)
+    // IgH libecrt setup (descriptor-driven EtherCAT DS402 bring-up)
     // -----------------------------------------------------------------------
     //
     // NOTE: This block compiles only when IgH headers are present. It is
     // intentionally "init-only" work; the cyclic loop below avoids allocation.
-    ec_master_t* master = nullptr;
     ec_domain_t* domain = nullptr;
     std::array<ec_domain_t*, gradient::ipc::v1::GRADIENT_MAX_AXES> axis_domain{};
     uint8_t* domain_pd = nullptr;
@@ -1367,7 +1649,7 @@ int main(int argc, char** argv) {
     ec_domain_state_t domain_state{};
 
     constexpr unsigned int kInvalidOffset = std::numeric_limits<unsigned int>::max();
-    constexpr size_t kMaxPdoRegsPerAxis = 16;
+    constexpr size_t kMaxPdoRegsPerAxis = 32;
 
     struct AxisOffsets {
       unsigned int cw = kInvalidOffset;
@@ -1379,6 +1661,7 @@ int main(int argc, char** argv) {
       unsigned int max_profile_vel = kInvalidOffset;
 
       unsigned int err = kInvalidOffset;
+      unsigned int manufacturer_err = kInvalidOffset;
       unsigned int sw = kInvalidOffset;
       unsigned int pos = kInvalidOffset;
       unsigned int torque = kInvalidOffset;
@@ -1437,135 +1720,43 @@ int main(int argc, char** argv) {
             ? (startup_skip_domain_queue_ns + kStartupDetailedDiagPostResumeNs)
             : kStartupDetailedDiagBaseNs;
 
-    // Supported A6-EC PDO profiles from the vendor ESI.
-    static ec_pdo_entry_info_t a6ec_entries_1701_1b01[] = {
-        // RxPDO 0x1701 (4 entries)
-        {0x6040, 0x00, 16}, // Controlword
-        {0x607A, 0x00, 32}, // Target position
-        {0x60B8, 0x00, 16}, // Touch probe function
-        {0x60FE, 0x01, 32}, // Physical outputs
-        // TxPDO 0x1B01 (9 entries)
-        {0x603F, 0x00, 16}, // Error code
-        {0x6041, 0x00, 16}, // Statusword
-        {0x6064, 0x00, 32}, // Position actual value
-        {0x6077, 0x00, 16}, // Torque actual value
-        {0x60F4, 0x00, 32}, // Following error actual value
-        {0x60B9, 0x00, 16}, // Touch probe status
-        {0x60BA, 0x00, 32}, // Touch probe pos1 value
-        {0x60BC, 0x00, 32}, // Touch probe pos2 value
-        {0x60FD, 0x00, 32}, // Digital inputs
-    };
-
-    static ec_pdo_info_t a6ec_pdos_1701_1b01[] = {
-        {0x1701, 4, a6ec_entries_1701_1b01 + 0},
-        {0x1B01, 9, a6ec_entries_1701_1b01 + 4},
-    };
-
-    static ec_sync_info_t a6ec_syncs_1701_1b01[] = {
-        {2, EC_DIR_OUTPUT, 1, a6ec_pdos_1701_1b01 + 0, EC_WD_ENABLE},
-        {3, EC_DIR_INPUT, 1, a6ec_pdos_1701_1b01 + 1, EC_WD_DISABLE},
+    std::vector<ec_pdo_entry_info_t> rx_pdo_entries{};
+    rx_pdo_entries.reserve(drive_pdo.rx_entries.size());
+    for (const auto& entry : drive_pdo.rx_entries) {
+      rx_pdo_entries.push_back(ec_pdo_entry_info_t{entry.index, entry.subindex, entry.bits});
+    }
+    std::vector<ec_pdo_entry_info_t> tx_pdo_entries{};
+    tx_pdo_entries.reserve(drive_pdo.tx_entries.size());
+    for (const auto& entry : drive_pdo.tx_entries) {
+      tx_pdo_entries.push_back(ec_pdo_entry_info_t{entry.index, entry.subindex, entry.bits});
+    }
+    std::array<ec_pdo_info_t, 2> runtime_pdos{{
+        {drive_pdo.rx_pdo, static_cast<unsigned int>(rx_pdo_entries.size()), rx_pdo_entries.data()},
+        {drive_pdo.tx_pdo, static_cast<unsigned int>(tx_pdo_entries.size()), tx_pdo_entries.data()},
+    }};
+    std::array<ec_sync_info_t, 3> runtime_syncs{{
+        {drive_pdo.rx_sync_index,
+         EC_DIR_OUTPUT,
+         1,
+         runtime_pdos.data() + 0,
+         opt.disable_output_watchdog ? EC_WD_DISABLE : EC_WD_ENABLE},
+        {drive_pdo.tx_sync_index,
+         EC_DIR_INPUT,
+         1,
+         runtime_pdos.data() + 1,
+         EC_WD_DISABLE},
         {0xff, EC_DIR_INVALID, 0, nullptr, EC_WD_DISABLE},
-    };
-
-    static ec_pdo_entry_info_t a6ec_entries_1702_1b02[] = {
-        // RxPDO 0x1702 (7 entries)
-        {0x6040, 0x00, 16}, // Controlword
-        {0x607A, 0x00, 32}, // Target position
-        {0x60FF, 0x00, 32}, // Target velocity
-        {0x6071, 0x00, 16}, // Target torque
-        {0x6060, 0x00, 8},  // Modes of operation
-        {0x60B8, 0x00, 16}, // Touch probe function
-        {0x607F, 0x00, 32}, // Max profile velocity
-        // TxPDO 0x1B02 (9 entries)
-        {0x603F, 0x00, 16}, // Error code
-        {0x6041, 0x00, 16}, // Statusword
-        {0x6064, 0x00, 32}, // Position actual value
-        {0x6077, 0x00, 16}, // Torque actual value
-        {0x6061, 0x00, 8},  // Modes of operation display
-        {0x60B9, 0x00, 16}, // Touch probe status
-        {0x60BA, 0x00, 32}, // Touch probe pos1 value
-        {0x60BC, 0x00, 32}, // Touch probe pos2 value
-        {0x60FD, 0x00, 32}, // Digital inputs
-    };
-
-    static ec_pdo_info_t a6ec_pdos_1702_1b02[] = {
-        {0x1702, 7, a6ec_entries_1702_1b02 + 0},
-        {0x1B02, 9, a6ec_entries_1702_1b02 + 7},
-    };
-
-    static ec_sync_info_t a6ec_syncs_1702_1b02[] = {
-        {2, EC_DIR_OUTPUT, 1, a6ec_pdos_1702_1b02 + 0, EC_WD_ENABLE},
-        {3, EC_DIR_INPUT, 1, a6ec_pdos_1702_1b02 + 1, EC_WD_DISABLE},
-        {0xff, EC_DIR_INVALID, 0, nullptr, EC_WD_DISABLE},
-    };
-
-    struct PdoProfileConfig {
-      const char* name = "custom";
-      uint16_t rx_pdo = 0;
-      uint16_t tx_pdo = 0;
-      const ec_sync_info_t* syncs = nullptr;
-      bool has_target_vel = false;
-      bool has_target_torque = false;
-      bool has_mode = false;
-      bool has_max_profile_vel = false;
-      bool has_mode_display = false;
-    };
-
-    static const PdoProfileConfig kPdoProfile1701_1b01{
-        "1701/1b01",
-        0x1701,
-        0x1B01,
-        a6ec_syncs_1701_1b01,
-        false,
-        false,
-        false,
-        false,
-        false,
-    };
-
-    static const PdoProfileConfig kPdoProfile1702_1b02{
-        "1702/1b02",
-        0x1702,
-        0x1B02,
-        a6ec_syncs_1702_1b02,
-        true,
-        true,
-        true,
-        true,
-        true,
-    };
-
-    const PdoProfileConfig* pdo_profile = nullptr;
-    if (opt.rx_pdo == kPdoProfile1701_1b01.rx_pdo &&
-        opt.tx_pdo == kPdoProfile1701_1b01.tx_pdo) {
-      pdo_profile = &kPdoProfile1701_1b01;
-    } else if (opt.rx_pdo == kPdoProfile1702_1b02.rx_pdo &&
-               opt.tx_pdo == kPdoProfile1702_1b02.tx_pdo) {
-      pdo_profile = &kPdoProfile1702_1b02;
-    }
-    if (!pdo_profile) {
-      logf("ERROR: unsupported PDO profile rx=0x%04x tx=0x%04x",
-           static_cast<unsigned int>(opt.rx_pdo),
-           static_cast<unsigned int>(opt.tx_pdo));
-      return;
-    }
-
-    std::array<ec_sync_info_t, 3> runtime_syncs{};
-    for (size_t i = 0; i < runtime_syncs.size(); ++i) {
-      runtime_syncs[i] = pdo_profile->syncs[i];
-    }
-    if (opt.disable_output_watchdog) {
-      runtime_syncs[0].watchdog_mode = EC_WD_DISABLE;
-    }
-
-    logf("EtherCAT bring-up config: pdo_profile=%s rx=0x%04x tx=0x%04x dc=%u "
+    }};
+    logf("EtherCAT bring-up config: pdo_profile=%s rx=0x%04x tx=0x%04x rx_sync=%u tx_sync=%u dc=%u "
          "output_watchdog=%u split_domains_per_axis=%u queue_split_domains_round_robin=%u "
          "explicit_pdo_config=%u "
          "wait_before_safeop_ms=%u preop_safeop_timeout_ms=%u safeop_op_timeout_ms=%u "
          "startup_passive_ms=%u startup_skip_domain_queue_ms=%u startup_diag_window_ms=%llu",
-         pdo_profile->name,
-         static_cast<unsigned int>(pdo_profile->rx_pdo),
-         static_cast<unsigned int>(pdo_profile->tx_pdo),
+         drive_pdo.label.c_str(),
+         static_cast<unsigned int>(drive_pdo.rx_pdo),
+         static_cast<unsigned int>(drive_pdo.tx_pdo),
+         static_cast<unsigned int>(drive_pdo.rx_sync_index),
+         static_cast<unsigned int>(drive_pdo.tx_sync_index),
          opt.use_dc ? 1u : 0u,
          opt.disable_output_watchdog ? 0u : 1u,
          opt.split_domains_per_axis ? 1u : 0u,
@@ -1685,7 +1876,7 @@ int main(int argc, char** argv) {
         if (!sc[i]) {
           continue;
         }
-        logf("EtherCAT phase=pdo_register axis=%u slave_pos=%u offsets cw=%u target_pos=%u sw=%u pos=%u err=%u di=%u",
+        logf("EtherCAT phase=pdo_register axis=%u slave_pos=%u offsets cw=%u target_pos=%u sw=%u pos=%u err=%u mfg_err=%u di=%u",
              i,
              static_cast<unsigned int>(opt.slave_position[i]),
              off[i].cw,
@@ -1693,8 +1884,69 @@ int main(int argc, char** argv) {
              off[i].sw,
              off[i].pos,
              off[i].err,
+             off[i].manufacturer_err,
              off[i].di);
       }
+    };
+
+    auto rx_offset_for_semantic = [&](AxisOffsets& axis_offsets, const std::string& semantic)
+        -> unsigned int* {
+      if (semantic == "cw") {
+        return &axis_offsets.cw;
+      }
+      if (semantic == "target_pos") {
+        return &axis_offsets.target_pos;
+      }
+      if (semantic == "target_vel") {
+        return &axis_offsets.target_vel;
+      }
+      if (semantic == "target_torque") {
+        return &axis_offsets.target_torque;
+      }
+      if (semantic == "mode") {
+        return &axis_offsets.mode;
+      }
+      if (semantic == "tp_func") {
+        return &axis_offsets.tp_func;
+      }
+      if (semantic == "max_profile_vel") {
+        return &axis_offsets.max_profile_vel;
+      }
+      return nullptr;
+    };
+    auto tx_offset_for_semantic = [&](AxisOffsets& axis_offsets, const std::string& semantic)
+        -> unsigned int* {
+      if (semantic == "err") {
+        return &axis_offsets.err;
+      }
+      if (semantic == "manufacturer_err") {
+        return &axis_offsets.manufacturer_err;
+      }
+      if (semantic == "sw") {
+        return &axis_offsets.sw;
+      }
+      if (semantic == "pos") {
+        return &axis_offsets.pos;
+      }
+      if (semantic == "torque") {
+        return &axis_offsets.torque;
+      }
+      if (semantic == "mode_disp") {
+        return &axis_offsets.mode_disp;
+      }
+      if (semantic == "tp_status") {
+        return &axis_offsets.tp_status;
+      }
+      if (semantic == "tp_pos1") {
+        return &axis_offsets.tp_pos1;
+      }
+      if (semantic == "tp_pos2") {
+        return &axis_offsets.tp_pos2;
+      }
+      if (semantic == "di") {
+        return &axis_offsets.di;
+      }
+      return nullptr;
     };
 
     auto fill_axis_regs = [&](uint32_t axis, auto& regs, size_t& reg_i) {
@@ -1702,41 +1954,23 @@ int main(int argc, char** argv) {
       auto add_reg = [&](uint16_t index, uint8_t subindex, unsigned int* offset) {
         regs[reg_i++] = {0,
                          slave_pos,
-                         gradient::a6ec::kVendorId,
-                         gradient::a6ec::kProductCode,
+                         opt.slave_vendor_id,
+                         opt.slave_product_code,
                          index,
                          subindex,
                          offset,
                          nullptr};
       };
-
-      add_reg(0x6040, 0x00, &off[axis].cw);
-      add_reg(0x607A, 0x00, &off[axis].target_pos);
-      if (pdo_profile->has_target_vel) {
-        add_reg(0x60FF, 0x00, &off[axis].target_vel);
+      for (const auto& entry : drive_pdo.rx_entries) {
+        if (unsigned int* offset = rx_offset_for_semantic(off[axis], entry.semantic)) {
+          add_reg(entry.index, entry.subindex, offset);
+        }
       }
-      if (pdo_profile->has_target_torque) {
-        add_reg(0x6071, 0x00, &off[axis].target_torque);
+      for (const auto& entry : drive_pdo.tx_entries) {
+        if (unsigned int* offset = tx_offset_for_semantic(off[axis], entry.semantic)) {
+          add_reg(entry.index, entry.subindex, offset);
+        }
       }
-      if (pdo_profile->has_mode) {
-        add_reg(0x6060, 0x00, &off[axis].mode);
-      }
-      add_reg(0x60B8, 0x00, &off[axis].tp_func);
-      if (pdo_profile->has_max_profile_vel) {
-        add_reg(0x607F, 0x00, &off[axis].max_profile_vel);
-      }
-
-      add_reg(0x603F, 0x00, &off[axis].err);
-      add_reg(0x6041, 0x00, &off[axis].sw);
-      add_reg(0x6064, 0x00, &off[axis].pos);
-      add_reg(0x6077, 0x00, &off[axis].torque);
-      if (pdo_profile->has_mode_display) {
-        add_reg(0x6061, 0x00, &off[axis].mode_disp);
-      }
-      add_reg(0x60B9, 0x00, &off[axis].tp_status);
-      add_reg(0x60BA, 0x00, &off[axis].tp_pos1);
-      add_reg(0x60BC, 0x00, &off[axis].tp_pos2);
-      add_reg(0x60FD, 0x00, &off[axis].di);
     };
 
     auto apply_pdo_profile = [&](uint32_t axis, uint16_t slave_pos) {
@@ -1748,7 +1982,7 @@ int main(int argc, char** argv) {
         logf("EtherCAT config phase=slave_config_pdos axis=%u slave_pos=%u profile=%s mode=wrapper ok",
              axis,
              slave_pos,
-             pdo_profile->name);
+             drive_pdo.label.c_str());
         return true;
       }
 
@@ -1784,7 +2018,52 @@ int main(int argc, char** argv) {
       logf("EtherCAT config phase=slave_config_pdos axis=%u slave_pos=%u profile=%s mode=explicit_assign ok",
            axis,
            slave_pos,
-           pdo_profile->name);
+           drive_pdo.label.c_str());
+      return true;
+    };
+
+    auto schedule_axis_startup_sdos = [&](uint32_t axis, uint16_t slave_pos) {
+      latest_feedback.startup_drive_config_configured[axis] = startup_sdo.valid ? 1u : 0u;
+      latest_feedback.startup_drive_config_commanded[axis] =
+          startup_sdo.valid ? startup_sdo.values[axis] : 0u;
+      if (!startup_sdo.valid) {
+        return true;
+      }
+      if (startup_sdo.type != StartupSdoValueType::kU16) {
+        logf("ERROR: unsupported startup SDO type for axis=%u slave_pos=%u key=%s",
+             axis,
+             slave_pos,
+             startup_sdo.key.c_str());
+        return false;
+      }
+      if (startup_sdo.values[axis] > static_cast<uint32_t>(std::numeric_limits<uint16_t>::max())) {
+        logf("ERROR: startup SDO value out of range for axis=%u slave_pos=%u key=%s value=%u",
+             axis,
+             slave_pos,
+             startup_sdo.key.c_str(),
+             static_cast<unsigned int>(startup_sdo.values[axis]));
+        return false;
+      }
+      const uint16_t value = static_cast<uint16_t>(startup_sdo.values[axis]);
+      const int rc = ecrt_slave_config_sdo16(sc[axis], startup_sdo.index, startup_sdo.subindex, value);
+      if (rc != 0) {
+        logf("ERROR: ecrt_slave_config_sdo16 failed for axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x value=%u rc=%d",
+             axis,
+             slave_pos,
+             startup_sdo.key.c_str(),
+             static_cast<unsigned int>(startup_sdo.index),
+             static_cast<unsigned int>(startup_sdo.subindex),
+             static_cast<unsigned int>(value),
+             rc);
+        return false;
+      }
+      logf("EtherCAT config phase=slave_config_sdo axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x value=%u ok",
+           axis,
+           slave_pos,
+           startup_sdo.key.c_str(),
+           static_cast<unsigned int>(startup_sdo.index),
+           static_cast<unsigned int>(startup_sdo.subindex),
+           static_cast<unsigned int>(value));
       return true;
     };
 
@@ -1811,46 +2090,27 @@ int main(int argc, char** argv) {
         return true;
       };
 
-      if (!reg(2, 0, &off[axis].cw, "cw") ||
-          !reg(2, 1, &off[axis].target_pos, "target_pos")) {
-        return false;
+      for (size_t entry_pos = 0; entry_pos < drive_pdo.rx_entries.size(); ++entry_pos) {
+        const auto& entry = drive_pdo.rx_entries[entry_pos];
+        if (unsigned int* offset = rx_offset_for_semantic(off[axis], entry.semantic)) {
+          if (!reg(drive_pdo.rx_sync_index,
+                   static_cast<unsigned int>(entry_pos),
+                   offset,
+                   entry.semantic.c_str())) {
+            return false;
+          }
+        }
       }
-
-      if (pdo_profile == &kPdoProfile1702_1b02) {
-        if (!reg(2, 2, &off[axis].target_vel, "target_vel") ||
-            !reg(2, 3, &off[axis].target_torque, "target_torque") ||
-            !reg(2, 4, &off[axis].mode, "mode") ||
-            !reg(2, 5, &off[axis].tp_func, "tp_func") ||
-            !reg(2, 6, &off[axis].max_profile_vel, "max_profile_vel") ||
-            !reg(3, 0, &off[axis].err, "err") ||
-            !reg(3, 1, &off[axis].sw, "sw") ||
-            !reg(3, 2, &off[axis].pos, "pos") ||
-            !reg(3, 3, &off[axis].torque, "torque") ||
-            !reg(3, 4, &off[axis].mode_disp, "mode_disp") ||
-            !reg(3, 5, &off[axis].tp_status, "tp_status") ||
-            !reg(3, 6, &off[axis].tp_pos1, "tp_pos1") ||
-            !reg(3, 7, &off[axis].tp_pos2, "tp_pos2") ||
-            !reg(3, 8, &off[axis].di, "di")) {
-          return false;
+      for (size_t entry_pos = 0; entry_pos < drive_pdo.tx_entries.size(); ++entry_pos) {
+        const auto& entry = drive_pdo.tx_entries[entry_pos];
+        if (unsigned int* offset = tx_offset_for_semantic(off[axis], entry.semantic)) {
+          if (!reg(drive_pdo.tx_sync_index,
+                   static_cast<unsigned int>(entry_pos),
+                   offset,
+                   entry.semantic.c_str())) {
+            return false;
+          }
         }
-      } else if (pdo_profile == &kPdoProfile1701_1b01) {
-        if (!reg(2, 2, &off[axis].tp_func, "tp_func") ||
-            !reg(3, 0, &off[axis].err, "err") ||
-            !reg(3, 1, &off[axis].sw, "sw") ||
-            !reg(3, 2, &off[axis].pos, "pos") ||
-            !reg(3, 3, &off[axis].torque, "torque") ||
-            !reg(3, 5, &off[axis].tp_status, "tp_status") ||
-            !reg(3, 6, &off[axis].tp_pos1, "tp_pos1") ||
-            !reg(3, 7, &off[axis].tp_pos2, "tp_pos2") ||
-            !reg(3, 8, &off[axis].di, "di")) {
-          return false;
-        }
-      } else {
-        logf("ERROR: unsupported explicit PDO profile registration for axis=%u slave_pos=%u profile=%s",
-             axis,
-             slave_pos,
-             pdo_profile->name);
-        return false;
       }
 
       return true;
@@ -1891,8 +2151,8 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < opt.num_axes; ++i) {
           const uint16_t slave_pos = opt.slave_position[i];
           sc[i] = ecrt_master_slave_config(master, 0, slave_pos,
-                                           gradient::a6ec::kVendorId,
-                                           gradient::a6ec::kProductCode);
+                                           opt.slave_vendor_id,
+                                           opt.slave_product_code);
           if (!sc[i]) {
             logf("ERROR: ecrt_master_slave_config failed for axis=%u slave_pos=%u", i, slave_pos);
             slave_config_ok = false;
@@ -1946,6 +2206,11 @@ int main(int argc, char** argv) {
             break;
           }
           log_phase_summary("after_slave_config_pdos", 0, 0);
+
+          if (!schedule_axis_startup_sdos(i, slave_pos)) {
+            slave_config_ok = false;
+            break;
+          }
 
           if (opt.use_dc) {
             // DC assign_activate 0x0300 (SYNC0). Shift left as 0 for now.
@@ -2061,6 +2326,65 @@ int main(int argc, char** argv) {
               }
               if (!have_domain_pd) {
               } else {
+                if (startup_sdo.valid && startup_sdo.type == StartupSdoValueType::kU16) {
+                  constexpr int kStartupReadbackAttempts = 5;
+                  for (uint32_t i = 0; i < opt.num_axes; ++i) {
+                    bool verified = false;
+                    for (int attempt = 1; attempt <= kStartupReadbackAttempts; ++attempt) {
+                      uint8_t readback_raw[sizeof(uint16_t)] = {};
+                      size_t readback_size = 0;
+                      uint32_t abort_code = 0;
+                      const int rc = ecrt_master_sdo_upload(
+                          master,
+                          opt.slave_position[i],
+                          startup_sdo.index,
+                          startup_sdo.subindex,
+                          readback_raw,
+                          sizeof(readback_raw),
+                          &readback_size,
+                          &abort_code);
+                      if (rc == 0 && readback_size >= sizeof(uint16_t)) {
+                        const uint16_t readback_value = EC_READ_U16(readback_raw);
+                        const bool readback_matches =
+                            readback_value == static_cast<uint16_t>(startup_sdo.values[i]);
+                        latest_feedback.startup_drive_config_readback_valid[i] = 1u;
+                        latest_feedback.startup_drive_config_readback[i] = readback_value;
+                        latest_feedback.startup_drive_config_verified[i] =
+                            readback_matches ? 1u : 0u;
+                        logf("EtherCAT startup readback axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x commanded=%u readback=%u verified=%u",
+                             i,
+                             static_cast<unsigned int>(opt.slave_position[i]),
+                             startup_sdo.key.c_str(),
+                             static_cast<unsigned int>(startup_sdo.index),
+                             static_cast<unsigned int>(startup_sdo.subindex),
+                             static_cast<unsigned int>(startup_sdo.values[i]),
+                             static_cast<unsigned int>(readback_value),
+                             readback_matches ? 1u : 0u);
+                        verified = true;
+                        break;
+                      }
+                      if (attempt < kStartupReadbackAttempts) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                      }
+                      if (attempt == kStartupReadbackAttempts) {
+                        logf("WARNING: EtherCAT startup readback failed for axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x rc=%d abort=0x%08x size=%zu",
+                             i,
+                             static_cast<unsigned int>(opt.slave_position[i]),
+                             startup_sdo.key.c_str(),
+                             static_cast<unsigned int>(startup_sdo.index),
+                             static_cast<unsigned int>(startup_sdo.subindex),
+                             rc,
+                             static_cast<unsigned int>(abort_code),
+                             readback_size);
+                      }
+                    }
+                    if (!verified) {
+                      latest_feedback.startup_drive_config_readback_valid[i] = 0u;
+                      latest_feedback.startup_drive_config_readback[i] = 0u;
+                      latest_feedback.startup_drive_config_verified[i] = 0u;
+                    }
+                  }
+                }
                 ecrt_ok = true;
                 startup_begin_ns = now_monotonic_ns();
                 startup_cycle_counter = 0;
@@ -2503,6 +2827,9 @@ int main(int argc, char** argv) {
           uint8_t* axis_pd = opt.split_domains_per_axis ? axis_domain_pd[i] : domain_pd;
           const uint16_t sw = EC_READ_U16(axis_pd + off[i].sw);
           const uint16_t err = EC_READ_U16(axis_pd + off[i].err);
+          const uint32_t manufacturer_err = off[i].manufacturer_err != kInvalidOffset
+                                              ? EC_READ_U32(axis_pd + off[i].manufacturer_err)
+                                              : 0;
           const int32_t pos = EC_READ_S32(axis_pd + off[i].pos);
           const int16_t torque = off[i].torque != kInvalidOffset
                                      ? EC_READ_S16(axis_pd + off[i].torque)
@@ -2651,6 +2978,7 @@ int main(int argc, char** argv) {
           latest_feedback.torque_raw[i] = torque;
           latest_feedback.statusword[i] = sw;
           latest_feedback.error_code[i] = err;
+          latest_feedback.manufacturer_error_code[i] = manufacturer_err;
           latest_feedback.mode_display[i] = mode_disp;
           latest_feedback.ds402_state[i] = static_cast<uint8_t>(st);
           latest_feedback.di_bits[i] = di;
@@ -3073,9 +3401,18 @@ int main(int argc, char** argv) {
       uint8_t startup_ready = 0;
       uint8_t startup_passive_active = 0;
       uint8_t startup_skip_domain_queue_active = 0;
+      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_configured{};
+      std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_commanded{};
+      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_readback_valid{};
+      std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_readback{};
+      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_verified{};
+      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_state{};
+      std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_position_offset{};
+      std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_last_abort_code{};
       std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> pos_counts{};
       std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> statusword{};
       std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> error_code{};
+      std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> manufacturer_error_code{};
       std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_al_state{};
       std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_online{};
       std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_operational{};
@@ -3097,9 +3434,18 @@ int main(int argc, char** argv) {
         startup_ready = latest_feedback.startup_ready;
         startup_passive_active = latest_feedback.startup_passive_active;
         startup_skip_domain_queue_active = latest_feedback.startup_skip_domain_queue_active;
+        startup_drive_config_configured = latest_feedback.startup_drive_config_configured;
+        startup_drive_config_commanded = latest_feedback.startup_drive_config_commanded;
+        startup_drive_config_readback_valid = latest_feedback.startup_drive_config_readback_valid;
+        startup_drive_config_readback = latest_feedback.startup_drive_config_readback;
+        startup_drive_config_verified = latest_feedback.startup_drive_config_verified;
+        native_home_state = latest_feedback.native_home_state;
+        native_home_position_offset = latest_feedback.native_home_position_offset;
+        native_home_last_abort_code = latest_feedback.native_home_last_abort_code;
         pos_counts = latest_feedback.pos_counts;
         statusword = latest_feedback.statusword;
         error_code = latest_feedback.error_code;
+        manufacturer_error_code = latest_feedback.manufacturer_error_code;
         slave_al_state = latest_feedback.slave_al_state;
         slave_online = latest_feedback.slave_online;
         slave_operational = latest_feedback.slave_operational;
@@ -3114,7 +3460,10 @@ int main(int argc, char** argv) {
       oss << "\"time_ns\":" << now_ns << ",";
       oss << "\"cycle_ns\":" << opt.cycle_ns << ",";
       oss << "\"num_axes\":" << opt.num_axes << ",";
-      oss << "\"pdo_profile\":\"" << pdo_profile_label(opt.rx_pdo, opt.tx_pdo) << "\",";
+      oss << "\"slave_vendor_id\":" << opt.slave_vendor_id << ",";
+      oss << "\"slave_product_code\":" << opt.slave_product_code << ",";
+      oss << "\"slave_revision_no\":" << opt.slave_revision_no << ",";
+      oss << "\"pdo_profile\":\"" << drive_pdo.label << "\",";
       oss << "\"rx_pdo\":" << opt.rx_pdo << ",";
       oss << "\"tx_pdo\":" << opt.tx_pdo << ",";
       oss << "\"dc_enabled\":" << (opt.use_dc ? 1 : 0) << ",";
@@ -3168,6 +3517,26 @@ int main(int argc, char** argv) {
         oss << "\"pos_counts\":" << pos_counts[i] << ",";
         oss << "\"statusword\":" << statusword[i] << ",";
         oss << "\"error_code\":" << error_code[i] << ",";
+        oss << "\"manufacturer_error_code\":" << manufacturer_error_code[i] << ",";
+        oss << "\"startup_drive_config\":";
+        if (startup_sdo.valid) {
+          oss << "{";
+          oss << "\"setting_key\":\"" << startup_sdo.key << "\",";
+          oss << "\"type\":\"u16\",";
+          oss << "\"index\":" << static_cast<unsigned int>(startup_sdo.index) << ",";
+          oss << "\"subindex\":" << static_cast<unsigned int>(startup_sdo.subindex) << ",";
+          oss << "\"configured\":" << static_cast<unsigned int>(startup_drive_config_configured[i]) << ",";
+          oss << "\"commanded\":" << startup_drive_config_commanded[i] << ",";
+          oss << "\"readback_valid\":" << static_cast<unsigned int>(startup_drive_config_readback_valid[i]) << ",";
+          oss << "\"readback\":" << startup_drive_config_readback[i] << ",";
+          oss << "\"verified\":" << static_cast<unsigned int>(startup_drive_config_verified[i]);
+          oss << "},";
+        } else {
+          oss << "null,";
+        }
+        oss << "\"native_home_state\":" << static_cast<unsigned int>(native_home_state[i]) << ",";
+        oss << "\"native_home_position_offset\":" << native_home_position_offset[i] << ",";
+        oss << "\"native_home_last_abort_code\":" << native_home_last_abort_code[i] << ",";
         oss << "\"slave_online\":" << static_cast<unsigned int>(slave_online[i]) << ",";
         oss << "\"slave_operational\":" << static_cast<unsigned int>(slave_operational[i]) << ",";
         oss << "\"slave_al_state\":" << static_cast<unsigned int>(slave_al_state[i]);
@@ -3525,6 +3894,123 @@ int main(int argc, char** argv) {
             now_monotonic_ns());
       };
 
+      auto read_stable_axis_feedback_counts = [&](uint32_t axis, int32_t* pos_counts_out) {
+        if (!pos_counts_out || axis >= opt.num_axes) {
+          return false;
+        }
+        for (int attempt = 0; attempt < 20; ++attempt) {
+          const uint64_t seq_before = latest_feedback.seq.load(std::memory_order_acquire);
+          const int32_t pos_counts = latest_feedback.pos_counts[axis];
+          const uint64_t seq_after = latest_feedback.seq.load(std::memory_order_acquire);
+          if (seq_before != 0 && seq_before == seq_after) {
+            *pos_counts_out = pos_counts;
+            return true;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+      };
+
+      auto native_home_axis = [&](uint32_t axis) {
+        latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_REQUESTED;
+        latest_feedback.native_home_last_abort_code[axis] = 0;
+
+        int32_t pos_counts = 0;
+        if (!read_stable_axis_feedback_counts(axis, &pos_counts)) {
+          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+          return;
+        }
+
+#if GRADIENT_HAVE_ECRT
+        if (!shared_master) {
+          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+          return;
+        }
+        uint8_t offset_raw[sizeof(int32_t)] = {};
+        size_t offset_size = 0;
+        uint32_t offset_abort = 0;
+        int rc = ecrt_master_sdo_upload(
+            shared_master,
+            opt.slave_position[axis],
+            0x60B0,
+            0x00,
+            offset_raw,
+            sizeof(offset_raw),
+            &offset_size,
+            &offset_abort);
+        if (rc != 0 || offset_size < sizeof(int32_t)) {
+          latest_feedback.native_home_last_abort_code[axis] = offset_abort;
+          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+          logf("WARNING: native_home upload failed axis=%u slave_pos=%u index=0x60B0 rc=%d abort=0x%08x size=%zu",
+               axis,
+               static_cast<unsigned int>(opt.slave_position[axis]),
+               rc,
+               static_cast<unsigned int>(offset_abort),
+               offset_size);
+          return;
+        }
+
+        const int32_t current_offset = EC_READ_S32(offset_raw);
+        const int32_t desired_offset = current_offset - pos_counts;
+        uint8_t desired_offset_raw[sizeof(int32_t)] = {};
+        EC_WRITE_S32(desired_offset_raw, desired_offset);
+        uint32_t write_abort = 0;
+        rc = ecrt_master_sdo_download(
+            shared_master,
+            opt.slave_position[axis],
+            0x60B0,
+            0x00,
+            desired_offset_raw,
+            sizeof(desired_offset_raw),
+            &write_abort);
+        if (rc != 0) {
+          latest_feedback.native_home_last_abort_code[axis] = write_abort;
+          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+          logf("WARNING: native_home download failed axis=%u slave_pos=%u index=0x60B0 rc=%d abort=0x%08x",
+               axis,
+               static_cast<unsigned int>(opt.slave_position[axis]),
+               rc,
+               static_cast<unsigned int>(write_abort));
+          return;
+        }
+
+        uint8_t save_raw[sizeof(uint32_t)] = {};
+        EC_WRITE_U32(save_raw, 0x65766173u); // "save"
+        uint32_t save_abort = 0;
+        rc = ecrt_master_sdo_download(
+            shared_master,
+            opt.slave_position[axis],
+            0x1010,
+            0x01,
+            save_raw,
+            sizeof(save_raw),
+            &save_abort);
+        if (rc != 0) {
+          latest_feedback.native_home_last_abort_code[axis] = save_abort;
+          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+          logf("WARNING: native_home store failed axis=%u slave_pos=%u index=0x1010 sub=0x01 rc=%d abort=0x%08x",
+               axis,
+               static_cast<unsigned int>(opt.slave_position[axis]),
+               rc,
+               static_cast<unsigned int>(save_abort));
+          return;
+        }
+
+        latest_feedback.native_home_position_offset[axis] = desired_offset;
+        latest_feedback.native_home_last_abort_code[axis] = 0;
+        latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_SUCCEEDED;
+        logf("EtherCAT native_home axis=%u slave_pos=%u pos_counts=%d current_offset=%d desired_offset=%d saved=1",
+             axis,
+             static_cast<unsigned int>(opt.slave_position[axis]),
+             pos_counts,
+             current_offset,
+             desired_offset);
+#else
+        (void)pos_counts;
+        latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+#endif
+      };
+
       // Emit STATUS_HELLO once on connect.
       {
         gradient::ipc::v1::StatusHelloV1 sh{};
@@ -3652,6 +4138,34 @@ int main(int argc, char** argv) {
                           gradient::ipc::v1::EVT_DISARMED,
                           gradient::ipc::v1::EXEC_STATE_ABORTED);
                       fault_reset_request.fetch_or(mask, std::memory_order_relaxed);
+                    }
+                  }
+                  break;
+                }
+                case gradient::ipc::v1::MSG_CMD_NATIVE_HOME: {
+                  if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::CmdNativeHomeV1)) {
+                    auto* cmd =
+                        reinterpret_cast<const gradient::ipc::v1::CmdNativeHomeV1*>(payload);
+                    uint32_t mask = cmd->axis_mask;
+                    const uint32_t valid =
+                        (opt.num_axes >= 32) ? 0xFFFFFFFFu : ((1u << opt.num_axes) - 1u);
+                    mask &= valid;
+                    if (mask != 0) {
+                      const uint32_t cur = axis_enable_mask.load(std::memory_order_relaxed);
+                      const uint32_t next = cur & ~mask;
+                      axis_enable_mask.store(next, std::memory_order_relaxed);
+                      if (next == 0u) {
+                        armed.store(false, std::memory_order_relaxed);
+                      }
+                      clear_motion_intent(
+                          mh->seq,
+                          gradient::ipc::v1::EVT_DISARMED,
+                          gradient::ipc::v1::EXEC_STATE_ABORTED);
+                      for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
+                        if ((mask & (1u << axis)) != 0u) {
+                          native_home_axis(axis);
+                        }
+                      }
                     }
                   }
                   break;
@@ -3910,6 +4424,7 @@ int main(int argc, char** argv) {
               snap.axes[i].torque_raw = latest_feedback.torque_raw[i];
               snap.axes[i].statusword = latest_feedback.statusword[i];
               snap.axes[i].error_code = latest_feedback.error_code[i];
+              snap.axes[i].manufacturer_error_code = latest_feedback.manufacturer_error_code[i];
               snap.axes[i].mode_display = latest_feedback.mode_display[i];
               snap.axes[i].ds402_state = latest_feedback.ds402_state[i];
               snap.axes[i].di_bits = latest_feedback.di_bits[i];

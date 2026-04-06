@@ -165,6 +165,19 @@ class Gradient05Config(RobotConfig):
         return [0.0] * 6
 
     @property
+    def ethercat_drive_startup_config(self) -> list[dict[str, int]]:
+        """
+        Optional robot-specific override hook.
+
+        Gradient-05 should not own manufacturer-specific drive startup policy by
+        default because the same robot may be commissioned with different drive
+        families. EtherCAT drive defaults now live in the separate drive-profile
+        catalog and this hook is left empty unless a robot-specific override is
+        explicitly required.
+        """
+        return []
+
+    @property
     def default_pid_gains(self) -> tuple[int, int, int]:
         """
         Gradient-05 defaults for PID gains. Since this relies on EtherCAT RTCore,
