@@ -1887,3 +1887,26 @@ Use this file as persistent, repo-local execution memory.
 ### 2026-04-06 - The always-in-context project instructions must explicitly point to the GradientOS skill
 - [user] Explicit preference: the primary always-in-context agent instructions should explicitly reference the top-level `gradientos-sop` entrypoint, not just mention it later in the skills catalog.
 - [self] Corrective rule: in `.cursor/rules/000-project-instructions.md`, keep an explicit top-level section that routes GradientOS control-stack tasks to `.cursor/skills/gradientos-sop/SKILL.md` and the long-form SOP path before the broader skills catalog.
+
+### 2026-04-06 - Testing guidance should be staged by safety and bring-up gates
+- [user] Explicit preference: when moving into live testing, define what should be tested to prove bring-up, safety, and commissioning behavior are not broken before diving into logs.
+- [self] Corrective rule: for GradientOS live validation, present tests in ordered gates: software/build checks, cold bring-up/no-motion checks, power-transition checks, conservative single-joint commissioning, telemetry/fault visibility, encoder-retention verification, and then trajectory/runtime execution.
+
+### 2026-04-07 - A launcher probe that says `INACTIVE/DOWN` can still hide a later-stage EtherCAT sync failure
+- [tool] `logs/startups/20260407-001033/launcher.log` only showed `physical_state=INACTIVE ... ethercat_master_state=DOWN ... startup_ready=0`, but the live `gradient-rt-motion.service` journal for the same run showed all 6 slaves discovered and online in `PREOP` during configuration.
+- [tool] Kernel log for that same startup recorded `AL status message 0x001A: "Synchronization error"` and `SAFEOP + ERROR` on multiple slaves, plus `EtherCAT WARNING 0: 1 datagram UNMATCHED!`.
+- [self] Corrective rule: when `start-stack` times out with `startup_ready=0`, do not assume a dead bus from the launcher probe alone. Check RTCore journal plus kernel EtherCAT logs before concluding NIC/master discovery failed.
+
+### 2026-04-07 - Front-panel `ErC1.1` matches the kernel-side EtherCAT sync fault
+- [user] Reported the drives show `ErC1.1` on most axes and one axis shows `28`, after suspecting the startup drive-mode write might be wrong.
+- [tool] `docs/resources/a6ec_manual_codes.md` maps `ErC1.1` to `Synchronization loss` with bus fault `0X8700`, which matches the kernel EtherCAT `0x001A "Synchronization error"` seen during the same startup.
+- [self] Corrective rule: if the drive front panel shows `ErC1.1`, prioritize debugging EtherCAT/DC synchronization and SAFEOP/OP transition behavior before blaming startup mode enforcement. The SDO write may still be unverified, but `ErC1.1` itself points to sync loss, not directly to the encoder tracking mode value.
+
+### 2026-04-07 - Blocking SDO uploads in `rt-cycle` can wedge bring-up and masquerade as a sync fault
+- [tool] After the failed startup, `gradient-rt-motion` stop timed out and the lingering `rt-cycle` thread was stuck in kernel state `D`.
+- [tool] Kernel stack traces showed `rt-cycle` blocked inside `ecrt_master_sdo_upload()`.
+- [self] Corrective rule: do not perform startup SDO readback uploads in the realtime bring-up path after `ecrt_master_activate()`. A blocking upload there can stall the RT loop, leave the master half-active, and provoke drive-side synchronization-loss faults.
+
+### 2026-04-07 - Startup drive-config verification belongs in the always-running non-RT metrics path
+- [user] Explicit correction: do the proper fix now; do not leave verification half-removed or deferred for later cleanup.
+- [self] Corrective rule: keep startup SDO writes in the RTCore config phase, keep `startup_ready` safety gating unchanged, and perform startup drive-config readback only from a non-RT thread that exists before controller connection. In this codebase that means the `metrics` thread, not `rt-cycle` and not the connection-scoped `ipc-helper`.

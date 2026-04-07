@@ -2326,64 +2326,14 @@ int main(int argc, char** argv) {
               }
               if (!have_domain_pd) {
               } else {
-                if (startup_sdo.valid && startup_sdo.type == StartupSdoValueType::kU16) {
-                  constexpr int kStartupReadbackAttempts = 5;
+                if (startup_sdo.valid) {
                   for (uint32_t i = 0; i < opt.num_axes; ++i) {
-                    bool verified = false;
-                    for (int attempt = 1; attempt <= kStartupReadbackAttempts; ++attempt) {
-                      uint8_t readback_raw[sizeof(uint16_t)] = {};
-                      size_t readback_size = 0;
-                      uint32_t abort_code = 0;
-                      const int rc = ecrt_master_sdo_upload(
-                          master,
-                          opt.slave_position[i],
-                          startup_sdo.index,
-                          startup_sdo.subindex,
-                          readback_raw,
-                          sizeof(readback_raw),
-                          &readback_size,
-                          &abort_code);
-                      if (rc == 0 && readback_size >= sizeof(uint16_t)) {
-                        const uint16_t readback_value = EC_READ_U16(readback_raw);
-                        const bool readback_matches =
-                            readback_value == static_cast<uint16_t>(startup_sdo.values[i]);
-                        latest_feedback.startup_drive_config_readback_valid[i] = 1u;
-                        latest_feedback.startup_drive_config_readback[i] = readback_value;
-                        latest_feedback.startup_drive_config_verified[i] =
-                            readback_matches ? 1u : 0u;
-                        logf("EtherCAT startup readback axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x commanded=%u readback=%u verified=%u",
-                             i,
-                             static_cast<unsigned int>(opt.slave_position[i]),
-                             startup_sdo.key.c_str(),
-                             static_cast<unsigned int>(startup_sdo.index),
-                             static_cast<unsigned int>(startup_sdo.subindex),
-                             static_cast<unsigned int>(startup_sdo.values[i]),
-                             static_cast<unsigned int>(readback_value),
-                             readback_matches ? 1u : 0u);
-                        verified = true;
-                        break;
-                      }
-                      if (attempt < kStartupReadbackAttempts) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                      }
-                      if (attempt == kStartupReadbackAttempts) {
-                        logf("WARNING: EtherCAT startup readback failed for axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x rc=%d abort=0x%08x size=%zu",
-                             i,
-                             static_cast<unsigned int>(opt.slave_position[i]),
-                             startup_sdo.key.c_str(),
-                             static_cast<unsigned int>(startup_sdo.index),
-                             static_cast<unsigned int>(startup_sdo.subindex),
-                             rc,
-                             static_cast<unsigned int>(abort_code),
-                             readback_size);
-                      }
-                    }
-                    if (!verified) {
-                      latest_feedback.startup_drive_config_readback_valid[i] = 0u;
-                      latest_feedback.startup_drive_config_readback[i] = 0u;
-                      latest_feedback.startup_drive_config_verified[i] = 0u;
-                    }
+                    latest_feedback.startup_drive_config_readback_valid[i] = 0u;
+                    latest_feedback.startup_drive_config_readback[i] = 0u;
+                    latest_feedback.startup_drive_config_verified[i] = 0u;
                   }
+                  logf("EtherCAT startup readback deferred for key=%s; metrics thread will verify after startup_ready to avoid blocking rt-cycle during bring-up",
+                       startup_sdo.key.c_str());
                 }
                 ecrt_ok = true;
                 startup_begin_ns = now_monotonic_ns();
@@ -3367,6 +3317,102 @@ int main(int argc, char** argv) {
     uint64_t last_cycles = rt_cycle_counter.load(std::memory_order_relaxed);
     uint64_t last_time_ns = now_monotonic_ns();
     uint64_t last_warn_ns = 0;
+    bool startup_readback_complete = !startup_sdo.valid;
+    uint64_t startup_readback_ready_since_ns = 0;
+    constexpr uint64_t kStartupReadbackDelayNs = 500000000ULL; // 500ms after startup_ready
+
+    auto perform_startup_drive_config_readback = [&](uint64_t now_ns, bool startup_ready_flag) {
+#if GRADIENT_HAVE_ECRT
+      if (startup_readback_complete || !startup_sdo.valid) {
+        return;
+      }
+      if (startup_sdo.type != StartupSdoValueType::kU16 || !shared_master) {
+        startup_readback_complete = true;
+        return;
+      }
+      if (!startup_ready_flag) {
+        startup_readback_ready_since_ns = 0;
+        return;
+      }
+      if (startup_readback_ready_since_ns == 0) {
+        startup_readback_ready_since_ns = now_ns;
+        return;
+      }
+      if (now_ns - startup_readback_ready_since_ns < kStartupReadbackDelayNs) {
+        return;
+      }
+
+      startup_readback_complete = true;
+      logf("EtherCAT startup readback begin key=%s delay_ms=%llu",
+           startup_sdo.key.c_str(),
+           static_cast<unsigned long long>(kStartupReadbackDelayNs / 1000000ULL));
+
+      constexpr int kStartupReadbackAttempts = 5;
+      for (uint32_t i = 0; i < opt.num_axes; ++i) {
+        bool verified = false;
+        for (int attempt = 1; attempt <= kStartupReadbackAttempts; ++attempt) {
+          uint8_t readback_raw[sizeof(uint16_t)] = {};
+          size_t readback_size = 0;
+          uint32_t abort_code = 0;
+          const int rc = ecrt_master_sdo_upload(
+              shared_master,
+              opt.slave_position[i],
+              startup_sdo.index,
+              startup_sdo.subindex,
+              readback_raw,
+              sizeof(readback_raw),
+              &readback_size,
+              &abort_code);
+          if (rc == 0 && readback_size >= sizeof(uint16_t)) {
+            const uint16_t readback_value = EC_READ_U16(readback_raw);
+            const bool readback_matches =
+                readback_value == static_cast<uint16_t>(startup_sdo.values[i]);
+            latest_feedback.startup_drive_config_readback_valid[i] = 1u;
+            latest_feedback.startup_drive_config_readback[i] = readback_value;
+            latest_feedback.startup_drive_config_verified[i] =
+                readback_matches ? 1u : 0u;
+            logf("EtherCAT startup readback axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x commanded=%u readback=%u verified=%u",
+                 i,
+                 static_cast<unsigned int>(opt.slave_position[i]),
+                 startup_sdo.key.c_str(),
+                 static_cast<unsigned int>(startup_sdo.index),
+                 static_cast<unsigned int>(startup_sdo.subindex),
+                 static_cast<unsigned int>(startup_sdo.values[i]),
+                 static_cast<unsigned int>(readback_value),
+                 readback_matches ? 1u : 0u);
+            verified = true;
+            break;
+          }
+          if (attempt < kStartupReadbackAttempts) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          }
+          if (attempt == kStartupReadbackAttempts) {
+            latest_feedback.startup_drive_config_readback_valid[i] = 0u;
+            latest_feedback.startup_drive_config_readback[i] = 0u;
+            latest_feedback.startup_drive_config_verified[i] = 0u;
+            logf("WARNING: EtherCAT startup readback failed for axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x rc=%d abort=0x%08x size=%zu",
+                 i,
+                 static_cast<unsigned int>(opt.slave_position[i]),
+                 startup_sdo.key.c_str(),
+                 static_cast<unsigned int>(startup_sdo.index),
+                 static_cast<unsigned int>(startup_sdo.subindex),
+                 rc,
+                 static_cast<unsigned int>(abort_code),
+                 readback_size);
+          }
+        }
+        if (!verified) {
+          latest_feedback.startup_drive_config_readback_valid[i] = 0u;
+          latest_feedback.startup_drive_config_readback[i] = 0u;
+          latest_feedback.startup_drive_config_verified[i] = 0u;
+        }
+      }
+#else
+      (void)now_ns;
+      (void)startup_ready_flag;
+      startup_readback_complete = true;
+#endif
+    };
 
     while (!g_stop.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -3452,6 +3498,11 @@ int main(int argc, char** argv) {
         const uint64_t s2 = latest_feedback.seq.load(std::memory_order_acquire);
         have_fb = (s1 == s2);
       }
+
+      perform_startup_drive_config_readback(now_ns, startup_ready != 0);
+      startup_drive_config_readback_valid = latest_feedback.startup_drive_config_readback_valid;
+      startup_drive_config_readback = latest_feedback.startup_drive_config_readback;
+      startup_drive_config_verified = latest_feedback.startup_drive_config_verified;
 
       const uint32_t en_mask = axis_enable_mask.load(std::memory_order_relaxed);
 

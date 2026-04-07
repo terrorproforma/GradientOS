@@ -7822,3 +7822,127 @@
     - confirmed the new explicit GradientOS entrypoint block appears above the general skills catalog
 - Follow-up notes / risks:
   - The repo has multiple `alwaysApply` rule files, but this change updated the primary project execution guide the user identified as the top-level entrypoint.
+
+## 2026-04-06 23:09 +0000
+
+- Task summary:
+  - Prepared a staged live-validation checklist for the GradientOS control stack focused on bring-up correctness, safety gates, commissioning behavior, telemetry visibility, encoder retention, and runtime execution.
+- Changes:
+  - Investigated the current validation guidance in:
+    - `.cursor/skills/gradientos-sop/commissioning-safety.md`
+    - `.cursor/skills/gradientos-sop/validation-and-debugging.md`
+    - `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md`
+    - `docs/ethercat/bringup.md`
+  - Derived a staged test order and expected outcomes for:
+    - `BUS_UP_DISARMED` startup behavior
+    - safe power-up / power-down
+    - STOP/no-sudden-move behavior
+    - `Drive Home` vs `Zero Joint`
+    - generic `startup_drive_config` verification
+    - manufacturer fault visibility
+    - encoder-retention snapshots under `logs/encoder-retention/`
+    - short and normal RTCore trajectory execution
+- Validation:
+  - Read-only research only; no code changes or runtime tests executed in this step
+- Follow-up notes / risks:
+  - The checklist is intentionally ordered so we stop before powered motion if any earlier safety/bring-up gate fails.
+
+## 2026-04-07 23:09 +0000
+
+- Task summary:
+  - Investigated the first live startup failure from `logs/startups/20260407-001033` and traced it to an EtherCAT synchronization failure during RTCore activation rather than a simple "no slaves found" or bad runtime-env case.
+- Changes:
+  - Inspected `logs/startups/20260407-001033/launcher.log`:
+    - confirmed `start-stack` timed out after seeing `physical_state=INACTIVE`, `ethercat_master_state=DOWN`, `startup_ready=0`, and `wkc=0`
+  - Inspected live `gradient-rt-motion.service` status/journal:
+    - confirmed the service is still running with the expected drive-profile/env arguments
+    - confirmed userspace bring-up progressed through slave config, PDO config, startup SDO config, and PDO registration
+    - confirmed all 6 slaves were discovered and online in `PREOP` during configuration
+  - Inspected `/run/gradient-rt-motion/metrics.json`:
+    - found metrics still frozen at `rt_cycle_counter=0`, `link_up=0`, `responding_slaves=0`, `startup_elapsed_ms=0`, explaining why the launcher probe kept reporting `INACTIVE/DOWN`
+  - Inspected kernel log around `2026-04-07 00:10:35`:
+    - found `AL status message 0x001A: "Synchronization error"` on multiple slaves
+    - found `SAFEOP + ERROR` transitions and `EtherCAT WARNING 0: 1 datagram UNMATCHED!`
+  - Attempted `ethercat master` / `ethercat slaves`:
+    - blocked by `/dev/EtherCAT0` permission error from the current non-root shell
+- Validation:
+  - Read-only investigation only; no code changes or service restarts performed in this step
+- Follow-up notes / risks:
+  - Current evidence points to a DC/synchronization failure during or just after activation, not a total bus-discovery failure.
+  - The stale zeroed RTCore metrics mean the launcher output under-reports how far bring-up actually got, so future debugging should check both RTCore journal and kernel EtherCAT logs together.
+
+## 2026-04-07 23:09 +0000
+
+- Task summary:
+  - Correlated the front-panel drive displays with the local A6-EC manual reference and confirmed the reported `ErC1.1` display matches the live EtherCAT synchronization fault observed in kernel logs.
+- Changes:
+  - Searched `docs/resources/a6ec_manual_codes.md` and `docs/resources/a6ec_manual_codes.json`
+  - Confirmed:
+    - `ErC1.1` = `Synchronization loss`
+    - associated bus fault family = `0X8700` (`Synchronization controller`)
+  - Compared that against the live kernel EtherCAT log:
+    - `AL status message 0x001A: "Synchronization error"`
+    - `SAFEOP + ERROR` on multiple slaves
+  - Reviewed the current RTCore journal:
+    - startup SDO configuration for `a6ec_encoder_position_tracking_mode` was queued successfully for all axes during config
+    - but startup never advanced far enough to prove readback/verification
+- Validation:
+  - Read-only investigation only; no code changes or service restarts performed in this step
+- Follow-up notes / risks:
+  - The user's suspicion about startup mode enforcement is still worth checking later through `startup_drive_config.readback/verified`, but the current observed front-panel fault is more directly explained by EtherCAT synchronization loss than by an obviously wrong mode value.
+
+## 2026-04-07 00:46 +0000
+
+- Task summary:
+  - Executed the live recovery/inspection sequence, confirmed the drives can be returned to a clean PREOP-ready state, and patched RTCore to stop performing blocking startup SDO readback uploads in the realtime bring-up path.
+- Changes:
+  - Live recovery/inspection:
+    - attempted to stop `gradient-rt-motion.service`; systemd timed out because the old `rt-cycle` thread remained stuck
+    - confirmed `ethercat.service` stop also failed initially because `ec_generic` was still in use
+    - after the user's hard stop and drive power cycle, confirmed all six slaves were visible again and uniformly in `PREOP`
+    - confirmed the drives/front-panel recovery state matched the user's `18rd` report better than the earlier sync-faulted state
+  - Root-cause evidence:
+    - `ps` showed lingering `rt-cycle` thread in uninterruptible `D` state
+    - kernel log showed the stuck `rt-cycle` thread blocked in `ecrt_master_sdo_upload()`
+    - this matches the startup code path that performed `startup_drive_config` readback inside the `rt-cycle` thread immediately after `ecrt_master_activate()`
+  - Updated `src/gradient_rt_motion/main.cpp`:
+    - removed the blocking startup SDO readback loop from the `rt-cycle` bring-up path after `ecrt_master_activate()`
+    - kept the configured/commanded startup-drive-config telemetry initialization
+    - now logs that startup readback is deferred instead of risking a blocking upload during RT bring-up
+- Validation:
+  - `make -C src/gradient_rt_motion`
+    - passed
+  - `ReadLints` on `src/gradient_rt_motion/main.cpp`
+    - no diagnostics
+- Follow-up notes / risks:
+  - The current host still has the old wedged `rt-cycle` thread from the pre-fix binary, so a clean reboot is needed before the next live retry; otherwise the next test would still be contaminated by the stuck old master session.
+  - This fix restores safer bring-up behavior but temporarily removes automatic startup readback verification of `0x2000:08`; if needed later, that verification should be reintroduced through a non-RT path.
+
+## 2026-04-07 - Completed the proper non-RT startup-drive-config verification fix
+
+- Context:
+  - The earlier emergency stabilization removed blocking startup SDO readback from `rt-cycle` so bring-up would stop wedging, but that still left startup-drive-config verification incomplete.
+  - The user explicitly requested the proper end-state fix immediately rather than leaving cleanup for later.
+- Changes:
+  - Updated `src/gradient_rt_motion/main.cpp` again so startup-drive-config readback is now executed by the always-running `metrics` thread instead of the realtime `rt-cycle` thread.
+  - Added a deferred verification gate in the metrics thread:
+    - only attempts readback when a startup SDO config exists
+    - waits until `startup_ready=1`
+    - waits an additional 500 ms settle delay before reading back
+    - performs the same per-axis `ecrt_master_sdo_upload()` verification logic there
+    - writes results back into `latest_feedback.startup_drive_config_{readback_valid,readback,verified}`
+  - Kept the RT bring-up path fail-closed:
+    - startup SDO writes still happen during bring-up/config
+    - `startup_ready` convergence and safety waits are unchanged
+    - no blocking SDO upload remains in `rt-cycle`
+  - Updated the bring-up log message to say readback is deferred to the metrics thread after `startup_ready`.
+- Why this is the correct architecture:
+  - `ipc-helper` was rejected as the readback location because it only exists after a controller connects, so it cannot support initial `start-stack` verification.
+  - The metrics thread already runs throughout startup and already owns the always-available `metrics.json` publication path, so it is the correct non-RT place to restore startup verification without reintroducing RT blocking.
+- Validation:
+  - `make -C src/gradient_rt_motion`
+    - passed
+  - `ReadLints` on `src/gradient_rt_motion/main.cpp`
+    - no diagnostics
+- Remaining live-system note:
+  - A clean host reboot is still required before the next hardware retry if the old wedged pre-fix `gradient-rt-motion` process is still resident, otherwise the new binary cannot be evaluated cleanly.
