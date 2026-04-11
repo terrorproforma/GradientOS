@@ -1574,6 +1574,41 @@ int main(int argc, char** argv) {
   ec_master_t* shared_master = nullptr;
 #endif
 
+  auto read_position_offset_axis = [&](uint32_t axis, int32_t* offset_out) {
+#if GRADIENT_HAVE_ECRT
+    if (!offset_out || !shared_master) {
+      return false;
+    }
+    uint8_t offset_raw[sizeof(int32_t)] = {};
+    size_t offset_size = 0;
+    uint32_t offset_abort = 0;
+    const int rc = ecrt_master_sdo_upload(
+        shared_master,
+        opt.slave_position[axis],
+        0x60B0,
+        0x00,
+        offset_raw,
+        sizeof(offset_raw),
+        &offset_size,
+        &offset_abort);
+    if (rc != 0 || offset_size < sizeof(int32_t)) {
+      logf("WARNING: position_offset upload failed axis=%u slave_pos=%u index=0x60B0 rc=%d abort=0x%08x size=%zu",
+           axis,
+           static_cast<unsigned int>(opt.slave_position[axis]),
+           rc,
+           static_cast<unsigned int>(offset_abort),
+           offset_size);
+      return false;
+    }
+    *offset_out = EC_READ_S32(offset_raw);
+    return true;
+#else
+    (void)axis;
+    (void)offset_out;
+    return false;
+#endif
+  };
+
   std::thread rt_thread([&]() {
     pthread_setname_np(pthread_self(), "rt-cycle");
 
@@ -2799,6 +2834,9 @@ int main(int argc, char** argv) {
           int8_t mode_out = 0;
           uint16_t tp_func_out = 0;
           uint32_t max_profile_vel_out = 0;
+          const int32_t feedback_aligned_target_counts = clamp_round_to_i32(
+              static_cast<double>(pos) -
+              static_cast<double>(latest_feedback.native_home_position_offset[i]));
 
           if (!startup_passive_active) {
             const bool want_enable = is_armed && ((en_mask & (1u << i)) != 0u);
@@ -2819,18 +2857,18 @@ int main(int argc, char** argv) {
             if ((snap_jog_hold_to_feedback_mask & (1u << i)) != 0u) {
               // When jog stops or expires we must immediately collapse the CSP hold target
               // onto live feedback, otherwise the axis can keep chasing the last jog target.
-              hold_target_counts[i] = pos;
+              hold_target_counts[i] = feedback_aligned_target_counts;
               have_hold[i] = true;
             }
             if (jog_stop_arrest_cycles_left[i] > 0) {
               // Briefly keep re-latching hold to live feedback after a jog stop/timeout so
               // the drive does not keep chasing a stale frozen CSP target.
-              hold_target_counts[i] = pos;
+              hold_target_counts[i] = feedback_aligned_target_counts;
               have_hold[i] = true;
             }
             if (want_enable && st == gradient::ds402::State::OperationEnabled) {
               if (!have_hold[i]) {
-                hold_target_counts[i] = pos;
+                hold_target_counts[i] = feedback_aligned_target_counts;
                 have_hold[i] = true;
               }
               if ((sp_mask & (1u << i)) != 0u) {
@@ -2865,7 +2903,7 @@ int main(int argc, char** argv) {
               }
             } else {
               // Track feedback until OP; keeps 0x607A aligned during state transitions.
-              hold_target_counts[i] = pos;
+              hold_target_counts[i] = feedback_aligned_target_counts;
               have_hold[i] = false;
             }
 
@@ -2887,7 +2925,7 @@ int main(int argc, char** argv) {
             // During passive startup we still exchange cyclic PDO frames, but avoid
             // DS402 state-driving writes so we can distinguish process-data transport
             // problems from higher-level controlword/mode/target sequencing problems.
-            hold_target_counts[i] = pos;
+            hold_target_counts[i] = feedback_aligned_target_counts;
             have_hold[i] = false;
           }
 
@@ -3318,7 +3356,12 @@ int main(int argc, char** argv) {
     uint64_t last_time_ns = now_monotonic_ns();
     uint64_t last_warn_ns = 0;
     bool startup_readback_complete = !startup_sdo.valid;
+    bool native_home_offset_refresh_complete = false;
     uint64_t startup_readback_ready_since_ns = 0;
+    uint64_t native_home_offset_ready_since_ns = 0;
+    bool startup_state_observed = false;
+    bool last_startup_ready_flag = false;
+    uint32_t last_startup_reset_count = 0;
     constexpr uint64_t kStartupReadbackDelayNs = 500000000ULL; // 500ms after startup_ready
 
     auto perform_startup_drive_config_readback = [&](uint64_t now_ns, bool startup_ready_flag) {
@@ -3414,6 +3457,66 @@ int main(int argc, char** argv) {
 #endif
     };
 
+    auto perform_startup_native_home_offset_refresh = [&](uint64_t now_ns,
+                                                          bool startup_ready_flag) {
+#if GRADIENT_HAVE_ECRT
+      if (native_home_offset_refresh_complete || !shared_master) {
+        return;
+      }
+      if (!startup_ready_flag) {
+        native_home_offset_ready_since_ns = 0;
+        return;
+      }
+      if (native_home_offset_ready_since_ns == 0) {
+        native_home_offset_ready_since_ns = now_ns;
+        return;
+      }
+      if (now_ns - native_home_offset_ready_since_ns < kStartupReadbackDelayNs) {
+        return;
+      }
+
+      logf("EtherCAT native-home offset refresh begin delay_ms=%llu",
+           static_cast<unsigned long long>(kStartupReadbackDelayNs / 1000000ULL));
+
+      constexpr int kNativeHomeOffsetReadAttempts = 5;
+      bool all_refreshed = true;
+      for (uint32_t i = 0; i < opt.num_axes; ++i) {
+        bool refreshed = false;
+        for (int attempt = 1; attempt <= kNativeHomeOffsetReadAttempts; ++attempt) {
+          int32_t refreshed_offset = 0;
+          if (read_position_offset_axis(i, &refreshed_offset)) {
+            latest_feedback.native_home_position_offset[i] = refreshed_offset;
+            logf("EtherCAT native-home offset refresh axis=%u slave_pos=%u offset=%d attempt=%d",
+                 i,
+                 static_cast<unsigned int>(opt.slave_position[i]),
+                 refreshed_offset,
+                 attempt);
+            refreshed = true;
+            break;
+          }
+          if (attempt < kNativeHomeOffsetReadAttempts) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          }
+        }
+        if (!refreshed) {
+          all_refreshed = false;
+          logf("WARNING: EtherCAT native-home offset refresh unavailable axis=%u slave_pos=%u; keeping in-memory offset=%d",
+               i,
+               static_cast<unsigned int>(opt.slave_position[i]),
+               latest_feedback.native_home_position_offset[i]);
+        }
+      }
+      native_home_offset_refresh_complete = all_refreshed;
+      if (!all_refreshed) {
+        native_home_offset_ready_since_ns = now_ns;
+      }
+#else
+      (void)now_ns;
+      (void)startup_ready_flag;
+      native_home_offset_refresh_complete = true;
+#endif
+    };
+
     while (!g_stop.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       const uint64_t now_ns = now_monotonic_ns();
@@ -3499,10 +3602,35 @@ int main(int argc, char** argv) {
         have_fb = (s1 == s2);
       }
 
-      perform_startup_drive_config_readback(now_ns, startup_ready != 0);
+      const bool startup_ready_flag = startup_ready != 0;
+      if (!startup_state_observed) {
+        startup_state_observed = true;
+        last_startup_ready_flag = startup_ready_flag;
+        last_startup_reset_count = startup_reset_count;
+      } else if (startup_reset_count != last_startup_reset_count ||
+                 (last_startup_ready_flag && !startup_ready_flag)) {
+        startup_readback_complete = !startup_sdo.valid;
+        native_home_offset_refresh_complete = false;
+        startup_readback_ready_since_ns = 0;
+        native_home_offset_ready_since_ns = 0;
+        logf("EtherCAT startup epoch changed: ready=%u->%u reset_count=%u->%u; rearming startup readback/offset refresh",
+             last_startup_ready_flag ? 1u : 0u,
+             startup_ready_flag ? 1u : 0u,
+             static_cast<unsigned int>(last_startup_reset_count),
+             static_cast<unsigned int>(startup_reset_count));
+        last_startup_ready_flag = startup_ready_flag;
+        last_startup_reset_count = startup_reset_count;
+      } else {
+        last_startup_ready_flag = startup_ready_flag;
+        last_startup_reset_count = startup_reset_count;
+      }
+
+      perform_startup_drive_config_readback(now_ns, startup_ready_flag);
+      perform_startup_native_home_offset_refresh(now_ns, startup_ready_flag);
       startup_drive_config_readback_valid = latest_feedback.startup_drive_config_readback_valid;
       startup_drive_config_readback = latest_feedback.startup_drive_config_readback;
       startup_drive_config_verified = latest_feedback.startup_drive_config_verified;
+      native_home_position_offset = latest_feedback.native_home_position_offset;
 
       const uint32_t en_mask = axis_enable_mask.load(std::memory_order_relaxed);
 
@@ -3977,36 +4105,17 @@ int main(int argc, char** argv) {
           latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
           return;
         }
-        uint8_t offset_raw[sizeof(int32_t)] = {};
-        size_t offset_size = 0;
-        uint32_t offset_abort = 0;
-        int rc = ecrt_master_sdo_upload(
-            shared_master,
-            opt.slave_position[axis],
-            0x60B0,
-            0x00,
-            offset_raw,
-            sizeof(offset_raw),
-            &offset_size,
-            &offset_abort);
-        if (rc != 0 || offset_size < sizeof(int32_t)) {
-          latest_feedback.native_home_last_abort_code[axis] = offset_abort;
+
+        int32_t current_offset = 0;
+        if (!read_position_offset_axis(axis, &current_offset)) {
           latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
-          logf("WARNING: native_home upload failed axis=%u slave_pos=%u index=0x60B0 rc=%d abort=0x%08x size=%zu",
-               axis,
-               static_cast<unsigned int>(opt.slave_position[axis]),
-               rc,
-               static_cast<unsigned int>(offset_abort),
-               offset_size);
           return;
         }
-
-        const int32_t current_offset = EC_READ_S32(offset_raw);
-        const int32_t desired_offset = current_offset - pos_counts;
+        const int32_t desired_offset = -pos_counts;
         uint8_t desired_offset_raw[sizeof(int32_t)] = {};
         EC_WRITE_S32(desired_offset_raw, desired_offset);
         uint32_t write_abort = 0;
-        rc = ecrt_master_sdo_download(
+        int rc = ecrt_master_sdo_download(
             shared_master,
             opt.slave_position[axis],
             0x60B0,
@@ -4047,18 +4156,114 @@ int main(int argc, char** argv) {
           return;
         }
 
+        // Some drives acknowledge the store command before the parameter is fully
+        // committed to nonvolatile memory. Keep native-home in-progress until the
+        // offset can be read back after a short settle window, so a subsequent
+        // operator-driven power cycle does not race an unfinished save.
+        constexpr int kNativeHomeVerifyAttempts = 10;
+        constexpr auto kNativeHomeVerifySleep = std::chrono::milliseconds(100);
+        bool verified_offset = false;
+        int32_t verified_offset_value = current_offset;
+        for (int attempt = 1; attempt <= kNativeHomeVerifyAttempts; ++attempt) {
+          std::this_thread::sleep_for(kNativeHomeVerifySleep);
+          int32_t readback_offset = 0;
+          if (!read_position_offset_axis(axis, &readback_offset)) {
+            continue;
+          }
+          verified_offset_value = readback_offset;
+          if (readback_offset == desired_offset) {
+            verified_offset = true;
+            break;
+          }
+        }
+        if (!verified_offset) {
+          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+          logf("WARNING: native_home verify failed axis=%u slave_pos=%u desired_offset=%d readback_offset=%d attempts=%u",
+               axis,
+               static_cast<unsigned int>(opt.slave_position[axis]),
+               desired_offset,
+               verified_offset_value,
+               static_cast<unsigned int>(kNativeHomeVerifyAttempts));
+          return;
+        }
+
         latest_feedback.native_home_position_offset[axis] = desired_offset;
         latest_feedback.native_home_last_abort_code[axis] = 0;
         latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_SUCCEEDED;
-        logf("EtherCAT native_home axis=%u slave_pos=%u pos_counts=%d current_offset=%d desired_offset=%d saved=1",
+        logf("EtherCAT native_home axis=%u slave_pos=%u pos_counts=%d current_offset=%d desired_offset=%d readback_offset=%d saved=1",
              axis,
              static_cast<unsigned int>(opt.slave_position[axis]),
              pos_counts,
              current_offset,
-             desired_offset);
+             desired_offset,
+             verified_offset_value);
 #else
         (void)pos_counts;
         latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+#endif
+      };
+
+      auto service_sdo_write_axes = [&](uint32_t axis_mask,
+                                        uint16_t index,
+                                        uint8_t subindex,
+                                        uint8_t value_type,
+                                        uint32_t value_u32) {
+#if GRADIENT_HAVE_ECRT
+        if (!shared_master) {
+          logf("WARNING: service_sdo_write skipped index=0x%04x sub=0x%02x; master unavailable",
+               static_cast<unsigned int>(index),
+               static_cast<unsigned int>(subindex));
+          return;
+        }
+        if (value_type != gradient::ipc::v1::SERVICE_SDO_VALUE_U16) {
+          logf("WARNING: service_sdo_write skipped index=0x%04x sub=0x%02x; unsupported value_type=%u",
+               static_cast<unsigned int>(index),
+               static_cast<unsigned int>(subindex),
+               static_cast<unsigned int>(value_type));
+          return;
+        }
+
+        uint8_t raw[sizeof(uint16_t)] = {};
+        EC_WRITE_U16(raw, static_cast<uint16_t>(value_u32 & 0xFFFFu));
+        for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
+          if ((axis_mask & (1u << axis)) == 0u) {
+            continue;
+          }
+          uint32_t abort_code = 0;
+          const int rc = ecrt_master_sdo_download(
+              shared_master,
+              opt.slave_position[axis],
+              index,
+              subindex,
+              raw,
+              sizeof(raw),
+              &abort_code);
+          if (rc != 0) {
+            logf("WARNING: service_sdo_write failed axis=%u slave_pos=%u index=0x%04x sub=0x%02x rc=%d abort=0x%08x value=%u type=%u",
+                 axis,
+                 static_cast<unsigned int>(opt.slave_position[axis]),
+                 static_cast<unsigned int>(index),
+                 static_cast<unsigned int>(subindex),
+                 rc,
+                 static_cast<unsigned int>(abort_code),
+                 static_cast<unsigned int>(value_u32),
+                 static_cast<unsigned int>(value_type));
+            continue;
+          }
+          logf("EtherCAT service_sdo_write axis=%u slave_pos=%u index=0x%04x sub=0x%02x value=%u type=%u",
+               axis,
+               static_cast<unsigned int>(opt.slave_position[axis]),
+               static_cast<unsigned int>(index),
+               static_cast<unsigned int>(subindex),
+               static_cast<unsigned int>(value_u32),
+               static_cast<unsigned int>(value_type));
+        }
+#else
+        (void)axis_mask;
+        (void)index;
+        (void)subindex;
+        (void)value_type;
+        (void)value_u32;
 #endif
       };
 
@@ -4098,6 +4303,13 @@ int main(int argc, char** argv) {
                    &status_seq,
                    now_monotonic_ns());
         eventfd_write_one(status_eventfd);
+      }
+
+      for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
+        int32_t current_offset = 0;
+        if (read_position_offset_axis(axis, &current_offset)) {
+          latest_feedback.native_home_position_offset[axis] = current_offset;
+        }
       }
 
       uint64_t next_snapshot_ns = now_monotonic_ns();
@@ -4212,11 +4424,55 @@ int main(int argc, char** argv) {
                           mh->seq,
                           gradient::ipc::v1::EVT_DISARMED,
                           gradient::ipc::v1::EXEC_STATE_ABORTED);
+                      bool all_succeeded = true;
                       for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
                         if ((mask & (1u << axis)) != 0u) {
                           native_home_axis(axis);
+                          if (latest_feedback.native_home_state[axis] !=
+                              gradient::ipc::v1::NATIVE_HOME_STATE_SUCCEEDED) {
+                            all_succeeded = false;
+                          }
                         }
                       }
+                      if (all_succeeded) {
+                        logf("Native-home success: homed axes remain disabled axis_mask 0x%x -> 0x%x armed=%u",
+                             static_cast<unsigned int>(cur),
+                             static_cast<unsigned int>(next),
+                             static_cast<unsigned int>(
+                                 armed.load(std::memory_order_relaxed) ? 1u : 0u));
+                      } else {
+                        logf("WARNING: native_home left requested axes disarmed after failure axis_mask=0x%x",
+                             static_cast<unsigned int>(mask));
+                      }
+                    }
+                  }
+                  break;
+                }
+                case gradient::ipc::v1::MSG_CMD_SERVICE_SDO_WRITE: {
+                  if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::CmdServiceSdoWriteV1)) {
+                    auto* cmd =
+                        reinterpret_cast<const gradient::ipc::v1::CmdServiceSdoWriteV1*>(payload);
+                    uint32_t mask = cmd->axis_mask;
+                    const uint32_t valid =
+                        (opt.num_axes >= 32) ? 0xFFFFFFFFu : ((1u << opt.num_axes) - 1u);
+                    mask &= valid;
+                    if (mask != 0u) {
+                      const uint32_t cur = axis_enable_mask.load(std::memory_order_relaxed);
+                      const uint32_t next = cur & ~mask;
+                      axis_enable_mask.store(next, std::memory_order_relaxed);
+                      if (next == 0u) {
+                        armed.store(false, std::memory_order_relaxed);
+                      }
+                      clear_motion_intent(
+                          mh->seq,
+                          gradient::ipc::v1::EVT_DISARMED,
+                          gradient::ipc::v1::EXEC_STATE_ABORTED);
+                      service_sdo_write_axes(
+                          mask,
+                          cmd->index,
+                          cmd->subindex,
+                          cmd->value_type,
+                          cmd->value_u32);
                     }
                   }
                   break;

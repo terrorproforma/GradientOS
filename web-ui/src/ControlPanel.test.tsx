@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ControlPanel } from "./ControlPanel";
+import { ControlPanel, ControlPanelRuntimeHeader } from "./ControlPanel";
 
 type FetchRecord = {
 	method: string;
@@ -55,10 +55,11 @@ describe("ControlPanel jog session lifecycle", () => {
 				body,
 			});
 
-			if (parsed.pathname === "/info/joints") {
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
 				return mockJsonResponse({
 					arm_deg: [0, 0, 0, 0, 0, 0],
 					gripper_deg: 0,
+					read_source: "live_feedback",
 				});
 			}
 			if (parsed.pathname === "/control/motion-status") {
@@ -126,7 +127,7 @@ describe("ControlPanel jog session lifecycle", () => {
 	it("does not open a jog session while armed but idle", async () => {
 		render(<ControlPanel apiHost="" />);
 
-		fireEvent.click(screen.getByRole("button", { name: "Arm" }));
+		fireEvent.click(screen.getByRole("button", { name: "Arm Jog" }));
 		await sleep(400);
 
 		const jogPosts = fetchCalls.filter((call) =>
@@ -138,9 +139,9 @@ describe("ControlPanel jog session lifecycle", () => {
 	it("starts on pointer down and stops on final release", async () => {
 		render(<ControlPanel apiHost="" />);
 
-		fireEvent.click(screen.getByRole("button", { name: "Arm" }));
+		fireEvent.click(screen.getByRole("button", { name: "Arm Jog" }));
 		await waitFor(() => {
-			expect(screen.getByRole("button", { name: "Disarm" })).toBeTruthy();
+			expect(screen.getByRole("button", { name: "Disarm Jog" })).toBeTruthy();
 		});
 		const plusX = screen.getByRole("button", { name: "+X" });
 
@@ -204,6 +205,185 @@ describe("ControlPanel jog session lifecycle", () => {
 		const button = screen.getByRole("button", { name: "Power Up Drives" }) as HTMLButtonElement;
 		expect(button.disabled).toBe(true);
 		expect(button.title).toContain("Active trajectory 9");
+	});
+
+	it("separates requested enable from actual drive feedback", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					armed: 1,
+					axis_enable_mask: 0x3f,
+					axis_enable_mask_hex: "0x3f",
+					enable_requested: true,
+					requested_axes: 6,
+					op_enabled_axes: 0,
+					num_axes: 6,
+					statusword_feedback_axes: 0,
+					axes: [],
+				}}
+				motionStatus={{
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				}}
+			/>,
+		);
+
+		const powerUpButton = screen.getByRole("button", { name: "Power Up Drives" }) as HTMLButtonElement;
+		const powerDownButton = screen.getByRole("button", { name: "Power Down Drives" }) as HTMLButtonElement;
+
+		expect(powerUpButton.disabled).toBe(true);
+		expect(powerUpButton.title).toContain("waiting for actual drive feedback");
+		expect(powerDownButton.disabled).toBe(false);
+		expect(screen.getByText("DISARMED")).toBeTruthy();
+	});
+
+	it("uses distinct drive-power and jog labels", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [],
+				}}
+				motionStatus={{
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				}}
+			/>,
+		);
+
+		expect(screen.getByRole("button", { name: "Power Up Drives" })).toBeTruthy();
+		expect(screen.getByRole("button", { name: "Arm Jog" })).toBeTruthy();
+		expect(screen.queryByRole("button", { name: "Arm" })).toBeNull();
+	});
+
+	it("uses explicit power labels in the runtime header", async () => {
+		render(
+			<ControlPanelRuntimeHeader
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [],
+				}}
+				motionStatus={{
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				}}
+			/>,
+		);
+
+		expect(screen.getByRole("button", { name: "Power Up" })).toBeTruthy();
+		expect(screen.getByRole("button", { name: "Power Down" })).toBeTruthy();
+		expect(screen.queryByRole("button", { name: "Arm" })).toBeNull();
+	});
+
+	it("hides software zero by default and only shows it when enabled", async () => {
+		const { rerender } = render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+		expect(screen.queryByRole("button", { name: "Zero" })).toBeNull();
+		expect(screen.getAllByRole("button", { name: "Drive Home" }).length).toBeGreaterThan(0);
+
+		rerender(
+			<ControlPanel
+				apiHost=""
+				showSoftwareZeroButton
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [],
+				}}
+			/>,
+		);
+
+		expect(screen.getAllByRole("button", { name: "Zero" }).length).toBeGreaterThan(0);
+	});
+
+	it("shows per-joint native home status from drive telemetry", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axis_enable_mask: 0x0,
+					axes: [
+						{
+							axis: 1,
+							logical_joint: 2,
+							ds402_state: "SwitchOnDisabled",
+							statusword: 0x1638,
+							error_code: 0,
+							native_home_state: 2,
+							native_home_state_name: "succeeded",
+							native_home_position_offset: -244354,
+							native_home_last_abort_code: 0,
+							native_home_last_abort_code_hex: "0x00000000",
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+		expect(screen.getByText(/Drive Home succeeded/i)).toBeTruthy();
+		expect(screen.getByText(/axis currently disarmed/i)).toBeTruthy();
 	});
 
 	it("uses wait-for-idle semantics for drive power-down", async () => {

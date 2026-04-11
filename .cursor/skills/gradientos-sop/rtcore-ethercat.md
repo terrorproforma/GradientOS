@@ -17,6 +17,20 @@ Use this file when changing `gradient-rt-motion`, EtherCAT host setup, drive bri
 - Keep manufacturer-specific decode/labels in drive-profile code.
 - Keep generic RTCore and generic Python telemetry vendor-neutral.
 - If a future drive needs a different object map, add descriptors and profile data instead of adding vendor branches to `main.cpp`.
+- Treat the configured PDO layout as safety-critical truth, not a convenience string.
+- Never add a drive-specific object to a cyclic PDO descriptor unless the drive's actual assigned PDO map includes it.
+- For A6-EC specifically, fixed TxPDO `0x1B02` does not include `0x203F`; forcing `manufacturer_err` into that layout shifts later offsets and corrupts cyclic feedback.
+- When vendor-specific EtherCAT or commissioning semantics are unclear, consult the in-repo A6-EC references first: `docs/resources/A6-EC_series_servo_drive_manual.pdf`, `docs/resources/a6ec_manual_codes.json`, and `docs/resources/a6ec_manual_codes.md`.
+
+## PDO Layout Guardrails
+
+- One wrong entry in a PDO descriptor can keep EtherCAT apparently healthy while making RTCore read the wrong bytes.
+- The dangerous signature is: slaves reach `OP`, but `statusword`, `pos_counts`, and DS402 state look implausible or flat-zero across axes.
+- For A6-EC, inserting `0x203F` into cyclic `0x1B02` shifted `0x6041`, `0x6064`, and later fields by 4 bytes and made the stack falsely think the drives were `NotReady`.
+- When debugging bring-up, verify both:
+  - the configured PDO assignment (`0x1702/0x1B02` here)
+  - the exact ordered layout inside that PDO, not just the PDO index names
+- If manufacturer fault detail is needed but is not in the cyclic PDO, fetch it through a separate non-RT path instead of breaking the PDO layout.
 
 ## Startup Verification
 
@@ -29,12 +43,14 @@ Use this file when changing `gradient-rt-motion`, EtherCAT host setup, drive bri
 - Carry both generic bus faults and manufacturer faults when the drive exposes both.
 - Decode manufacturer faults in profile/backend-specific code, not generic OS layers.
 - Reuse existing status and telemetry payloads rather than inventing a second fault channel.
+- "Carry both" does not mean "force both into the cyclic PDO layout". Keep the acquisition path honest to the drive's real object map.
 
 ## Safe Enable and Power
 
 - Synchronize targets with feedback before enabling.
 - STOP and power transitions must not re-inject stale motion into RTCore.
 - Preserve the no-sudden-move contract across restart, enable, and recovery flows.
+- For A6-EC native home, target synchronization must use the drive target frame implied by `native_home_position_offset` rather than raw `0x6064` counts, otherwise a later CSP enable can still trip `Er87.*` / `0xFF00` despite a successful home save.
 
 ## Commissioning and Bring-Up
 

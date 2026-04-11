@@ -24,6 +24,18 @@ STARTUP_SETTING_VALUE_LABELS = {
     4: "Battery-backed linear infinite-turn absolute encoder mode",
     5: "Battery-backed rotary multi-turn absolute encoder mode",
 }
+ENCODER_DATA_RESET_OPERATION = {
+    "operation_key": "encoder_data_reset",
+    "operation_label": "A6-EC encoder data reset",
+    "parameter": "F31.10",
+    "object_label": "Operation reset Parameter / Encoder data reset",
+    "index": 0x2031,
+    "subindex": 0x11,
+    "type": "u16",
+    "value": 4,
+    "requires_power_cycle": True,
+    "requires_rehome": True,
+}
 
 _DRIVE_FAULT_CODEBOOK_CACHE: dict[str, Any] | None = None
 
@@ -256,3 +268,7 @@ def extract_startup_config_axis(axis: Mapping[str, Any]) -> dict[str, Any] | Non
         "readback_value_label": _startup_mode_value_label(startup_drive_config.get("readback", 0)),
         "verified": bool(startup_drive_config.get("verified")),
     }
+
+
+def get_encoder_data_reset_operation() -> dict[str, Any]:
+    return dict(ENCODER_DATA_RESET_OPERATION)

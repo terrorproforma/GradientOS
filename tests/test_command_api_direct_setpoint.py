@@ -1717,6 +1717,48 @@ def test_handle_reset_faults_leaves_system_disarmed(monkeypatch):
     assert reset_calls == [1]
 
 
+def test_handle_reset_encoder_data_requests_safe_recovery(monkeypatch):
+    reset_calls: list[int | None] = []
+
+    class _Backend:
+        def reset_encoder_data(self, logical_joint_index=None):
+            reset_calls.append(logical_joint_index)
+            return True
+
+    completed_motion = {
+        "accepted": True,
+        "state": "completed",
+        "completion_scope": "rtcore_execution",
+        "trajectory_id": 0,
+        "source_of_truth": "rtcore",
+        "safe_for_power_transition": True,
+        "power_transition_blockers": [],
+        "power_transition_blocker_details": [],
+        "execution": {
+            "controller_thread_running": False,
+            "rtcore_status_present": True,
+            "safe_for_power_transition": True,
+            "power_transition_blockers": [],
+            "power_transition_blocker_details": [],
+        },
+    }
+
+    monkeypatch.setattr(command_api, "handle_stop_command", lambda: None)
+    monkeypatch.setattr(command_api, "handle_wait_for_idle", lambda timeout_s=30.0: dict(completed_motion))
+    monkeypatch.setattr(command_api.backend_registry, "get_active_backend", lambda: _Backend())
+    monkeypatch.setattr(command_api, "get_motion_execution_status", lambda: dict(completed_motion))
+
+    result = command_api.handle_reset_encoder_data(logical_joint_index=1)
+
+    assert result["accepted"] is True
+    assert result["code"] == "RESET_ENCODER_DATA_SENT"
+    assert result["disarmed_after_reset"] is True
+    assert result["requires_power_cycle"] is True
+    assert result["requires_rehome"] is True
+    assert result["joint"] == 2
+    assert reset_calls == [1]
+
+
 def test_handle_stop_command_skips_legacy_brake_write_for_rtcore_backend(monkeypatch):
     servo_writes: list[list[float]] = []
     aborted: list[str] = []

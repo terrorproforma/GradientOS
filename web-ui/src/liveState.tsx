@@ -90,6 +90,11 @@ export type DriveFaultAxis = {
   slave_al_state?: number;
   slave_al_state_name?: string;
   pos_counts?: number;
+  native_home_state?: number;
+  native_home_state_name?: string;
+  native_home_position_offset?: number;
+  native_home_last_abort_code?: number;
+  native_home_last_abort_code_hex?: string;
   fault?: DriveFaultDetail | null;
   manufacturer_fault?: DriveFaultDetail | null;
 };
@@ -109,9 +114,14 @@ export type DriveFaultSnapshot = {
   armed?: number;
   axis_enable_mask?: number;
   axis_enable_mask_hex?: string;
+  enable_requested?: boolean;
+  requested_axes?: number;
   op_enabled_axes?: number;
   num_axes?: number;
   faulted_axes?: number;
+  statusword_feedback_axes?: number;
+  slave_online_axes?: number;
+  slave_operational_axes?: number;
   link_up?: number;
   responding?: number;
   online?: number;

@@ -288,6 +288,21 @@ struct CmdNativeHomeV1 {
 };
 static_assert(sizeof(CmdNativeHomeV1) == 8, "CmdNativeHomeV1 size must match spec");
 
+enum : uint8_t {
+  SERVICE_SDO_VALUE_NONE = 0,
+  SERVICE_SDO_VALUE_U16 = 1,
+};
+
+struct CmdServiceSdoWriteV1 {
+  uint32_t axis_mask;
+  uint16_t index;
+  uint8_t subindex;
+  uint8_t value_type; // enum ServiceSdoValueTypeV1
+  uint32_t value_u32;
+  uint32_t flags;
+};
+static_assert(sizeof(CmdServiceSdoWriteV1) == 16, "CmdServiceSdoWriteV1 size must match spec");
+
 struct CmdSetModeV1 {
   uint32_t axis_mask;
   uint32_t mode; // v1: 8=CSP only
@@ -409,6 +424,7 @@ enum : uint16_t {
   MSG_CMD_SET_MODE = 0x0106,
   MSG_CMD_REQUEST_BUNDLE = 0x0107,
   MSG_CMD_NATIVE_HOME = 0x0108,
+  MSG_CMD_SERVICE_SDO_WRITE = 0x0109,
   MSG_CMD_IO_WRITE = 0x0110,
   MSG_CMD_TRAJECTORY_BEGIN = 0x0120,
   MSG_CMD_TRAJECTORY_POINT = 0x0121,

@@ -159,6 +159,11 @@ type DriveFaultAxis = {
   slave_al_state?: number;
   slave_al_state_name?: string;
   pos_counts?: number;
+  native_home_state?: number;
+  native_home_state_name?: string;
+  native_home_position_offset?: number;
+  native_home_last_abort_code?: number;
+  native_home_last_abort_code_hex?: string;
   fault?: DriveFaultDetail | null;
   manufacturer_fault?: DriveFaultDetail | null;
 };
@@ -178,9 +183,14 @@ type DriveFaultSnapshot = {
   armed?: number;
   axis_enable_mask?: number;
   axis_enable_mask_hex?: string;
+  enable_requested?: boolean;
+  requested_axes?: number;
   op_enabled_axes?: number;
   num_axes?: number;
   faulted_axes?: number;
+  statusword_feedback_axes?: number;
+  slave_online_axes?: number;
+  slave_operational_axes?: number;
   link_up?: number;
   responding?: number;
   online?: number;
@@ -537,6 +547,7 @@ type RuntimeConfigSnapshot = {
 type PersistedSettings = {
   showBoundingBox: boolean;
   showGripperPanel: boolean;
+  showSoftwareZeroButton: boolean;
   collapseLiveCharts: boolean;
   collapseStepImport: boolean;
   collapseTrajectory: boolean;
@@ -1186,6 +1197,7 @@ function loadPersistedSettings(): PersistedSettings {
   const defaults: PersistedSettings = {
     showBoundingBox: true,
     showGripperPanel: false,
+    showSoftwareZeroButton: false,
     collapseLiveCharts: false,
     collapseStepImport: false,
     collapseTrajectory: false,
@@ -1220,6 +1232,10 @@ function loadPersistedSettings(): PersistedSettings {
           typeof parsed.showGripperPanel === "boolean"
             ? parsed.showGripperPanel
             : defaults.showGripperPanel,
+        showSoftwareZeroButton:
+          typeof parsed.showSoftwareZeroButton === "boolean"
+            ? parsed.showSoftwareZeroButton
+            : defaults.showSoftwareZeroButton,
         collapseLiveCharts:
           typeof parsed.collapseLiveCharts === "boolean"
             ? parsed.collapseLiveCharts
@@ -3870,6 +3886,7 @@ type SettingsDialogProps = {
   visionHost: string;
   showBoundingBox: boolean;
   showGripperPanel: boolean;
+  showSoftwareZeroButton: boolean;
   robots: RobotPolicyOption[];
   selectedRobotName: string;
   selectedRtMaxRpmInput: string;
@@ -3895,6 +3912,7 @@ type SettingsDialogProps = {
   onVisionHostChange: (value: string) => void;
   onShowBoundingBoxChange: (value: boolean) => void;
   onShowGripperPanelChange: (value: boolean) => void;
+  onShowSoftwareZeroButtonChange: (value: boolean) => void;
   onSelectedRobotNameChange: (value: string) => void;
   onSelectedRtMaxRpmInputChange: (value: string) => void;
   onSelectedToolIdChange: (value: string) => void;
@@ -3929,6 +3947,7 @@ function SettingsDialog({
   visionHost,
   showBoundingBox,
   showGripperPanel,
+  showSoftwareZeroButton,
   robots,
   selectedRobotName,
   selectedRtMaxRpmInput,
@@ -3954,6 +3973,7 @@ function SettingsDialog({
   onVisionHostChange,
   onShowBoundingBoxChange,
   onShowGripperPanelChange,
+  onShowSoftwareZeroButtonChange,
   onSelectedRobotNameChange,
   onSelectedRtMaxRpmInputChange,
   onSelectedToolIdChange,
@@ -4656,6 +4676,17 @@ function SettingsDialog({
             <input
               type="checkbox"
               className="h-4 w-4 rounded border border-slate-600 bg-slate-900 text-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
+              checked={showSoftwareZeroButton}
+              onChange={(event) => onShowSoftwareZeroButtonChange(event.target.checked)}
+            />
+            Show software zero button in commissioning panel
+            </label>
+            ) : null}
+            {activeTab === "general" ? (
+            <label className="mt-4 flex items-center gap-3 text-sm font-medium text-slate-200/90">
+            <input
+              type="checkbox"
+              className="h-4 w-4 rounded border border-slate-600 bg-slate-900 text-cyan-400 focus:outline-none focus:ring-2 focus:ring-cyan-500/40"
               checked={showBoundingBox}
               onChange={(event) => onShowBoundingBoxChange(event.target.checked)}
             />
@@ -4873,6 +4904,7 @@ export default function App() {
   } | null>(null);
   const showBoundingBox = settings.showBoundingBox;
   const showGripperPanel = settings.showGripperPanel;
+  const showSoftwareZeroButton = settings.showSoftwareZeroButton;
   const activePanel = settings.activePanel;
   const showProgramTree = settings.showProgramTree;
   const programTreeViewMode = settings.programTreeViewMode;
@@ -6549,6 +6581,25 @@ export default function App() {
 
   const handleFallbackJointFeedback = useCallback(
     (anglesDeg: number[], gripperDeg?: number) => {
+      if (!Array.isArray(anglesDeg) || anglesDeg.length === 0) {
+        lastAcceptedJointsRef.current = null;
+        setLatest((prev) => {
+          if (!prev) {
+            return {
+              timestamp: Date.now(),
+              raw: "fallback:joint-feedback-unavailable",
+              joints: [],
+            };
+          }
+          return {
+            ...prev,
+            timestamp: Date.now(),
+            raw: prev.raw ?? "fallback:joint-feedback-unavailable",
+            joints: [],
+          };
+        });
+        return;
+      }
       const nextJoints = anglesDeg
         .map((value) => Number(value))
         .filter((value) => Number.isFinite(value))
@@ -6601,6 +6652,7 @@ export default function App() {
     }
     connect();
   }, [connect, disconnect, isConnected]);
+  const hasLiveJointPose = Array.isArray(latest?.joints) && latest.joints.length > 0;
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -9248,6 +9300,11 @@ export default function App() {
                     stepTransform={stepTransform}
                     onStepStatusChange={setStepLoadStatus}
                   />
+                  {!hasLiveJointPose && latest ? (
+                    <div className="pointer-events-none absolute left-4 top-4 rounded-xl border border-amber-500/35 bg-slate-950/85 px-3 py-2 text-xs text-amber-100 shadow-lg shadow-black/40">
+                      Live joint feedback unavailable. Stage pose may be stale.
+                    </div>
+                  ) : null}
                 </Suspense>
               ) : (
                 <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.12),transparent_32%),linear-gradient(180deg,rgba(2,6,23,0.88),rgba(2,6,23,1))]">
@@ -9528,6 +9585,7 @@ export default function App() {
                       splitStatusSections
                       showStatusSections={false}
                       showGripperPanel={showGripperPanel}
+                      showSoftwareZeroButton={showSoftwareZeroButton}
                       controlsCollapsed={isRobotControlCollapsed}
                       onToggleControlsCollapsed={() =>
                         updateSettings({ collapseRobotControl: !isRobotControlCollapsed })
@@ -9547,6 +9605,7 @@ export default function App() {
         visionHost={visionHost}
         showBoundingBox={showBoundingBox}
         showGripperPanel={showGripperPanel}
+        showSoftwareZeroButton={showSoftwareZeroButton}
         robots={robotOptions}
         selectedRobotName={selectedRobotName}
         selectedRtMaxRpmInput={selectedRtMaxRpmInput}
@@ -9572,6 +9631,7 @@ export default function App() {
         onVisionHostChange={setVisionHost}
         onShowBoundingBoxChange={(value) => updateSettings({ showBoundingBox: value })}
         onShowGripperPanelChange={(value) => updateSettings({ showGripperPanel: value })}
+        onShowSoftwareZeroButtonChange={(value) => updateSettings({ showSoftwareZeroButton: value })}
         onSelectedRobotNameChange={setSelectedRobotName}
         onSelectedRtMaxRpmInputChange={setSelectedRtMaxRpmInput}
         onSelectedToolIdChange={setSelectedToolId}

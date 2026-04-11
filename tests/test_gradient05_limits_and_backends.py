@@ -240,7 +240,93 @@ def test_ethercat_backend_applies_master_offsets_to_setpoints(monkeypatch, tmp_p
     assert traj_id == 123
     assert len(points) == 1
     assert points[0]["positions_rad"] == pytest.approx([1.0, 2.0, 0.0, 0.0, 0.0, 0.0])
+    assert "qd" not in points[0]
+    assert "flags" not in points[0]
     assert points[0]["axis_mask"] == 0x3
+
+
+def test_ethercat_backend_sync_write_ignores_legacy_speed_and_accel(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+
+    commands = backend.prepare_sync_write_commands([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], speed=321, accel=7)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        backend,
+        "set_joint_positions",
+        lambda positions_rad, speed, acceleration: captured.update(
+            {
+                "positions_rad": positions_rad,
+                "speed": speed,
+                "acceleration": acceleration,
+            }
+        ),
+    )
+
+    backend.sync_write(commands)
+
+    assert captured == {
+        "positions_rad": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        "speed": 0.0,
+        "acceleration": 0.0,
+    }
+
+
+def test_ethercat_backend_single_actuator_setpoint_emits_position_only_trajectory(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 2
+    backend._axis_to_joint = [0, 1]
+
+    captured: dict[str, object] = {"begin": None, "points": None, "commit": None}
+
+    monkeypatch.setattr(
+        backend,
+        "begin_trajectory",
+        lambda **kwargs: captured.__setitem__("begin", kwargs) or 456,
+    )
+    monkeypatch.setattr(
+        backend,
+        "enqueue_trajectory_points",
+        lambda traj_id, points: captured.__setitem__("points", (traj_id, points)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "commit_trajectory",
+        lambda traj_id: captured.__setitem__("commit", traj_id),
+    )
+
+    backend.set_single_actuator_position(1, 0.5, speed=640, accel=0)
+
+    assert captured["begin"] == {"axis_mask": 0x2, "expected_points": 1}
+    assert captured["commit"] == 456
+    traj_id, points = captured["points"]
+    assert traj_id == 456
+    assert len(points) == 1
+    assert points[0]["axis_q"] == pytest.approx([0.0, 0.5])
+    assert "qd" not in points[0]
+    assert "flags" not in points[0]
+    assert points[0]["axis_mask"] == 0x2
+    assert backend._last_joint_setpoint_rad[1] == pytest.approx(0.5)
+
+
+def test_ethercat_backend_set_joint_positions_does_not_advance_cache_on_commit_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 2
+    backend._axis_to_joint = [0, 1]
+    backend._last_joint_setpoint_rad = [0.2, -0.3, 0.0, 0.0, 0.0, 0.0]
+
+    monkeypatch.setattr(backend, "begin_trajectory", lambda **kwargs: 999)
+    monkeypatch.setattr(backend, "enqueue_trajectory_points", lambda traj_id, points: None)
+    monkeypatch.setattr(backend, "commit_trajectory", lambda traj_id: (_ for _ in ()).throw(RuntimeError("commit failed")))
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        backend.set_joint_positions([0.8, 0.1, 0.0, 0.0, 0.0, 0.0], speed=500.0, acceleration=0.0)
+
+    assert backend._last_joint_setpoint_rad[:2] == pytest.approx([0.2, -0.3])
 
 
 def test_ethercat_backend_converts_feedback_using_axis_scaling(monkeypatch, tmp_path):
@@ -300,6 +386,24 @@ def test_ethercat_backend_zero_capture_persists_joint_offsets(monkeypatch, tmp_p
     assert loaded_offsets[2] == pytest.approx(1.5)
 
 
+def test_ethercat_backend_connected_reads_return_feedback_without_freshness_gate(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 2
+    backend._axis_to_joint = [0, 1]
+    backend._axis_config = _AxisConfig(
+        num_axes=2,
+        counts_per_unit=[100.0, 100.0] + [0.0] * 14,
+        sign=[1, 1] + [0] * 14,
+    )
+    backend._axis_counts[0] = 25
+    backend._axis_counts[1] = 50
+
+    assert backend.sync_read_positions() == {0: 25, 1: 50}
+    assert backend.get_joint_positions()[:2] == pytest.approx([0.25, 0.5])
+
+
 def test_ethercat_backend_safe_power_down_disables_axes_and_disarms(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
@@ -349,6 +453,115 @@ def test_ethercat_backend_safe_power_up_arms_sets_mode_and_enables(monkeypatch, 
     backend._best_effort_safe_power_up()
 
     assert calls == [("arm", True), ("mode", (0x7, 8)), ("enable", 0x7)]
+
+
+def test_ethercat_backend_native_home_waits_for_neutral_before_request(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 3
+    backend._axis_to_joint = [0, 1, 2]
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        backend,
+        "prepare_for_power_transition",
+        lambda **kwargs: calls.append(("prepare", dict(kwargs))),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_send_cmd_native_home",
+        lambda axis_mask: calls.append(("native_home", axis_mask)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_wait_for_native_home_result",
+        lambda axis_mask, *, timeout_s: calls.append(("wait_native_home", (axis_mask, timeout_s))) or True,
+    )
+
+    assert backend.native_home_joint(1) is True
+    assert calls == [
+        ("prepare", {"wait_for_idle": True, "timeout_s": 1.0}),
+        ("native_home", 0x2),
+        ("wait_native_home", (0x2, 3.0)),
+    ]
+
+
+def test_ethercat_backend_native_home_aborts_when_pre_neutralization_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 3
+    backend._axis_to_joint = [0, 1, 2]
+
+    calls: list[tuple[str, object]] = []
+
+    def _raise_prepare(**_kwargs):
+        raise RuntimeError("neutralization failed")
+
+    monkeypatch.setattr(backend, "prepare_for_power_transition", _raise_prepare)
+    monkeypatch.setattr(
+        backend,
+        "_send_cmd_native_home",
+        lambda axis_mask: calls.append(("native_home", axis_mask)),
+    )
+
+    assert backend.native_home_joint(1) is False
+    assert calls == []
+
+
+def test_ethercat_backend_native_home_fails_when_verification_times_out(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 3
+    backend._axis_to_joint = [0, 1, 2]
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        backend,
+        "prepare_for_power_transition",
+        lambda **kwargs: calls.append(("prepare", dict(kwargs))),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_send_cmd_native_home",
+        lambda axis_mask: calls.append(("native_home", axis_mask)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_wait_for_native_home_result",
+        lambda axis_mask, *, timeout_s: calls.append(("wait_native_home", (axis_mask, timeout_s))) or False,
+    )
+
+    assert backend.native_home_joint(1) is False
+    assert calls == [
+        ("prepare", {"wait_for_idle": True, "timeout_s": 1.0}),
+        ("native_home", 0x2),
+        ("wait_native_home", (0x2, 3.0)),
+    ]
+
+
+def test_ethercat_backend_applies_native_home_offsets_to_feedback_but_not_command_targets(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._axis_to_joint = [0]
+    backend._rt_num_axes = 1
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[100.0] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+    )
+    backend._native_home_offset_counts[0] = -25
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+
+    logical_positions = backend.raw_to_joint_positions({0: 25})
+    commanded_axis_q = backend._axis_q_from_joint_positions([0.0] * backend.num_joints)
+
+    assert logical_positions[0] == pytest.approx(0.0)
+    assert commanded_axis_q[0] == pytest.approx(0.0)
 
 
 def test_ethercat_backend_defaults_to_disarmed_connect(monkeypatch, tmp_path):

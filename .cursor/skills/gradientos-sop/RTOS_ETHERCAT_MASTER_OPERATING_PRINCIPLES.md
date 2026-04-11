@@ -1025,6 +1025,13 @@ For EtherCAT, the drive catalog is now the source of truth for:
 - PDO layout defaults,
 - startup SDO defaults and schema.
 
+That source of truth must match the drive's real assigned PDO map exactly. A live A6-EC bring-up failure proved that even a single extra field in the catalog can silently poison RTCore feedback while EtherCAT still appears healthy.
+
+Concrete rule:
+
+- never add a cyclic PDO entry to the catalog unless the configured drive PDO actually includes it,
+- and treat PDO entry order/width as safety-critical, not cosmetic.
+
 Example:
 
 ```python
@@ -1123,12 +1130,25 @@ Final rule:
 - controller/API telemetry should forward both raw values,
 - profile code should decode them in profile-specific modules,
 - frontend/operator views should show both the generic fault context and the manufacturer-specific detail when present.
+- but only through an acquisition path that is truthful to the drive's real object map.
 
 This matters because:
 
 - `0x603F` is necessary for portable DS402/EtherCAT reasoning,
 - `0x203F` is necessary for precise vendor diagnostics such as battery and multi-turn encoder faults,
 - and hiding one or the other creates either ambiguity or loss of actionable detail.
+
+Critical nuance learned in validated live bring-up:
+
+- "carry both" does not mean "force both into the cyclic TxPDO layout",
+- for A6-EC fixed TxPDO `0x1B02`, `0x203F` is not part of the assigned cyclic map,
+- inserting `manufacturer_err|0x203F|0x00|32` shifted all later feedback fields by 4 bytes,
+- the result was a dangerous false picture: EtherCAT reached `OP`, but RTCore misread cyclic feedback and reported `statusword=0`, `pos_counts=0`, and `ds402=NotReady`.
+
+Canonical rule:
+
+- only declare cyclic PDO entries that are actually present in the assigned PDO,
+- if a manufacturer-specific diagnostic is needed and is not part of that cyclic PDO, acquire it through a separate non-RT path instead of falsifying the cyclic layout.
 
 Example normalized fault payload shape:
 
@@ -1441,6 +1461,13 @@ The current stack intentionally supports both because they solve different probl
 
 - native home is for the drive’s physical reference model,
 - software zero is for the robot/application logical frame.
+- but the frontend should bias operators toward native home for normal absolute-encoder commissioning.
+
+Current UI policy:
+
+- keep software zero implemented in the OS/controller/API layers,
+- hide the software-zero button from the normal commissioning UI by default,
+- and only re-expose it through an explicit Settings toggle when an advanced logical-offset workflow is actually needed.
 
 ### 12.3A Commissioning jog/zero/home flows must reuse existing controller pathways and stay conservative
 
@@ -1455,7 +1482,8 @@ Final operational model:
 - per-joint commissioning jog uses the controller’s existing joint command path,
 - per-joint logical zero uses the software-offset capture flow,
 - per-joint native home uses the dedicated drive-native home command path,
-- all three remain visible as distinct operator actions.
+- jog and native home remain the default visible operator actions,
+- while software zero remains supported but is hidden by default behind an explicit UI settings toggle.
 
 Commissioning-specific best practices:
 
@@ -2589,6 +2617,21 @@ Observed failure mode:
 Lesson:
 
 - separate link/discovery diagnosis from PDO/state/configuration diagnosis.
+
+### 14.3A Wrong PDO descriptors can preserve `OP` while poisoning feedback
+
+Observed failure mode:
+
+- EtherCAT reached `OP`,
+- startup readback and slave operational counts looked healthy,
+- but all axes still appeared `NotReady` with implausible zeroed cyclic feedback,
+- because the configured A6-EC `0x1B02` descriptor incorrectly included `0x203F` and shifted all later offsets by 4 bytes.
+
+Lesson:
+
+- do not stop at "the bus is OP"; verify that cyclic values themselves are plausible,
+- when `statusword`, position, and DS402 state are uniformly impossible or flat-zero, suspect descriptor/order errors before blaming the DS402 enable state machine,
+- and treat PDO descriptor accuracy as part of the safety contract.
 
 ### 14.4 STOP semantics must be backend-aware
 

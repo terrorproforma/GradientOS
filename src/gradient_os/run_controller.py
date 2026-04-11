@@ -1223,9 +1223,23 @@ Examples:
             
             while not telemetry_stop_event.is_set():
                 try:
-                    q = servo_driver.get_current_arm_state_rad(verbose=False)
+                    joint_feedback_available = True
+                    joint_feedback_error = None
+                    try:
+                        q = servo_driver.get_current_arm_state_rad(verbose=False)
+                    except Exception as exc:
+                        q = None
+                        joint_feedback_available = False
+                        joint_feedback_error = str(exc)
                     g = utils.current_gripper_angle_rad if utils.gripper_present else None
-                    msg: dict[str, object] = {"t": time.time(), "joints": [float(x) for x in q]}
+                    msg: dict[str, object] = {
+                        "t": time.time(),
+                        "joint_feedback_available": joint_feedback_available,
+                    }
+                    if q is not None:
+                        msg["joints"] = [float(x) for x in q]
+                    if joint_feedback_error:
+                        msg["joint_feedback_error"] = joint_feedback_error
                     correlation_id = utils.trajectory_state_get("last_correlation_id")
                     if isinstance(correlation_id, str) and correlation_id:
                         msg["correlation_id"] = correlation_id
@@ -2046,6 +2060,33 @@ Examples:
                         sock.sendto("ERROR,RESET_FAULTS,BAD_ARGS".encode("utf-8"), addr)
                     except Exception as e:
                         sock.sendto(f"ERROR,RESET_FAULTS,{e}".encode("utf-8", errors="replace"), addr)
+
+                elif command == "RESET_ENCODER_DATA":
+                    try:
+                        logical_joint_index = None
+                        if len(parts) > 1 and parts[1].strip():
+                            joint_num = int(parts[1])
+                            logical_joint_index = joint_num - 1
+                            if logical_joint_index < 0 or logical_joint_index >= selected_robot.num_logical_joints:
+                                sock.sendto(
+                                    f"ERROR,RESET_ENCODER_DATA,Joint number must be 1-{selected_robot.num_logical_joints}".encode("utf-8"),
+                                    addr,
+                                )
+                                continue
+
+                        payload = command_api.handle_reset_encoder_data(logical_joint_index=logical_joint_index)
+                        if isinstance(payload, dict):
+                            prefix = "ACK" if bool(payload.get("accepted", False)) else "ERROR"
+                            sock.sendto(
+                                f"{prefix},RESET_ENCODER_DATA,{_encode_controller_payload_b64(payload)}".encode("utf-8"),
+                                addr,
+                            )
+                        else:
+                            sock.sendto(f"ACK,RESET_ENCODER_DATA,{payload}".encode("utf-8"), addr)
+                    except (ValueError, IndexError):
+                        sock.sendto("ERROR,RESET_ENCODER_DATA,BAD_ARGS".encode("utf-8"), addr)
+                    except Exception as e:
+                        sock.sendto(f"ERROR,RESET_ENCODER_DATA,{e}".encode("utf-8", errors="replace"), addr)
 
                 # ------------------------------------------------------------------
                 # NEW: Gripper Commands

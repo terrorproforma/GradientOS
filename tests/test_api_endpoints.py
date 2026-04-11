@@ -117,6 +117,18 @@ def patch_send(monkeypatch):
         "power_transition_blocker_details": [],
         "disarmed_after_reset": True,
     }
+    reset_encoder_data_payload = {
+        **completed_motion_payload,
+        "power_action": "reset_encoder_data",
+        "code": "RESET_ENCODER_DATA_SENT",
+        "message": "Encoder data reset requested. Drives remain disarmed; perform a safe repower and native re-home before trusting absolute multi-turn position.",
+        "safe_for_power_transition": True,
+        "power_transition_blockers": [],
+        "power_transition_blocker_details": [],
+        "disarmed_after_reset": True,
+        "requires_power_cycle": True,
+        "requires_rehome": True,
+    }
     active_program = {
         "name": "alpha",
         "active": True,
@@ -206,6 +218,8 @@ def patch_send(monkeypatch):
         "WAIT_FOR_IDLE,12.5": (True, f"ACK,WAIT_FOR_IDLE,{_payload_token({**completed_motion_payload, 'wait_timeout_s': 12.5, 'waited_for_motion': True, 'wait_timed_out': False})}"),
         "RESET_FAULTS": (True, f"ACK,RESET_FAULTS,{_payload_token({**reset_faults_payload, 'joint': None})}"),
         "RESET_FAULTS,1": (True, f"ACK,RESET_FAULTS,{_payload_token({**reset_faults_payload, 'joint': 1})}"),
+        "RESET_ENCODER_DATA": (True, f"ACK,RESET_ENCODER_DATA,{_payload_token({**reset_encoder_data_payload, 'joint': None})}"),
+        "RESET_ENCODER_DATA,1": (True, f"ACK,RESET_ENCODER_DATA,{_payload_token({**reset_encoder_data_payload, 'joint': 1})}"),
         "ZERO_JOINT,3": (True, "ACK,ZERO_JOINT,3"),
         "NATIVE_HOME_JOINT,3": (True, "ACK,NATIVE_HOME_JOINT,3"),
         "GET_MOTION_STATUS": (True, f"MOTION_STATUS,{_payload_token(accepted_program_motion_payload)}"),
@@ -920,6 +934,30 @@ def test_control_reset_faults_joint(client):
     assert client.command_calls[-1] == ("RESET_FAULTS,1", 5.0, True)
 
 
+def test_control_reset_encoder_data_all(client):
+    resp = client.post("/control/reset-encoder-data")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["detail"].startswith("ACK,RESET_ENCODER_DATA,")
+    assert body["joint"] is None
+    assert body["code"] == "RESET_ENCODER_DATA_SENT"
+    assert body["requires_power_cycle"] is True
+    assert body["requires_rehome"] is True
+    assert client.command_calls[-1] == ("RESET_ENCODER_DATA", 5.0, True)
+
+
+def test_control_reset_encoder_data_joint(client):
+    resp = client.post("/control/reset-encoder-data", json={"joint": 1})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["detail"].startswith("ACK,RESET_ENCODER_DATA,")
+    assert body["joint"] == 1
+    assert body["code"] == "RESET_ENCODER_DATA_SENT"
+    assert body["requires_power_cycle"] is True
+    assert body["requires_rehome"] is True
+    assert client.command_calls[-1] == ("RESET_ENCODER_DATA,1", 5.0, True)
+
+
 def test_control_home(client):
     resp = client.post("/control/home")
     assert resp.status_code == 200
@@ -1067,6 +1105,32 @@ def test_control_joint_jog(client):
     assert expect_response is True
     assert last_command.startswith("APPLY_JOINT_SETPOINT,")
     payload = json.loads(base64.urlsafe_b64decode(last_command.split(",", 1)[1]).decode("utf-8"))
+    assert payload["max_motor_rpm"] == pytest.approx(100.0)
+
+
+def test_control_joint_jog_ignores_wait_for_idle_flag(client):
+    start_len = len(client.command_calls)
+    resp = client.post(
+        "/control/joint-jog",
+        json={"joint": 2, "delta_deg": -1.0, "wait_for_idle": True},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["joint"] == 2
+    assert body["delta_deg"] == pytest.approx(-1.0)
+    assert body["wait_for_idle_requested"] is True
+    assert body["waited_for_idle"] is False
+    assert body["max_motor_rpm"] == pytest.approx(100.0)
+
+    commands = client.command_calls[start_len:]
+    assert len(commands) == 2
+    assert commands[0] == ("GET_JOINT_ANGLES", 1.0, True)
+    assert commands[1][0].startswith("APPLY_JOINT_SETPOINT,")
+    _, timeout_s, expect_response = commands[-1]
+    assert timeout_s == 2.0
+    assert expect_response is True
+    payload = _decode_command_payload(commands[-1][0])
     assert payload["max_motor_rpm"] == pytest.approx(100.0)
 
 

@@ -1921,6 +1921,7 @@ def _open_loop_executor_thread(
     # ----------------------------------------------
     backend = _get_backend()
     use_backend = backend is not None and backend.is_initialized
+    time_step = 1.0 / frequency
     try:
         executor_speed = max(0, int(utils.ENCODER_RESOLUTION))
     except Exception:
@@ -1965,7 +1966,7 @@ def _open_loop_executor_thread(
         return
 
     if use_backend:
-        precomputed_cmds: list[list[tuple]] = [
+        precomputed_cmds = [
             backend.prepare_sync_write_commands(list(q), speed=executor_speed, accel=0)
             for q in joint_path
         ]
@@ -1984,7 +1985,6 @@ def _open_loop_executor_thread(
     _actual_angles_per_joint: list[list[float]] = [[] for _ in range(utils.NUM_LOGICAL_JOINTS)]
     _target_angles_per_joint: list[list[float]] = [[] for _ in range(utils.NUM_LOGICAL_JOINTS)]
 
-    time_step = 1.0 / frequency
     start_time = time.monotonic()
 
     try:

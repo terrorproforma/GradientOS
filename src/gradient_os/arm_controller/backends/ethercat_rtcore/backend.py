@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array
+import json
 import mmap
 import os
 import select
@@ -9,9 +10,11 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from ...actuator_interface import ActuatorBackend
+from ...profiles import registry as drive_profile_registry
 from .runtime import (
     RTCORE_EXEC_STATE_ABORTED,
     RTCORE_EXEC_STATE_COMPLETED,
@@ -62,6 +65,7 @@ _MSG_CMD_AXIS_DISABLE = 0x0103
 _MSG_CMD_FAULT_RESET = 0x0104
 _MSG_CMD_SET_MODE = 0x0106
 _MSG_CMD_NATIVE_HOME = 0x0108
+_MSG_CMD_SERVICE_SDO_WRITE = 0x0109
 _MSG_CMD_TRAJECTORY_BEGIN = 0x0120
 _MSG_CMD_TRAJECTORY_POINT = 0x0121
 _MSG_CMD_TRAJECTORY_COMMIT = 0x0122
@@ -74,9 +78,13 @@ _TRAJ_POINTF_LAST_POINT = 1 << 1
 _JOG_FLAG_ACTIVE = 1 << 0
 _JOG_FLAG_STOP = 1 << 1
 _JOG_FLAG_QUICK_STOP = 1 << 2
+_SERVICE_SDO_VALUE_U16 = 1
 
 _POWER_TRANSITION_WAIT_POLL_INTERVAL_S = 0.01
 _POWER_TRANSITION_DEFAULT_TIMEOUT_S = 1.0
+_NATIVE_HOME_WAIT_POLL_INTERVAL_S = 0.05
+_NATIVE_HOME_WAIT_TIMEOUT_S = 3.0
+_RTCORE_METRICS_PATH = Path("/run/gradient-rt-motion/metrics.json")
 
 _HELLO_STRUCT = struct.Struct("<IHHIIQ4Q")  # 56 bytes
 _WELCOME_STRUCT = struct.Struct("<IHHI II 4x QQ IIII Q 4Q")  # 96 bytes (includes padding after reserved0)
@@ -87,6 +95,7 @@ _MSG_HEADER_STRUCT = struct.Struct("<HHIQQ")  # 24 bytes
 
 _CMD_ARM_STRUCT = struct.Struct("<II")
 _CMD_AXIS_MASK_STRUCT = struct.Struct("<II")
+_CMD_SERVICE_SDO_WRITE_STRUCT = struct.Struct("<I H B B I I")
 _CMD_SET_MODE_STRUCT = struct.Struct("<II")
 _CMD_TRAJECTORY_BEGIN_STRUCT = struct.Struct("<QIIII")
 _TRAJECTORY_POINT_STRUCT = struct.Struct("<QIIQ16d16dII")
@@ -311,11 +320,14 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._axis_di_bits: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_fault_flags: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_brake_state: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._native_home_offset_counts: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._native_home_metrics_mtime_ns = -1
         self._rt_drive_profile_code = 0
         self._rt_drive_profile_id: Optional[str] = None
         self._last_wkc_expected = 0
         self._last_wkc_actual = 0
         self._last_master_state = 0
+        self._last_status_snapshot_monotonic_s = 0.0
         self._execution_status = RTCoreExecutionStatus(
             active_mode=RTCORE_MOTION_MODE_IDLE,
             active_mode_name=rtcore_motion_mode_id_to_name(RTCORE_MOTION_MODE_IDLE) or "idle",
@@ -817,8 +829,16 @@ class EthercatRTCoreBackend(ActuatorBackend):
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         saw_target_trajectory = False
         terminal_state_names = {"idle", "completed", "aborted", "faulted", "underrun"}
+        last_status: Optional[RTCoreExecutionStatus] = None
+
+        def _is_terminal_idle_or_complete(status: RTCoreExecutionStatus) -> bool:
+            state_name = str(getattr(status, "state_name", "idle") or "idle").strip().lower() or "idle"
+            queue_depth = int(getattr(status, "queue_depth", 0) or 0)
+            return bool(status.motion_done and queue_depth == 0 and state_name in terminal_state_names)
+
         while time.monotonic() <= deadline:
             status = self.get_execution_status()
+            last_status = status
             state_name = str(getattr(status, "state_name", "idle") or "idle").strip().lower() or "idle"
             queue_depth = int(getattr(status, "queue_depth", 0) or 0)
             active_command_seq = int(getattr(status, "active_command_seq", 0) or 0)
@@ -838,14 +858,39 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 not saw_target_trajectory
                 and submitted_command_seq is not None
                 and active_command_seq >= int(submitted_command_seq)
-                and status.motion_done
-                and queue_depth == 0
-                and state_name in terminal_state_names
+                and _is_terminal_idle_or_complete(status)
             ):
                 # Very short trajectories can fully execute between polls, leaving no
-                # observable window where active_traj_id == traj_id.
+                # observable window where active_traj_id == traj_id. In live commissioning
+                # it is not safe to treat a bare idle snapshot as completion unless the
+                # commit sequence has actually become visible in RTCore status.
                 return status
             time.sleep(0.01)
+        final_status = self.get_execution_status()
+        if final_status.active_traj_id == int(traj_id) and final_status.state in (
+            RTCORE_EXEC_STATE_COMPLETED,
+            RTCORE_EXEC_STATE_ABORTED,
+            RTCORE_EXEC_STATE_FAULTED,
+            RTCORE_EXEC_STATE_UNDERRUN,
+        ):
+            return final_status
+        if saw_target_trajectory and final_status.motion_done and final_status.last_update_ns > 0:
+            return final_status
+        if (
+            not saw_target_trajectory
+            and submitted_command_seq is not None
+            and int(getattr(final_status, "active_command_seq", 0) or 0) >= int(submitted_command_seq)
+            and _is_terminal_idle_or_complete(final_status)
+        ):
+            return final_status
+        if (
+            last_status is not None
+            and not saw_target_trajectory
+            and submitted_command_seq is not None
+            and int(getattr(last_status, "active_command_seq", 0) or 0) >= int(submitted_command_seq)
+            and _is_terminal_idle_or_complete(last_status)
+        ):
+            return last_status
         raise TimeoutError(f"Timed out waiting for RTCore trajectory {traj_id} to complete")
 
     def reset_faults(self, logical_joint_index: Optional[int] = None) -> bool:
@@ -894,6 +939,80 @@ class EthercatRTCoreBackend(ActuatorBackend):
         )
         return True
 
+    def reset_encoder_data(self, logical_joint_index: Optional[int] = None) -> bool:
+        if not self._connected:
+            print("[EtherCAT RTCore] WARNING: cannot reset encoder data while RTCore is disconnected")
+            return False
+
+        if self._rt_num_axes <= 0:
+            print("[EtherCAT RTCore] WARNING: cannot reset encoder data without any configured axes")
+            return False
+
+        live_profile_id = self.get_live_drive_profile_id()
+        if not live_profile_id and self._rt_drive_profile_code:
+            live_profile_id = rtcore_drive_profile_id_to_name(self._rt_drive_profile_code)
+        operation = drive_profile_registry.get_drive_encoder_data_reset_operation(live_profile_id)
+        if not isinstance(operation, dict):
+            print(
+                "[EtherCAT RTCore] WARNING: active drive profile does not define an encoder-data reset operation:"
+                f" profile={live_profile_id!r}"
+            )
+            return False
+
+        if str(operation.get("type", "")).strip().lower() != "u16":
+            print(
+                "[EtherCAT RTCore] WARNING: unsupported encoder-data reset operation type:"
+                f" {operation.get('type')!r}"
+            )
+            return False
+
+        if logical_joint_index is None:
+            axis_mask = (1 << self._rt_num_axes) - 1
+            label = "all axes"
+        else:
+            joint_i = int(logical_joint_index)
+            if joint_i < 0 or joint_i >= self._num_joints:
+                print(f"[EtherCAT RTCore] WARNING: joint index out of range for encoder reset: {joint_i}")
+                return False
+            axis_mask = 0
+            for axis_i, mapped_joint in enumerate(self._axis_to_joint):
+                if mapped_joint == joint_i:
+                    axis_mask |= (1 << axis_i)
+            if axis_mask == 0:
+                print(
+                    "[EtherCAT RTCore] WARNING: cannot reset encoder data for joint"
+                    f" {joint_i + 1}; no mapped RTCore axes"
+                )
+                return False
+            label = f"joint {joint_i + 1}"
+
+        try:
+            self.prepare_for_power_transition(wait_for_idle=True, timeout_s=_POWER_TRANSITION_DEFAULT_TIMEOUT_S)
+            axis_mask_all = self._all_axis_mask()
+            if axis_mask_all:
+                self._send_cmd_axis_disable(axis_mask=axis_mask_all)
+            self._send_cmd_arm(False)
+            time.sleep(0.05)
+        except Exception as exc:
+            print(f"[EtherCAT RTCore] WARNING: pre-encoder-reset neutralization failed: {exc}")
+
+        self._send_cmd_service_sdo_write(
+            axis_mask=axis_mask,
+            index=int(operation.get("index", 0)),
+            subindex=int(operation.get("subindex", 0)),
+            value_type=_SERVICE_SDO_VALUE_U16,
+            value_u32=int(operation.get("value", 0)),
+        )
+        print(
+            "[EtherCAT RTCore] Encoder data reset requested:"
+            f" target={label} axis_mask=0x{axis_mask:x}"
+            f" profile={live_profile_id!r} parameter={operation.get('parameter')}"
+            f" index=0x{int(operation.get('index', 0)) & 0xFFFF:04x}"
+            f" sub=0x{int(operation.get('subindex', 0)) & 0xFF:02x}"
+            f" value={int(operation.get('value', 0))}"
+        )
+        return True
+
     def native_home_joint(self, logical_joint_index: int) -> bool:
         if not self._connected:
             print("[EtherCAT RTCore] WARNING: cannot drive-home a joint while RTCore is disconnected")
@@ -918,10 +1037,23 @@ class EthercatRTCoreBackend(ActuatorBackend):
             )
             return False
 
+        try:
+            self.prepare_for_power_transition(wait_for_idle=True, timeout_s=_POWER_TRANSITION_DEFAULT_TIMEOUT_S)
+        except Exception as exc:
+            print(f"[EtherCAT RTCore] WARNING: pre-native-home neutralization failed: {exc}")
+            return False
+
         self._send_cmd_native_home(axis_mask=axis_mask)
+        if not self._wait_for_native_home_result(axis_mask, timeout_s=_NATIVE_HOME_WAIT_TIMEOUT_S):
+            print(
+                "[EtherCAT RTCore] WARNING: native drive-home did not reach a verified terminal state:"
+                f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
+            )
+            return False
         print(
             "[EtherCAT RTCore] Native drive-home requested:"
             f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
+            " leaving the homed axis disabled until an explicit safe power-up"
         )
         return True
 
@@ -992,8 +1124,6 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if len(positions_rad) != self._num_joints:
             raise ValueError(f"Expected {self._num_joints} joint positions, got {len(positions_rad)}")
 
-        self._last_joint_setpoint_rad = list(positions_rad)
-
         if not self._connected:
             raise RuntimeError("RTCore not connected (cannot send setpoints)")
 
@@ -1012,6 +1142,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             ],
         )
         self.commit_trajectory(traj_id)
+        self._store_last_joint_setpoint_rad(positions_rad)
 
     def get_joint_positions(self, verbose: bool = False) -> list[float]:
         if self._connected and self._axis_config is None:
@@ -1025,7 +1156,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if verbose:
             state = "connected" if self._connected else "disconnected"
             print(f"[EtherCAT RTCore] get_joint_positions() ({state}) -> last setpoint")
-        return list(self._last_joint_setpoint_rad)
+        return self._copy_last_joint_setpoint_rad()
 
     def prepare_sync_write_commands(
         self,
@@ -1053,7 +1184,6 @@ class EthercatRTCoreBackend(ActuatorBackend):
         positions_rad = commands[0][1]
         if not isinstance(positions_rad, list):
             raise ValueError("Invalid setpoint command format")
-
         self.set_joint_positions(positions_rad, speed=0.0, acceleration=0.0)
 
     def sync_read_positions(self, timeout_s: Optional[float] = None) -> dict[int, int]:
@@ -1064,7 +1194,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         return {i: int(self._axis_counts[i]) for i in range(self._rt_num_axes)}
 
     def raw_to_joint_positions(self, raw_positions: dict[int, int]) -> list[float]:
-        positions = list(self._last_joint_setpoint_rad)
+        positions = self._copy_last_joint_setpoint_rad()
         for axis_i, joint_i in enumerate(self._axis_to_joint):
             raw = raw_positions.get(axis_i)
             if raw is None or not (0 <= joint_i < self._num_joints):
@@ -1072,7 +1202,11 @@ class EthercatRTCoreBackend(ActuatorBackend):
             physical_q = self._axis_q_from_counts(axis_i, int(raw))
             if physical_q is None:
                 continue
-            positions[joint_i] = physical_q - self._master_offset_for_joint(joint_i)
+            positions[joint_i] = (
+                physical_q
+                + self._native_home_offset_q_for_axis(axis_i)
+                - self._master_offset_for_joint(joint_i)
+            )
         return positions
 
     def set_single_actuator_position(
@@ -1104,6 +1238,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             ],
         )
         self.commit_trajectory(traj_id)
+        self._store_last_axis_target_q(actuator_id, float(position_rad))
 
     def read_single_actuator_position(self, actuator_id: int) -> Optional[int]:
         if not self._connected:
@@ -1145,9 +1280,17 @@ class EthercatRTCoreBackend(ActuatorBackend):
             )
             return False
 
-        new_offset = float(sum(physical_samples) / len(physical_samples))
+        native_home_samples = [
+            physical_q + self._native_home_offset_q_for_axis(axis_i)
+            for axis_i, physical_q in zip(
+                [axis_i for axis_i, mapped_joint in enumerate(self._axis_to_joint) if mapped_joint == joint_i],
+                physical_samples,
+                strict=False,
+            )
+        ]
+        new_offset = float(sum(native_home_samples) / len(native_home_samples))
         self._master_offsets_rad[joint_i] = new_offset
-        self._last_joint_setpoint_rad[joint_i] = 0.0
+        self._store_last_joint_index_setpoint(joint_i, 0.0)
         save_joint_zero_offsets(
             self._robot_id,
             self._master_offsets_rad,
@@ -1441,6 +1584,28 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def _send_cmd_native_home(self, axis_mask: int) -> None:
         self._cmd_ring_write(_MSG_CMD_NATIVE_HOME, _CMD_AXIS_MASK_STRUCT.pack(int(axis_mask), 0))
 
+    def _send_cmd_service_sdo_write(
+        self,
+        *,
+        axis_mask: int,
+        index: int,
+        subindex: int,
+        value_type: int,
+        value_u32: int,
+        flags: int = 0,
+    ) -> None:
+        self._cmd_ring_write(
+            _MSG_CMD_SERVICE_SDO_WRITE,
+            _CMD_SERVICE_SDO_WRITE_STRUCT.pack(
+                int(axis_mask),
+                int(index) & 0xFFFF,
+                int(subindex) & 0xFF,
+                int(value_type) & 0xFF,
+                int(value_u32) & 0xFFFFFFFF,
+                int(flags) & 0xFFFFFFFF,
+            ),
+        )
+
     def _send_cmd_jog(
         self,
         *,
@@ -1707,12 +1872,119 @@ class EthercatRTCoreBackend(ActuatorBackend):
             return float(self._master_offsets_rad[logical_joint_idx])
         return 0.0
 
+    def _copy_last_joint_setpoint_rad(self) -> list[float]:
+        with self._status_lock:
+            return [float(value) for value in self._last_joint_setpoint_rad]
+
+    def _store_last_joint_setpoint_rad(self, positions_rad: list[float]) -> None:
+        with self._status_lock:
+            self._last_joint_setpoint_rad = [float(value) for value in positions_rad]
+
+    def _store_last_joint_index_setpoint(self, joint_i: int, position_rad: float) -> None:
+        if joint_i < 0 or joint_i >= self._num_joints:
+            return
+        with self._status_lock:
+            updated = list(self._last_joint_setpoint_rad)
+            updated[joint_i] = float(position_rad)
+            self._last_joint_setpoint_rad = updated
+
+    def _store_last_axis_target_q(self, axis_i: int, target_axis_q: float) -> None:
+        if axis_i < 0 or axis_i >= len(self._axis_to_joint):
+            return
+        joint_i = self._axis_to_joint[axis_i]
+        if joint_i < 0 or joint_i >= self._num_joints:
+            return
+        logical_q = float(target_axis_q) - self._master_offset_for_joint(joint_i)
+        self._store_last_joint_index_setpoint(joint_i, logical_q)
+
+    def _refresh_native_home_offsets_from_metrics(self) -> None:
+        try:
+            stat = _RTCORE_METRICS_PATH.stat()
+        except OSError:
+            return
+        if stat.st_mtime_ns == self._native_home_metrics_mtime_ns:
+            return
+        try:
+            payload = json.loads(_RTCORE_METRICS_PATH.read_text())
+        except Exception:
+            return
+        axes = payload.get("axes")
+        if not isinstance(axes, list):
+            return
+        offsets = [0] * _GRADIENT_MAX_AXES
+        for axis_i, axis in enumerate(axes[:_GRADIENT_MAX_AXES]):
+            if not isinstance(axis, dict):
+                continue
+            try:
+                offsets[axis_i] = int(axis.get("native_home_position_offset", 0))
+            except Exception:
+                offsets[axis_i] = 0
+        with self._status_lock:
+            self._native_home_offset_counts = offsets
+            self._native_home_metrics_mtime_ns = stat.st_mtime_ns
+
+    def _load_rtcore_metrics_axes(self) -> list[dict[str, object]]:
+        try:
+            payload = json.loads(_RTCORE_METRICS_PATH.read_text())
+        except Exception:
+            return []
+        axes = payload.get("axes")
+        if not isinstance(axes, list):
+            return []
+        return [axis for axis in axes if isinstance(axis, dict)]
+
+    def _wait_for_native_home_result(self, axis_mask: int, *, timeout_s: float) -> bool:
+        target_axes = [
+            axis_i
+            for axis_i in range(self._rt_num_axes)
+            if (int(axis_mask) & (1 << axis_i)) != 0
+        ]
+        if not target_axes:
+            return False
+
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while time.monotonic() <= deadline:
+            axes = self._load_rtcore_metrics_axes()
+            if axes:
+                any_failed = False
+                all_succeeded = True
+                for axis_i in target_axes:
+                    if axis_i >= len(axes):
+                        all_succeeded = False
+                        continue
+                    try:
+                        state = int(axes[axis_i].get("native_home_state", 0))
+                    except Exception:
+                        state = 0
+                    if state == 3:
+                        any_failed = True
+                    elif state != 2:
+                        all_succeeded = False
+                if any_failed:
+                    return False
+                if all_succeeded:
+                    return True
+            time.sleep(_NATIVE_HOME_WAIT_POLL_INTERVAL_S)
+        return False
+
+    def _native_home_offset_q_for_axis(self, axis_i: int) -> float:
+        self._refresh_native_home_offsets_from_metrics()
+        with self._status_lock:
+            if axis_i < 0 or axis_i >= len(self._native_home_offset_counts):
+                return 0.0
+            native_home_offset_counts = int(self._native_home_offset_counts[axis_i])
+        native_home_offset_q = self._axis_q_from_counts(axis_i, native_home_offset_counts)
+        return float(native_home_offset_q) if native_home_offset_q is not None else 0.0
+
     def _axis_q_from_joint_positions(self, positions_rad: list[float]) -> list[float]:
         if len(positions_rad) != self._num_joints:
             raise ValueError(f"Expected {self._num_joints} joint positions, got {len(positions_rad)}")
         axis_q: list[float] = [0.0] * self._rt_num_axes
         for axis_i, joint_i in enumerate(self._axis_to_joint):
             if 0 <= joint_i < len(positions_rad):
+                # RTCore target counts already operate in the same logical frame that
+                # native-home/hold-target alignment uses. Subtracting the drive-native
+                # offset again here double-applies 0x60B0 on commanded motion.
                 axis_q[axis_i] = float(positions_rad[joint_i]) + self._master_offset_for_joint(joint_i)
         return axis_q
 
@@ -1827,6 +2099,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     self._last_wkc_expected = int(wkc_expected)
                     self._last_wkc_actual = int(wkc_actual)
                     self._last_master_state = int(master_state)
+                    self._last_status_snapshot_monotonic_s = time.monotonic()
                 for axis_i in range(min(self._rt_num_axes, _GRADIENT_MAX_AXES)):
                     axis_off = 40 + axis_i * 28
                     if axis_off + 28 <= len(payload):

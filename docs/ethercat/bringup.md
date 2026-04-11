@@ -314,13 +314,22 @@ For A6-EC absolute encoder commissioning there are now two distinct operations:
 - `POST /control/zero-joint` keeps the existing GradientOS software-zero workflow by
   storing a logical offset in `.gradient_joint_zero_offsets.json`.
 
+UI policy:
+
+- `Drive Home` remains the normal commissioning action in the frontend.
+- The software `Zero` action is intentionally hidden by default in the commissioning UI
+  to reduce ambiguity with native homing.
+- The software-zero path still exists in GradientOS and can be re-exposed from the UI
+  through the Settings toggle `Show software zero button in commissioning panel`.
+
 Recommended order:
 
 1. Verify axis mapping, sign, and scaling first.
 2. Use `Drive Home` / `/control/home-joint-native` when you want the servo drive's
    own absolute reference updated.
 3. Use `Zero Joint` / `/control/zero-joint` only when you want to redefine the
-   robot's logical work zero without changing the drive's native reference.
+   robot's logical work zero without changing the drive's native reference. In the
+   current UI this is treated as an advanced action and is hidden by default.
 
 Example native-home call:
 
@@ -330,17 +339,48 @@ curl -X POST http://127.0.0.1:8000/control/home-joint-native \
   -d '{"joint": 5}'
 ```
 
-#### A6-EC absolute multi-turn mode verification
+#### A6-EC mode layers and native-home commissioning
 
-The active EtherCAT drive family is now selected through the runtime drive profile,
-not the robot config. Manufacturer-specific RTCore load details such as slave
-identity, PDO defaults, and startup-setting defaults live in the separate
-EtherCAT drive catalog under `src/gradient_os/arm_controller/ethercat_drive_catalog.py`.
+The active EtherCAT drive family is selected through the runtime drive profile,
+not the robot config. Manufacturer-specific startup defaults and labels live in
+`src/gradient_os/arm_controller/ethercat_drive_catalog.py` and
+`src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`.
 
-For the current `a6ec_ds402` profile, RTCore configures each A6-EC axis for the
-battery-backed limited multi-turn absolute encoder mode on startup via `C00.07`
-(`0x2000:08`, mode value `1`). RTCore also reads the value back and publishes
-whether the commanded mode verified successfully.
+The A6-EC manual uses the word "mode" at two different layers. Keep them
+separate when debugging or changing commissioning behavior:
+
+| Layer | Objects / manual section | What it controls | When it applies | GradientOS intent |
+| --- | --- | --- | --- | --- |
+| Absolute-system startup mode | `C00.07 / 0x2000:08`, Chapter 5 | How the drive interprets the absolute encoder and multi-turn position after power-on | Set at stop, takes effect on re-power-on | For Gradient-05 rotary joints with ranges beyond one turn, the working target is `C00.07 = 4` (absolute position rotation mode), not the older `1` assumption |
+| DS402 runtime operating mode | `0x6060 / 0x6061`, Chapter 4 | Which runtime control law the drive executes | While the axis is armed/enabled | Normal RTCore motion should stay in `CSP` (`0x6060 = 8`) |
+| Homing contract | `0x6098`, `0x6099`, `0x609A`, `0x607C`, `0x60E6`, `0x6040`, `0x6041`, Section `4.1.5` | How "home" is established and how feedback is rewritten | Only during a homing transaction | The production native-home path should use `HM` (`0x6060 = 6`) for a commissioning-only transaction, then return to `CSP` |
+| CSP runtime position shift | `0x60B0`, Section `4.1.6` | Live position-offset term in the CSP control flow | During CSP motion | Treat as a runtime motion-frame term, not as the durable hardware-home store |
+
+Validated conclusions so far:
+
+- The manual defines `C00.07 = 4` as `Absolute position rotation mode`, while
+  the current profile/docs still describe `1` as the intended multi-turn rotary
+  mode. That old assumption should be treated as stale until the profile is
+  corrected.
+- Direct power-cycle experiments showed `0x60B0` does not survive real drive
+  power loss on this A6-EC setup, while `0x607C` does.
+- Section `4.1.5` defines HM mode `35` as "the current position is used as the
+  home", which is the closest vendor-native match for GradientOS's "capture the
+  current pose as native home" action.
+
+This implies that GradientOS should treat native home as a specific
+commissioning workflow, not as a normal runtime jog/motion feature:
+
+1. Start the stack disarmed and verify the startup absolute mode through
+   `startup_drive_config`.
+2. Jog a single axis conservatively in normal `CSP` to the desired mechanical
+   home pose.
+3. Run a commissioning-only native-home transaction on that axis:
+   temporarily switch the axis to `HM`, execute the vendor-native home capture
+   sequence, publish refreshed home truth, then switch the axis back to `CSP`.
+4. Re-synchronize command targets to feedback before any later enable or jog.
+5. Verify persistence with a real drive power cycle before trusting the axis for
+   general motion.
 
 To inspect the live startup verification snapshot:
 
@@ -357,11 +397,10 @@ Look for:
 - `startup_drive_config.verified`
 - `manufacturer_error_code` / decoded `manufacturer_fault`
 
-The generic `startup_drive_config` object is now the primary telemetry contract from
-RTCore through the Python controller and UI.
-
-These fields help catch startup-mode mismatches and battery/multi-turn encoder faults
-such as `Er20.8` and `Er20.9` after power-up.
+The generic `startup_drive_config` object remains the primary telemetry contract
+from RTCore through the Python controller and UI. These fields help catch
+startup-mode mismatches and battery/multi-turn encoder faults such as `Er20.8`
+and `Er20.9` after power-up.
 
 #### Encoder retention experiment logging
 

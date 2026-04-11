@@ -17,6 +17,7 @@ type Props = {
 	splitStatusSections?: boolean;
 	showStatusSections?: boolean;
 	showGripperPanel?: boolean;
+	showSoftwareZeroButton?: boolean;
 	controlsCollapsed?: boolean;
 	onToggleControlsCollapsed?: () => void;
 };
@@ -37,6 +38,7 @@ type JointInfoResponse = {
 	arm_rad?: number[];
 	gripper_deg?: number;
 	gripper_rad?: number;
+	read_source?: string;
 };
 
 type MotionExecutionPayload = {
@@ -163,6 +165,11 @@ type DriveFaultAxis = {
 	manufacturer_error_code?: number;
 	manufacturer_error_code_hex?: string;
 	startup_drive_config?: DriveStartupConfig | null;
+	native_home_state?: number;
+	native_home_state_name?: string;
+	native_home_position_offset?: number;
+	native_home_last_abort_code?: number;
+	native_home_last_abort_code_hex?: string;
 	fault?: DriveFaultDetail | null;
 	manufacturer_fault?: DriveFaultDetail | null;
 };
@@ -185,10 +192,17 @@ type DriveFaultSnapshot = {
 	driver_state?: string;
 	ethercat_master_state?: string;
 	rtcore_state?: string;
+	armed?: number;
+	axis_enable_mask?: number;
 	axis_enable_mask_hex?: string;
+	enable_requested?: boolean;
+	requested_axes?: number;
 	op_enabled_axes?: number;
 	num_axes?: number;
 	faulted_axes?: number;
+	statusword_feedback_axes?: number;
+	slave_online_axes?: number;
+	slave_operational_axes?: number;
 	startup_drive_config_configured_axes?: number;
 	startup_drive_config_verified_axes?: number;
 	startup_drive_config_mismatch_axes?: number;
@@ -279,6 +293,38 @@ function formatDriveFaultDescription(axis: DriveFaultAxis): string {
 		}
 	}
 	return parts.join(" | ");
+}
+
+function formatNativeHomeStatus(
+	axis: DriveFaultAxis | undefined,
+	driveFaults: DriveFaultSnapshot | null | undefined,
+): string | null {
+	if (!axis) {
+		return null;
+	}
+	const stateName = (axis.native_home_state_name ?? "").trim().toLowerCase();
+	if (!stateName || stateName === "idle") {
+		return null;
+	}
+	if (stateName === "requested") {
+		return "Drive Home requested...";
+	}
+	if (stateName === "succeeded") {
+		const parts = ["Drive Home succeeded"];
+		if (typeof axis.native_home_position_offset === "number") {
+			parts.push(`offset ${axis.native_home_position_offset} cnt`);
+		}
+		const axisMask = driveFaults?.axis_enable_mask ?? 0;
+		if ((axisMask & (1 << axis.axis)) === 0) {
+			parts.push("axis currently disarmed");
+		}
+		return parts.join(" | ");
+	}
+	if (stateName === "failed") {
+		const abortCode = axis.native_home_last_abort_code_hex ?? "0x00000000";
+		return `Drive Home failed | abort ${abortCode}`;
+	}
+	return `Drive Home ${stateName}`;
 }
 
 function expSliderToMultiplier(v: number): number {
@@ -424,9 +470,25 @@ export function ControlPanelRuntimeHeader({
 			),
 		[driveFaults],
 	);
+	const commissioningDriveAxesByJoint = useMemo(() => {
+		const mapping = new Map<number, DriveFaultAxis>();
+		for (const axis of driveFaults?.axes ?? []) {
+			if (typeof axis.logical_joint === "number" && Number.isFinite(axis.logical_joint)) {
+				mapping.set(axis.logical_joint, axis);
+			}
+		}
+		return mapping;
+	}, [driveFaults]);
 	const driveControlBackend = (driveFaults?.servo_backend ?? activeServoBackend ?? "").trim().toLowerCase();
 	const requiresExplicitDrivePower = driveControlBackend === "ethercat_rtcore";
-	const isDrivePowerActive = (driveFaults?.driver_state ?? "").trim().toUpperCase() === "ACTIVE";
+	const drivePowerRequested = Boolean(
+		driveFaults?.enable_requested
+		?? ((driveFaults?.armed ?? 0) !== 0 || (driveFaults?.axis_enable_mask ?? 0) !== 0),
+	);
+	const totalDriveAxes = driveFaults?.num_axes ?? 0;
+	const actualOpEnabledAxes = driveFaults?.op_enabled_axes ?? 0;
+	const statuswordFeedbackAxes = driveFaults?.statusword_feedback_axes ?? 0;
+	const isDrivePowerActive = actualOpEnabledAxes > 0 || (driveFaults?.driver_state ?? "").trim().toUpperCase() === "ACTIVE";
 	const motionStateName = (motionStatus?.state ?? motionStatus?.execution?.state_name ?? "idle").trim().toLowerCase();
 	const motionBusy = motionStateName === "accepted" || motionStateName === "queued" || motionStateName === "executing";
 	const powerTransitionStatus = motionStatus as (MotionStatusResponse & PowerTransitionStatusView) | null;
@@ -586,6 +648,8 @@ export function ControlPanelRuntimeHeader({
 				? "DISARM"
 				: isDrivePowerActive
 					? "ARMED"
+					: drivePowerRequested
+						? "REQUESTED"
 					: "DISARM";
 	const motionStatusLabel = motionStateName === "faulted" || motionStateName === "aborted" || motionStateName === "underrun"
 		? "FAULT"
@@ -600,7 +664,7 @@ export function ControlPanelRuntimeHeader({
 	const driveStatusTitle = requiresExplicitDrivePower
 		? (
 			driveFaults
-				? `Drive power ${isDrivePowerActive ? "armed" : "disarmed"}. Backend ${driveFaults.servo_backend ?? "unknown"} | driver ${driveFaults.driver_state ?? "unknown"} | EtherCAT ${driveFaults.ethercat_master_state ?? "unknown"} | RTCore ${driveFaults.rtcore_state ?? "unknown"} | op-enabled ${driveFaults.op_enabled_axes ?? 0}/${driveFaults.num_axes ?? 0}`
+				? `Drive power actual ${driveFaults.driver_state ?? "unknown"}. Backend ${driveFaults.servo_backend ?? "unknown"} | request ${drivePowerRequested ? "enable" : "none"} | EtherCAT ${driveFaults.ethercat_master_state ?? "unknown"} | RTCore ${driveFaults.rtcore_state ?? "unknown"} | op-enabled ${actualOpEnabledAxes}/${totalDriveAxes} | statusword feedback ${statuswordFeedbackAxes}/${totalDriveAxes}`
 				: "Waiting for RTCore drive-state telemetry."
 		)
 		: "Drive power controls are only required for the EtherCAT RTCore backend.";
@@ -667,22 +731,28 @@ export function ControlPanelRuntimeHeader({
 						onClick={() => {
 							void handlePowerUpDrives();
 						}}
-						disabled={pendingPowerAction !== null || isDrivePowerActive || powerUpBlocked}
-						title={powerUpBlocked ? powerUpBlockerMessage : "Explicitly arm and enable RTCore-controlled axes"}
+						disabled={pendingPowerAction !== null || isDrivePowerActive || drivePowerRequested || powerUpBlocked}
+						title={
+							drivePowerRequested && !isDrivePowerActive
+								? "Enable already requested; waiting for actual drive feedback."
+								: powerUpBlocked
+									? powerUpBlockerMessage
+									: "Explicitly power up and enable RTCore-controlled axes"
+						}
 						className="shrink-0 h-full border border-cyan-500/40 bg-cyan-400/10 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-300/15 disabled:cursor-not-allowed disabled:opacity-50"
 					>
-						{pendingPowerAction === "power-up" ? "Arming..." : "Arm"}
+						{pendingPowerAction === "power-up" ? "Powering..." : "Power Up"}
 					</button>
 					<button
 						type="button"
 						onClick={() => {
 							void handlePowerDownDrives();
 						}}
-						disabled={pendingPowerAction !== null || !isDrivePowerActive}
-						title="Explicitly disable and disarm RTCore-controlled axes"
+						disabled={pendingPowerAction !== null || (!isDrivePowerActive && !drivePowerRequested)}
+						title="Explicitly power down and disarm RTCore-controlled axes"
 						className="shrink-0 h-full border border-rose-500/40 bg-rose-400/10 px-3 text-[10px] font-semibold uppercase tracking-[0.16em] text-rose-100 transition hover:border-rose-300/60 hover:bg-rose-300/15 disabled:cursor-not-allowed disabled:opacity-50"
 					>
-						{pendingPowerAction === "power-down" ? "Disarming..." : "Disarm"}
+						{pendingPowerAction === "power-down" ? "Powering Down..." : "Power Down"}
 					</button>
 					<button
 						type="button"
@@ -712,6 +782,7 @@ export function ControlPanel({
 	splitStatusSections = false,
 	showStatusSections = true,
 	showGripperPanel = true,
+	showSoftwareZeroButton = false,
 	controlsCollapsed = false,
 	onToggleControlsCollapsed,
 }: Props) {
@@ -749,9 +820,25 @@ export function ControlPanel({
 			),
 		[driveFaults],
 	);
+	const commissioningDriveAxesByJoint = useMemo(() => {
+		const mapping = new Map<number, DriveFaultAxis>();
+		for (const axis of driveFaults?.axes ?? []) {
+			if (typeof axis.logical_joint === "number" && Number.isFinite(axis.logical_joint)) {
+				mapping.set(axis.logical_joint, axis);
+			}
+		}
+		return mapping;
+	}, [driveFaults]);
 	const driveControlBackend = (driveFaults?.servo_backend ?? activeServoBackend ?? "").trim().toLowerCase();
 	const requiresExplicitDrivePower = driveControlBackend === "ethercat_rtcore";
-	const isDrivePowerActive = (driveFaults?.driver_state ?? "").trim().toUpperCase() === "ACTIVE";
+	const drivePowerRequested = Boolean(
+		driveFaults?.enable_requested
+		?? ((driveFaults?.armed ?? 0) !== 0 || (driveFaults?.axis_enable_mask ?? 0) !== 0),
+	);
+	const totalDriveAxes = driveFaults?.num_axes ?? 0;
+	const actualOpEnabledAxes = driveFaults?.op_enabled_axes ?? 0;
+	const statuswordFeedbackAxes = driveFaults?.statusword_feedback_axes ?? 0;
+	const isDrivePowerActive = actualOpEnabledAxes > 0 || (driveFaults?.driver_state ?? "").trim().toUpperCase() === "ACTIVE";
 	const drivePowerReady = !requiresExplicitDrivePower || isDrivePowerActive;
 	const motionStateName = (motionStatus?.state ?? motionStatus?.execution?.state_name ?? "idle").trim().toLowerCase();
 	const motionTrajectoryId = typeof motionStatus?.trajectory_id === "number" && motionStatus.trajectory_id > 0
@@ -877,11 +964,27 @@ export function ControlPanel({
 	}, [post]);
 
 	const refreshJointAngles = useCallback(async (silent = true) => {
-		const payload = await getJson<JointInfoResponse>("/info/joints", silent);
+		const payload = await getJson<JointInfoResponse>("/info/joints-detailed", silent);
 		if (!payload || !Array.isArray(payload.arm_deg)) {
+			setJointAnglesDeg([]);
+			try {
+				onJointFeedback?.([], undefined);
+			} catch {
+				// Ignore visualizer sync errors so commissioning feedback stays usable.
+			}
 			if (!silent) {
 				setJointFeedbackError("Joint feedback unavailable.");
 			}
+			return false;
+		}
+		if (String(payload.read_source ?? "live_feedback").trim().toLowerCase() !== "live_feedback") {
+			setJointAnglesDeg([]);
+			try {
+				onJointFeedback?.([], undefined);
+			} catch {
+				// Ignore visualizer sync errors so commissioning feedback stays usable.
+			}
+			setJointFeedbackError("Live joint feedback unavailable; controller only has cached joint state.");
 			return false;
 		}
 		const nextAngles = payload.arm_deg.map((value) => Number(value));
@@ -897,6 +1000,31 @@ export function ControlPanel({
 		setJointFeedbackError(null);
 		return true;
 	}, [getJson, onJointFeedback]);
+
+	const waitForLiveJointFeedback = useCallback(async (
+		initialDelayMs = 150,
+		attempts = 6,
+		intervalMs = 150,
+	) => {
+		const sleep = (delayMs: number) => new Promise<void>((resolve) => {
+			window.setTimeout(resolve, delayMs);
+		});
+		const totalAttempts = Math.max(1, attempts);
+		if (initialDelayMs > 0) {
+			await sleep(initialDelayMs);
+		}
+		for (let attempt = 0; attempt < totalAttempts; attempt += 1) {
+			const silent = attempt + 1 < totalAttempts;
+			const ok = await refreshJointAngles(silent);
+			if (ok) {
+				return true;
+			}
+			if (attempt + 1 < totalAttempts && intervalMs > 0) {
+				await sleep(intervalMs);
+			}
+		}
+		return false;
+	}, [refreshJointAngles]);
 
 	useEffect(() => {
 		if (!isMonitorFresh || !Array.isArray(latestTelemetry?.joints) || latestTelemetry.joints.length === 0) {
@@ -1512,7 +1640,7 @@ export function ControlPanel({
 			? `${jointAnglesDeg[jointIndex].toFixed(2)} deg`
 			: "current feedback";
 		const confirmed = window.confirm(
-			`Capture J${jointNumber} at ${angleLabel} as the drive-native home position? This updates the drive's own offset, not the software logical zero.`,
+			`Capture J${jointNumber} at ${angleLabel} as the drive-native home position? This updates the drive's own offset, leaves only that homed axis disabled afterward, and may require an explicit Power Up before you move it again.`,
 		);
 		if (!confirmed) {
 			return;
@@ -1528,16 +1656,16 @@ export function ControlPanel({
 			}
 			const result = await post("/control/home-joint-native", { joint: jointNumber });
 			if (result) {
-				const refreshed = await refreshJointAngles(false);
+				const refreshed = await waitForLiveJointFeedback();
 				setCommissioningStatus(
 					refreshed
 						? {
 							tone: "success",
-							message: `Requested drive-native home for J${jointNumber}. Live feedback refreshed; use Zero separately if you also want a software logical offset.`,
+							message: `Drive-native home requested for J${jointNumber}. Live feedback refreshed from the new encoder reference. The homed axis remains disabled until you explicitly power it back up.`,
 						}
 						: {
 							tone: "error",
-							message: `Requested drive-native home for J${jointNumber}, but live feedback refresh did not succeed.`,
+							message: `Drive-native home requested for J${jointNumber}, but the post-home live feedback did not refresh yet. Keep that axis disabled and confirm the pose before powering it back up.`,
 						},
 				);
 			} else {
@@ -1549,7 +1677,7 @@ export function ControlPanel({
 		} finally {
 			setPendingJointAction(null);
 		}
-	}, [pendingJointAction, jointAnglesDeg, jogEnabled, stopJog, post, refreshJointAngles]);
+	}, [pendingJointAction, jointAnglesDeg, jogEnabled, stopJog, post, waitForLiveJointFeedback]);
 
 	const handleRefreshJointFeedback = useCallback(async () => {
 		setCommissioningStatus({
@@ -1859,7 +1987,7 @@ export function ControlPanel({
 			</div>
 			<div className="mb-3 text-[10px] text-slate-400">
 				{driveFaults
-					? `Backend ${driveFaults.servo_backend ?? "unknown"} | driver ${driveFaults.driver_state ?? "unknown"} | EtherCAT ${driveFaults.ethercat_master_state ?? "unknown"} | RTCore ${driveFaults.rtcore_state ?? "unknown"} | enable mask ${driveFaults.axis_enable_mask_hex ?? "unknown"} | op-enabled ${driveFaults.op_enabled_axes ?? 0}/${driveFaults.num_axes ?? 0}`
+					? `Backend ${driveFaults.servo_backend ?? "unknown"} | driver ${driveFaults.driver_state ?? "unknown"} | request ${drivePowerRequested ? "enable" : "none"} | EtherCAT ${driveFaults.ethercat_master_state ?? "unknown"} | RTCore ${driveFaults.rtcore_state ?? "unknown"} | enable mask ${driveFaults.axis_enable_mask_hex ?? "unknown"} | op-enabled ${actualOpEnabledAxes}/${totalDriveAxes} | statusword feedback ${statuswordFeedbackAxes}/${totalDriveAxes}`
 					: requiresExplicitDrivePower
 						? "Waiting for live drive-state telemetry..."
 						: "No RTCore drive state available for this backend."}
@@ -1875,8 +2003,14 @@ export function ControlPanel({
 					onClick={() => {
 						void handlePowerUpDrives();
 					}}
-					disabled={pendingJointAction !== null || !requiresExplicitDrivePower || isDrivePowerActive || powerUpBlocked}
-					title={powerUpBlocked ? powerUpBlockerMessage : "Explicitly arm and enable RTCore-controlled axes"}
+					disabled={pendingJointAction !== null || !requiresExplicitDrivePower || isDrivePowerActive || drivePowerRequested || powerUpBlocked}
+					title={
+						drivePowerRequested && !isDrivePowerActive
+							? "Enable already requested; waiting for actual drive feedback."
+							: powerUpBlocked
+								? powerUpBlockerMessage
+								: "Explicitly arm and enable RTCore-controlled axes"
+					}
 				>
 					{pendingJointAction === "power-up" ? "..." : "Power Up Drives"}
 				</button>
@@ -1886,7 +2020,7 @@ export function ControlPanel({
 					onClick={() => {
 						void handlePowerDownDrives();
 					}}
-					disabled={pendingJointAction !== null || !requiresExplicitDrivePower || !isDrivePowerActive}
+					disabled={pendingJointAction !== null || !requiresExplicitDrivePower || (!isDrivePowerActive && !drivePowerRequested)}
 					title="Explicitly disable and disarm RTCore-controlled axes"
 				>
 					{pendingJointAction === "power-down" ? "..." : "Power Down Drives"}
@@ -2104,7 +2238,7 @@ export function ControlPanel({
 							className={`rounded px-2 py-1 ${jogEnabled ? "bg-rose-600 text-white" : "bg-slate-800 hover:bg-slate-700"}`}
 							onClick={async () => (jogEnabled ? await stopJog() : armJogMode())}
 						>
-							{jogEnabled ? "Disarm" : "Arm"}
+							{jogEnabled ? "Disarm Jog" : "Arm Jog"}
 						</button>
 					</div>
 				</div>
@@ -2148,7 +2282,7 @@ export function ControlPanel({
 						roll={lastJogCommand[3].toFixed(3)} pitch={lastJogCommand[4].toFixed(3)} yaw={lastJogCommand[5].toFixed(3)}
 					</div>
 					<div className="mt-1 text-[10px] text-slate-500">
-						Arm mode enables hold-to-jog. The controller session only exists while a jog button is actively held.
+						Jog mode enables hold-to-jog. The controller session only exists while a jog button is actively held.
 					</div>
 				</div>
 				<div className="grid grid-cols-3 gap-1">
@@ -2549,6 +2683,8 @@ export function ControlPanel({
 								const jointNumber = jointIndex + 1;
 								const angleDeg = jointAnglesDeg[jointIndex];
 								const angleLabel = Number.isFinite(angleDeg) ? `${angleDeg.toFixed(2)}°` : "--";
+								const driveAxis = commissioningDriveAxesByJoint.get(jointNumber);
+								const nativeHomeStatus = formatNativeHomeStatus(driveAxis, driveFaults);
 								const isPending = pendingJointAction === `jog-${jointIndex}`
 									|| pendingJointAction === `zero-${jointIndex}`
 									|| pendingJointAction === `native-home-${jointIndex}`;
@@ -2566,6 +2702,11 @@ export function ControlPanel({
 												J{jointNumber}
 											</div>
 											<div className="tabular-nums text-sm font-semibold text-cyan-100">{angleLabel}</div>
+											{nativeHomeStatus ? (
+												<div className="mt-0.5 max-w-[12rem] text-[10px] leading-snug text-amber-200/90">
+													{nativeHomeStatus}
+												</div>
+											) : null}
 										</div>
 										<div className="ml-auto grid grid-cols-3 gap-1">
 											<button
@@ -2602,21 +2743,23 @@ export function ControlPanel({
 											>
 												+{jointStepLabel}°
 											</button>
-											<button
-												type="button"
-												className="rounded border border-amber-500/40 bg-amber-400/10 px-2 py-1 text-xs font-semibold text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
-												onClick={() => {
-													void handleJointZero(jointIndex);
-												}}
-												disabled={zeroDisabled}
-												title={
-													hasLiveFeedback
-														? `Capture current J${jointNumber} position as logical zero`
-														: `Live joint feedback is required before zero capture on J${jointNumber}`
-												}
-											>
-												{isPending && pendingJointAction === `zero-${jointIndex}` ? "..." : "Zero"}
-											</button>
+											{showSoftwareZeroButton ? (
+												<button
+													type="button"
+													className="rounded border border-amber-500/40 bg-amber-400/10 px-2 py-1 text-xs font-semibold text-amber-100 transition hover:border-amber-300/60 hover:bg-amber-300/15 disabled:cursor-not-allowed disabled:opacity-50"
+													onClick={() => {
+														void handleJointZero(jointIndex);
+													}}
+													disabled={zeroDisabled}
+													title={
+														hasLiveFeedback
+															? `Capture current J${jointNumber} position as logical zero`
+															: `Live joint feedback is required before zero capture on J${jointNumber}`
+													}
+												>
+													{isPending && pendingJointAction === `zero-${jointIndex}` ? "..." : "Zero"}
+												</button>
+											) : null}
 											<button
 												type="button"
 												className="rounded border border-cyan-500/40 bg-cyan-400/10 px-2 py-1 text-xs font-semibold text-cyan-100 transition hover:border-cyan-300/60 hover:bg-cyan-300/15 disabled:cursor-not-allowed disabled:opacity-50"

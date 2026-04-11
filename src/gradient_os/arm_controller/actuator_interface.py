@@ -536,6 +536,23 @@ class ActuatorBackend(ABC):
         """
         return False  # Default: not supported
 
+    def reset_encoder_data(self, logical_joint_index: Optional[int] = None) -> bool:
+        """
+        Best-effort reset of drive-side encoder data for the selected joint/axis group.
+
+        This is intended for recovery workflows such as absolute-encoder battery or
+        multi-turn reset procedures where the drive manual requires writing a service
+        parameter and then performing a repower/re-home sequence.
+
+        Args:
+            logical_joint_index: Optional 0-based logical joint index to target.
+                If omitted, reset encoder data for all supported joints/axes.
+
+        Returns:
+            bool: True if an encoder-reset request was sent successfully.
+        """
+        return False  # Default: not supported
+
 
 # =============================================================================
 # SimulationBackend - Now located in backends/simulation/backend.py

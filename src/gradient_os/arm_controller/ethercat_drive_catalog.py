@@ -28,7 +28,6 @@ ETHERCAT_DRIVE_CATALOG: dict[str, dict[str, Any]] = {
             ],
             "tx_pdo_layout": [
                 {"semantic": "err", "index": 0x603F, "subindex": 0x00, "bits": 16},
-                {"semantic": "manufacturer_err", "index": 0x203F, "subindex": 0x00, "bits": 32},
                 {"semantic": "sw", "index": 0x6041, "subindex": 0x00, "bits": 16},
                 {"semantic": "pos", "index": 0x6064, "subindex": 0x00, "bits": 32},
                 {"semantic": "torque", "index": 0x6077, "subindex": 0x00, "bits": 16},

@@ -1605,6 +1605,24 @@ def create_app() -> FastAPI:
         )
         return {"status": "ok", "detail": detail, "joint": joint, **structured}
 
+    @api.post("/control/reset-encoder-data", summary="Request drive-side encoder data reset")
+    async def control_reset_encoder_data(payload: dict[str, Any] | None = None):
+        joint: int | None = None
+        if isinstance(payload, dict) and payload.get("joint", payload.get("joint_num")) is not None:
+            raw_joint = payload.get("joint", payload.get("joint_num"))
+            try:
+                joint = int(raw_joint)
+            except Exception:
+                raise HTTPException(status_code=400, detail="joint must be an integer")
+            if joint <= 0:
+                raise HTTPException(status_code=400, detail="joint must be >= 1")
+
+        command = f"RESET_ENCODER_DATA,{joint}" if joint is not None else "RESET_ENCODER_DATA"
+        detail, structured = await run_in_threadpool(
+            _controller_structured_call, command, "RESET_ENCODER_DATA", timeout=5.0
+        )
+        return {"status": "ok", "detail": detail, "joint": joint, **structured}
+
     @api.post("/control/home", summary="Move all joints to zero position")
     async def control_home():
         detail = await run_in_threadpool(

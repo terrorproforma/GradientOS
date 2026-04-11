@@ -62,7 +62,7 @@ def test_render_rtcore_systemd_env_contains_scaling_and_profile():
     assert 'GRADIENT_RT_DRIVE_RX_PDO="0x1702"' in rendered
     assert 'GRADIENT_RT_DRIVE_TX_PDO="0x1B02"' in rendered
     assert 'GRADIENT_RT_DRIVE_RX_PDO_LAYOUT="cw|0x6040|0x00|16;target_pos|0x607A|0x00|32;' in rendered
-    assert 'GRADIENT_RT_DRIVE_TX_PDO_LAYOUT="err|0x603F|0x00|16;manufacturer_err|0x203F|0x00|32;' in rendered
+    assert 'GRADIENT_RT_DRIVE_TX_PDO_LAYOUT="err|0x603F|0x00|16;sw|0x6041|0x00|16;pos|0x6064|0x00|32;' in rendered
     assert f'GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG="{expected_startup_sdo}"' in rendered
 
 

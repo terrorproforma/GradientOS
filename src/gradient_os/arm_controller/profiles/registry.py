@@ -105,6 +105,15 @@ def extract_drive_startup_config_axis(
     return None
 
 
+def get_drive_encoder_data_reset_operation(profile_id: str | None) -> dict[str, Any] | None:
+    module = get_drive_profile(profile_id)
+    getter = getattr(module, "get_encoder_data_reset_operation", None) if module is not None else None
+    if callable(getter):
+        payload = getter()
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
 def decode_fieldbus_state(profile_id: str | None, value: int) -> dict[str, Any] | None:
     module = get_fieldbus_profile(profile_id)
     decoder = getattr(module, "decode_al_state", None) if module is not None else None

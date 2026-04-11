@@ -19,6 +19,17 @@ def axis_snapshot_is_faulted(axis: Mapping[str, object]) -> bool:
     return error_code != 0 or ds402_state in {"Fault", "FaultReactionActive"}
 
 
+def native_home_state_name(value: object) -> str:
+    state = coerce_int(value, 0)
+    labels = {
+        0: "idle",
+        1: "requested",
+        2: "succeeded",
+        3: "failed",
+    }
+    return labels.get(state, f"unknown:{state}")
+
+
 def build_startup_fault_reset_plan(probe: Mapping[str, object]) -> dict[str, Any]:
     physical_state = str(probe.get("physical_state", "")).strip().upper() or "UNKNOWN"
     driver_state = str(probe.get("driver_state", "")).strip().upper() or "UNKNOWN"
@@ -136,6 +147,12 @@ def build_drive_fault_snapshot(
     wkc_actual = coerce_int(metrics.get("wkc_actual"), 0)
     wkc_expected = coerce_int(metrics.get("wkc_expected"), 0)
     master_al = coerce_int(metrics.get("master_al_states"), 0)
+    enable_requested = armed != 0 or enable_mask != 0
+    requested_axes = (
+        (enable_mask & ((1 << num_axes) - 1)).bit_count()
+        if num_axes > 0
+        else 0
+    )
     configured_profile = configured_drive_profile if configured_drive_profile is not None else drive_profile
     effective_drive_profile = live_drive_profile or drive_profile or configured_profile
     drive_profile_source = "live_rtcore" if live_drive_profile else "configured_fallback"
@@ -162,6 +179,9 @@ def build_drive_fault_snapshot(
     axes_payload: list[dict[str, object]] = []
     op_enabled_axes = 0
     faulted_axes = 0
+    statusword_feedback_axes = 0
+    slave_online_axes = 0
+    slave_operational_axes = 0
     startup_drive_config_configured_axes = 0
     startup_drive_config_verified_axes = 0
     startup_drive_config_mismatch_axes = 0
@@ -172,6 +192,8 @@ def build_drive_fault_snapshot(
         statusword = coerce_int(axis.get("statusword"), 0)
         error_code = coerce_int(axis.get("error_code"), 0)
         manufacturer_error_code = coerce_int(axis.get("manufacturer_error_code"), 0)
+        if statusword != 0:
+            statusword_feedback_axes += 1
         drive_state = backend_registry.decode_drive_statusword_for_backend(
             servo_backend,
             statusword,
@@ -193,6 +215,12 @@ def build_drive_fault_snapshot(
                 logical_joint = None
 
         slave_al_state = coerce_int(axis.get("slave_al_state"), 0)
+        slave_online = bool(coerce_int(axis.get("slave_online"), 0))
+        slave_operational = bool(coerce_int(axis.get("slave_operational"), 0))
+        if slave_online:
+            slave_online_axes += 1
+        if slave_operational:
+            slave_operational_axes += 1
         startup_drive_config = backend_registry.extract_drive_startup_config_axis_for_backend(
             servo_backend,
             dict(axis),
@@ -223,8 +251,8 @@ def build_drive_fault_snapshot(
                 "manufacturer_error_code": manufacturer_error_code,
                 "manufacturer_error_code_hex": f"0x{manufacturer_error_code & 0xFFFFFFFF:08x}",
                 "startup_drive_config": startup_drive_config,
-                "slave_online": bool(coerce_int(axis.get("slave_online"), 0)),
-                "slave_operational": bool(coerce_int(axis.get("slave_operational"), 0)),
+                "slave_online": slave_online,
+                "slave_operational": slave_operational,
                 "slave_al_state": slave_al_state,
                 "slave_al_state_name": (
                     str(slave_al_detail.get("name", "UNKNOWN"))
@@ -232,6 +260,13 @@ def build_drive_fault_snapshot(
                     else "UNKNOWN"
                 ),
                 "pos_counts": coerce_int(axis.get("pos_counts"), 0),
+                "native_home_state": coerce_int(axis.get("native_home_state"), 0),
+                "native_home_state_name": native_home_state_name(axis.get("native_home_state")),
+                "native_home_position_offset": coerce_int(axis.get("native_home_position_offset"), 0),
+                "native_home_last_abort_code": coerce_int(axis.get("native_home_last_abort_code"), 0),
+                "native_home_last_abort_code_hex": (
+                    f"0x{coerce_int(axis.get('native_home_last_abort_code'), 0) & 0xFFFFFFFF:08x}"
+                ),
                 "fault": backend_registry.describe_drive_fault_code_for_backend(
                     servo_backend,
                     error_code,
@@ -247,14 +282,16 @@ def build_drive_fault_snapshot(
 
     if faulted_axes > 0:
         physical_state = "FAULTED"
-    elif armed or enable_mask != 0 or op_enabled_axes > 0:
+    elif op_enabled_axes > 0:
         physical_state = "ACTIVE"
     elif link_up and responding > 0:
         physical_state = "BUS_UP_DISARMED"
     else:
         physical_state = "INACTIVE"
 
-    if armed or enable_mask != 0:
+    if faulted_axes > 0:
+        driver_state = "FAULTED"
+    elif op_enabled_axes > 0:
         driver_state = "ACTIVE"
     elif link_up and responding > 0:
         driver_state = "DISARMED"
@@ -299,9 +336,14 @@ def build_drive_fault_snapshot(
         "armed": armed,
         "axis_enable_mask": enable_mask,
         "axis_enable_mask_hex": f"0x{enable_mask:x}",
+        "enable_requested": enable_requested,
+        "requested_axes": requested_axes,
         "op_enabled_axes": op_enabled_axes,
         "num_axes": num_axes,
         "faulted_axes": faulted_axes,
+        "statusword_feedback_axes": statusword_feedback_axes,
+        "slave_online_axes": slave_online_axes,
+        "slave_operational_axes": slave_operational_axes,
         "link_up": link_up,
         "responding": responding,
         "online": online,

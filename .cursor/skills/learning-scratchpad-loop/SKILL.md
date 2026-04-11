@@ -106,4 +106,24 @@ During consolidation, compress older entries into a short "Retained Lessons" sec
 - critical failure patterns
 - proven checks that prevent regressions
 
+Do not delete older scratchpad history just to make the live file smaller.
+
+When the scratchpad needs a fresh slate, use archive-first rollover:
+
+1. Determine the active date range covered by the current live scratchpad.
+2. Rename `.cursor/memory/AGENT_SCRATCHPAD.md` to a dated snapshot such as:
+   - `.cursor/memory/AGENT_SCRATCHPAD_YYYY-MM-DD_to_YYYY-MM-DD.md`
+3. Prepend a short `Archived Scratchpad Summary` at the top of the renamed snapshot that states:
+   - the active date window
+   - the major workstreams covered
+   - the most important lessons preserved there
+4. Create a new slim `.cursor/memory/AGENT_SCRATCHPAD.md` that carries forward only:
+   - durable user preferences
+   - recurring regression-prevention guardrails
+   - active unresolved risks/workstreams
+   - a short pointer to the dated snapshot and any older archive file
+5. Leave prior archive files intact unless the user explicitly asks for a deeper archive refactor.
+
+If the user asks for a "fresh slate," interpret that as "roll over and preserve history," not "delete old memory."
+
 Use `references/scratchpad-template.md` as the canonical section layout.

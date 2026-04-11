@@ -3284,6 +3284,19 @@ def handle_apply_joint_setpoint(
             arm_angles_rad,
             max_motor_rpm=float(max_motor_rpm),
         )
+        try:
+            current_deg = np.round(np.rad2deg(current_q[: len(arm_angles_rad)]), 3).tolist()
+            target_deg = np.round(np.rad2deg(arm_angles_rad), 3).tolist()
+            print(
+                "[Controller] APPLY_JOINT_SETPOINT bounded move:"
+                f" current_deg={current_deg}"
+                f" target_deg={target_deg}"
+                f" max_motor_rpm={float(max_motor_rpm):.1f}"
+                f" duration_s={float(duration_s):.3f}"
+                f" points={len(joint_path)}"
+            )
+        except Exception:
+            pass
 
         executor_thread = threading.Thread(
             target=trajectory_execution._open_loop_executor_thread,
@@ -3583,6 +3596,73 @@ def handle_reset_faults(logical_joint_index: int | None = None) -> dict[str, obj
         extra={
             "joint": None if logical_joint_index is None else logical_joint_index + 1,
             "disarmed_after_reset": True,
+        },
+    )
+
+
+def handle_reset_encoder_data(logical_joint_index: int | None = None) -> dict[str, object]:
+    print(
+        "[Controller] Received RESET_ENCODER_DATA command."
+        + (f" target_joint={logical_joint_index + 1}" if logical_joint_index is not None else "")
+    )
+    try:
+        backend = backend_registry.get_active_backend()
+    except Exception as exc:
+        msg = f"No active backend: {exc}"
+        print(f"[Controller] WARNING: {msg}")
+        return _power_transition_result(
+            action="reset_encoder_data",
+            accepted=False,
+            code="RESET_ENCODER_DATA_UNAVAILABLE",
+            message=msg,
+            extra={"joint": None if logical_joint_index is None else logical_joint_index + 1},
+        )
+
+    try:
+        handle_stop_command()
+    except Exception as exc:
+        print(f"[Controller] WARNING: STOP during encoder-data reset failed: {exc}")
+
+    try:
+        handle_wait_for_idle(timeout_s=_POWER_TRANSITION_DEFAULT_TIMEOUT_S)
+    except Exception as exc:
+        print(f"[Controller] WARNING: WAIT_FOR_IDLE during encoder-data reset failed: {exc}")
+
+    try:
+        handled = bool(backend.reset_encoder_data(logical_joint_index=logical_joint_index))
+    except Exception as exc:
+        msg = f"Encoder data reset failed: {exc}"
+        print(f"[Controller] WARNING: {msg}")
+        return _power_transition_result(
+            action="reset_encoder_data",
+            accepted=False,
+            code="RESET_ENCODER_DATA_FAILED",
+            message=msg,
+            extra={"joint": None if logical_joint_index is None else logical_joint_index + 1},
+        )
+
+    if not handled:
+        return _power_transition_result(
+            action="reset_encoder_data",
+            accepted=False,
+            code="RESET_ENCODER_DATA_FAILED",
+            message="Active backend rejected the encoder-data reset request.",
+            extra={"joint": None if logical_joint_index is None else logical_joint_index + 1},
+        )
+
+    return _power_transition_result(
+        action="reset_encoder_data",
+        accepted=True,
+        code="RESET_ENCODER_DATA_SENT",
+        message=(
+            "Encoder data reset requested. Drives remain disarmed; perform a safe repower and "
+            "native re-home before trusting absolute multi-turn position."
+        ),
+        extra={
+            "joint": None if logical_joint_index is None else logical_joint_index + 1,
+            "disarmed_after_reset": True,
+            "requires_power_cycle": True,
+            "requires_rehome": True,
         },
     )
 

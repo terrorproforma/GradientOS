@@ -110,4 +110,5 @@ def save_joint_zero_offsets(
         json.dump(store, handle, indent=2)
         handle.write("\n")
     os.replace(temp_path, path)
+    
     return robots[robot_key]

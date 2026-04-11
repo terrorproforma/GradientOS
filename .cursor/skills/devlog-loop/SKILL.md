@@ -34,3 +34,24 @@ Keep entries concise and factual. Prefer bullet points.
 ## Template
 
 Use `references/devlog-entry-template.md` for consistent structure.
+
+## Maintenance
+
+Keep `.cursor/memory/DEVLOG.md` concise enough that recent engineering state is easy to scan.
+
+When the devlog grows large or the user wants a fresh active log, do not delete old entries. Use archive-first rollover:
+
+1. Determine the active date range covered by the current live devlog.
+2. Rename `.cursor/memory/DEVLOG.md` to a dated snapshot such as:
+   - `.cursor/memory/DEVLOG_YYYY-MM-DD_to_YYYY-MM-DD.md`
+3. Prepend a short `Archived Devlog Summary` at the top of the renamed snapshot that states:
+   - the active date window
+   - the major work completed in that span
+   - the main risks or workstreams preserved there
+4. Create a new slim `.cursor/memory/DEVLOG.md` whose first entry records:
+   - that rollover occurred
+   - where the prior detailed history moved
+   - what high-level context was intentionally carried forward
+5. Leave older archive files and dated snapshots intact unless the user explicitly requests a deeper archive reorganization.
+
+If scratchpad and devlog are being cleaned up together, prefer rolling both in the same pass so the active working memory and the active engineering timeline stay aligned.
