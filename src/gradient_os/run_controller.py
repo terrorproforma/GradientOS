@@ -1580,8 +1580,16 @@ Examples:
 
                         backend = backend_registry.get_active_backend()
                         if backend and hasattr(backend, "native_home_joint"):
-                            ok = bool(backend.native_home_joint(logical_joint_index))
-                            if ok:
+                            result = backend.native_home_joint(logical_joint_index)
+                            if isinstance(result, dict):
+                                prefix = "ACK" if bool(result.get("accepted", False)) else "ERROR"
+                                sock.sendto(
+                                    f"{prefix},NATIVE_HOME_JOINT,{_encode_controller_payload_b64(result)}".encode(
+                                        "utf-8"
+                                    ),
+                                    addr,
+                                )
+                            elif bool(result):
                                 sock.sendto(f"ACK,NATIVE_HOME_JOINT,{joint_num}".encode("utf-8"), addr)
                             else:
                                 sock.sendto(

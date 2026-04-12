@@ -50,7 +50,8 @@ Use this file when changing `gradient-rt-motion`, EtherCAT host setup, drive bri
 - Synchronize targets with feedback before enabling.
 - STOP and power transitions must not re-inject stale motion into RTCore.
 - Preserve the no-sudden-move contract across restart, enable, and recovery flows.
-- For A6-EC native home, target synchronization must use the drive target frame implied by `native_home_position_offset` rather than raw `0x6064` counts, otherwise a later CSP enable can still trip `Er87.*` / `0xFF00` despite a successful home save.
+- For A6-EC with persisted native home in `0x607C`, drive-facing CSP hold/output/enable targets must stay in the raw PDO wire frame (`0x6064` / `0x607A` counts).
+- Subtract `native_home_position_offset` only when converting queued controller/logical targets into raw CSP wire counts; do not subtract it again when mirroring live feedback into hold targets or seeding realtime jog accumulators.
 
 ## Commissioning and Bring-Up
 

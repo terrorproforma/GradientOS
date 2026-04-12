@@ -194,6 +194,20 @@ def build_rtcore_drive_profile_env(
     return rendered
 
 
+def build_rtcore_native_home_env(
+    *,
+    drive_profile: str | None,
+) -> dict[str, str]:
+    normalized_profile = normalize_drive_profile_id(drive_profile)
+    payload = backend_registry.get_drive_native_home_config_for_backend(
+        "ethercat_rtcore",
+        drive_profile_id=normalized_profile,
+    )
+    env = dict(payload.get("env", {})) if isinstance(payload, dict) else {}
+    env.setdefault("GRADIENT_RT_NATIVE_HOME_CONFIG", "")
+    return {str(key): str(value) for key, value in env.items()}
+
+
 def build_rtcore_startup_env(
     *,
     robot_config: dict[str, Any],
@@ -221,9 +235,11 @@ def build_rtcore_startup_env(
         "GRADIENT_RT_MAX_RPM": f"{resolved_max_rpm:g}",
     }
     env.update(build_rtcore_drive_profile_env(drive_profile=normalized_profile))
+    env.update(build_rtcore_native_home_env(drive_profile=normalized_profile))
     for key, value in (startup_config.get("env") if isinstance(startup_config, dict) else {}).items():
         env[str(key)] = str(value)
     env.setdefault("GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG", "")
+    env.setdefault("GRADIENT_RT_NATIVE_HOME_CONFIG", "")
     return env
 
 

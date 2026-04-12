@@ -386,6 +386,84 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(screen.getByText(/axis currently disarmed/i)).toBeTruthy();
 	});
 
+	it("shows a warning when native-home verification is still pending", async () => {
+		vi.spyOn(window, "confirm").mockReturnValue(true);
+		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+			const method = init?.method ?? "GET";
+			const parsed = new URL(url, "http://localhost");
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
+				return mockJsonResponse({
+					arm_deg: [0, 0, 0, 0, 0, 0],
+					gripper_deg: 0,
+					read_source: "live_feedback",
+				});
+			}
+			if (parsed.pathname === "/control/motion-status") {
+				return mockJsonResponse({
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						controller_thread_running: false,
+						rtcore_status_present: true,
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				});
+			}
+			if (parsed.pathname === "/control/home-joint-native" && method === "POST") {
+				return mockJsonResponse({
+					status: "ok",
+					accepted: true,
+					verified: false,
+					timed_out: true,
+					code: "NATIVE_HOME_PENDING_VERIFICATION",
+					message: "Drive-native commissioning home was requested, but verification is still pending.",
+					joint: 1,
+					native_home_state: 1,
+					native_home_state_name: "requested",
+				});
+			}
+			return mockJsonResponse({});
+		}));
+
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+		await waitFor(() => {
+			expect((screen.getAllByRole("button", { name: "Drive Home" })[0] as HTMLButtonElement).disabled).toBe(false);
+		});
+		fireEvent.click(screen.getAllByRole("button", { name: "Drive Home" })[0]);
+
+		await waitFor(() => {
+			expect(screen.getByText(/verification is still pending/i)).toBeTruthy();
+		});
+		expect(screen.queryByText(/Failed to request drive-native home/i)).toBeNull();
+	});
+
 	it("uses wait-for-idle semantics for drive power-down", async () => {
 		vi.spyOn(window, "confirm").mockReturnValue(true);
 

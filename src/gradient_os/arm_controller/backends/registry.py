@@ -579,6 +579,22 @@ def extract_drive_startup_config_axis_for_backend(
     return None
 
 
+def get_drive_native_home_config_for_backend(
+    backend_name: Optional[str],
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.get_drive_native_home_config(effective_profile)
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    return None
+
+
 def decode_drive_statusword_for_backend(
     backend_name: Optional[str],
     statusword: int,

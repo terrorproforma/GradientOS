@@ -1180,9 +1180,15 @@ Best practice:
 
 One of the most important drive-safety rules is:
 
-- before enable, synchronize the commanded hold target to live feedback.
+- before enable, synchronize the commanded hold target to live feedback in the same drive-facing frame that RTCore will actually write to CSP.
 
 This avoids large target steps during DS402 transitions, which were explicitly associated with avoiding `Er87.*` behavior.
+
+Final native-home-specific clarification:
+
+- for A6-EC with persisted native home in `0x607C`, drive-facing hold/output/enable targets must stay in raw PDO wire counts (`0x6064` / `0x607A`),
+- subtract `native_home_position_offset` only when converting queued controller/logical targets into raw CSP wire counts,
+- do not subtract it again when mirroring live feedback into hold targets or seeding realtime jog accumulators.
 
 From RTCore comments:
 
@@ -1212,7 +1218,7 @@ The final neutral contract includes:
 - `motion_done=true`,
 - `stale_command=false`,
 - no live drive faults,
-- command targets synchronized to feedback.
+- command targets synchronized to feedback in their drive-facing wire frame.
 
 ### 10.2 Controller-side power guard
 
@@ -1258,7 +1264,7 @@ This directly fixed the stale `active_traj_id` post-power-down bug seen during l
 The final power transition flow is:
 
 - `power-down`: stop jog, abort trajectory ownership, optionally wait for neutral, disable axes, disarm.
-- `power-up`: reject unless `safe_for_power_transition=true`, synchronize targets from feedback, then arm + CSP + enable.
+- `power-up`: reject unless `safe_for_power_transition=true`, synchronize drive-facing targets from feedback in the correct CSP wire frame, then arm + CSP + enable.
 
 This is the right model for a fieldbus drive system. It treats drive power as a controlled transition, not an incidental side effect of process startup or shutdown.
 
@@ -1448,8 +1454,16 @@ Logical zeroing means:
 Drive-native homing means:
 
 - explicitly ask the drive to capture its internal reference/home,
+- treat persisted `0x607C` as the durable drive-native home truth rather than `0x60B0`,
 - treat that as a drive operation with different semantics and safety considerations,
 - expose it clearly in telemetry/UI as a separate action.
+
+The finalized native-home execution/status contract is:
+
+- the home command is a commissioning transaction, not a normal runtime motion feature,
+- the homed axis remains disabled afterward until an explicit safe power-up,
+- verification must wait for a fresh post-command RTCore metrics sample before trusting `requested`, `succeeded`, or `failed`,
+- controller/API/UI should preserve structured outcome fields such as `accepted`, `verified`, and `timed_out` instead of collapsing the result to a boolean.
 
 Final rule:
 
@@ -1490,7 +1504,8 @@ Commissioning-specific best practices:
 - preserve conservative RTCore speed limits during setup work (for example `--max-rpm 100`),
 - treat commissioning joint jog as a small relative absolute-position operation, not a new ad hoc realtime velocity loop,
 - reuse backend-aware controller/run-controller pathways rather than bypassing them from the frontend,
-- and keep UI messaging explicit about what is logical calibration vs drive-native reference capture.
+- keep UI messaging explicit about what is logical calibration vs drive-native reference capture,
+- and if native-home verification has not converged yet, degrade operator messaging to pending/warning rather than generic request failure.
 
 This distinction prevents a common class of safety and operator-understanding regressions:
 

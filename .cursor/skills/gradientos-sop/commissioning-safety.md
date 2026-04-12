@@ -25,6 +25,8 @@ Use this file for power transitions, safe restarts, commissioning motion flows, 
 - Current evidence also says `0x607C` survives real power loss on this A6-EC setup while `0x60B0` does not.
 - For Gradient-05 style rotary joints, Chapter 5 strongly suggests the startup absolute mode should be the rotation-mode setting, not the older linear-mode assumption.
 - Native home should therefore be modeled as a commissioning-only workflow: jog in normal `CSP`, run a one-shot HM capture transaction, refresh truth, return to `CSP`, and then re-sync targets before further motion.
+- After native home, keep the homed axis disabled until an explicit safe power-up; do not silently re-enable it as part of the home transaction.
+- Native-home verification should use a fresh post-command RTCore metrics sample before trusting `requested`, `succeeded`, or `failed`; stale pre-command metrics can create false commissioning outcomes.
 - If encoder battery health or multi-turn retention is suspect, expect vendor faults such as `ALF9.0` (battery voltage low), `Er20.8` (encoder battery failure), or `Er20.9` (encoder multi-turn error), and re-validate native home before trusting the pose after a power cycle.
 
 ## Commissioning Motion Rules
@@ -35,6 +37,7 @@ Use this file for power transitions, safe restarts, commissioning motion flows, 
 - Use clear operator messaging about what the move does and what state the robot must be in first.
 - Keep native-home execution scoped to one axis at a time until startup mode, frame composition, and persistence are revalidated.
 - Do not treat native-home capture as a normal runtime motion feature; it is a commissioning workflow with extra preconditions and post-checks.
+- If native-home verification does not converge within the current wait window, degrade operator messaging to "pending verification" rather than a generic request failure, and require the axis to stay disabled until telemetry settles.
 
 ## Power and STOP
 

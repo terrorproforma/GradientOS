@@ -83,7 +83,7 @@ _SERVICE_SDO_VALUE_U16 = 1
 _POWER_TRANSITION_WAIT_POLL_INTERVAL_S = 0.01
 _POWER_TRANSITION_DEFAULT_TIMEOUT_S = 1.0
 _NATIVE_HOME_WAIT_POLL_INTERVAL_S = 0.05
-_NATIVE_HOME_WAIT_TIMEOUT_S = 3.0
+_NATIVE_HOME_WAIT_TIMEOUT_S = 10.0
 _RTCORE_METRICS_PATH = Path("/run/gradient-rt-motion/metrics.json")
 
 _HELLO_STRUCT = struct.Struct("<IHHIIQ4Q")  # 56 bytes
@@ -119,6 +119,20 @@ def _align_up(value: int, alignment: int) -> int:
 def _now_monotonic_ns() -> int:
     # Use monotonic clock to match RTCore.
     return time.monotonic_ns()
+
+
+def _native_home_state_name(value: object) -> str:
+    try:
+        state = int(value)
+    except Exception:
+        state = 0
+    labels = {
+        0: "idle",
+        1: "requested",
+        2: "succeeded",
+        3: "failed",
+    }
+    return labels.get(state, f"unknown:{state}")
 
 
 def _estimate_joint_path_velocities(
@@ -1013,18 +1027,71 @@ class EthercatRTCoreBackend(ActuatorBackend):
         )
         return True
 
-    def native_home_joint(self, logical_joint_index: int) -> bool:
+    def native_home_joint(self, logical_joint_index: int) -> dict[str, object]:
+        def _result(
+            *,
+            accepted: bool,
+            verified: bool,
+            code: str,
+            message: str,
+            joint: int,
+            axis_mask: int,
+            timed_out: bool = False,
+            terminal_state: str = "idle",
+            native_home_state: int = 0,
+            native_home_last_abort_code: int = 0,
+            metrics_time_ns: int = 0,
+        ) -> dict[str, object]:
+            abort_code = int(native_home_last_abort_code)
+            return {
+                "accepted": bool(accepted),
+                "verified": bool(verified),
+                "timed_out": bool(timed_out),
+                "code": str(code),
+                "message": str(message),
+                "joint": int(joint),
+                "axis_mask": int(axis_mask),
+                "terminal_state": str(terminal_state),
+                "native_home_state": int(native_home_state),
+                "native_home_state_name": _native_home_state_name(native_home_state),
+                "native_home_last_abort_code": abort_code,
+                "native_home_last_abort_code_hex": f"0x{abort_code & 0xFFFFFFFF:08X}",
+                "disarmed_after_home": True,
+                "metrics_time_ns": int(metrics_time_ns),
+            }
+
         if not self._connected:
             print("[EtherCAT RTCore] WARNING: cannot drive-home a joint while RTCore is disconnected")
-            return False
+            return _result(
+                accepted=False,
+                verified=False,
+                code="NATIVE_HOME_UNAVAILABLE",
+                message="RTCore is disconnected; cannot run drive-native home.",
+                joint=int(logical_joint_index) + 1,
+                axis_mask=0,
+            )
         if self._rt_num_axes <= 0:
             print("[EtherCAT RTCore] WARNING: cannot drive-home without any configured axes")
-            return False
+            return _result(
+                accepted=False,
+                verified=False,
+                code="NATIVE_HOME_UNAVAILABLE",
+                message="RTCore did not report any configured axes for native home.",
+                joint=int(logical_joint_index) + 1,
+                axis_mask=0,
+            )
 
         joint_i = int(logical_joint_index)
         if joint_i < 0 or joint_i >= self._num_joints:
             print(f"[EtherCAT RTCore] WARNING: joint index out of range for native homing: {joint_i}")
-            return False
+            return _result(
+                accepted=False,
+                verified=False,
+                code="NATIVE_HOME_INVALID_JOINT",
+                message=f"Joint index {joint_i + 1} is out of range for native home.",
+                joint=joint_i + 1,
+                axis_mask=0,
+            )
 
         axis_mask = 0
         for axis_i, mapped_joint in enumerate(self._axis_to_joint):
@@ -1035,27 +1102,119 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 "[EtherCAT RTCore] WARNING: cannot drive-home joint"
                 f" {joint_i + 1}; no mapped RTCore axes"
             )
-            return False
+            return _result(
+                accepted=False,
+                verified=False,
+                code="NATIVE_HOME_UNMAPPED",
+                message=f"Joint {joint_i + 1} has no mapped RTCore axis for native home.",
+                joint=joint_i + 1,
+                axis_mask=0,
+            )
 
         try:
             self.prepare_for_power_transition(wait_for_idle=True, timeout_s=_POWER_TRANSITION_DEFAULT_TIMEOUT_S)
         except Exception as exc:
             print(f"[EtherCAT RTCore] WARNING: pre-native-home neutralization failed: {exc}")
-            return False
-
-        self._send_cmd_native_home(axis_mask=axis_mask)
-        if not self._wait_for_native_home_result(axis_mask, timeout_s=_NATIVE_HOME_WAIT_TIMEOUT_S):
-            print(
-                "[EtherCAT RTCore] WARNING: native drive-home did not reach a verified terminal state:"
-                f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
+            return _result(
+                accepted=False,
+                verified=False,
+                code="NATIVE_HOME_PRECONDITION_FAILED",
+                message=f"Could not neutralize motion before drive-native home: {exc}",
+                joint=joint_i + 1,
+                axis_mask=axis_mask,
             )
-            return False
-        print(
-            "[EtherCAT RTCore] Native drive-home requested:"
-            f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
-            " leaving the homed axis disabled until an explicit safe power-up"
+
+        baseline_snapshot = self._load_rtcore_metrics_snapshot()
+        self._send_cmd_native_home(axis_mask=axis_mask)
+        wait_timeout_s = self._env_float(
+            "GRADIENT_RTCORE_NATIVE_HOME_WAIT_TIMEOUT_S",
+            _NATIVE_HOME_WAIT_TIMEOUT_S,
         )
-        return True
+        wait_result = self._wait_for_native_home_result(
+            axis_mask,
+            timeout_s=wait_timeout_s,
+            min_metrics_time_ns=(
+                int(baseline_snapshot.get("time_ns", 0))
+                if isinstance(baseline_snapshot, dict)
+                else 0
+            ),
+            min_metrics_mtime_ns=(
+                int(baseline_snapshot.get("_mtime_ns", 0))
+                if isinstance(baseline_snapshot, dict)
+                else 0
+            ),
+        )
+        if bool(wait_result.get("verified", False)):
+            print(
+                "[EtherCAT RTCore] Native drive-home verified:"
+                f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
+                " leaving the homed axis disabled until an explicit safe power-up"
+            )
+            return _result(
+                accepted=True,
+                verified=True,
+                code="NATIVE_HOME_VERIFIED",
+                message=(
+                    "Drive-native commissioning home verified. "
+                    "The homed axis remains disabled until an explicit safe power-up."
+                ),
+                joint=joint_i + 1,
+                axis_mask=axis_mask,
+                terminal_state=str(wait_result.get("terminal_state", "succeeded")),
+                native_home_state=int(wait_result.get("native_home_state", 2)),
+                native_home_last_abort_code=int(wait_result.get("native_home_last_abort_code", 0)),
+                metrics_time_ns=int(wait_result.get("metrics_time_ns", 0)),
+            )
+
+        if bool(wait_result.get("timed_out", False)):
+            print(
+                "[EtherCAT RTCore] WARNING: native drive-home is still awaiting verified terminal state:"
+                f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
+                f" timeout_s={wait_timeout_s:.2f}"
+            )
+            return _result(
+                accepted=True,
+                verified=False,
+                timed_out=True,
+                code="NATIVE_HOME_PENDING_VERIFICATION",
+                message=(
+                    "Drive-native commissioning home was requested, but RTCore did not observe a "
+                    "verified terminal state before the wait window expired. Keep the axis disabled "
+                    "and confirm the live drive-home status before powering it back up."
+                ),
+                joint=joint_i + 1,
+                axis_mask=axis_mask,
+                terminal_state=str(wait_result.get("terminal_state", "pending")),
+                native_home_state=int(wait_result.get("native_home_state", 1)),
+                native_home_last_abort_code=int(wait_result.get("native_home_last_abort_code", 0)),
+                metrics_time_ns=int(wait_result.get("metrics_time_ns", 0)),
+            )
+
+        abort_code = int(wait_result.get("native_home_last_abort_code", 0))
+        print(
+            "[EtherCAT RTCore] WARNING: native drive-home failed verification:"
+            f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
+            f" abort=0x{abort_code & 0xFFFFFFFF:08X}"
+        )
+        return _result(
+            accepted=False,
+            verified=False,
+            code="NATIVE_HOME_FAILED",
+            message=(
+                "Drive-native commissioning home failed verification."
+                + (
+                    f" Abort code 0x{abort_code & 0xFFFFFFFF:08X}."
+                    if abort_code != 0
+                    else ""
+                )
+            ),
+            joint=joint_i + 1,
+            axis_mask=axis_mask,
+            terminal_state=str(wait_result.get("terminal_state", "failed")),
+            native_home_state=int(wait_result.get("native_home_state", 3)),
+            native_home_last_abort_code=abort_code,
+            metrics_time_ns=int(wait_result.get("metrics_time_ns", 0)),
+        )
 
     def _best_effort_safe_power_down(
         self,
@@ -1202,6 +1361,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
             physical_q = self._axis_q_from_counts(axis_i, int(raw))
             if physical_q is None:
                 continue
+            # Controller-facing joint feedback remains in the logical commissioning
+            # frame: scaled feedback plus the drive's persisted native-home offset,
+            # then minus the software zero offset.
             positions[joint_i] = (
                 physical_q
                 + self._native_home_offset_q_for_axis(axis_i)
@@ -1923,49 +2085,150 @@ class EthercatRTCoreBackend(ActuatorBackend):
             self._native_home_offset_counts = offsets
             self._native_home_metrics_mtime_ns = stat.st_mtime_ns
 
-    def _load_rtcore_metrics_axes(self) -> list[dict[str, object]]:
+    def _load_rtcore_metrics_snapshot(self) -> dict[str, object] | None:
         try:
+            stat = _RTCORE_METRICS_PATH.stat()
             payload = json.loads(_RTCORE_METRICS_PATH.read_text())
         except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload["_mtime_ns"] = int(stat.st_mtime_ns)
+        return payload
+
+    def _load_rtcore_metrics_axes(self) -> list[dict[str, object]]:
+        snapshot = self._load_rtcore_metrics_snapshot()
+        if not isinstance(snapshot, dict):
             return []
-        axes = payload.get("axes")
+        axes = snapshot.get("axes")
         if not isinstance(axes, list):
             return []
         return [axis for axis in axes if isinstance(axis, dict)]
 
-    def _wait_for_native_home_result(self, axis_mask: int, *, timeout_s: float) -> bool:
+    def _native_home_metrics_result(
+        self,
+        target_axes: list[int],
+        *,
+        snapshot: dict[str, object],
+    ) -> dict[str, object]:
+        axes = snapshot.get("axes")
+        axis_results: list[dict[str, object]] = []
+        any_failed = False
+        all_succeeded = True
+        if not isinstance(axes, list):
+            axes = []
+        for axis_i in target_axes:
+            axis_payload = axes[axis_i] if axis_i < len(axes) and isinstance(axes[axis_i], dict) else {}
+            try:
+                state = int(axis_payload.get("native_home_state", 0))
+            except Exception:
+                state = 0
+            try:
+                abort_code = int(axis_payload.get("native_home_last_abort_code", 0))
+            except Exception:
+                abort_code = 0
+            axis_results.append(
+                {
+                    "axis": int(axis_i),
+                    "native_home_state": int(state),
+                    "native_home_state_name": _native_home_state_name(state),
+                    "native_home_last_abort_code": int(abort_code),
+                    "native_home_last_abort_code_hex": f"0x{abort_code & 0xFFFFFFFF:08X}",
+                }
+            )
+            if state == 3:
+                any_failed = True
+            elif state != 2:
+                all_succeeded = False
+
+        terminal_state = "pending"
+        if any_failed:
+            terminal_state = "failed"
+        elif axis_results and all_succeeded:
+            terminal_state = "succeeded"
+
+        primary = axis_results[0] if axis_results else {}
+        return {
+            "verified": terminal_state == "succeeded",
+            "timed_out": False,
+            "terminal_state": terminal_state,
+            "native_home_state": int(primary.get("native_home_state", 0) or 0),
+            "native_home_state_name": str(primary.get("native_home_state_name", "idle") or "idle"),
+            "native_home_last_abort_code": int(primary.get("native_home_last_abort_code", 0) or 0),
+            "native_home_last_abort_code_hex": str(
+                primary.get("native_home_last_abort_code_hex", "0x00000000") or "0x00000000"
+            ),
+            "metrics_time_ns": int(snapshot.get("time_ns", 0) or 0),
+            "axis_results": axis_results,
+        }
+
+    def _wait_for_native_home_result(
+        self,
+        axis_mask: int,
+        *,
+        timeout_s: float,
+        min_metrics_time_ns: int = 0,
+        min_metrics_mtime_ns: int = 0,
+    ) -> dict[str, object]:
         target_axes = [
             axis_i
             for axis_i in range(self._rt_num_axes)
             if (int(axis_mask) & (1 << axis_i)) != 0
         ]
         if not target_axes:
-            return False
+            return {
+                "verified": False,
+                "timed_out": False,
+                "terminal_state": "invalid",
+                "native_home_state": 0,
+                "native_home_state_name": "idle",
+                "native_home_last_abort_code": 0,
+                "native_home_last_abort_code_hex": "0x00000000",
+                "metrics_time_ns": 0,
+                "axis_results": [],
+            }
 
         deadline = time.monotonic() + max(0.0, float(timeout_s))
+        last_result: dict[str, object] | None = None
+        saw_fresh_snapshot = False
         while time.monotonic() <= deadline:
-            axes = self._load_rtcore_metrics_axes()
-            if axes:
-                any_failed = False
-                all_succeeded = True
-                for axis_i in target_axes:
-                    if axis_i >= len(axes):
-                        all_succeeded = False
-                        continue
-                    try:
-                        state = int(axes[axis_i].get("native_home_state", 0))
-                    except Exception:
-                        state = 0
-                    if state == 3:
-                        any_failed = True
-                    elif state != 2:
-                        all_succeeded = False
-                if any_failed:
-                    return False
-                if all_succeeded:
-                    return True
+            snapshot = self._load_rtcore_metrics_snapshot()
+            if isinstance(snapshot, dict):
+                snapshot_time_ns = int(snapshot.get("time_ns", 0) or 0)
+                snapshot_mtime_ns = int(snapshot.get("_mtime_ns", 0) or 0)
+                if snapshot_time_ns > int(min_metrics_time_ns) or snapshot_mtime_ns > int(min_metrics_mtime_ns):
+                    saw_fresh_snapshot = True
+                    last_result = self._native_home_metrics_result(target_axes, snapshot=snapshot)
+                    if str(last_result.get("terminal_state", "pending")) in {"failed", "succeeded"}:
+                        return last_result
             time.sleep(_NATIVE_HOME_WAIT_POLL_INTERVAL_S)
-        return False
+        if not saw_fresh_snapshot:
+            return {
+                "verified": False,
+                "timed_out": True,
+                "terminal_state": "pending",
+                "native_home_state": 0,
+                "native_home_state_name": "idle",
+                "native_home_last_abort_code": 0,
+                "native_home_last_abort_code_hex": "0x00000000",
+                "metrics_time_ns": 0,
+                "axis_results": [],
+            }
+        if last_result is None:
+            last_result = {
+                "verified": False,
+                "timed_out": True,
+                "terminal_state": "pending",
+                "native_home_state": 0,
+                "native_home_state_name": "idle",
+                "native_home_last_abort_code": 0,
+                "native_home_last_abort_code_hex": "0x00000000",
+                "metrics_time_ns": 0,
+                "axis_results": [],
+            }
+        last_result = dict(last_result)
+        last_result["timed_out"] = str(last_result.get("terminal_state", "pending")) not in {"failed", "succeeded"}
+        return last_result
 
     def _native_home_offset_q_for_axis(self, axis_i: int) -> float:
         self._refresh_native_home_offsets_from_metrics()
@@ -1982,9 +2245,12 @@ class EthercatRTCoreBackend(ActuatorBackend):
         axis_q: list[float] = [0.0] * self._rt_num_axes
         for axis_i, joint_i in enumerate(self._axis_to_joint):
             if 0 <= joint_i < len(positions_rad):
-                # RTCore target counts already operate in the same logical frame that
-                # native-home/hold-target alignment uses. Subtracting the drive-native
-                # offset again here double-applies 0x60B0 on commanded motion.
+                # Queue trajectory points in the same controller/logical frame that
+                # `raw_to_joint_positions()` publishes. RTCore converts those queued
+                # targets once into raw CSP wire counts (the same 0x6064/0x607A
+                # frame the drive uses) by subtracting the persisted native-home
+                # offset during trajectory-point latch, so Python must not subtract
+                # the drive-home offset here.
                 axis_q[axis_i] = float(positions_rad[joint_i]) + self._master_offset_for_joint(joint_i)
         return axis_q
 

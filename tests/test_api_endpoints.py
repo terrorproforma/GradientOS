@@ -1004,6 +1004,67 @@ def test_control_home_joint_native(client):
     assert client.command_calls[-1] == ("NATIVE_HOME_JOINT,3", 5.0, True)
 
 
+def test_control_home_joint_native_returns_structured_pending_result(client, monkeypatch):
+    payload = {
+        "accepted": True,
+        "verified": False,
+        "timed_out": True,
+        "code": "NATIVE_HOME_PENDING_VERIFICATION",
+        "message": "Drive-native commissioning home was requested, but verification is still pending.",
+        "joint": 3,
+        "axis_mask": 0x4,
+        "native_home_state": 1,
+        "native_home_state_name": "requested",
+    }
+
+    def fake_send(message: str, timeout: float = 0.5, expect_response: bool = True):
+        assert message == "NATIVE_HOME_JOINT,3"
+        return True, f"ACK,NATIVE_HOME_JOINT,{_payload_token(payload)}"
+
+    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
+
+    resp = client.post("/control/home-joint-native", json={"joint": 3})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["joint"] == 3
+    assert body["accepted"] is True
+    assert body["verified"] is False
+    assert body["timed_out"] is True
+    assert body["code"] == "NATIVE_HOME_PENDING_VERIFICATION"
+    assert body["native_home_state_name"] == "requested"
+
+
+def test_control_home_joint_native_returns_structured_error_result(client, monkeypatch):
+    payload = {
+        "accepted": False,
+        "verified": False,
+        "code": "NATIVE_HOME_FAILED",
+        "message": "Drive-native commissioning home failed verification.",
+        "joint": 3,
+        "axis_mask": 0x4,
+        "native_home_state": 3,
+        "native_home_state_name": "failed",
+        "native_home_last_abort_code": 42,
+        "native_home_last_abort_code_hex": "0x0000002A",
+    }
+
+    def fake_send(message: str, timeout: float = 0.5, expect_response: bool = True):
+        assert message == "NATIVE_HOME_JOINT,3"
+        return False, f"ERROR,NATIVE_HOME_JOINT,{_payload_token(payload)}"
+
+    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
+
+    resp = client.post("/control/home-joint-native", json={"joint": 3})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "error"
+    assert body["joint"] == 3
+    assert body["accepted"] is False
+    assert body["code"] == "NATIVE_HOME_FAILED"
+    assert body["native_home_last_abort_code_hex"] == "0x0000002A"
+
+
 def test_control_encoder_retention_capture_writes_snapshot_and_comparison(client, monkeypatch, tmp_path):
     monkeypatch.setattr(
         encoder_retention_module,
@@ -1037,10 +1098,10 @@ def test_control_encoder_retention_capture_writes_snapshot_and_comparison(client
                         "setting_label": "A6-EC encoder position tracking mode",
                         "configured": 1,
                         "commanded": 1,
-                        "commanded_value_label": "Battery-backed limited multi-turn absolute encoder mode",
+                        "commanded_value_label": "Absolute position linear mode",
                         "readback_valid": 1,
                         "readback": 1,
-                        "readback_value_label": "Battery-backed limited multi-turn absolute encoder mode",
+                        "readback_value_label": "Absolute position linear mode",
                         "verified": 1,
                     },
                     "slave_online": 1,

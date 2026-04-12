@@ -39,7 +39,7 @@ ETHERCAT_DRIVE_CATALOG: dict[str, dict[str, Any]] = {
             ],
         },
         "startup_defaults": {
-            "a6ec_encoder_position_tracking_mode": 1,
+            "a6ec_encoder_position_tracking_mode": 4,
         },
         "startup_schema": {
             "a6ec_encoder_position_tracking_mode": {

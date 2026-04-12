@@ -465,3 +465,276 @@
   - Confirmed the plan now specifies defaults, descriptor shape, field semantics, validation axes, and post-home state instead of leaving them implicit.
 - Follow-up notes / risks:
   - The remaining uncertainty is live bench proof only; the plan no longer leaves material build choices undecided for the first implementation cut.
+
+## 2026-04-11 21:13 +0000
+
+- Task summary:
+  - Started the first production build cut for A6-EC native homing by moving the HM workflow into profile-owned descriptor data, switching the startup absolute-mode default to the manual-backed rotation mode, and replacing the RTCore hardcoded `0x60B0` native-home path with a generic descriptor executor.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - corrected the human-readable `C00.07 / 0x2000:08` labels so value `4` is the rotation-mode default
+    - added a profile-owned native-home descriptor for the first HM cut (`steady_state_mode=8`, `commissioning_mode=6`, `truth_source=0x607C`, HM method `35`, `60E6=0`, `607C=0`)
+    - rendered that descriptor into the new RTCore env var `GRADIENT_RT_NATIVE_HOME_CONFIG`
+  - Updated `src/gradient_os/arm_controller/ethercat_drive_catalog.py`:
+    - changed the A6-EC startup default from `1` to `4`
+  - Updated `src/gradient_os/arm_controller/profiles/registry.py`, `src/gradient_os/arm_controller/backends/registry.py`, and `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py`:
+    - threaded the profile-owned native-home config through the backend/profile registry
+    - included `GRADIENT_RT_NATIVE_HOME_CONFIG` in the rendered RTCore systemd env
+  - Updated `src/gradient_rt_motion/main.cpp`:
+    - added a generic native-home descriptor parser for `set_mode`, `write_sdo`, `controlword_sequence`, `wait_statusword`, `refresh_truth`, and `restore_mode`
+    - replaced the old A6-EC-specific `0x60B0` write/save implementation with a descriptor-driven executor
+    - switched startup/native-home truth refresh from the hardcoded `0x60B0` path to the descriptor-selected truth source
+    - made `MSG_CMD_SET_MODE` update a real per-axis desired-mode path instead of writing to an unused single atomic
+    - added a generic per-axis service override so RTCore can drive PDO-owned `0x6040` / `0x6060` fields during HM without SDO-vs-PDO races
+  - Updated `systemd/rt-motion/gradient-rt-motion.service`:
+    - passed the new `GRADIENT_RT_NATIVE_HOME_CONFIG` env var through to the RTCore CLI
+  - Updated `src/gradient_os/api/main.py` and `web-ui/src/ControlPanel.tsx`:
+    - reframed native home as a commissioning-only transaction in the operator-facing API/UI copy
+  - Updated `tests/test_rtcore_runtime.py`, `tests/test_api_endpoints.py`, and `tests/test_encoder_retention.py`:
+    - aligned startup-default expectations with `C00.07 = 4`
+    - added coverage that the rendered RTCore env now includes the native-home descriptor
+    - updated startup-mode label expectations to the manual-backed `Absolute position linear mode` wording for value `1`
+- Validation:
+  - `make -C src/gradient_rt_motion`
+  - `source ./start.sh && python -m pytest tests/test_rtcore_runtime.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q`
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py src/gradient_os/arm_controller/profiles/registry.py src/gradient_os/arm_controller/backends/registry.py src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py src/gradient_os/api/main.py tests/test_rtcore_runtime.py tests/test_api_endpoints.py tests/test_encoder_retention.py`
+  - `cd web-ui && npm run build`
+  - `ReadLints` on all touched product/test files returned clean
+- Follow-up notes / risks:
+  - This pass proves the code and focused tests, but the HM transaction still needs live bench validation on `J4` and `J2` to confirm the A6-EC statusword masks, post-home truth (`0x607C -> 0`), and safe power-up behavior.
+  - The RTCore generic executor is currently tailored to the first descriptor shape; if a future drive family needs richer waits or multi-axis commissioning semantics, extend the descriptor/parser instead of reintroducing vendor branches in `main.cpp`.
+
+## 2026-04-11 22:50 +0000
+
+- Task summary:
+  - Fixed the A6-EC HM start-edge timing for `J4`, redeployed the runtime, and completed a clean live proof that the commissioning native-home transaction now succeeds on `J4`.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - split the HM controlword handshake so the descriptor now does:
+      - `controlword_sequence [6,7,15]`
+      - `wait_statusword all_set=0x0227 all_clear=0x2048`
+      - `controlword_sequence [31]`
+    - kept the existing completion wait (`all_set=0x9000`, `all_clear=0x2000`) and `0x607C` truth refresh unchanged
+  - Updated `tests/test_rtcore_runtime.py`:
+    - aligned the expected `GRADIENT_RT_NATIVE_HOME_CONFIG` env string with the new two-phase HM handshake
+  - Synced the updated runtime into the installed service with `systemd/rt-motion/sync-runtime.sh --ensure-active`
+  - Performed a full stack restart after discovering that restarting RTCore alone left the controller on a stale IPC session
+- Validation:
+  - `source ./start.sh && python -m pytest tests/test_rtcore_runtime.py -q`
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py tests/test_rtcore_runtime.py`
+  - Verified the installed env at `/etc/default/gradient-rt-motion` now contains:
+    - `op|controlword_sequence|6,7,15`
+    - `op|wait_statusword|0x0227|0x2048`
+    - `op|controlword_sequence|31`
+  - Verified full stack reconnection after restart:
+    - RTCore journal logged `Controller connected` and `IPC handshake complete`
+    - controller log showed `EtherCAT RTCore Connected` and `Feedback ready`
+  - Clean live `J4` proof:
+    - API `POST /control/home-joint-native` returned `200 OK` with `ACK,NATIVE_HOME_JOINT,4`
+    - RTCore journal logged `EtherCAT native_home axis=3 ... steps=10` followed by `Native-home success`
+    - live EtherCAT sampling on slave position `3` showed `0x6061: 8 -> 6 -> 8` and `0x6041: 0x1650 -> 0x0633 -> 0x0237 -> 0x9650`
+    - `0x607C` stayed `0` throughout the successful J4 run
+    - final metrics show axis 3 `native_home_state=2`, `native_home_last_abort_code=0`, `statusword=38480 (0x9650)`, and feedback position near zero (`pos_counts=-1`)
+- Follow-up notes / risks:
+  - A retry issued after only restarting `gradient-rt-motion.service` failed misleadingly until the controller/API stack was restarted; future commissioning validation after RTCore restarts should always confirm a fresh IPC reconnect first.
+  - `startup_drive_config.readback_valid/verified` was still `0` in the immediate post-start metrics snapshot even though the later startup logs completed successfully; this looks like timing of when the snapshot was read, not a regression, but should be remembered when sampling right after restart.
+  - The next meaningful scope step is to repeat the same clean proof on the next target joint (`J2` or whichever joint the user chooses) before generalizing the result across all axes.
+
+## 2026-04-11 23:58 +0000
+
+- Task summary:
+  - Investigated a live commissioning regression where a UI jog intended for `J4` visibly moved `J1` and left `J2` faulted after power-down.
+- Changes:
+  - No product code changed in this pass.
+  - Collected and correlated evidence from:
+    - `logs/startups/20260411-234934/controller.log`
+    - `logs/startups/20260411-234934/api.log`
+    - `journalctl -u gradient-rt-motion.service`
+    - `/run/gradient-rt-motion/metrics.json`
+    - direct EtherCAT SDO reads on J2 (`0x603F`, `0x203F`, `0x6041`)
+- Validation:
+  - Confirmed the stack itself restarted cleanly:
+    - `gradient-rt-motion.service` and `ethercat.service` active
+    - API `/health` returning OK
+    - RTCore metrics reporting `startup_ready=1`, `operational_slaves=6`
+  - Confirmed the first jog command path was formed for software joint 4, not joint 1:
+    - controller log showed `target_deg` changing only the 4th joint from about `-0.002` to `-1.002`
+  - Confirmed the resulting motion/fault contradicted that intended target:
+    - next controller feedback sample showed `J1` changed from about `-1.876` to `-2.215`
+    - RTCore-backed trajectory execution ended in state `faulted`
+  - Decoded the unexpected J2 fault:
+    - `0x603F = 0xFF00`
+    - `0x203F = 0x0871`
+    - A6-EC manual reference maps that to `Er87.1` ("one-time excessive position reference increment")
+  - Correlated the unintended motion with the live native-home offsets still present on uninvolved axes:
+    - metrics showed `J1` offset `12345` counts and `J2` offset `-96135` counts
+    - `12345` counts converts to about `0.339 deg`, which matches the observed unintended J1 movement almost exactly
+  - Read the relevant code paths and identified a likely frame mismatch:
+    - RTCore hold-target alignment uses `pos - native_home_position_offset`
+    - backend trajectory upload currently converts joint positions to axis targets without compensating for that offset frame
+- Follow-up notes / risks:
+  - Current evidence says this is not a simple `J4 -> J1` joint-index remap bug; it is more likely a commanded-target vs hold-target frame mismatch that becomes dangerous whenever uninvolved axes still have nonzero native-home offsets.
+  - Because queued trajectories currently upload all-axis points, a jog on one joint can inject hidden target steps on other axes that are merely meant to hold position.
+  - If the user truly pressed the `J4` jog button only once, there may also be a second UI/session anomaly: the later jog POSTs in the same browser session appear to target software joint 3. That is worth verifying separately, but it is not required to explain the observed `J1` motion and `J2` `Er87.1` fault.
+  - Safest next step is a code fix plus a controlled retest before any more commissioning jog or re-home attempts on live hardware.
+
+## 2026-04-12 01:35 +0000
+
+- Task summary:
+  - Implemented the RTCore/backend jog-frame fix so queued trajectories, realtime RTCore jog, and completion checks now use the same native-home-aware target frame.
+- Changes:
+  - Updated `src/gradient_rt_motion/main.cpp` to:
+    - document the per-axis frame contract explicitly
+    - translate queued trajectory point targets into RTCore's feedback-aligned hold frame when trajectory points are latched
+    - seed realtime jog target accumulation from the same feedback-aligned frame instead of raw `pos_counts`
+    - compare final trajectory completion against feedback translated into the same frame as the queued target
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` comments so the Python side now explicitly documents that it uploads controller/logical targets and leaves the final native-home reframe to RTCore.
+  - Updated `tests/test_gradient05_limits_and_backends.py` with a focused regression test that locks the queued-trajectory payload contract when a native-home offset is present.
+- Validation:
+  - `make -C src/gradient_rt_motion`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py -q -k "applies_native_home_offsets_to_feedback_but_not_command_targets or enqueue_trajectory_points_keeps_controller_logical_frame_with_native_home_offset"`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_gradient05_limits_and_backends.py`
+  - `ReadLints` on `src/gradient_rt_motion/main.cpp`, `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`, and `tests/test_gradient05_limits_and_backends.py` returned clean.
+  - A broad `python -m pytest tests/test_gradient05_limits_and_backends.py -q` run on this live machine still reports unrelated failures because some older tests pull current RTCore metrics and inherit the present nonzero `native_home_position_offset` state.
+- Follow-up notes / risks:
+  - This pass is compile-tested and covered by focused backend tests, but it still needs the planned hardware proof with the current nonzero `J1/J2` `0x607C` values left intact.
+  - Live retest should follow the existing safety plan: clear the `J2` fault, keep `J1/J2` offsets unchanged, then verify a single `J4 -1 deg` commissioning jog moves only `J4` and reaches a clean RTCore terminal state.
+
+## 2026-04-12 02:00 +0000
+
+- Task summary:
+  - Ran the post-implementation live proof with the rebuilt RTCore deployed and found that the remaining unsafe step occurs on `SAFE_POWER_UP` before the `J4` jog itself.
+- Changes:
+  - No product code changed in this pass.
+  - Captured live proof artifacts from:
+    - `http://127.0.0.1:4000/info/joints-detailed`
+    - `http://127.0.0.1:4000/control/motion-status`
+    - `http://127.0.0.1:4000/control/power-up`
+    - `http://127.0.0.1:4000/control/joint-jog`
+    - `http://127.0.0.1:4000/control/wait-for-idle`
+    - `http://127.0.0.1:4000/control/power-down`
+    - `/run/gradient-rt-motion/metrics.json`
+    - `logs/startups/20260412-015821/controller.log`
+    - `logs/startups/20260412-015821/api.log`
+    - direct `sudo ethercat upload` reads for `0x607C`, `0x603F`, `0x203F`, and `0x6041`
+- Validation:
+  - Confirmed the installed RTCore binary matches the rebuilt repo binary:
+    - `sha256sum /home/pi/GradientOS/src/gradient_rt_motion/gradient-rt-motion /usr/local/bin/gradient-rt-motion`
+  - Confirmed the proof condition still held before motion:
+    - `J1 0x607C = 12345`
+    - `J2 0x607C = -96135`
+    - `J4 0x607C = 0`
+    - API motion status was `idle`
+  - Live proof result:
+    - before power-up, `J1` was about `105276` counts / `-3.2306 deg`
+    - after `SAFE_POWER_UP`, `J1` was about `92889` counts / `-2.8903 deg`
+    - the `J1` delta was about `-12387` counts, effectively the persisted `J1` offset magnitude
+    - `J2` faulted during/after power-up, before the jog proved anything useful:
+      - `0x603F = 0xFF00`
+      - `0x203F = 0x0871`
+      - `0x6041 = 0x1638`
+    - the subsequent single `J4 -1 deg` jog returned `accepted` but RTCore ended `faulted`, `WAIT_FOR_IDLE` timed out, and `J4` did not make the intended `-1 deg` move
+  - Controller log evidence:
+    - `SAFE_POWER_UP` completed
+    - `APPLY_JOINT_SETPOINT` targeted only joint 4
+    - controller thread raised `RuntimeError: RTCore trajectory execution ended in state 'faulted'`
+- Follow-up notes / risks:
+  - The original queued-target/jog-frame fix was not sufficient for live safety because RTCore still appears to inject the persisted home offset on enable/hold synchronization.
+  - The new highest-confidence hypothesis is that subtracting `native_home_position_offset` in RTCore hold-target alignment is itself wrong for live `0x607C` behavior; the bench now suggests `0x6064`/`0x607A` may already be in the drive's homed frame, so the software subtraction may be double-applying the offset.
+  - The next implementation pass should target the enable/hold-target contract first, not the API jog route.
+
+## 2026-04-12 03:10 +0000
+
+- Task summary:
+  - Fixed the remaining RTCore power-up frame bug so enable/hold synchronization stays in raw CSP wire counts, then proved on hardware that `SAFE_POWER_UP` and the original `J4 -1 deg` commissioning jog both behave safely with nonzero persisted `0x607C` offsets on other axes.
+- Changes:
+  - Updated `src/gradient_rt_motion/main.cpp` to:
+    - keep drive-facing hold/output targets in raw `0x6064` / `0x607A` counts during pre-enable, passive startup, stop-collapse, and first-`OperationEnabled` latch
+    - keep queued trajectory-point conversion explicit by subtracting `native_home_position_offset` only when converting controller/logical targets into raw CSP wire counts
+    - restore realtime jog target seeding and trajectory completion checks to the raw CSP wire frame
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` comments so the Python contract now explicitly says RTCore converts queued controller/logical targets once into raw CSP wire counts.
+  - Updated `tests/test_gradient05_limits_and_backends.py` so the focused backend tests cover safe-power-up synchronization and keep the queued-target payload contract explicit with native-home offsets present.
+- Validation:
+  - `make -C src/gradient_rt_motion`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py -q -k "safe_power_up_arms_sets_mode_and_enables or applies_native_home_offsets_to_feedback_but_not_command_targets or enqueue_trajectory_points_keeps_controller_logical_frame_with_native_home_offset"`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_gradient05_limits_and_backends.py`
+  - Live proof on the rebuilt headless stack using the exact controller/API path:
+    - Stage 1 `POST /control/power-up` with `J1 0x607C=12345`, `J2 0x607C=-96135`, `J4 0x607C=0`
+    - direct `ethercat upload` reads for `0x607C`, `0x6064`, `0x607A`, `0x6041`, `0x603F`, `0x203F` on J1/J2/J4 before and after power-up
+    - result: no nonzero fault words, J1 delta about `-42` counts / `+0.001 deg`, J2 delta about `+1284` counts / `+0.035 deg`, J4 delta about `+15` counts / `-0.002 deg`
+    - Stage 2 `POST /control/joint-jog {"joint":4,"delta_deg":-1.0}` followed by `POST /control/wait-for-idle`
+    - result: only J4 moved (about `-1.01 deg`, `+6619` counts), terminal state was `completed`, and RTCore reported the normal trajectory-completed event rather than a fault
+- Follow-up notes / risks:
+  - The live proof now contradicts the earlier assumption recorded during the first jog-frame fix: the safe wire-frame contract is raw CSP counts for hold/output/jog-completion, not `pos_counts - native_home_position_offset`.
+  - `J2` still showed a noticeable raw-count delta during power-up without meaningful joint-angle motion or any fault words; treat joint-space deltas plus SDO/API fault checks as the real go/no-go signal, not a raw-count threshold alone.
+
+## 2026-04-12 04:32 +0000
+
+- Task summary:
+  - Fixed the native-home false-negative/UI contradiction so long-running drive home operations no longer fall back to a generic request failure while RTCore telemetry later reports success.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` to:
+    - extend the native-home verification wait window from `3.0s` to `10.0s`
+    - require a fresh post-command RTCore metrics sample before trusting native-home terminal state
+    - return a structured native-home result with `accepted`, `verified`, `timed_out`, `code`, `message`, and live native-home status fields instead of a bare boolean
+  - Updated `src/gradient_os/run_controller.py` so `NATIVE_HOME_JOINT` replies preserve the structured backend payload across the UDP controller boundary.
+  - Updated `src/gradient_os/api/main.py` so `/control/home-joint-native` returns the structured native-home result for both ACK and controller-level ERROR replies instead of collapsing domain outcomes into a generic `503`.
+  - Updated `web-ui/src/ControlPanel.tsx` so drive-native home shows:
+    - success for verified results
+    - warning for accepted-but-pending verification or missing post-home feedback refresh
+    - error only for true native-home failure / request failure
+  - Updated focused regressions in:
+    - `tests/test_gradient05_limits_and_backends.py`
+    - `tests/test_api_endpoints.py`
+    - `web-ui/src/ControlPanel.test.tsx`
+- Validation:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/run_controller.py src/gradient_os/api/main.py tests/test_gradient05_limits_and_backends.py tests/test_api_endpoints.py`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py -q -k "native_home or safe_power_up_arms_sets_mode_and_enables or applies_native_home_offsets_to_feedback_but_not_command_targets or enqueue_trajectory_points_keeps_controller_logical_frame_with_native_home_offset"`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_api_endpoints.py -q -k "home_joint_native"`
+  - `npm test -- src/ControlPanel.test.tsx`
+  - `ReadLints` on the edited backend/controller/API/UI/test files returned no diagnostics
+- Follow-up notes / risks:
+  - The `10.0s` native-home wait is a safer default for current observed drive behavior, but if a particular axis routinely exceeds it the UI will now degrade to a warning/pending-verification state rather than a hard failure.
+  - This pass improves controller/API/UI truthfulness for native-home, but live bench revalidation on the actual J1 flow is still the right next proof step.
+
+## 2026-04-12 04:39 +0000
+
+- Task summary:
+  - Verified the post-restart J1 native-home flow on live logs/metrics and promoted the now-stable native-home frame/status rules into the canonical GradientOS SOP skill files.
+- Changes:
+  - Verified the latest restart session in `logs/startups/20260412-043326/`:
+    - `controller.log` shows `Received: 'NATIVE_HOME_JOINT,1'` followed by `[EtherCAT RTCore] Native drive-home verified: joint=1 axis_mask=0x1`
+    - `api.log` shows `POST /control/home-joint-native HTTP/1.1" 200 OK`
+    - `/run/gradient-rt-motion/metrics.json` shows axis 0 with `native_home_state=2`, `native_home_last_abort_code=0`, and `axis_enable_mask=62`, which matches the intended "J1 left disabled after home" contract
+  - Updated canonical SOP skill references:
+    - `.cursor/skills/gradientos-sop/rtcore-ethercat.md`
+    - `.cursor/skills/gradientos-sop/commissioning-safety.md`
+    - `.cursor/skills/gradientos-sop/ui-api-telemetry.md`
+  - Replaced the stale RTCore native-home frame note with the validated contract:
+    - drive-facing CSP hold/output/enable targets stay in raw `0x6064` / `0x607A` wire counts
+    - subtract `native_home_position_offset` only when converting queued controller/logical targets into raw CSP wire counts
+  - Added stable commissioning/UI guidance:
+    - native-home keeps the homed axis disabled until explicit safe power-up
+    - native-home verification must use a fresh post-command RTCore metrics sample
+    - accepted-but-still-verifying native-home should surface as pending/warning, not generic request failure
+- Validation:
+  - log/metrics inspection only; no new code tests were needed for the skill-file consolidation pass
+- Follow-up notes / risks:
+  - The canonical skill now matches the validated native-home frame and status contract observed on live hardware after restart.
+
+## 2026-04-12 04:44 +0000
+
+- Task summary:
+  - Updated the long-form canonical SOP source file so the master GradientOS operating-principles document no longer carries stale native-home frame/status guidance.
+- Changes:
+  - Updated `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` to:
+    - clarify that safe-enable/power-up synchronization must happen in the actual drive-facing CSP wire frame
+    - state the validated A6-EC rule that `0x607C` is durable native-home truth while hold/output/enable targets remain raw `0x6064` / `0x607A` counts
+    - document that `native_home_position_offset` is applied only when converting queued controller/logical targets into raw CSP wire counts
+    - describe the finalized native-home execution/status contract (`accepted`, `verified`, `timed_out`) and the requirement to wait for fresh post-command RTCore metrics
+    - note that non-converged native-home verification should degrade to pending/warning messaging instead of generic request failure
+- Validation:
+  - searched the `gradientos-sop` corpus for stale native-home wording after the edit
+  - `ReadLints` on the edited master markdown file returned no diagnostics
+- Follow-up notes / risks:
+  - The routed SOP files and the long-form master file are now aligned for the native-home workstream.

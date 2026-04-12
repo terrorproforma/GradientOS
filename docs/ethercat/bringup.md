@@ -308,9 +308,11 @@ Notes:
 
 For A6-EC absolute encoder commissioning there are now two distinct operations:
 
-- `POST /control/home-joint-native` tells RTCore to set the drive's native home by
-  rewriting the A6-EC position offset (`0x60B0`) for that axis and saving it to the
-  drive (`0x1010:01`).
+- `POST /control/home-joint-native` tells RTCore to run the vendor-native homing
+  capture workflow for that axis. On this A6-EC path, the **durable** native-home
+  truth is persisted in **`0x607C`** (home offset / native home position), not the
+  runtime CSP position-shift object **`0x60B0`**. Treat `0x60B0` as a CSP motion-frame
+  term (Section `4.1.6`), not as the canonical EEPROM-backed store for native home.
 - `POST /control/zero-joint` keeps the existing GradientOS software-zero workflow by
   storing a logical offset in `.gradient_joint_zero_offsets.json`.
 
@@ -364,6 +366,7 @@ Validated conclusions so far:
   corrected.
 - Direct power-cycle experiments showed `0x60B0` does not survive real drive
   power loss on this A6-EC setup, while `0x607C` does.
+- Live proof (2026-04-12) with nonzero persisted `0x607C` on other axes showed that `SAFE_POWER_UP` stays safe only when drive-facing cyclic CSP targets during enable/hold synchronization remain in the raw `0x6064` / `0x607A` wire frame. Subtracting the persisted native-home offset again while mirroring live feedback into enable/hold targets injects an offset-sized step and can fault drives even when joint-space motion looks small.
 - Section `4.1.5` defines HM mode `35` as "the current position is used as the
   home", which is the closest vendor-native match for GradientOS's "capture the
   current pose as native home" action.

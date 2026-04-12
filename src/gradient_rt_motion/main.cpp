@@ -78,6 +78,21 @@ int32_t clamp_round_to_i32(double value) {
   return static_cast<int32_t>(std::llround(clamped));
 }
 
+// RTCore writes drive-facing CSP targets in the same raw PDO count frame that
+// the drive publishes through 0x6064 and expects on 0x607A. Controller-side
+// logical targets still include persisted native-home truth, so RTCore must
+// subtract that offset exactly once when it converts queued targets into CSP
+// wire counts. Mirroring live feedback back to a hold target must stay in raw
+// PDO counts, otherwise SAFE_POWER_UP injects a step roughly equal to 0x607C.
+int32_t csp_wire_counts_from_feedback(int32_t feedback_pos_counts) {
+  return feedback_pos_counts;
+}
+
+double controller_target_to_csp_wire_counts(double controller_target_counts,
+                                            int32_t native_home_offset_counts) {
+  return controller_target_counts - static_cast<double>(native_home_offset_counts);
+}
+
 void logf(const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -160,6 +175,51 @@ struct StartupSdoConfig {
   uint16_t index = 0;
   uint8_t subindex = 0;
   std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> values{};
+};
+
+enum class SdoScalarType : uint8_t {
+  kNone = 0,
+  kU8 = 1,
+  kI8 = 2,
+  kU16 = 3,
+  kI16 = 4,
+  kU32 = 5,
+  kI32 = 6,
+};
+
+struct SdoObjectSpec {
+  bool valid = false;
+  uint16_t index = 0;
+  uint8_t subindex = 0;
+  SdoScalarType type = SdoScalarType::kNone;
+};
+
+enum class NativeHomeOpKind : uint8_t {
+  kNone = 0,
+  kSetMode = 1,
+  kWriteSdo = 2,
+  kControlwordSequence = 3,
+  kWaitStatusword = 4,
+  kRefreshTruth = 5,
+  kRestoreMode = 6,
+};
+
+struct NativeHomeOp {
+  NativeHomeOpKind kind = NativeHomeOpKind::kNone;
+  SdoObjectSpec object{};
+  int32_t value_i32 = 0;
+  std::array<uint16_t, 8> controlword_values{};
+  uint32_t controlword_count = 0;
+  uint16_t wait_all_set_mask = 0;
+  uint16_t wait_all_clear_mask = 0;
+};
+
+struct NativeHomeConfig {
+  bool valid = false;
+  uint32_t steady_state_mode = 8;
+  uint32_t commissioning_mode = 6;
+  SdoObjectSpec truth_source{};
+  std::vector<NativeHomeOp> transaction{};
 };
 
 struct DrivePdoConfig {
@@ -304,6 +364,20 @@ bool parse_u32_auto(const char* s, uint32_t* out) {
   return true;
 }
 
+bool parse_i64_auto(const char* s, int64_t* out) {
+  if (!s || !*s || !out) {
+    return false;
+  }
+  char* end = nullptr;
+  errno = 0;
+  long long v = std::strtoll(s, &end, 0);
+  if (errno != 0 || end == s || *end != '\0') {
+    return false;
+  }
+  *out = static_cast<int64_t>(v);
+  return true;
+}
+
 uint32_t drive_profile_token_hash(const std::string& token) {
   uint32_t value = 0x811C9DC5u;
   for (char c : token) {
@@ -348,6 +422,15 @@ std::string trim_ascii_ws(const std::string& s) {
   }
   const size_t last = s.find_last_not_of(" \t\r\n");
   return s.substr(first, last - first + 1);
+}
+
+std::string ascii_lower_copy(std::string value) {
+  for (char& c : value) {
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');
+    }
+  }
+  return value;
 }
 
 std::vector<std::string> split_csv_strict(const std::string& spec) {
@@ -501,6 +584,173 @@ bool parse_startup_sdo_config_spec(const std::string& spec,
   cfg.type = StartupSdoValueType::kU16;
   cfg.index = index;
   cfg.subindex = static_cast<uint8_t>(subindex & 0xFFu);
+  *out = cfg;
+  return true;
+}
+
+bool parse_sdo_scalar_type_token(const std::string& token, SdoScalarType* out) {
+  if (!out) {
+    return false;
+  }
+  const std::string lowered = ascii_lower_copy(trim_ascii_ws(token));
+  if (lowered == "u8") {
+    *out = SdoScalarType::kU8;
+    return true;
+  }
+  if (lowered == "i8") {
+    *out = SdoScalarType::kI8;
+    return true;
+  }
+  if (lowered == "u16") {
+    *out = SdoScalarType::kU16;
+    return true;
+  }
+  if (lowered == "i16") {
+    *out = SdoScalarType::kI16;
+    return true;
+  }
+  if (lowered == "u32") {
+    *out = SdoScalarType::kU32;
+    return true;
+  }
+  if (lowered == "i32") {
+    *out = SdoScalarType::kI32;
+    return true;
+  }
+  return false;
+}
+
+bool parse_native_home_config_spec(const std::string& spec, NativeHomeConfig* out) {
+  if (!out) {
+    return false;
+  }
+  *out = NativeHomeConfig{};
+  const std::string trimmed = trim_ascii_ws(spec);
+  if (trimmed.empty()) {
+    return true;
+  }
+  const auto descriptors = split_delim_strict(trimmed, ';');
+  if (descriptors.empty()) {
+    return false;
+  }
+
+  NativeHomeConfig cfg{};
+  for (const auto& descriptor : descriptors) {
+    const auto fields = split_delim_strict(descriptor, '|');
+    if (fields.empty()) {
+      return false;
+    }
+    const std::string entry_kind = ascii_lower_copy(trim_ascii_ws(fields[0]));
+    if (entry_kind == "steady_state_mode") {
+      uint32_t mode = 0;
+      if (fields.size() != 2 || !parse_u32_auto(fields[1].c_str(), &mode)) {
+        return false;
+      }
+      cfg.steady_state_mode = mode;
+      continue;
+    }
+    if (entry_kind == "commissioning_mode") {
+      uint32_t mode = 0;
+      if (fields.size() != 2 || !parse_u32_auto(fields[1].c_str(), &mode)) {
+        return false;
+      }
+      cfg.commissioning_mode = mode;
+      continue;
+    }
+    if (entry_kind == "truth_source") {
+      uint16_t index = 0;
+      uint16_t subindex = 0;
+      SdoScalarType type = SdoScalarType::kNone;
+      if (fields.size() != 4 ||
+          !parse_u16_auto(fields[1].c_str(), &index) ||
+          !parse_u16_auto(fields[2].c_str(), &subindex) ||
+          !parse_sdo_scalar_type_token(fields[3], &type)) {
+        return false;
+      }
+      cfg.truth_source.valid = true;
+      cfg.truth_source.index = index;
+      cfg.truth_source.subindex = static_cast<uint8_t>(subindex & 0xFFu);
+      cfg.truth_source.type = type;
+      continue;
+    }
+    if (entry_kind != "op" || fields.size() < 2) {
+      return false;
+    }
+
+    const std::string op_name = ascii_lower_copy(trim_ascii_ws(fields[1]));
+    NativeHomeOp op{};
+    if (op_name == "set_mode") {
+      int64_t value = 0;
+      if (fields.size() != 3 || !parse_i64_auto(fields[2].c_str(), &value)) {
+        return false;
+      }
+      op.kind = NativeHomeOpKind::kSetMode;
+      op.value_i32 = static_cast<int32_t>(value);
+    } else if (op_name == "restore_mode") {
+      int64_t value = 0;
+      if (fields.size() != 3 || !parse_i64_auto(fields[2].c_str(), &value)) {
+        return false;
+      }
+      op.kind = NativeHomeOpKind::kRestoreMode;
+      op.value_i32 = static_cast<int32_t>(value);
+    } else if (op_name == "write_sdo") {
+      uint16_t index = 0;
+      uint16_t subindex = 0;
+      SdoScalarType type = SdoScalarType::kNone;
+      int64_t value = 0;
+      if (fields.size() != 6 ||
+          !parse_u16_auto(fields[2].c_str(), &index) ||
+          !parse_u16_auto(fields[3].c_str(), &subindex) ||
+          !parse_sdo_scalar_type_token(fields[4], &type) ||
+          !parse_i64_auto(fields[5].c_str(), &value)) {
+        return false;
+      }
+      op.kind = NativeHomeOpKind::kWriteSdo;
+      op.object.valid = true;
+      op.object.index = index;
+      op.object.subindex = static_cast<uint8_t>(subindex & 0xFFu);
+      op.object.type = type;
+      op.value_i32 = static_cast<int32_t>(value);
+    } else if (op_name == "controlword_sequence") {
+      std::vector<uint32_t> values{};
+      if (fields.size() != 3 || !parse_u32_csv_allow_zero(fields[2], &values) || values.empty() ||
+          values.size() > op.controlword_values.size()) {
+        return false;
+      }
+      op.kind = NativeHomeOpKind::kControlwordSequence;
+      op.controlword_count = static_cast<uint32_t>(values.size());
+      for (size_t i = 0; i < values.size(); ++i) {
+        if (values[i] > static_cast<uint32_t>(std::numeric_limits<uint16_t>::max())) {
+          return false;
+        }
+        op.controlword_values[i] = static_cast<uint16_t>(values[i] & 0xFFFFu);
+      }
+    } else if (op_name == "wait_statusword") {
+      uint16_t all_set_mask = 0;
+      uint16_t all_clear_mask = 0;
+      if (fields.size() != 4 ||
+          !parse_u16_auto(fields[2].c_str(), &all_set_mask) ||
+          !parse_u16_auto(fields[3].c_str(), &all_clear_mask)) {
+        return false;
+      }
+      op.kind = NativeHomeOpKind::kWaitStatusword;
+      op.wait_all_set_mask = all_set_mask;
+      op.wait_all_clear_mask = all_clear_mask;
+    } else if (op_name == "refresh_truth") {
+      if (fields.size() != 2) {
+        return false;
+      }
+      op.kind = NativeHomeOpKind::kRefreshTruth;
+    } else {
+      return false;
+    }
+    cfg.transaction.push_back(op);
+  }
+
+  if (!cfg.truth_source.valid || cfg.transaction.empty()) {
+    return false;
+  }
+  cfg.valid = true;
   *out = cfg;
   return true;
 }
@@ -859,6 +1109,7 @@ void print_usage(const char* argv0) {
       "[--counts-per-rev N[,N..]] [--gear-ratio R[,R..]] [--sign S[,S..]] "
       "[--axis-type T[,T..]] [--lead-m-per-rev M[,M..]] [--drive-profile ID] [--max-rpm RPM] "
       "[--startup-sdo-config SPEC] "
+      "[--native-home-config SPEC] "
       "[--slave-vendor-id VID] [--slave-product-code PID] [--slave-revision-no REV] "
       "[--rx-sync-index N] [--tx-sync-index N] [--dc-cycle-multiple-ns NS] "
       "[--slave-positions P[,P..]] "
@@ -879,6 +1130,7 @@ void print_usage(const char* argv0) {
       "  --drive-profile <profile-or-id>\n"
       "  --max-rpm      100\n"
       "  --startup-sdo-config key|u16|0xINDEX|0xSUB|V[,V..]\n"
+      "  --native-home-config descriptor string for commissioning-only native-home transactions\n"
       "  --slave-vendor-id  0x....\n"
       "  --slave-product-code 0x....\n"
       "  --slave-revision-no 0x....\n"
@@ -1092,6 +1344,7 @@ int main(int argc, char** argv) {
   std::string rx_pdo_layout_spec;
   std::string tx_pdo_layout_spec;
   std::string startup_sdo_config_spec;
+  std::string native_home_config_spec;
 
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -1154,6 +1407,10 @@ int main(int argc, char** argv) {
     }
     if (arg == "--startup-sdo-config" && i + 1 < argc) {
       startup_sdo_config_spec = argv[++i];
+      continue;
+    }
+    if (arg == "--native-home-config" && i + 1 < argc) {
+      native_home_config_spec = argv[++i];
       continue;
     }
     if (arg == "--slave-vendor-id" && i + 1 < argc) {
@@ -1322,6 +1579,11 @@ int main(int argc, char** argv) {
     logf("ERROR: invalid --startup-sdo-config");
     return 2;
   }
+  NativeHomeConfig native_home_cfg{};
+  if (!parse_native_home_config_spec(native_home_config_spec, &native_home_cfg)) {
+    logf("ERROR: invalid --native-home-config");
+    return 2;
+  }
   if (opt.slave_vendor_id == 0 || opt.slave_product_code == 0) {
     logf("ERROR: EtherCAT slave identity is incomplete "
          "(provide --slave-vendor-id and --slave-product-code)");
@@ -1450,6 +1712,8 @@ int main(int argc, char** argv) {
     uint64_t t_from_start_ns = 0;
     uint32_t axis_mask = 0;
     uint32_t flags = 0;
+    // Stored in RTCore's raw CSP wire frame: the same count space the drive
+    // publishes on 0x6064 and expects on 0x607A.
     std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> target_counts{};
     std::array<double, gradient::ipc::v1::GRADIENT_MAX_AXES> velocity_counts_per_s{};
   };
@@ -1547,9 +1811,13 @@ int main(int argc, char** argv) {
     std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> output_target_velocity_counts_per_s{};
   };
 
+  constexpr int32_t kNoModeOverride = std::numeric_limits<int32_t>::min();
   std::atomic<bool> armed{false};
   std::atomic<uint32_t> axis_enable_mask{0};
-  std::atomic<int32_t> mode_of_operation{0}; // e.g. 8=CSP
+  std::array<std::atomic<int32_t>, gradient::ipc::v1::GRADIENT_MAX_AXES> desired_mode_of_operation{};
+  std::atomic<uint32_t> service_mode_axis_mask{0};
+  std::array<std::atomic<int32_t>, gradient::ipc::v1::GRADIENT_MAX_AXES> service_mode_override{};
+  std::array<std::atomic<uint32_t>, gradient::ipc::v1::GRADIENT_MAX_AXES> service_controlword_override{};
   std::atomic<uint32_t> fault_reset_request{0}; // bitmask; helper thread -> RT thread
   std::atomic<uint64_t> trajectory_abort_request{0}; // 0 means none, UINT64_MAX means any active trajectory
   CommittedTrajectory committed_trajectory{};
@@ -1574,37 +1842,185 @@ int main(int argc, char** argv) {
   ec_master_t* shared_master = nullptr;
 #endif
 
-  auto read_position_offset_axis = [&](uint32_t axis, int32_t* offset_out) {
+  for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+    desired_mode_of_operation[i].store(8, std::memory_order_relaxed);
+    service_mode_override[i].store(kNoModeOverride, std::memory_order_relaxed);
+    service_controlword_override[i].store(0, std::memory_order_relaxed);
+  }
+
+  auto write_sdo_scalar_axis = [&](uint32_t axis,
+                                   uint16_t index,
+                                   uint8_t subindex,
+                                   SdoScalarType type,
+                                   int32_t value,
+                                   uint32_t* abort_out) {
 #if GRADIENT_HAVE_ECRT
-    if (!offset_out || !shared_master) {
+    if (!shared_master) {
       return false;
     }
-    uint8_t offset_raw[sizeof(int32_t)] = {};
-    size_t offset_size = 0;
-    uint32_t offset_abort = 0;
+    uint8_t raw[sizeof(int32_t)] = {};
+    size_t raw_size = 0;
+    switch (type) {
+      case SdoScalarType::kU8:
+        raw[0] = static_cast<uint8_t>(value & 0xFF);
+        raw_size = sizeof(uint8_t);
+        break;
+      case SdoScalarType::kI8:
+        raw[0] = static_cast<uint8_t>(static_cast<int8_t>(value));
+        raw_size = sizeof(int8_t);
+        break;
+      case SdoScalarType::kU16:
+        EC_WRITE_U16(raw, static_cast<uint16_t>(value & 0xFFFF));
+        raw_size = sizeof(uint16_t);
+        break;
+      case SdoScalarType::kI16:
+        EC_WRITE_S16(raw, static_cast<int16_t>(value));
+        raw_size = sizeof(int16_t);
+        break;
+      case SdoScalarType::kU32:
+        EC_WRITE_U32(raw, static_cast<uint32_t>(value));
+        raw_size = sizeof(uint32_t);
+        break;
+      case SdoScalarType::kI32:
+        EC_WRITE_S32(raw, value);
+        raw_size = sizeof(int32_t);
+        break;
+      case SdoScalarType::kNone:
+      default:
+        return false;
+    }
+    uint32_t abort_code = 0;
+    const int rc = ecrt_master_sdo_download(
+        shared_master,
+        opt.slave_position[axis],
+        index,
+        subindex,
+        raw,
+        raw_size,
+        &abort_code);
+    if (abort_out) {
+      *abort_out = abort_code;
+    }
+    return rc == 0;
+#else
+    (void)axis;
+    (void)index;
+    (void)subindex;
+    (void)type;
+    (void)value;
+    if (abort_out) {
+      *abort_out = 0;
+    }
+    return false;
+#endif
+  };
+
+  auto read_sdo_scalar_axis = [&](uint32_t axis,
+                                  uint16_t index,
+                                  uint8_t subindex,
+                                  SdoScalarType type,
+                                  int32_t* value_out,
+                                  uint32_t* abort_out) {
+#if GRADIENT_HAVE_ECRT
+    if (!value_out || !shared_master) {
+      return false;
+    }
+    uint8_t raw[sizeof(int32_t)] = {};
+    size_t raw_size = 0;
+    uint32_t abort_code = 0;
     const int rc = ecrt_master_sdo_upload(
         shared_master,
         opt.slave_position[axis],
-        0x60B0,
-        0x00,
-        offset_raw,
-        sizeof(offset_raw),
-        &offset_size,
-        &offset_abort);
-    if (rc != 0 || offset_size < sizeof(int32_t)) {
-      logf("WARNING: position_offset upload failed axis=%u slave_pos=%u index=0x60B0 rc=%d abort=0x%08x size=%zu",
-           axis,
-           static_cast<unsigned int>(opt.slave_position[axis]),
-           rc,
-           static_cast<unsigned int>(offset_abort),
-           offset_size);
+        index,
+        subindex,
+        raw,
+        sizeof(raw),
+        &raw_size,
+        &abort_code);
+    if (abort_out) {
+      *abort_out = abort_code;
+    }
+    if (rc != 0) {
       return false;
     }
-    *offset_out = EC_READ_S32(offset_raw);
+    switch (type) {
+      case SdoScalarType::kU8:
+        if (raw_size < sizeof(uint8_t)) {
+          return false;
+        }
+        *value_out = static_cast<int32_t>(raw[0]);
+        return true;
+      case SdoScalarType::kI8:
+        if (raw_size < sizeof(int8_t)) {
+          return false;
+        }
+        *value_out = static_cast<int32_t>(static_cast<int8_t>(raw[0]));
+        return true;
+      case SdoScalarType::kU16:
+        if (raw_size < sizeof(uint16_t)) {
+          return false;
+        }
+        *value_out = static_cast<int32_t>(EC_READ_U16(raw));
+        return true;
+      case SdoScalarType::kI16:
+        if (raw_size < sizeof(int16_t)) {
+          return false;
+        }
+        *value_out = static_cast<int32_t>(EC_READ_S16(raw));
+        return true;
+      case SdoScalarType::kU32:
+        if (raw_size < sizeof(uint32_t)) {
+          return false;
+        }
+        *value_out = static_cast<int32_t>(EC_READ_U32(raw));
+        return true;
+      case SdoScalarType::kI32:
+        if (raw_size < sizeof(int32_t)) {
+          return false;
+        }
+        *value_out = EC_READ_S32(raw);
+        return true;
+      case SdoScalarType::kNone:
+      default:
+        return false;
+    }
+#else
+    (void)axis;
+    (void)index;
+    (void)subindex;
+    (void)type;
+    (void)value_out;
+    if (abort_out) {
+      *abort_out = 0;
+    }
+    return false;
+#endif
+  };
+
+  auto read_native_home_truth_axis = [&](uint32_t axis, int32_t* truth_out) {
+#if GRADIENT_HAVE_ECRT
+    if (!truth_out || !native_home_cfg.valid || !native_home_cfg.truth_source.valid) {
+      return false;
+    }
+    uint32_t abort_code = 0;
+    if (!read_sdo_scalar_axis(axis,
+                              native_home_cfg.truth_source.index,
+                              native_home_cfg.truth_source.subindex,
+                              native_home_cfg.truth_source.type,
+                              truth_out,
+                              &abort_code)) {
+      logf("WARNING: native_home truth upload failed axis=%u slave_pos=%u index=0x%04x sub=0x%02x abort=0x%08x",
+           axis,
+           static_cast<unsigned int>(opt.slave_position[axis]),
+           static_cast<unsigned int>(native_home_cfg.truth_source.index),
+           static_cast<unsigned int>(native_home_cfg.truth_source.subindex),
+           static_cast<unsigned int>(abort_code));
+      return false;
+    }
     return true;
 #else
     (void)axis;
-    (void)offset_out;
+    (void)truth_out;
     return false;
 #endif
   };
@@ -2446,7 +2862,12 @@ int main(int argc, char** argv) {
           shutdown_until_ns = diag_now_ns + kShutdownGraceNs;
           armed.store(false, std::memory_order_relaxed);
           axis_enable_mask.store(0, std::memory_order_relaxed);
-          mode_of_operation.store(0, std::memory_order_relaxed);
+          service_mode_axis_mask.store(0, std::memory_order_relaxed);
+          for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
+            desired_mode_of_operation[axis].store(0, std::memory_order_relaxed);
+            service_mode_override[axis].store(kNoModeOverride, std::memory_order_relaxed);
+            service_controlword_override[axis].store(0, std::memory_order_relaxed);
+          }
         }
 
         ecrt_master_application_time(master, app_time_ns);
@@ -2775,7 +3196,8 @@ int main(int argc, char** argv) {
                   continue;
                 }
                 if (!have_jog_target[i]) {
-                  jog_target_counts_float[i] = static_cast<double>(latest_feedback.pos_counts[i]);
+                  jog_target_counts_float[i] = static_cast<double>(
+                      csp_wire_counts_from_feedback(latest_feedback.pos_counts[i]));
                   have_jog_target[i] = true;
                 }
                 jog_target_counts_float[i] += active_jog_velocity_counts_per_s[i] * period_s;
@@ -2834,98 +3256,113 @@ int main(int argc, char** argv) {
           int8_t mode_out = 0;
           uint16_t tp_func_out = 0;
           uint32_t max_profile_vel_out = 0;
-          const int32_t feedback_aligned_target_counts = clamp_round_to_i32(
-              static_cast<double>(pos) -
-              static_cast<double>(latest_feedback.native_home_position_offset[i]));
+          const int32_t feedback_wire_target_counts = csp_wire_counts_from_feedback(pos);
+          const bool service_mode_active =
+              (service_mode_axis_mask.load(std::memory_order_relaxed) & (1u << i)) != 0u;
+          const int32_t commanded_mode = desired_mode_of_operation[i].load(std::memory_order_relaxed);
 
           if (!startup_passive_active) {
-            const bool want_enable = is_armed && ((en_mask & (1u << i)) != 0u);
-            bool want_fault_reset = (fault_reset_left[i] > 0);
-            const bool want_jog_quick_stop =
-                want_enable && (jog_stop_quick_stop_cycles_left[i] > 0) &&
-                !active_jog && !active_trajectory;
-            if (want_fault_reset && st != gradient::ds402::State::Fault) {
-              // Stop pulsing once the drive leaves FAULT (or if it never was in FAULT).
-              fault_reset_left[i] = 0;
-              want_fault_reset = false;
-            }
+            if (service_mode_active) {
+              hold_target_counts[i] = feedback_wire_target_counts;
+              have_hold[i] = false;
+              cw = static_cast<uint16_t>(
+                  service_controlword_override[i].load(std::memory_order_relaxed) & 0xFFFFu);
+              target_pos_out = feedback_wire_target_counts;
+              target_vel_out = 0;
+              target_torque_out = 0;
+              const int32_t service_mode = service_mode_override[i].load(std::memory_order_relaxed);
+              mode_out = static_cast<int8_t>(
+                  (service_mode == kNoModeOverride ? commanded_mode : service_mode));
+              tp_func_out = 0;
+              max_profile_vel_out = opt.axis[i].max_profile_vel_counts_per_s;
+            } else {
+              const bool want_enable = is_armed && ((en_mask & (1u << i)) != 0u);
+              bool want_fault_reset = (fault_reset_left[i] > 0);
+              const bool want_jog_quick_stop =
+                  want_enable && (jog_stop_quick_stop_cycles_left[i] > 0) &&
+                  !active_jog && !active_trajectory;
+              if (want_fault_reset && st != gradient::ds402::State::Fault) {
+                // Stop pulsing once the drive leaves FAULT (or if it never was in FAULT).
+                fault_reset_left[i] = 0;
+                want_fault_reset = false;
+              }
 
-            // Hold-target logic:
-            // - While not operation-enabled (or not wanting enable), keep the target aligned to feedback
-            //   so we don't present a "big step" when DS402 transitions to OperationEnabled (manual: Er87.*).
-            // - Once operation-enabled, latch once, then track commanded targets with optional per-cycle clamp.
-            if ((snap_jog_hold_to_feedback_mask & (1u << i)) != 0u) {
-              // When jog stops or expires we must immediately collapse the CSP hold target
-              // onto live feedback, otherwise the axis can keep chasing the last jog target.
-              hold_target_counts[i] = feedback_aligned_target_counts;
-              have_hold[i] = true;
-            }
-            if (jog_stop_arrest_cycles_left[i] > 0) {
-              // Briefly keep re-latching hold to live feedback after a jog stop/timeout so
-              // the drive does not keep chasing a stale frozen CSP target.
-              hold_target_counts[i] = feedback_aligned_target_counts;
-              have_hold[i] = true;
-            }
-            if (want_enable && st == gradient::ds402::State::OperationEnabled) {
-              if (!have_hold[i]) {
-                hold_target_counts[i] = feedback_aligned_target_counts;
+              // Hold-target logic:
+              // - While not operation-enabled (or not wanting enable), keep the drive-facing CSP target
+              //   mirrored to raw feedback so 0x607A stays in the same wire frame as 0x6064.
+              // - Once operation-enabled, latch once, then track commanded targets with optional per-cycle clamp.
+              if ((snap_jog_hold_to_feedback_mask & (1u << i)) != 0u) {
+                // When jog stops or expires we must immediately collapse the CSP hold target
+                // onto live feedback, otherwise the axis can keep chasing the last jog target.
+                hold_target_counts[i] = feedback_wire_target_counts;
                 have_hold[i] = true;
               }
-              if ((sp_mask & (1u << i)) != 0u) {
-                const int32_t desired = target_counts[i];
-                const int32_t max_step = opt.axis[i].max_step_counts_per_cycle;
-                const double desired_velocity = target_velocity_counts_per_s[i];
-                if (max_step > 0) {
-                  const int32_t cur = hold_target_counts[i];
-                  const int64_t delta = static_cast<int64_t>(desired) - static_cast<int64_t>(cur);
-                  if (delta > max_step) {
-                    hold_target_counts[i] = cur + max_step;
-                  } else if (delta < -max_step) {
-                    hold_target_counts[i] = cur - max_step;
+              if (jog_stop_arrest_cycles_left[i] > 0) {
+                // Briefly keep re-latching hold to live feedback after a jog stop/timeout so
+                // the drive does not keep chasing a stale frozen CSP target.
+                hold_target_counts[i] = feedback_wire_target_counts;
+                have_hold[i] = true;
+              }
+              if (want_enable && st == gradient::ds402::State::OperationEnabled) {
+                if (!have_hold[i]) {
+                  hold_target_counts[i] = feedback_wire_target_counts;
+                  have_hold[i] = true;
+                }
+                if ((sp_mask & (1u << i)) != 0u) {
+                  const int32_t desired = target_counts[i];
+                  const int32_t max_step = opt.axis[i].max_step_counts_per_cycle;
+                  const double desired_velocity = target_velocity_counts_per_s[i];
+                  if (max_step > 0) {
+                    const int32_t cur = hold_target_counts[i];
+                    const int64_t delta = static_cast<int64_t>(desired) - static_cast<int64_t>(cur);
+                    if (delta > max_step) {
+                      hold_target_counts[i] = cur + max_step;
+                    } else if (delta < -max_step) {
+                      hold_target_counts[i] = cur - max_step;
+                    } else {
+                      hold_target_counts[i] = desired;
+                    }
                   } else {
                     hold_target_counts[i] = desired;
                   }
-                } else {
-                  hold_target_counts[i] = desired;
-                }
-                const double max_velocity_from_step = static_cast<double>(max_step) / period_s;
-                if (max_step > 0) {
-                  if (desired_velocity > max_velocity_from_step) {
-                    target_vel_out = clamp_round_to_i32(max_velocity_from_step);
-                  } else if (desired_velocity < -max_velocity_from_step) {
-                    target_vel_out = clamp_round_to_i32(-max_velocity_from_step);
+                  const double max_velocity_from_step = static_cast<double>(max_step) / period_s;
+                  if (max_step > 0) {
+                    if (desired_velocity > max_velocity_from_step) {
+                      target_vel_out = clamp_round_to_i32(max_velocity_from_step);
+                    } else if (desired_velocity < -max_velocity_from_step) {
+                      target_vel_out = clamp_round_to_i32(-max_velocity_from_step);
+                    } else {
+                      target_vel_out = clamp_round_to_i32(desired_velocity);
+                    }
                   } else {
                     target_vel_out = clamp_round_to_i32(desired_velocity);
                   }
-                } else {
-                  target_vel_out = clamp_round_to_i32(desired_velocity);
                 }
+              } else {
+                // Track feedback until OP; keeps 0x607A aligned during state transitions.
+                hold_target_counts[i] = feedback_wire_target_counts;
+                have_hold[i] = false;
               }
-            } else {
-              // Track feedback until OP; keeps 0x607A aligned during state transitions.
-              hold_target_counts[i] = feedback_aligned_target_counts;
-              have_hold[i] = false;
+              cw = gradient::ds402::controlword_for_enable(st, want_enable, want_fault_reset);
+              if (want_jog_quick_stop &&
+                  (st == gradient::ds402::State::OperationEnabled ||
+                   st == gradient::ds402::State::QuickStopActive)) {
+                cw = gradient::ds402::CW_QUICK_STOP;
+              }
+              if (want_fault_reset && st == gradient::ds402::State::Fault && fault_reset_left[i] > 0) {
+                fault_reset_left[i]--;
+              }
+              target_pos_out = hold_target_counts[i];
+              target_torque_out = 0;
+              mode_out = static_cast<int8_t>(commanded_mode);
+              tp_func_out = 0;
+              max_profile_vel_out = opt.axis[i].max_profile_vel_counts_per_s;
             }
-
-            cw = gradient::ds402::controlword_for_enable(st, want_enable, want_fault_reset);
-            if (want_jog_quick_stop &&
-                (st == gradient::ds402::State::OperationEnabled ||
-                 st == gradient::ds402::State::QuickStopActive)) {
-              cw = gradient::ds402::CW_QUICK_STOP;
-            }
-            if (want_fault_reset && st == gradient::ds402::State::Fault && fault_reset_left[i] > 0) {
-              fault_reset_left[i]--;
-            }
-            target_pos_out = hold_target_counts[i];
-            target_torque_out = 0;
-            mode_out = want_enable ? 8 : 0;
-            tp_func_out = 0;
-            max_profile_vel_out = opt.axis[i].max_profile_vel_counts_per_s;
           } else {
             // During passive startup we still exchange cyclic PDO frames, but avoid
             // DS402 state-driving writes so we can distinguish process-data transport
             // problems from higher-level controlword/mode/target sequencing problems.
-            hold_target_counts[i] = feedback_aligned_target_counts;
+            hold_target_counts[i] = feedback_wire_target_counts;
             have_hold[i] = false;
           }
 
@@ -3018,8 +3455,10 @@ int main(int argc, char** argv) {
               any_faulted = true;
             }
             const int32_t final_target_counts = clamp_round_to_i32(final_point.target_counts[i]);
+            const int32_t final_feedback_counts =
+                csp_wire_counts_from_feedback(latest_feedback.pos_counts[i]);
             const int64_t error_counts =
-                static_cast<int64_t>(latest_feedback.pos_counts[i]) -
+                static_cast<int64_t>(final_feedback_counts) -
                 static_cast<int64_t>(final_target_counts);
             if (error_counts < -static_cast<int64_t>(kTrajectoryCompletionToleranceCounts) ||
                 error_counts > static_cast<int64_t>(kTrajectoryCompletionToleranceCounts)) {
@@ -3356,7 +3795,7 @@ int main(int argc, char** argv) {
     uint64_t last_time_ns = now_monotonic_ns();
     uint64_t last_warn_ns = 0;
     bool startup_readback_complete = !startup_sdo.valid;
-    bool native_home_offset_refresh_complete = false;
+    bool native_home_offset_refresh_complete = !native_home_cfg.valid;
     uint64_t startup_readback_ready_since_ns = 0;
     uint64_t native_home_offset_ready_since_ns = 0;
     bool startup_state_observed = false;
@@ -3460,7 +3899,7 @@ int main(int argc, char** argv) {
     auto perform_startup_native_home_offset_refresh = [&](uint64_t now_ns,
                                                           bool startup_ready_flag) {
 #if GRADIENT_HAVE_ECRT
-      if (native_home_offset_refresh_complete || !shared_master) {
+      if (native_home_offset_refresh_complete || !shared_master || !native_home_cfg.valid) {
         return;
       }
       if (!startup_ready_flag) {
@@ -3475,7 +3914,7 @@ int main(int argc, char** argv) {
         return;
       }
 
-      logf("EtherCAT native-home offset refresh begin delay_ms=%llu",
+      logf("EtherCAT native-home truth refresh begin delay_ms=%llu",
            static_cast<unsigned long long>(kStartupReadbackDelayNs / 1000000ULL));
 
       constexpr int kNativeHomeOffsetReadAttempts = 5;
@@ -3484,9 +3923,9 @@ int main(int argc, char** argv) {
         bool refreshed = false;
         for (int attempt = 1; attempt <= kNativeHomeOffsetReadAttempts; ++attempt) {
           int32_t refreshed_offset = 0;
-          if (read_position_offset_axis(i, &refreshed_offset)) {
+          if (read_native_home_truth_axis(i, &refreshed_offset)) {
             latest_feedback.native_home_position_offset[i] = refreshed_offset;
-            logf("EtherCAT native-home offset refresh axis=%u slave_pos=%u offset=%d attempt=%d",
+            logf("EtherCAT native-home truth refresh axis=%u slave_pos=%u value=%d attempt=%d",
                  i,
                  static_cast<unsigned int>(opt.slave_position[i]),
                  refreshed_offset,
@@ -3500,7 +3939,7 @@ int main(int argc, char** argv) {
         }
         if (!refreshed) {
           all_refreshed = false;
-          logf("WARNING: EtherCAT native-home offset refresh unavailable axis=%u slave_pos=%u; keeping in-memory offset=%d",
+          logf("WARNING: EtherCAT native-home truth refresh unavailable axis=%u slave_pos=%u; keeping in-memory value=%d",
                i,
                static_cast<unsigned int>(opt.slave_position[i]),
                latest_feedback.native_home_position_offset[i]);
@@ -3610,7 +4049,7 @@ int main(int argc, char** argv) {
       } else if (startup_reset_count != last_startup_reset_count ||
                  (last_startup_ready_flag && !startup_ready_flag)) {
         startup_readback_complete = !startup_sdo.valid;
-        native_home_offset_refresh_complete = false;
+        native_home_offset_refresh_complete = !native_home_cfg.valid;
         startup_readback_ready_since_ns = 0;
         native_home_offset_ready_since_ns = 0;
         logf("EtherCAT startup epoch changed: ready=%u->%u reset_count=%u->%u; rearming startup readback/offset refresh",
@@ -4094,109 +4533,168 @@ int main(int argc, char** argv) {
         latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_REQUESTED;
         latest_feedback.native_home_last_abort_code[axis] = 0;
 
-        int32_t pos_counts = 0;
-        if (!read_stable_axis_feedback_counts(axis, &pos_counts)) {
-          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
-          return;
-        }
+        int32_t pos_counts = latest_feedback.pos_counts[axis];
+        (void)read_stable_axis_feedback_counts(axis, &pos_counts);
 
 #if GRADIENT_HAVE_ECRT
+        if (!native_home_cfg.valid || !native_home_cfg.truth_source.valid ||
+            native_home_cfg.transaction.empty()) {
+          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+          logf("WARNING: native_home requested axis=%u but no native-home descriptor is configured",
+               axis);
+          return;
+        }
         if (!shared_master) {
           latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
           return;
         }
+        constexpr auto kServiceStepSleep = std::chrono::milliseconds(50);
+        constexpr uint64_t kWaitStatuswordTimeoutNs = 10000000000ULL;
+        const uint32_t axis_bit = (1u << axis);
+        service_controlword_override[axis].store(0, std::memory_order_relaxed);
+        service_mode_override[axis].store(
+            static_cast<int32_t>(native_home_cfg.commissioning_mode),
+            std::memory_order_relaxed);
+        service_mode_axis_mask.fetch_or(axis_bit, std::memory_order_relaxed);
+        std::this_thread::sleep_for(kServiceStepSleep);
 
-        int32_t current_offset = 0;
-        if (!read_position_offset_axis(axis, &current_offset)) {
-          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
-          return;
-        }
-        const int32_t desired_offset = -pos_counts;
-        uint8_t desired_offset_raw[sizeof(int32_t)] = {};
-        EC_WRITE_S32(desired_offset_raw, desired_offset);
-        uint32_t write_abort = 0;
-        int rc = ecrt_master_sdo_download(
-            shared_master,
-            opt.slave_position[axis],
-            0x60B0,
-            0x00,
-            desired_offset_raw,
-            sizeof(desired_offset_raw),
-            &write_abort);
-        if (rc != 0) {
-          latest_feedback.native_home_last_abort_code[axis] = write_abort;
-          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
-          logf("WARNING: native_home download failed axis=%u slave_pos=%u index=0x60B0 rc=%d abort=0x%08x",
-               axis,
-               static_cast<unsigned int>(opt.slave_position[axis]),
-               rc,
-               static_cast<unsigned int>(write_abort));
-          return;
-        }
-
-        uint8_t save_raw[sizeof(uint32_t)] = {};
-        EC_WRITE_U32(save_raw, 0x65766173u); // "save"
-        uint32_t save_abort = 0;
-        rc = ecrt_master_sdo_download(
-            shared_master,
-            opt.slave_position[axis],
-            0x1010,
-            0x01,
-            save_raw,
-            sizeof(save_raw),
-            &save_abort);
-        if (rc != 0) {
-          latest_feedback.native_home_last_abort_code[axis] = save_abort;
-          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
-          logf("WARNING: native_home store failed axis=%u slave_pos=%u index=0x1010 sub=0x01 rc=%d abort=0x%08x",
-               axis,
-               static_cast<unsigned int>(opt.slave_position[axis]),
-               rc,
-               static_cast<unsigned int>(save_abort));
-          return;
-        }
-
-        // Some drives acknowledge the store command before the parameter is fully
-        // committed to nonvolatile memory. Keep native-home in-progress until the
-        // offset can be read back after a short settle window, so a subsequent
-        // operator-driven power cycle does not race an unfinished save.
-        constexpr int kNativeHomeVerifyAttempts = 10;
-        constexpr auto kNativeHomeVerifySleep = std::chrono::milliseconds(100);
-        bool verified_offset = false;
-        int32_t verified_offset_value = current_offset;
-        for (int attempt = 1; attempt <= kNativeHomeVerifyAttempts; ++attempt) {
-          std::this_thread::sleep_for(kNativeHomeVerifySleep);
-          int32_t readback_offset = 0;
-          if (!read_position_offset_axis(axis, &readback_offset)) {
-            continue;
+        auto release_service_override = [&](bool restore_steady_mode) {
+          service_controlword_override[axis].store(0, std::memory_order_relaxed);
+          if (restore_steady_mode) {
+            desired_mode_of_operation[axis].store(
+                static_cast<int32_t>(native_home_cfg.steady_state_mode),
+                std::memory_order_relaxed);
+            service_mode_override[axis].store(
+                static_cast<int32_t>(native_home_cfg.steady_state_mode),
+                std::memory_order_relaxed);
+          } else {
+            service_mode_override[axis].store(kNoModeOverride, std::memory_order_relaxed);
           }
-          verified_offset_value = readback_offset;
-          if (readback_offset == desired_offset) {
-            verified_offset = true;
+          std::this_thread::sleep_for(kServiceStepSleep);
+          service_mode_axis_mask.fetch_and(~axis_bit, std::memory_order_relaxed);
+          service_mode_override[axis].store(kNoModeOverride, std::memory_order_relaxed);
+          service_controlword_override[axis].store(0, std::memory_order_relaxed);
+        };
+
+        bool succeeded = true;
+        bool refreshed_truth = false;
+        for (const NativeHomeOp& step : native_home_cfg.transaction) {
+          if (!succeeded) {
             break;
           }
+          switch (step.kind) {
+            case NativeHomeOpKind::kSetMode:
+            case NativeHomeOpKind::kRestoreMode:
+              service_mode_override[axis].store(step.value_i32, std::memory_order_relaxed);
+              std::this_thread::sleep_for(kServiceStepSleep);
+              break;
+            case NativeHomeOpKind::kWriteSdo: {
+              uint32_t abort_code = 0;
+              if (!step.object.valid ||
+                  !write_sdo_scalar_axis(axis,
+                                         step.object.index,
+                                         step.object.subindex,
+                                         step.object.type,
+                                         step.value_i32,
+                                         &abort_code)) {
+                latest_feedback.native_home_last_abort_code[axis] = abort_code;
+                latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+                logf("WARNING: native_home write_sdo failed axis=%u slave_pos=%u index=0x%04x sub=0x%02x abort=0x%08x value=%d",
+                     axis,
+                     static_cast<unsigned int>(opt.slave_position[axis]),
+                     static_cast<unsigned int>(step.object.index),
+                     static_cast<unsigned int>(step.object.subindex),
+                     static_cast<unsigned int>(abort_code),
+                     step.value_i32);
+                succeeded = false;
+              }
+              break;
+            }
+            case NativeHomeOpKind::kControlwordSequence:
+              if (step.controlword_count == 0) {
+                latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+                succeeded = false;
+                break;
+              }
+              for (uint32_t step_i = 0; step_i < step.controlword_count; ++step_i) {
+                service_controlword_override[axis].store(
+                    static_cast<uint32_t>(step.controlword_values[step_i]),
+                    std::memory_order_relaxed);
+                std::this_thread::sleep_for(kServiceStepSleep);
+              }
+              break;
+            case NativeHomeOpKind::kWaitStatusword: {
+              bool matched = false;
+              const uint64_t deadline_ns = now_monotonic_ns() + kWaitStatuswordTimeoutNs;
+              while (now_monotonic_ns() < deadline_ns) {
+                const uint16_t statusword = latest_feedback.statusword[axis];
+                if ((statusword & step.wait_all_set_mask) == step.wait_all_set_mask &&
+                    (statusword & step.wait_all_clear_mask) == 0u) {
+                  matched = true;
+                  break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+              }
+              if (!matched) {
+                latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+                logf("WARNING: native_home wait_statusword timed out axis=%u slave_pos=%u all_set=0x%04x all_clear=0x%04x last_statusword=0x%04x",
+                     axis,
+                     static_cast<unsigned int>(opt.slave_position[axis]),
+                     static_cast<unsigned int>(step.wait_all_set_mask),
+                     static_cast<unsigned int>(step.wait_all_clear_mask),
+                     static_cast<unsigned int>(latest_feedback.statusword[axis]));
+                succeeded = false;
+              }
+              break;
+            }
+            case NativeHomeOpKind::kRefreshTruth: {
+              int32_t refreshed_value = 0;
+              if (!read_native_home_truth_axis(axis, &refreshed_value)) {
+                latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+                succeeded = false;
+                break;
+              }
+              latest_feedback.native_home_position_offset[axis] = refreshed_value;
+              refreshed_truth = true;
+              break;
+            }
+            case NativeHomeOpKind::kNone:
+            default:
+              latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+              succeeded = false;
+              break;
+          }
         }
-        if (!verified_offset) {
-          latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
-          logf("WARNING: native_home verify failed axis=%u slave_pos=%u desired_offset=%d readback_offset=%d attempts=%u",
-               axis,
-               static_cast<unsigned int>(opt.slave_position[axis]),
-               desired_offset,
-               verified_offset_value,
-               static_cast<unsigned int>(kNativeHomeVerifyAttempts));
+
+        if (succeeded && !refreshed_truth) {
+          int32_t refreshed_value = 0;
+          if (!read_native_home_truth_axis(axis, &refreshed_value)) {
+            latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+            succeeded = false;
+          } else {
+            latest_feedback.native_home_position_offset[axis] = refreshed_value;
+          }
+        }
+
+        release_service_override(succeeded);
+        if (!succeeded) {
+          if (latest_feedback.native_home_state[axis] !=
+              gradient::ipc::v1::NATIVE_HOME_STATE_FAILED) {
+            latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+          }
           return;
         }
 
-        latest_feedback.native_home_position_offset[axis] = desired_offset;
         latest_feedback.native_home_last_abort_code[axis] = 0;
         latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_SUCCEEDED;
-        logf("EtherCAT native_home axis=%u slave_pos=%u pos_counts=%d current_offset=%d desired_offset=%d readback_offset=%d saved=1",
+        logf("EtherCAT native_home axis=%u slave_pos=%u feedback_counts=%d truth_value=%d commissioning_mode=%u steady_state_mode=%u steps=%zu",
              axis,
              static_cast<unsigned int>(opt.slave_position[axis]),
              pos_counts,
-             current_offset,
-             desired_offset,
-             verified_offset_value);
+             latest_feedback.native_home_position_offset[axis],
+             static_cast<unsigned int>(native_home_cfg.commissioning_mode),
+             static_cast<unsigned int>(native_home_cfg.steady_state_mode),
+             native_home_cfg.transaction.size());
 #else
         (void)pos_counts;
         latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
@@ -4307,7 +4805,7 @@ int main(int argc, char** argv) {
 
       for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
         int32_t current_offset = 0;
-        if (read_position_offset_axis(axis, &current_offset)) {
+        if (read_native_home_truth_axis(axis, &current_offset)) {
           latest_feedback.native_home_position_offset[axis] = current_offset;
         }
       }
@@ -4379,8 +4877,21 @@ int main(int argc, char** argv) {
                 case gradient::ipc::v1::MSG_CMD_SET_MODE: {
                   if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::CmdSetModeV1)) {
                     auto* cmd = reinterpret_cast<const gradient::ipc::v1::CmdSetModeV1*>(payload);
-                    mode_of_operation.store(static_cast<int32_t>(cmd->mode),
-                                            std::memory_order_relaxed);
+                    uint32_t mask = cmd->axis_mask;
+                    const uint32_t valid =
+                        (opt.num_axes >= 32) ? 0xFFFFFFFFu : ((1u << opt.num_axes) - 1u);
+                    if (mask == 0u) {
+                      mask = valid;
+                    }
+                    mask &= valid;
+                    for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
+                      if ((mask & (1u << axis)) == 0u) {
+                        continue;
+                      }
+                      desired_mode_of_operation[axis].store(
+                          static_cast<int32_t>(cmd->mode),
+                          std::memory_order_relaxed);
+                    }
                   }
                   break;
                 }
@@ -4558,7 +5069,9 @@ int main(int argc, char** argv) {
                       const double cpu = opt.axis[i].counts_per_unit;
                       const int sgn = opt.axis[i].sign;
                       const double raw_counts = cmd->q[i] * cpu * static_cast<double>(sgn);
-                      runtime_point.target_counts[i] = clamp_double_to_i32_range(raw_counts);
+                      runtime_point.target_counts[i] = clamp_double_to_i32_range(
+                          controller_target_to_csp_wire_counts(
+                              raw_counts, latest_feedback.native_home_position_offset[i]));
                       if ((cmd->flags & gradient::ipc::v1::TRAJ_POINTF_HAS_VELOCITY) != 0u) {
                         const double raw_velocity =
                             cmd->qd[i] * cpu * static_cast<double>(sgn);

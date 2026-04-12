@@ -124,8 +124,21 @@ type JogSessionResponse = {
 };
 
 type CommissioningStatus = {
-	tone: "info" | "success" | "error";
+	tone: "info" | "success" | "warning" | "error";
 	message: string;
+};
+
+type NativeHomeResponse = {
+	status?: string;
+	accepted?: boolean;
+	verified?: boolean;
+	timed_out?: boolean;
+	code?: string;
+	message?: string;
+	joint?: number;
+	detail?: string;
+	native_home_state?: number;
+	native_home_state_name?: string;
 };
 
 type DriveFaultDetail = {
@@ -1640,7 +1653,7 @@ export function ControlPanel({
 			? `${jointAnglesDeg[jointIndex].toFixed(2)} deg`
 			: "current feedback";
 		const confirmed = window.confirm(
-			`Capture J${jointNumber} at ${angleLabel} as the drive-native home position? This updates the drive's own offset, leaves only that homed axis disabled afterward, and may require an explicit Power Up before you move it again.`,
+			`Capture J${jointNumber} at ${angleLabel} as the drive-native home position? This runs the drive's commissioning homing transaction, leaves only that homed axis disabled afterward, and may require an explicit Power Up before you move it again.`,
 		);
 		if (!confirmed) {
 			return;
@@ -1648,30 +1661,58 @@ export function ControlPanel({
 		setPendingJointAction(`native-home-${jointIndex}`);
 		setCommissioningStatus({
 			tone: "info",
-			message: `Capturing J${jointNumber} at ${angleLabel} as drive-native home...`,
+			message: `Running drive-native commissioning home for J${jointNumber} at ${angleLabel}...`,
 		});
 		try {
 			if (jogEnabled) {
 				await stopJog();
 			}
-			const result = await post("/control/home-joint-native", { joint: jointNumber });
+			const result = await post("/control/home-joint-native", { joint: jointNumber }) as NativeHomeResponse | null;
 			if (result) {
 				const refreshed = await waitForLiveJointFeedback();
-				setCommissioningStatus(
-					refreshed
-						? {
-							tone: "success",
-							message: `Drive-native home requested for J${jointNumber}. Live feedback refreshed from the new encoder reference. The homed axis remains disabled until you explicitly power it back up.`,
-						}
-						: {
-							tone: "error",
-							message: `Drive-native home requested for J${jointNumber}, but the post-home live feedback did not refresh yet. Keep that axis disabled and confirm the pose before powering it back up.`,
-						},
-				);
+				const accepted = result.accepted !== false;
+				const verified = result.verified === true;
+				const resultMessage = typeof result.message === "string" && result.message.trim().length > 0
+					? result.message.trim()
+					: null;
+				if (accepted && verified) {
+					setCommissioningStatus(
+						refreshed
+							? {
+								tone: "success",
+								message: resultMessage
+									?? `Drive-native commissioning home verified for J${jointNumber}. Live feedback refreshed from the new encoder reference. The homed axis remains disabled until you explicitly power it back up.`,
+							}
+							: {
+								tone: "warning",
+								message: resultMessage
+									?? `Drive-native commissioning home verified for J${jointNumber}, but the post-home live feedback did not refresh yet. Keep that axis disabled and confirm the pose before powering it back up.`,
+							},
+					);
+				} else if (accepted) {
+					setCommissioningStatus({
+						tone: "warning",
+						message: resultMessage
+							?? (
+								refreshed
+									? `Drive-native commissioning home for J${jointNumber} was accepted, but verification is still pending. Live feedback refreshed; keep the axis disabled until the drive-home status settles.`
+									: `Drive-native commissioning home for J${jointNumber} was accepted, but verification is still pending and live feedback did not refresh yet. Keep that axis disabled until the drive-home status settles.`
+							),
+					});
+				} else {
+					setCommissioningStatus({
+						tone: "error",
+						message: resultMessage
+							?? `Drive-native commissioning home failed for J${jointNumber}. Keep that axis disabled and inspect the drive-home status before retrying.`,
+					});
+				}
 			} else {
+				const requestError = lastRequestErrorRef.current?.trim();
 				setCommissioningStatus({
 					tone: "error",
-					message: `Failed to request drive-native home for J${jointNumber}.`,
+					message: requestError
+						? `Failed to request drive-native home for J${jointNumber}: ${requestError}`
+						: `Failed to request drive-native home for J${jointNumber}.`,
 				});
 			}
 		} finally {
@@ -2670,6 +2711,8 @@ export function ControlPanel({
 								className={`mb-2 rounded border px-2 py-1.5 text-[11px] ${
 									commissioningStatus.tone === "success"
 										? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100"
+										: commissioningStatus.tone === "warning"
+											? "border-amber-500/30 bg-amber-400/10 text-amber-100"
 										: commissioningStatus.tone === "error"
 											? "border-rose-500/30 bg-rose-400/10 text-rose-100"
 											: "border-cyan-500/20 bg-cyan-400/10 text-cyan-100"
@@ -2769,8 +2812,8 @@ export function ControlPanel({
 												disabled={zeroDisabled}
 												title={
 													hasLiveFeedback
-														? `Capture current J${jointNumber} position as drive-native home`
-														: `Live joint feedback is required before drive-native homing on J${jointNumber}`
+														? `Run commissioning drive-native home for J${jointNumber} at the current pose`
+														: `Live joint feedback is required before commissioning drive-native home on J${jointNumber}`
 												}
 											>
 												{isPending && pendingJointAction === `native-home-${jointIndex}` ? "..." : "Drive Home"}

@@ -16,13 +16,38 @@ STARTUP_SETTING_KEY = "a6ec_encoder_position_tracking_mode"
 STARTUP_SETTING_LABEL = "A6-EC encoder position tracking mode"
 STARTUP_SETTING_OBJECT = "C00.07 / 0x2000:08"
 STARTUP_SETTING_ENV_VAR = "GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG"
+NATIVE_HOME_CONFIG_ENV_VAR = "GRADIENT_RT_NATIVE_HOME_CONFIG"
 STARTUP_SETTING_VALUE_LABELS = {
     0: "Incremental encoder mode",
-    1: "Battery-backed limited multi-turn absolute encoder mode",
-    2: "Battery-backed single-turn absolute encoder mode",
-    3: "Battery-backed linear multi-turn absolute encoder mode",
-    4: "Battery-backed linear infinite-turn absolute encoder mode",
-    5: "Battery-backed rotary multi-turn absolute encoder mode",
+    1: "Absolute position linear mode",
+    2: "Absolute position single-turn mode",
+    3: "Absolute-position mode 3 (verify against vendor manual)",
+    4: "Absolute position rotation mode",
+    5: "Absolute-position mode 5 (verify against vendor manual)",
+}
+NATIVE_HOME_TRUTH_SOURCE = {
+    "kind": "sdo",
+    "index": 0x607C,
+    "subindex": 0x00,
+    "type": "i32",
+}
+NATIVE_HOME_CONFIG = {
+    "profile_id": PROFILE_ID,
+    "steady_state_mode": 8,
+    "commissioning_mode": 6,
+    "truth_source": NATIVE_HOME_TRUTH_SOURCE,
+    "transaction": [
+        {"op": "set_mode", "value": 6},
+        {"op": "write_sdo", "index": 0x60E6, "subindex": 0x00, "type": "u8", "value": 0},
+        {"op": "write_sdo", "index": 0x607C, "subindex": 0x00, "type": "i32", "value": 0},
+        {"op": "write_sdo", "index": 0x6098, "subindex": 0x00, "type": "i8", "value": 35},
+        {"op": "controlword_sequence", "values": [6, 7, 15]},
+        {"op": "wait_statusword", "all_set_mask": 0x0227, "all_clear_mask": 0x2048},
+        {"op": "controlword_sequence", "values": [31]},
+        {"op": "wait_statusword", "all_set_mask": 0x9000, "all_clear_mask": 0x2000},
+        {"op": "refresh_truth"},
+        {"op": "restore_mode", "value": 8},
+    ],
 }
 ENCODER_DATA_RESET_OPERATION = {
     "operation_key": "encoder_data_reset",
@@ -193,6 +218,50 @@ def _startup_mode_value_label(raw_value: object) -> str | None:
     return STARTUP_SETTING_VALUE_LABELS.get(mode_value)
 
 
+def _render_native_home_config_spec(config: Mapping[str, Any]) -> str:
+    parts = [
+        f"steady_state_mode|{int(config.get('steady_state_mode', 0))}",
+        f"commissioning_mode|{int(config.get('commissioning_mode', 0))}",
+    ]
+    truth_source = config.get("truth_source") if isinstance(config.get("truth_source"), Mapping) else {}
+    parts.append(
+        "truth_source|"
+        f"0x{int(truth_source.get('index', 0)) & 0xFFFF:04X}|"
+        f"0x{int(truth_source.get('subindex', 0)) & 0xFF:02X}|"
+        f"{str(truth_source.get('type', 'i32')).strip().lower()}"
+    )
+    for step in list(config.get("transaction", [])):
+        if not isinstance(step, Mapping):
+            continue
+        op = str(step.get("op", "")).strip().lower()
+        if op in {"set_mode", "restore_mode"}:
+            parts.append(f"op|{op}|{int(step.get('value', 0))}")
+            continue
+        if op == "write_sdo":
+            parts.append(
+                "op|write_sdo|"
+                f"0x{int(step.get('index', 0)) & 0xFFFF:04X}|"
+                f"0x{int(step.get('subindex', 0)) & 0xFF:02X}|"
+                f"{str(step.get('type', 'u16')).strip().lower()}|"
+                f"{int(step.get('value', 0))}"
+            )
+            continue
+        if op == "controlword_sequence":
+            rendered_values = ",".join(str(int(value)) for value in list(step.get("values", [])))
+            parts.append(f"op|controlword_sequence|{rendered_values}")
+            continue
+        if op == "wait_statusword":
+            parts.append(
+                "op|wait_statusword|"
+                f"0x{int(step.get('all_set_mask', 0)) & 0xFFFF:04X}|"
+                f"0x{int(step.get('all_clear_mask', 0)) & 0xFFFF:04X}"
+            )
+            continue
+        if op == "refresh_truth":
+            parts.append("op|refresh_truth")
+    return ";".join(parts)
+
+
 def build_startup_config(raw_entries: object, *, num_axes: int) -> dict[str, Any]:
     profile = get_ethercat_drive_profile(PROFILE_ID) or {}
     startup_schema = profile.get("startup_schema") if isinstance(profile, dict) else {}
@@ -272,3 +341,13 @@ def extract_startup_config_axis(axis: Mapping[str, Any]) -> dict[str, Any] | Non
 
 def get_encoder_data_reset_operation() -> dict[str, Any]:
     return dict(ENCODER_DATA_RESET_OPERATION)
+
+
+def get_native_home_config() -> dict[str, Any]:
+    payload = dict(NATIVE_HOME_CONFIG)
+    payload["truth_source"] = dict(NATIVE_HOME_TRUTH_SOURCE)
+    payload["transaction"] = [dict(step) for step in list(NATIVE_HOME_CONFIG.get("transaction", []))]
+    payload["env"] = {
+        NATIVE_HOME_CONFIG_ENV_VAR: _render_native_home_config_spec(payload),
+    }
+    return payload

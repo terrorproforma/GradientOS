@@ -1664,7 +1664,7 @@ def create_app() -> FastAPI:
 
     @api.post(
         "/control/home-joint-native",
-        summary="Capture the current encoder position as a drive-native home for one joint",
+        summary="Run the commissioning-only drive-native home transaction for one joint",
     )
     async def control_home_joint_native(payload: dict[str, Any]):
         raw_joint = payload.get("joint", payload.get("joint_num"))
@@ -1674,13 +1674,25 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="joint must be an integer")
         if joint <= 0:
             raise HTTPException(status_code=400, detail="joint must be >= 1")
-        detail = await run_in_threadpool(
-            _controller_call_or_503,
+        ok, detail = await run_in_threadpool(
+            _send_controller_command,
             f"NATIVE_HOME_JOINT,{joint}",
-            timeout=5.0,
-            expect_response=True,
+            5.0,
+            True,
         )
-        return {"status": "ok", "joint": joint, "detail": detail}
+        if ok:
+            result = _parse_controller_ack_payload(
+                detail,
+                "NATIVE_HOME_JOINT",
+                allow_plain_suffix=True,
+            )
+            result.setdefault("accepted", True)
+            return {"status": "ok", "joint": joint, "detail": detail, **result}
+        error_payload = _parse_controller_error_payload(detail, "NATIVE_HOME_JOINT")
+        if error_payload is not None:
+            error_payload.setdefault("accepted", False)
+            return {"status": "error", "joint": joint, "detail": detail, **error_payload}
+        raise HTTPException(status_code=503, detail=detail)
 
     @api.post("/control/joint-jog", summary="Jog one joint by a relative angle in degrees")
     async def control_joint_jog(payload: dict[str, Any]):

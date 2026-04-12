@@ -28,6 +28,8 @@ Use this file when extending REST/SSE payloads, live state, UI controls, or oper
 - If data belongs to an existing live snapshot, motion status response, or fault payload, extend that shape.
 - Avoid parallel status channels that can drift from the existing source of truth.
 - Keep naming generic in common payloads and leave manufacturer-specific wording to the profile layer or operator-facing formatting.
+- For commissioning actions with asynchronous verification, preserve structured command results such as `accepted`, `verified`, and `timed_out` instead of collapsing them into a boolean or generic transport failure.
+- If live telemetry can later refine the operator view, UI messaging should degrade to a warning/pending state rather than contradicting a successful live status with a generic request failure.
 
 ## Common Checks
 

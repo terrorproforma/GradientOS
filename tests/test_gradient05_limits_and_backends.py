@@ -17,6 +17,7 @@ from gradient_os.arm_controller.backends.ethercat_rtcore.backend import (
     _MSG_HEADER_STRUCT,
     _RING_HEADER_STRUCT,
     _TRAJ_POINTF_HAS_VELOCITY,
+    _TRAJECTORY_POINT_STRUCT,
     _ShmHeader,
     _AxisConfig,
 )
@@ -432,6 +433,15 @@ def test_ethercat_backend_safe_power_up_arms_sets_mode_and_enables(monkeypatch, 
     backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
     backend._connected = True
     backend._rt_num_axes = 3
+    backend._axis_to_joint = [0, 1, 2]
+    backend._axis_config = _AxisConfig(
+        num_axes=3,
+        counts_per_unit=[100.0, 100.0, 100.0] + [0.0] * 13,
+        sign=[1, 1, 1] + [0] * 13,
+    )
+    backend._axis_counts[0] = 25
+    backend._native_home_offset_counts[0] = -25
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
 
     calls: list[tuple[str, object]] = []
     monkeypatch.setattr(
@@ -453,6 +463,9 @@ def test_ethercat_backend_safe_power_up_arms_sets_mode_and_enables(monkeypatch, 
     backend._best_effort_safe_power_up()
 
     assert calls == [("arm", True), ("mode", (0x7, 8)), ("enable", 0x7)]
+    # Python power-up synchronization should keep controller setpoints in the
+    # same logical/native-home-aware frame exposed through joint feedback.
+    assert backend._last_joint_setpoint_rad[0] == pytest.approx(0.0)
 
 
 def test_ethercat_backend_native_home_waits_for_neutral_before_request(monkeypatch, tmp_path):
@@ -476,15 +489,36 @@ def test_ethercat_backend_native_home_waits_for_neutral_before_request(monkeypat
     monkeypatch.setattr(
         backend,
         "_wait_for_native_home_result",
-        lambda axis_mask, *, timeout_s: calls.append(("wait_native_home", (axis_mask, timeout_s))) or True,
+        lambda axis_mask, *, timeout_s, min_metrics_time_ns=0, min_metrics_mtime_ns=0: (
+            calls.append(
+                (
+                    "wait_native_home",
+                    (axis_mask, timeout_s, min_metrics_time_ns, min_metrics_mtime_ns),
+                )
+            )
+            or {
+                "verified": True,
+                "timed_out": False,
+                "terminal_state": "succeeded",
+                "native_home_state": 2,
+                "native_home_last_abort_code": 0,
+                "metrics_time_ns": 123,
+            }
+        ),
     )
 
-    assert backend.native_home_joint(1) is True
-    assert calls == [
-        ("prepare", {"wait_for_idle": True, "timeout_s": 1.0}),
-        ("native_home", 0x2),
-        ("wait_native_home", (0x2, 3.0)),
-    ]
+    result = backend.native_home_joint(1)
+    assert result["accepted"] is True
+    assert result["verified"] is True
+    assert result["code"] == "NATIVE_HOME_VERIFIED"
+    assert calls[0] == ("prepare", {"wait_for_idle": True, "timeout_s": 1.0})
+    assert calls[1] == ("native_home", 0x2)
+    assert calls[2][0] == "wait_native_home"
+    wait_axis_mask, wait_timeout_s, wait_time_ns, wait_mtime_ns = calls[2][1]
+    assert wait_axis_mask == 0x2
+    assert wait_timeout_s == 10.0
+    assert wait_time_ns >= 0
+    assert wait_mtime_ns >= 0
 
 
 def test_ethercat_backend_native_home_aborts_when_pre_neutralization_fails(monkeypatch, tmp_path):
@@ -506,11 +540,14 @@ def test_ethercat_backend_native_home_aborts_when_pre_neutralization_fails(monke
         lambda axis_mask: calls.append(("native_home", axis_mask)),
     )
 
-    assert backend.native_home_joint(1) is False
+    result = backend.native_home_joint(1)
+    assert result["accepted"] is False
+    assert result["verified"] is False
+    assert result["code"] == "NATIVE_HOME_PRECONDITION_FAILED"
     assert calls == []
 
 
-def test_ethercat_backend_native_home_fails_when_verification_times_out(monkeypatch, tmp_path):
+def test_ethercat_backend_native_home_reports_pending_when_verification_times_out(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
     backend._connected = True
@@ -531,15 +568,37 @@ def test_ethercat_backend_native_home_fails_when_verification_times_out(monkeypa
     monkeypatch.setattr(
         backend,
         "_wait_for_native_home_result",
-        lambda axis_mask, *, timeout_s: calls.append(("wait_native_home", (axis_mask, timeout_s))) or False,
+        lambda axis_mask, *, timeout_s, min_metrics_time_ns=0, min_metrics_mtime_ns=0: (
+            calls.append(
+                (
+                    "wait_native_home",
+                    (axis_mask, timeout_s, min_metrics_time_ns, min_metrics_mtime_ns),
+                )
+            )
+            or {
+                "verified": False,
+                "timed_out": True,
+                "terminal_state": "pending",
+                "native_home_state": 1,
+                "native_home_last_abort_code": 0,
+                "metrics_time_ns": 456,
+            }
+        ),
     )
 
-    assert backend.native_home_joint(1) is False
-    assert calls == [
-        ("prepare", {"wait_for_idle": True, "timeout_s": 1.0}),
-        ("native_home", 0x2),
-        ("wait_native_home", (0x2, 3.0)),
-    ]
+    result = backend.native_home_joint(1)
+    assert result["accepted"] is True
+    assert result["verified"] is False
+    assert result["timed_out"] is True
+    assert result["code"] == "NATIVE_HOME_PENDING_VERIFICATION"
+    assert calls[0] == ("prepare", {"wait_for_idle": True, "timeout_s": 1.0})
+    assert calls[1] == ("native_home", 0x2)
+    assert calls[2][0] == "wait_native_home"
+    wait_axis_mask, wait_timeout_s, wait_time_ns, wait_mtime_ns = calls[2][1]
+    assert wait_axis_mask == 0x2
+    assert wait_timeout_s == 10.0
+    assert wait_time_ns >= 0
+    assert wait_mtime_ns >= 0
 
 
 def test_ethercat_backend_applies_native_home_offsets_to_feedback_but_not_command_targets(
@@ -562,6 +621,51 @@ def test_ethercat_backend_applies_native_home_offsets_to_feedback_but_not_comman
 
     assert logical_positions[0] == pytest.approx(0.0)
     assert commanded_axis_q[0] == pytest.approx(0.0)
+
+
+def test_ethercat_backend_enqueue_trajectory_points_keeps_controller_logical_frame_with_native_home_offset(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._master_offsets_rad[0] = 0.5
+    backend._native_home_offset_counts[0] = -25
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+
+    captured: list[tuple[int, bytes]] = []
+    monkeypatch.setattr(
+        backend,
+        "_cmd_ring_write",
+        lambda msg_type, payload: captured.append((msg_type, payload)) or 1,
+    )
+
+    backend.enqueue_trajectory_points(
+        7,
+        [
+            {
+                "positions_rad": [1.0] + ([0.0] * (backend.num_joints - 1)),
+                "qd": [0.25],
+                "flags": _TRAJ_POINTF_HAS_VELOCITY,
+                "t_from_start_ns": 12_000_000,
+            }
+        ],
+    )
+
+    assert len(captured) == 1
+    _msg_type, payload = captured[0]
+    unpacked = _TRAJECTORY_POINT_STRUCT.unpack(payload)
+    q_values = unpacked[4:20]
+    qd_values = unpacked[20:36]
+    axis_mask = unpacked[36]
+
+    # Python uploads controller/logical q values. RTCore converts them once into
+    # raw CSP wire counts before writing 0x607A.
+    assert q_values[0] == pytest.approx(1.5)
+    assert qd_values[0] == pytest.approx(0.25)
+    assert axis_mask == 0x1
 
 
 def test_ethercat_backend_defaults_to_disarmed_connect(monkeypatch, tmp_path):
