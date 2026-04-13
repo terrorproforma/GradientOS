@@ -342,23 +342,73 @@ def _send_motion_status(sock: socket.socket, addr, payload: dict[str, object]) -
     sock.sendto(message.encode("utf-8"), addr)
 
 
+def _sync_backend_raw_positions(backend: object | None) -> dict[int, int] | None:
+    if backend is None:
+        return None
+    sync_read_positions = getattr(backend, "sync_read_positions", None)
+    if not callable(sync_read_positions):
+        return None
+    try:
+        raw_positions = sync_read_positions(timeout_s=0.05)
+    except TypeError:
+        raw_positions = sync_read_positions()
+    except Exception:
+        return None
+    if not isinstance(raw_positions, dict) or not raw_positions:
+        return None
+    return {int(axis_i): int(counts) for axis_i, counts in raw_positions.items()}
+
+
+def _backend_display_feedback_snapshot(
+    backend: object | None,
+    raw_positions: dict[int, int] | None,
+) -> dict[str, object] | None:
+    if backend is None or raw_positions is None:
+        return None
+    get_display_feedback_snapshot = getattr(backend, "get_display_feedback_snapshot", None)
+    if callable(get_display_feedback_snapshot):
+        try:
+            snapshot = get_display_feedback_snapshot(raw_positions)
+        except Exception:
+            snapshot = None
+        if isinstance(snapshot, dict):
+            return snapshot
+    raw_to_display_joint_positions = getattr(backend, "raw_to_display_joint_positions", None)
+    if not callable(raw_to_display_joint_positions):
+        return None
+    try:
+        display_positions = raw_to_display_joint_positions(raw_positions)
+    except Exception:
+        return None
+    return {
+        "joint_positions_rad": [float(value) for value in display_positions],
+    }
+
+
 def _build_joint_state_snapshot() -> dict[str, object]:
     read_source = "live_feedback"
+    truth_error: str | None = None
     try:
         current_angles_rad = servo_driver.get_current_arm_state_rad(verbose=False)
     except Exception as exc:
         print(f"[Controller] WARNING: joint snapshot live read failed: {exc}")
         current_angles_rad = list(utils.current_logical_joint_angles_rad)
         read_source = "cached_fallback"
+        truth_error = str(exc)
 
     arm_rad = [float(value) for value in current_angles_rad]
     arm_deg = [float(np.rad2deg(value)) for value in arm_rad]
     snapshot: dict[str, object] = {
         "arm_rad": arm_rad,
         "arm_deg": arm_deg,
+        "arm_display_rad": list(arm_rad),
+        "arm_display_deg": list(arm_deg),
         "read_source": read_source,
+        "canonical_joint_truth_available": read_source == "live_feedback",
         "numeric_precision": "float64",
     }
+    if truth_error:
+        snapshot["canonical_joint_truth_error"] = truth_error
 
     if utils.gripper_present:
         gripper_rad = float(utils.current_gripper_angle_rad)
@@ -372,18 +422,33 @@ def _build_joint_state_snapshot() -> dict[str, object]:
         backend = None
 
     if backend is not None:
-        sync_read_positions = getattr(backend, "sync_read_positions", None)
-        if callable(sync_read_positions):
-            try:
-                raw_positions = sync_read_positions(timeout_s=0.05)
-                if isinstance(raw_positions, dict) and raw_positions:
-                    max_axis = max(int(axis_i) for axis_i in raw_positions.keys())
-                    snapshot["axis_counts"] = [
-                        int(raw_positions[i]) if i in raw_positions else None
-                        for i in range(max_axis + 1)
+        raw_positions = _sync_backend_raw_positions(backend)
+        if raw_positions:
+            max_axis = max(int(axis_i) for axis_i in raw_positions.keys())
+            snapshot["axis_counts"] = [
+                int(raw_positions[i]) if i in raw_positions else None
+                for i in range(max_axis + 1)
+            ]
+            display_snapshot = _backend_display_feedback_snapshot(backend, raw_positions)
+            if isinstance(display_snapshot, dict):
+                truth_available = bool(display_snapshot.get("truth_available", True))
+                snapshot["canonical_joint_truth_available"] = (
+                    bool(snapshot.get("canonical_joint_truth_available", False))
+                    and truth_available
+                )
+                truth_unavailable_axes = display_snapshot.get("truth_unavailable_axes")
+                if isinstance(truth_unavailable_axes, list):
+                    snapshot["canonical_joint_truth_unavailable_axes"] = [
+                        int(value) for value in truth_unavailable_axes
                     ]
-            except Exception:
-                pass
+                truth_unavailable_joints = display_snapshot.get("truth_unavailable_joints")
+                if isinstance(truth_unavailable_joints, list):
+                    snapshot["canonical_joint_truth_unavailable_joints"] = [
+                        int(value) for value in truth_unavailable_joints
+                    ]
+                axis_absolute_feedback = display_snapshot.get("axis_absolute_feedback")
+                if isinstance(axis_absolute_feedback, list):
+                    snapshot["axis_absolute_feedback"] = axis_absolute_feedback
 
         axis_to_joint = getattr(backend, "_axis_to_joint", None)
         if isinstance(axis_to_joint, list) and axis_to_joint:
@@ -1238,6 +1303,7 @@ Examples:
                     }
                     if q is not None:
                         msg["joints"] = [float(x) for x in q]
+                        msg["display_joints"] = [float(x) for x in q]
                     if joint_feedback_error:
                         msg["joint_feedback_error"] = joint_feedback_error
                     correlation_id = utils.trajectory_state_get("last_correlation_id")
@@ -1285,6 +1351,12 @@ Examples:
                         backend = backend_registry.get_active_backend()
                     except Exception:
                         backend = None
+                    raw_positions = _sync_backend_raw_positions(backend)
+                    display_snapshot = _backend_display_feedback_snapshot(backend, raw_positions)
+                    if isinstance(display_snapshot, dict):
+                        axis_absolute_feedback = display_snapshot.get("axis_absolute_feedback")
+                        if isinstance(axis_absolute_feedback, list):
+                            msg["axis_absolute_feedback"] = axis_absolute_feedback
                     if cached_motion_status is None or now - last_motion_status_ts >= 0.1:
                         cached_motion_status = _build_monitor_motion_status_payload()
                         last_motion_status_ts = now

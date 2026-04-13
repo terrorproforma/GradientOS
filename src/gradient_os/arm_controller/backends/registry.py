@@ -595,6 +595,78 @@ def get_drive_native_home_config_for_backend(
     return None
 
 
+def get_drive_absolute_feedback_config_for_backend(
+    backend_name: Optional[str],
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.get_drive_absolute_feedback_config(effective_profile)
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    return None
+
+
+def get_drive_motion_feedback_config_for_backend(
+    backend_name: Optional[str],
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.get_drive_motion_feedback_config(effective_profile)
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    return None
+
+
+def normalize_drive_absolute_feedback_for_backend(
+    backend_name: Optional[str],
+    raw_feedback: object,
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.normalize_drive_absolute_feedback(
+            effective_profile,
+            raw_feedback,
+        )
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    return None
+
+
+def resolve_drive_absolute_feedback_counts_for_backend(
+    backend_name: Optional[str],
+    raw_feedback: object,
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.resolve_drive_absolute_feedback_counts(
+            effective_profile,
+            raw_feedback,
+        )
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    return None
+
+
 def decode_drive_statusword_for_backend(
     backend_name: Optional[str],
     statusword: int,

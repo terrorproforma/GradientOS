@@ -144,6 +144,12 @@ type DriveStartupConfig = {
   verified?: boolean;
 };
 
+type AbsoluteFeedbackField = {
+  label?: string;
+  valid?: boolean;
+  value?: number;
+};
+
 type DriveFaultAxis = {
   axis: number;
   logical_joint?: number | null;
@@ -159,8 +165,10 @@ type DriveFaultAxis = {
   slave_al_state?: number;
   slave_al_state_name?: string;
   pos_counts?: number;
+  absolute_feedback?: Record<string, AbsoluteFeedbackField> | null;
   native_home_state?: number;
   native_home_state_name?: string;
+  native_home_active?: boolean;
   native_home_position_offset?: number;
   native_home_last_abort_code?: number;
   native_home_last_abort_code_hex?: string;
@@ -183,6 +191,8 @@ type DriveFaultSnapshot = {
   armed?: number;
   axis_enable_mask?: number;
   axis_enable_mask_hex?: string;
+  native_home_active_axis_mask?: number;
+  native_home_active_axis_mask_hex?: string;
   enable_requested?: boolean;
   requested_axes?: number;
   op_enabled_axes?: number;
@@ -211,6 +221,7 @@ type TelemetryEvent = {
   timestamp: number;
   raw: string;
   joints?: number[];
+  display_joints?: number[];
   gripper?: number;
   servos?: Record<string, ServoSample>;
   alerts?: Alert[];
@@ -220,6 +231,16 @@ type TelemetryEvent = {
   comms?: Record<string, unknown>;
   motion_status?: MotionStatusResponse | null;
 };
+
+function preferredDisplayPoseJoints(latest: TelemetryEvent | null | undefined): number[] | null {
+  if (Array.isArray(latest?.joints) && latest.joints.length > 0) {
+    return latest.joints;
+  }
+  if (Array.isArray(latest?.display_joints) && latest.display_joints.length > 0) {
+    return latest.display_joints;
+  }
+  return null;
+}
 
 type MotionExecutionPayload = {
   controller_motion_state?: string;
@@ -2061,6 +2082,8 @@ function findWeldProgramNodeIdByEdge(
 }
 
 function TelemetryPanel({ latest }: { latest: TelemetryEvent | null }) {
+  const poseJoints = preferredDisplayPoseJoints(latest);
+
   return (
     <div className="pointer-events-auto w-full">
       {latest ? (
@@ -2069,13 +2092,13 @@ function TelemetryPanel({ latest }: { latest: TelemetryEvent | null }) {
             <span className="font-medium text-slate-100">Received</span>
             <span>{new Date(latest.timestamp).toLocaleTimeString()}</span>
           </div>
-          {latest.joints && latest.joints.length > 0 && (
+          {poseJoints && poseJoints.length > 0 && (
             <div className="flex flex-col gap-2">
               <span className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300/80">
                 Joints (deg)
               </span>
               <ul className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm text-slate-100/90">
-                {latest.joints.map((value, index) => {
+                {poseJoints.map((value, index) => {
                   const degrees = value * (180 / Math.PI);
                   return (
                     <li key={index}>
@@ -6388,6 +6411,7 @@ export default function App() {
 
   const handleMessage = useCallback((payload: string) => {
     let joints: number[] | undefined;
+    let displayJoints: number[] | undefined;
     let gripper: number | undefined;
     let servos: Record<string, ServoSample> | undefined;
     let parsedAlerts: Alert[] | undefined;
@@ -6410,6 +6434,13 @@ export default function App() {
       }
       if (Array.isArray(parsed?.joints)) {
         joints = parsed.joints
+          .map((value: unknown) =>
+            typeof value === "number" ? value : Number(value),
+          )
+          .filter((value: number) => Number.isFinite(value));
+      }
+      if (Array.isArray(parsed?.display_joints)) {
+        displayJoints = parsed.display_joints
           .map((value: unknown) =>
             typeof value === "number" ? value : Number(value),
           )
@@ -6486,6 +6517,7 @@ export default function App() {
       timestamp: Date.now(),
       raw: payload,
       joints,
+      display_joints: displayJoints,
       gripper,
       servos,
       alerts: parsedAlerts,
@@ -6652,7 +6684,8 @@ export default function App() {
     }
     connect();
   }, [connect, disconnect, isConnected]);
-  const hasLiveJointPose = Array.isArray(latest?.joints) && latest.joints.length > 0;
+  const livePoseJoints = preferredDisplayPoseJoints(latest);
+  const hasLiveJointPose = Array.isArray(livePoseJoints) && livePoseJoints.length > 0;
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -9275,7 +9308,7 @@ export default function App() {
                     robotId={visualizerRobotId}
                     activeTool={visualizerTool}
                     ref={visualizerRef}
-                    joints={latest?.joints}
+                    joints={livePoseJoints ?? undefined}
                     showBoundingBox={showBoundingBox}
                     selectionMode={isPlanning && !isPlanLoading}
                     onPointSelected={handlePointSelected}

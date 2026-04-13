@@ -160,6 +160,55 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(jogPosts[jogPosts.length - 1]?.pathname).toBe("/control/jog/session/stop");
 	});
 
+	it("prefers canonical joint angles for frontend feedback", async () => {
+		const onJointFeedback = vi.fn();
+		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+			const parsed = new URL(url, "http://localhost");
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
+				return mockJsonResponse({
+					arm_deg: [10, 20, 30, 40, 50, 60],
+					arm_display_deg: [1, 2, 3, 4, 5, 6],
+					gripper_deg: 7,
+					read_source: "live_feedback",
+				});
+			}
+			if (parsed.pathname === "/control/motion-status") {
+				return mockJsonResponse({
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						controller_thread_running: false,
+						rtcore_status_present: true,
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				});
+			}
+			return mockJsonResponse({});
+		}));
+
+		render(<ControlPanel apiHost="" onJointFeedback={onJointFeedback} />);
+
+		await waitFor(() => {
+			expect(onJointFeedback).toHaveBeenCalledWith([10, 20, 30, 40, 50, 60], 7);
+		});
+	});
+
 	it("blocks drive power-up when the runtime is unsafe", async () => {
 		render(
 			<ControlPanel
@@ -384,6 +433,41 @@ describe("ControlPanel jog session lifecycle", () => {
 		fireEvent.click(screen.getByRole("button", { name: "Show" }));
 		expect(screen.getByText(/Drive Home succeeded/i)).toBeTruthy();
 		expect(screen.getByText(/axis currently disarmed/i)).toBeTruthy();
+	});
+
+	it("blocks drive-home buttons while a native-home transaction is still active", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axis_enable_mask: 0x0,
+					native_home_active_axis_mask: 0x2,
+					axes: [
+						{
+							axis: 1,
+							logical_joint: 2,
+							ds402_state: "SwitchOnDisabled",
+							statusword: 0x1650,
+							error_code: 0,
+							native_home_state: 0,
+							native_home_state_name: "idle",
+							native_home_active: true,
+							native_home_last_abort_code: 0,
+							native_home_last_abort_code_hex: "0x00000000",
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+		expect(screen.getByText(/Drive-native home still running for J2/i)).toBeTruthy();
+		expect(screen.getByText(/Drive Home requested/i)).toBeTruthy();
+		for (const button of screen.getAllByRole("button", { name: "Drive Home" })) {
+			expect((button as HTMLButtonElement).disabled).toBe(true);
+		}
 	});
 
 	it("shows a warning when native-home verification is still pending", async () => {

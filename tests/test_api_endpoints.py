@@ -236,6 +236,8 @@ def patch_send(monkeypatch):
                 {
                     "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
                     "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    "arm_display_rad": [0.11, 0.21, 0.31, 0.41, 0.51, 0.61],
+                    "arm_display_deg": [1.5, 2.5, 3.5, 4.5, 5.5, 6.5],
                     "gripper_rad": 0.7,
                     "gripper_deg": 7.0,
                     "axis_counts": [101, 202, 303, 404, 505, 606],
@@ -256,6 +258,24 @@ def patch_send(monkeypatch):
                     "axis_fault_flags": [0, 0, 0, 0, 0, 0],
                     "axis_brake_state": [1, 1, 1, 1, 1, 1],
                     "axis_to_joint": [0, 1, 2, 3, 4, 5],
+                    "axis_absolute_feedback": [
+                        {
+                            "axis": 0,
+                            "logical_joint": 1,
+                            "absolute_feedback": {
+                                "encoder_multi_turn_low": {"valid": True, "value": 1234},
+                                "encoder_multi_turn_high": {"valid": True, "value": 0},
+                            },
+                            "absolute_home_anchor_rad": 10.0,
+                            "absolute_home_anchor_source": "encoder_multi_turn_counts",
+                            "absolute_counts": 1234,
+                            "absolute_source": "encoder_multi_turn_counts",
+                            "absolute_axis_q_rad": 12.34,
+                            "reference_pre_zero_rad": 2.34,
+                            "display_source": "absolute_encoder_anchor",
+                            "display_rad": 2.34,
+                        }
+                    ],
                     "backend_name": "ethercat_rtcore",
                     "read_source": "live_feedback",
                     "numeric_precision": "float64",
@@ -1001,7 +1021,7 @@ def test_control_home_joint_native(client):
     assert resp.status_code == 200
     assert resp.json()["joint"] == 3
     assert resp.json()["detail"] == "ACK,NATIVE_HOME_JOINT,3"
-    assert client.command_calls[-1] == ("NATIVE_HOME_JOINT,3", 5.0, True)
+    assert client.command_calls[-1] == ("NATIVE_HOME_JOINT,3", 25.0, True)
 
 
 def test_control_home_joint_native_returns_structured_pending_result(client, monkeypatch):
@@ -1145,6 +1165,15 @@ def test_control_joint_jog(client):
     body = resp.json()
     assert body["joint"] == 3
     assert body["delta_deg"] == pytest.approx(2.5)
+    assert body["feedback_snapshot_source"] == "GET_JOINT_STATE"
+    assert body["current_arm_deg"] == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    assert body["current_arm_display_deg"] == pytest.approx([1.5, 2.5, 3.5, 4.5, 5.5, 6.5])
+    assert body["selected_joint_feedback"]["joint"] == 3
+    assert body["selected_joint_feedback"]["current_raw_deg"] == pytest.approx(3.0)
+    assert body["selected_joint_feedback"]["current_display_deg"] == pytest.approx(3.5)
+    assert body["selected_joint_feedback"]["raw_minus_display_deg"] == pytest.approx(-0.5)
+    assert body["selected_joint_feedback"]["axis_index"] == 2
+    assert body["selected_joint_feedback"]["axis_counts"] == 303
     assert body["max_motor_rpm"] == pytest.approx(100.0)
     assert body["target_arm_deg"] == [1.0, 2.0, 5.5, 4.0, 5.0, 6.0]
     assert body["target_arm_rad"] == pytest.approx([
@@ -1160,7 +1189,7 @@ def test_control_joint_jog(client):
     assert body["state"] == "accepted"
     assert body["trajectory_id"] == 7
     assert body["waited_for_idle"] is False
-    assert client.command_calls[-2] == ("GET_JOINT_ANGLES", 1.0, True)
+    assert client.command_calls[-2] == ("GET_JOINT_STATE", 1.0, True)
     last_command, timeout_s, expect_response = client.command_calls[-1]
     assert timeout_s == 2.0
     assert expect_response is True
@@ -1186,7 +1215,7 @@ def test_control_joint_jog_ignores_wait_for_idle_flag(client):
 
     commands = client.command_calls[start_len:]
     assert len(commands) == 2
-    assert commands[0] == ("GET_JOINT_ANGLES", 1.0, True)
+    assert commands[0] == ("GET_JOINT_STATE", 1.0, True)
     assert commands[1][0].startswith("APPLY_JOINT_SETPOINT,")
     _, timeout_s, expect_response = commands[-1]
     assert timeout_s == 2.0
@@ -1197,8 +1226,17 @@ def test_control_joint_jog_ignores_wait_for_idle_flag(client):
 
 def test_control_joint_jog_surfaces_backend_rejection(client, monkeypatch):
     def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
-        if command == "GET_JOINT_ANGLES":
-            return True, "JOINT_ANGLES,1,2,3,4,5,6,7"
+        if command == "GET_JOINT_STATE":
+            return True, (
+                "JOINT_STATE_JSON,"
+                + json.dumps(
+                    {
+                        "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                        "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                    },
+                    separators=(",", ":"),
+                )
+            )
         if command.startswith("APPLY_JOINT_SETPOINT,"):
             return False, "ERROR,APPLY_JOINT_SETPOINT,RTCore did not provide a setpoint slot"
         return True, "ACK"
@@ -1211,6 +1249,40 @@ def test_control_joint_jog_surfaces_backend_rejection(client, monkeypatch):
     assert resp.json()["detail"] == {
         "code": "APPLY_JOINT_SETPOINT_REJECTED",
         "message": "RTCore did not provide a setpoint slot",
+    }
+
+
+def test_control_joint_jog_rejects_when_canonical_truth_is_unavailable(client, monkeypatch):
+    def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
+        if command == "GET_JOINT_STATE":
+            return True, (
+                "JOINT_STATE_JSON,"
+                + json.dumps(
+                    {
+                        "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                        "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                        "read_source": "live_feedback",
+                        "canonical_joint_truth_available": False,
+                        "canonical_joint_truth_unavailable_axes": [0],
+                        "canonical_joint_truth_unavailable_joints": [1],
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        return True, "ACK"
+
+    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
+
+    resp = client.post("/control/joint-jog", json={"joint": 1, "delta_deg": 1.0})
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "code": "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
+        "message": "Live canonical joint feedback is unavailable; refusing to baseline joint jog without anchored absolute truth.",
+        "read_source": "live_feedback",
+        "canonical_joint_truth_available": False,
+        "canonical_joint_truth_unavailable_axes": [0],
+        "canonical_joint_truth_unavailable_joints": [1],
     }
 
 
@@ -1244,16 +1316,11 @@ def test_info_joints(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["arm_deg"] == [1, 2, 3, 4, 5, 6]
-    assert body["arm_rad"] == pytest.approx([
-        0.017453292519943295,
-        0.03490658503988659,
-        0.05235987755982989,
-        0.06981317007977318,
-        0.08726646259971647,
-        0.10471975511965978,
-    ])
+    assert body["arm_rad"] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    assert body["arm_display_deg"] == [1.5, 2.5, 3.5, 4.5, 5.5, 6.5]
+    assert body["arm_display_rad"] == pytest.approx([0.11, 0.21, 0.31, 0.41, 0.51, 0.61])
     assert body["gripper_deg"] == 7
-    assert body["gripper_rad"] == pytest.approx(0.12217304763960307)
+    assert body["gripper_rad"] == pytest.approx(0.7)
 
 
 def test_info_joints_detailed(client):
@@ -1262,6 +1329,8 @@ def test_info_joints_detailed(client):
     assert resp.json() == {
         "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
         "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "arm_display_rad": [0.11, 0.21, 0.31, 0.41, 0.51, 0.61],
+        "arm_display_deg": [1.5, 2.5, 3.5, 4.5, 5.5, 6.5],
         "gripper_rad": 0.7,
         "gripper_deg": 7.0,
         "axis_counts": [101, 202, 303, 404, 505, 606],
@@ -1282,6 +1351,24 @@ def test_info_joints_detailed(client):
         "axis_fault_flags": [0, 0, 0, 0, 0, 0],
         "axis_brake_state": [1, 1, 1, 1, 1, 1],
         "axis_to_joint": [0, 1, 2, 3, 4, 5],
+        "axis_absolute_feedback": [
+            {
+                "axis": 0,
+                "logical_joint": 1,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": True, "value": 1234},
+                    "encoder_multi_turn_high": {"valid": True, "value": 0},
+                },
+                "absolute_home_anchor_rad": 10.0,
+                "absolute_home_anchor_source": "encoder_multi_turn_counts",
+                "absolute_counts": 1234,
+                "absolute_source": "encoder_multi_turn_counts",
+                "absolute_axis_q_rad": 12.34,
+                "reference_pre_zero_rad": 2.34,
+                "display_source": "absolute_encoder_anchor",
+                "display_rad": 2.34,
+            }
+        ],
         "backend_name": "ethercat_rtcore",
         "read_source": "live_feedback",
         "numeric_precision": "float64",

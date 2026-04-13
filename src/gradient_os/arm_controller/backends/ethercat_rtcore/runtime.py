@@ -56,6 +56,8 @@ RTCORE_JOG_STOP_REASON_ID_TO_NAME: dict[int, str] = {
     RTCORE_JOG_STOP_REASON_TRAJECTORY_PREEMPT: "trajectory_preempt",
 }
 
+RTCORE_FEEDBACK_WRAP_AXIS_MASK_ENV_VAR = "GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK"
+
 
 def _rtcore_drive_profile_hash(token: str) -> int:
     value = 0x811C9DC5
@@ -208,6 +210,59 @@ def build_rtcore_native_home_env(
     return {str(key): str(value) for key, value in env.items()}
 
 
+def build_rtcore_absolute_feedback_env(
+    *,
+    drive_profile: str | None,
+) -> dict[str, str]:
+    normalized_profile = normalize_drive_profile_id(drive_profile)
+    payload = backend_registry.get_drive_absolute_feedback_config_for_backend(
+        "ethercat_rtcore",
+        drive_profile_id=normalized_profile,
+    )
+    env = dict(payload.get("env", {})) if isinstance(payload, dict) else {}
+    env.setdefault("GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG", "")
+    return {str(key): str(value) for key, value in env.items()}
+
+
+def build_rtcore_motion_feedback_env(
+    *,
+    num_axes: int,
+    drive_profile: str | None,
+) -> dict[str, str]:
+    normalized_profile = normalize_drive_profile_id(drive_profile)
+    payload = backend_registry.get_drive_motion_feedback_config_for_backend(
+        "ethercat_rtcore",
+        drive_profile_id=normalized_profile,
+    )
+    wrap_mask = 0
+    if isinstance(payload, dict):
+        raw_mask = payload.get("feedback_wrap_axis_mask")
+        if raw_mask is not None:
+            try:
+                wrap_mask = int(raw_mask, 0) if isinstance(raw_mask, str) else int(raw_mask)
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid feedback_wrap_axis_mask for RTCore drive profile '{normalized_profile}'."
+                ) from exc
+        else:
+            raw_axes = payload.get("feedback_wrap_axes")
+            if isinstance(raw_axes, list):
+                for raw_axis in raw_axes:
+                    axis_i = int(raw_axis)
+                    if axis_i < 0 or axis_i >= int(num_axes):
+                        raise ValueError(
+                            f"feedback_wrap_axes entry {axis_i} is out of range for num_axes={int(num_axes)}."
+                        )
+                    wrap_mask |= 1 << axis_i
+            elif bool(payload.get("feedback_counts_wrap")):
+                wrap_mask = (1 << int(num_axes)) - 1 if int(num_axes) > 0 else 0
+    valid_mask = (1 << int(num_axes)) - 1 if int(num_axes) > 0 else 0
+    wrap_mask &= valid_mask
+    return {
+        RTCORE_FEEDBACK_WRAP_AXIS_MASK_ENV_VAR: f"0x{wrap_mask:x}",
+    }
+
+
 def build_rtcore_startup_env(
     *,
     robot_config: dict[str, Any],
@@ -236,10 +291,19 @@ def build_rtcore_startup_env(
     }
     env.update(build_rtcore_drive_profile_env(drive_profile=normalized_profile))
     env.update(build_rtcore_native_home_env(drive_profile=normalized_profile))
+    env.update(build_rtcore_absolute_feedback_env(drive_profile=normalized_profile))
+    env.update(
+        build_rtcore_motion_feedback_env(
+            num_axes=int(axis_scaling["num_axes"]),
+            drive_profile=normalized_profile,
+        )
+    )
     for key, value in (startup_config.get("env") if isinstance(startup_config, dict) else {}).items():
         env[str(key)] = str(value)
     env.setdefault("GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG", "")
     env.setdefault("GRADIENT_RT_NATIVE_HOME_CONFIG", "")
+    env.setdefault("GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG", "")
+    env.setdefault(RTCORE_FEEDBACK_WRAP_AXIS_MASK_ENV_VAR, "0x0")
     return env
 
 

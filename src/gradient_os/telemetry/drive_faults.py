@@ -30,6 +30,44 @@ def native_home_state_name(value: object) -> str:
     return labels.get(state, f"unknown:{state}")
 
 
+def derive_effective_native_home_status(
+    axis: Mapping[str, object],
+    *,
+    statusword: int,
+    error_code: int,
+    manufacturer_error_code: int,
+) -> dict[str, object]:
+    reported_state = coerce_int(axis.get("native_home_state"), 0)
+    reported_abort_code = coerce_int(axis.get("native_home_last_abort_code"), 0)
+    effective_state = reported_state
+    effective_abort_code = reported_abort_code
+    verification_source = "reported"
+
+    # If the drive currently advertises HM bit 15 with no live fault, trust that
+    # fresh wire-state over a stale last-operation result cached in metrics.
+    if (
+        effective_state not in {1, 2}
+        and error_code == 0
+        and manufacturer_error_code == 0
+        and (int(statusword) & 0x8000) != 0
+    ):
+        effective_state = 2
+        effective_abort_code = 0
+        verification_source = "statusword_bit15"
+
+    return {
+        "native_home_state": int(effective_state),
+        "native_home_state_name": native_home_state_name(effective_state),
+        "native_home_last_abort_code": int(effective_abort_code),
+        "native_home_last_abort_code_hex": f"0x{effective_abort_code & 0xFFFFFFFF:08x}",
+        "native_home_state_reported": int(reported_state),
+        "native_home_state_reported_name": native_home_state_name(reported_state),
+        "native_home_last_abort_code_reported": int(reported_abort_code),
+        "native_home_last_abort_code_reported_hex": f"0x{reported_abort_code & 0xFFFFFFFF:08x}",
+        "native_home_verification_source": verification_source,
+    }
+
+
 def build_startup_fault_reset_plan(probe: Mapping[str, object]) -> dict[str, Any]:
     physical_state = str(probe.get("physical_state", "")).strip().upper() or "UNKNOWN"
     driver_state = str(probe.get("driver_state", "")).strip().upper() or "UNKNOWN"
@@ -139,6 +177,7 @@ def build_drive_fault_snapshot(
     num_axes = coerce_int(metrics.get("num_axes"), 0)
     armed = coerce_int(metrics.get("armed"), 0)
     enable_mask = coerce_int(metrics.get("axis_enable_mask"), 0)
+    native_home_active_axis_mask = coerce_int(metrics.get("native_home_active_axis_mask"), 0)
     link_up = coerce_int(metrics.get("link_up"), 0)
     responding = coerce_int(metrics.get("responding_slaves"), 0)
     online = coerce_int(metrics.get("online_slaves"), 0)
@@ -204,6 +243,12 @@ def build_drive_fault_snapshot(
             op_enabled_axes += 1
         if axis_snapshot_is_faulted({"error_code": error_code, "ds402_state": ds402_state}):
             faulted_axes += 1
+        native_home_status = derive_effective_native_home_status(
+            axis,
+            statusword=statusword,
+            error_code=error_code,
+            manufacturer_error_code=manufacturer_error_code,
+        )
 
         logical_joint = None
         if axis_index < len(axis_to_joint_list):
@@ -224,6 +269,11 @@ def build_drive_fault_snapshot(
         startup_drive_config = backend_registry.extract_drive_startup_config_axis_for_backend(
             servo_backend,
             dict(axis),
+            drive_profile_id=resolved_drive_profile,
+        )
+        absolute_feedback = backend_registry.normalize_drive_absolute_feedback_for_backend(
+            servo_backend,
+            axis.get("absolute_feedback"),
             drive_profile_id=resolved_drive_profile,
         )
         if isinstance(startup_drive_config, Mapping):
@@ -260,12 +310,27 @@ def build_drive_fault_snapshot(
                     else "UNKNOWN"
                 ),
                 "pos_counts": coerce_int(axis.get("pos_counts"), 0),
-                "native_home_state": coerce_int(axis.get("native_home_state"), 0),
-                "native_home_state_name": native_home_state_name(axis.get("native_home_state")),
+                "absolute_feedback": absolute_feedback,
+                "native_home_state": int(native_home_status["native_home_state"]),
+                "native_home_state_name": str(native_home_status["native_home_state_name"]),
+                "native_home_active": bool((native_home_active_axis_mask & (1 << axis_index)) != 0),
                 "native_home_position_offset": coerce_int(axis.get("native_home_position_offset"), 0),
-                "native_home_last_abort_code": coerce_int(axis.get("native_home_last_abort_code"), 0),
-                "native_home_last_abort_code_hex": (
-                    f"0x{coerce_int(axis.get('native_home_last_abort_code'), 0) & 0xFFFFFFFF:08x}"
+                "native_home_last_abort_code": int(native_home_status["native_home_last_abort_code"]),
+                "native_home_last_abort_code_hex": str(
+                    native_home_status["native_home_last_abort_code_hex"]
+                ),
+                "native_home_state_reported": int(native_home_status["native_home_state_reported"]),
+                "native_home_state_reported_name": str(
+                    native_home_status["native_home_state_reported_name"]
+                ),
+                "native_home_last_abort_code_reported": int(
+                    native_home_status["native_home_last_abort_code_reported"]
+                ),
+                "native_home_last_abort_code_reported_hex": str(
+                    native_home_status["native_home_last_abort_code_reported_hex"]
+                ),
+                "native_home_verification_source": str(
+                    native_home_status["native_home_verification_source"]
                 ),
                 "fault": backend_registry.describe_drive_fault_code_for_backend(
                     servo_backend,
@@ -336,6 +401,8 @@ def build_drive_fault_snapshot(
         "armed": armed,
         "axis_enable_mask": enable_mask,
         "axis_enable_mask_hex": f"0x{enable_mask:x}",
+        "native_home_active_axis_mask": native_home_active_axis_mask,
+        "native_home_active_axis_mask_hex": f"0x{native_home_active_axis_mask:x}",
         "enable_requested": enable_requested,
         "requested_axes": requested_axes,
         "op_enabled_axes": op_enabled_axes,

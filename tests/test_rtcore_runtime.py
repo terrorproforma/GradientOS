@@ -50,7 +50,20 @@ def test_render_rtcore_systemd_env_contains_scaling_and_profile():
         "op|set_mode|6;op|write_sdo|0x60E6|0x00|u8|0;op|write_sdo|0x607C|0x00|i32|0;"
         "op|write_sdo|0x6098|0x00|i8|35;op|controlword_sequence|6,7,15;"
         "op|wait_statusword|0x0227|0x2048;op|controlword_sequence|31;"
-        "op|wait_statusword|0x9000|0x2000;op|refresh_truth;op|restore_mode|8"
+        "op|wait_statusword|0x9000|0x2000;op|refresh_truth;op|restore_mode|8;"
+        "op|release_service_override;"
+        "op|write_sdo|0x2031|0x11|u16|1;op|wait_sdo|0x2031|0x11|u16|0;"
+        "op|write_sdo|0x2031|0x11|u16|2;op|wait_sdo|0x2031|0x11|u16|0"
+    )
+    expected_absolute_feedback = (
+        "absolute_position_reference|0x2040|0x17|i32;"
+        "encoder_single_turn_data|0x2040|0x1D|i32;"
+        "encoder_multi_turn_position|0x2040|0x1F|u16;"
+        "encoder_multi_turn_low|0x2040|0x21|i32;"
+        "encoder_multi_turn_high|0x2040|0x23|i32;"
+        "rotation_mode_position_reference|0x2040|0x29|i32;"
+        "rotation_mode_encoder_low|0x2040|0x2B|i32;"
+        "rotation_mode_encoder_high|0x2040|0x2D|i32"
     )
     rendered = render_rtcore_systemd_env(
         robot_config=robot_cfg,
@@ -71,7 +84,9 @@ def test_render_rtcore_systemd_env_contains_scaling_and_profile():
     assert 'GRADIENT_RT_DRIVE_RX_PDO_LAYOUT="cw|0x6040|0x00|16;target_pos|0x607A|0x00|32;' in rendered
     assert 'GRADIENT_RT_DRIVE_TX_PDO_LAYOUT="err|0x603F|0x00|16;sw|0x6041|0x00|16;pos|0x6064|0x00|32;' in rendered
     assert f'GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG="{expected_startup_sdo}"' in rendered
+    assert f'GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG="{expected_absolute_feedback}"' in rendered
     assert f'GRADIENT_RT_NATIVE_HOME_CONFIG="{expected_native_home}"' in rendered
+    assert 'GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK="0x3f"' in rendered
 
 
 def test_build_rtcore_drive_startup_config_uses_drive_profile_defaults_when_robot_has_no_override():

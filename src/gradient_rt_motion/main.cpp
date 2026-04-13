@@ -93,6 +93,22 @@ double controller_target_to_csp_wire_counts(double controller_target_counts,
   return controller_target_counts - static_cast<double>(native_home_offset_counts);
 }
 
+int64_t shortest_periodic_error_counts(int64_t error_counts, uint32_t counts_per_rev) {
+  if (counts_per_rev == 0) {
+    return error_counts;
+  }
+  const int64_t period = static_cast<int64_t>(counts_per_rev);
+  const int64_t half_turn = period / 2;
+  if (half_turn <= 0) {
+    return error_counts;
+  }
+  int64_t wrapped = (error_counts + half_turn) % period;
+  if (wrapped < 0) {
+    wrapped += period;
+  }
+  return wrapped - half_turn;
+}
+
 void logf(const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -145,6 +161,7 @@ struct AxisConfig {
   uint32_t counts_per_rev = 131072; // common 17-bit encoder counts per rev
   double gear_ratio = 1.0;
   int sign = +1; // +1 or -1 (mechanical orientation)
+  bool feedback_counts_wrap = false; // compare feedback modulo counts_per_rev when true
   uint8_t axis_type = gradient::ipc::v1::AXIS_TYPE_ROTARY; // q is radians by default
   double lead_m_per_rev = 0.0; // only used when axis_type==AXIS_TYPE_LINEAR
 
@@ -194,6 +211,20 @@ struct SdoObjectSpec {
   SdoScalarType type = SdoScalarType::kNone;
 };
 
+constexpr uint32_t kMaxAbsoluteFeedbackFields = 16;
+
+struct AbsoluteFeedbackFieldConfig {
+  bool valid = false;
+  std::string key;
+  SdoObjectSpec object{};
+};
+
+struct AbsoluteFeedbackConfig {
+  bool valid = false;
+  uint32_t field_count = 0;
+  std::array<AbsoluteFeedbackFieldConfig, kMaxAbsoluteFeedbackFields> fields{};
+};
+
 enum class NativeHomeOpKind : uint8_t {
   kNone = 0,
   kSetMode = 1,
@@ -202,6 +233,8 @@ enum class NativeHomeOpKind : uint8_t {
   kWaitStatusword = 4,
   kRefreshTruth = 5,
   kRestoreMode = 6,
+  kWaitSdo = 7,
+  kReleaseServiceOverride = 8,
 };
 
 struct NativeHomeOp {
@@ -220,6 +253,15 @@ struct NativeHomeConfig {
   uint32_t commissioning_mode = 6;
   SdoObjectSpec truth_source{};
   std::vector<NativeHomeOp> transaction{};
+};
+
+struct AbsoluteFeedbackFieldSample {
+  uint8_t valid = 0;
+  int32_t value = 0;
+};
+
+struct AbsoluteFeedbackAxis {
+  std::array<AbsoluteFeedbackFieldSample, kMaxAbsoluteFeedbackFields> fields{};
 };
 
 struct DrivePdoConfig {
@@ -251,6 +293,7 @@ struct Options {
   // Per-axis lists can be provided via the CLI (comma-separated).
   std::array<AxisConfig, gradient::ipc::v1::GRADIENT_MAX_AXES> axis{};
   std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_position{};
+  uint32_t feedback_wrap_axis_mask = 0;
 
   // Safety: cap commanded motor speed (rpm). 0 disables clamping.
   double max_rpm = 100.0;
@@ -620,6 +663,55 @@ bool parse_sdo_scalar_type_token(const std::string& token, SdoScalarType* out) {
   return false;
 }
 
+bool parse_absolute_feedback_config_spec(const std::string& spec,
+                                        AbsoluteFeedbackConfig* out) {
+  if (!out) {
+    return false;
+  }
+  *out = AbsoluteFeedbackConfig{};
+  const std::string trimmed = trim_ascii_ws(spec);
+  if (trimmed.empty()) {
+    return true;
+  }
+  const auto descriptors = split_delim_strict(trimmed, ';');
+  if (descriptors.empty() ||
+      descriptors.size() > static_cast<size_t>(kMaxAbsoluteFeedbackFields)) {
+    return false;
+  }
+  AbsoluteFeedbackConfig cfg{};
+  for (size_t idx = 0; idx < descriptors.size(); ++idx) {
+    const auto fields = split_delim_strict(descriptors[idx], '|');
+    if (fields.size() != 4) {
+      return false;
+    }
+    const std::string key = trim_ascii_ws(fields[0]);
+    uint16_t index = 0;
+    uint16_t subindex = 0;
+    SdoScalarType type = SdoScalarType::kNone;
+    if (key.empty() ||
+        !parse_u16_auto(fields[1].c_str(), &index) ||
+        !parse_u16_auto(fields[2].c_str(), &subindex) ||
+        !parse_sdo_scalar_type_token(fields[3], &type)) {
+      return false;
+    }
+    for (size_t prev = 0; prev < idx; ++prev) {
+      if (cfg.fields[prev].valid && cfg.fields[prev].key == key) {
+        return false;
+      }
+    }
+    cfg.fields[idx].valid = true;
+    cfg.fields[idx].key = key;
+    cfg.fields[idx].object.valid = true;
+    cfg.fields[idx].object.index = index;
+    cfg.fields[idx].object.subindex = static_cast<uint8_t>(subindex & 0xFFu);
+    cfg.fields[idx].object.type = type;
+  }
+  cfg.field_count = static_cast<uint32_t>(descriptors.size());
+  cfg.valid = cfg.field_count > 0;
+  *out = cfg;
+  return true;
+}
+
 bool parse_native_home_config_spec(const std::string& spec, NativeHomeConfig* out) {
   if (!out) {
     return false;
@@ -736,6 +828,29 @@ bool parse_native_home_config_spec(const std::string& spec, NativeHomeConfig* ou
       op.kind = NativeHomeOpKind::kWaitStatusword;
       op.wait_all_set_mask = all_set_mask;
       op.wait_all_clear_mask = all_clear_mask;
+    } else if (op_name == "wait_sdo") {
+      uint16_t index = 0;
+      uint16_t subindex = 0;
+      SdoScalarType type = SdoScalarType::kNone;
+      int64_t value = 0;
+      if (fields.size() != 6 ||
+          !parse_u16_auto(fields[2].c_str(), &index) ||
+          !parse_u16_auto(fields[3].c_str(), &subindex) ||
+          !parse_sdo_scalar_type_token(fields[4], &type) ||
+          !parse_i64_auto(fields[5].c_str(), &value)) {
+        return false;
+      }
+      op.kind = NativeHomeOpKind::kWaitSdo;
+      op.object.valid = true;
+      op.object.index = index;
+      op.object.subindex = static_cast<uint8_t>(subindex & 0xFFu);
+      op.object.type = type;
+      op.value_i32 = static_cast<int32_t>(value);
+    } else if (op_name == "release_service_override") {
+      if (fields.size() != 2) {
+        return false;
+      }
+      op.kind = NativeHomeOpKind::kReleaseServiceOverride;
     } else if (op_name == "refresh_truth") {
       if (fields.size() != 2) {
         return false;
@@ -1107,8 +1222,10 @@ void print_usage(const char* argv0) {
       stderr,
       "Usage: %s [--socket-path PATH] [--cycle-ns NS] [--num-axes N] "
       "[--counts-per-rev N[,N..]] [--gear-ratio R[,R..]] [--sign S[,S..]] "
+      "[--feedback-wrap-axis-mask MASK] "
       "[--axis-type T[,T..]] [--lead-m-per-rev M[,M..]] [--drive-profile ID] [--max-rpm RPM] "
       "[--startup-sdo-config SPEC] "
+      "[--absolute-feedback-config SPEC] "
       "[--native-home-config SPEC] "
       "[--slave-vendor-id VID] [--slave-product-code PID] [--slave-revision-no REV] "
       "[--rx-sync-index N] [--tx-sync-index N] [--dc-cycle-multiple-ns NS] "
@@ -1126,10 +1243,12 @@ void print_usage(const char* argv0) {
       "  --counts-per-rev 131072\n"
       "  --gear-ratio   1.0\n"
       "  --sign         +1\n"
+      "  --feedback-wrap-axis-mask 0x0\n"
       "  --axis-type    rotary\n"
       "  --drive-profile <profile-or-id>\n"
       "  --max-rpm      100\n"
       "  --startup-sdo-config key|u16|0xINDEX|0xSUB|V[,V..]\n"
+      "  --absolute-feedback-config key|0xINDEX|0xSUB|TYPE;...\n"
       "  --native-home-config descriptor string for commissioning-only native-home transactions\n"
       "  --slave-vendor-id  0x....\n"
       "  --slave-product-code 0x....\n"
@@ -1344,6 +1463,7 @@ int main(int argc, char** argv) {
   std::string rx_pdo_layout_spec;
   std::string tx_pdo_layout_spec;
   std::string startup_sdo_config_spec;
+  std::string absolute_feedback_config_spec;
   std::string native_home_config_spec;
 
   for (int i = 1; i < argc; ++i) {
@@ -1383,6 +1503,13 @@ int main(int argc, char** argv) {
       sign_spec = argv[++i];
       continue;
     }
+    if (arg == "--feedback-wrap-axis-mask" && i + 1 < argc) {
+      if (!parse_u32_auto(argv[++i], &opt.feedback_wrap_axis_mask)) {
+        logf("ERROR: invalid --feedback-wrap-axis-mask");
+        return 2;
+      }
+      continue;
+    }
     if (arg == "--axis-type" && i + 1 < argc) {
       axis_type_spec = argv[++i];
       continue;
@@ -1407,6 +1534,10 @@ int main(int argc, char** argv) {
     }
     if (arg == "--startup-sdo-config" && i + 1 < argc) {
       startup_sdo_config_spec = argv[++i];
+      continue;
+    }
+    if (arg == "--absolute-feedback-config" && i + 1 < argc) {
+      absolute_feedback_config_spec = argv[++i];
       continue;
     }
     if (arg == "--native-home-config" && i + 1 < argc) {
@@ -1558,6 +1689,10 @@ int main(int argc, char** argv) {
                             lead_m_per_rev_spec)) {
     return 2;
   }
+  for (uint32_t axis_i = 0; axis_i < opt.num_axes; ++axis_i) {
+    opt.axis[axis_i].feedback_counts_wrap =
+        (opt.feedback_wrap_axis_mask & (1u << axis_i)) != 0u;
+  }
   if (!finalize_slave_positions(&opt, slave_positions_spec)) {
     return 2;
   }
@@ -1577,6 +1712,11 @@ int main(int argc, char** argv) {
   StartupSdoConfig startup_sdo{};
   if (!parse_startup_sdo_config_spec(startup_sdo_config_spec, opt.num_axes, &startup_sdo)) {
     logf("ERROR: invalid --startup-sdo-config");
+    return 2;
+  }
+  AbsoluteFeedbackConfig absolute_feedback_cfg{};
+  if (!parse_absolute_feedback_config_spec(absolute_feedback_config_spec, &absolute_feedback_cfg)) {
+    logf("ERROR: invalid --absolute-feedback-config");
     return 2;
   }
   NativeHomeConfig native_home_cfg{};
@@ -1779,6 +1919,7 @@ int main(int argc, char** argv) {
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> mode_display{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ds402_state{};
     std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> di_bits{};
+    std::array<AbsoluteFeedbackAxis, gradient::ipc::v1::GRADIENT_MAX_AXES> absolute_feedback{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_al_state{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_online{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_operational{};
@@ -1820,6 +1961,7 @@ int main(int argc, char** argv) {
   std::array<std::atomic<uint32_t>, gradient::ipc::v1::GRADIENT_MAX_AXES> service_controlword_override{};
   std::atomic<uint32_t> fault_reset_request{0}; // bitmask; helper thread -> RT thread
   std::atomic<uint64_t> trajectory_abort_request{0}; // 0 means none, UINT64_MAX means any active trajectory
+  std::atomic<uint32_t> native_home_active_axis_mask{0};
   CommittedTrajectory committed_trajectory{};
   JogCommandRuntime latest_jog_command{};
   LatestFeedback latest_feedback{};
@@ -2024,6 +2166,38 @@ int main(int argc, char** argv) {
     return false;
 #endif
   };
+
+  auto read_absolute_feedback_field_axis = [&](uint32_t axis,
+                                               uint16_t index,
+                                               uint8_t subindex,
+                                               SdoScalarType type,
+                                               AbsoluteFeedbackFieldSample* out) {
+    if (!out) {
+      return false;
+    }
+#if GRADIENT_HAVE_ECRT
+    int32_t value = 0;
+    uint32_t abort_code = 0;
+    if (!read_sdo_scalar_axis(axis, index, subindex, type, &value, &abort_code)) {
+      out->valid = 0u;
+      out->value = 0;
+      return false;
+    }
+    out->valid = 1u;
+    out->value = value;
+    return true;
+#else
+    (void)axis;
+    (void)index;
+    (void)subindex;
+    (void)type;
+    out->valid = 0u;
+    out->value = 0;
+    return false;
+#endif
+  };
+
+  std::atomic<int> process_exit_code{0};
 
   std::thread rt_thread([&]() {
     pthread_setname_np(pthread_self(), "rt-cycle");
@@ -2570,6 +2744,9 @@ int main(int argc, char** argv) {
     master = ecrt_request_master(0);
     if (!master) {
       logf("ERROR: ecrt_request_master(0) failed");
+      process_exit_code.store(3, std::memory_order_relaxed);
+      g_stop.store(true, std::memory_order_relaxed);
+      return;
     } else {
       logf("EtherCAT config phase=request_master ok");
       bool have_domains = true;
@@ -2863,6 +3040,7 @@ int main(int argc, char** argv) {
           armed.store(false, std::memory_order_relaxed);
           axis_enable_mask.store(0, std::memory_order_relaxed);
           service_mode_axis_mask.store(0, std::memory_order_relaxed);
+          native_home_active_axis_mask.store(0, std::memory_order_relaxed);
           for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
             desired_mode_of_operation[axis].store(0, std::memory_order_relaxed);
             service_mode_override[axis].store(kNoModeOverride, std::memory_order_relaxed);
@@ -3460,8 +3638,14 @@ int main(int argc, char** argv) {
             const int64_t error_counts =
                 static_cast<int64_t>(final_feedback_counts) -
                 static_cast<int64_t>(final_target_counts);
-            if (error_counts < -static_cast<int64_t>(kTrajectoryCompletionToleranceCounts) ||
-                error_counts > static_cast<int64_t>(kTrajectoryCompletionToleranceCounts)) {
+            const int64_t comparable_error_counts =
+                opt.axis[i].feedback_counts_wrap
+                    ? shortest_periodic_error_counts(error_counts, opt.axis[i].counts_per_rev)
+                    : error_counts;
+            if (comparable_error_counts <
+                    -static_cast<int64_t>(kTrajectoryCompletionToleranceCounts) ||
+                comparable_error_counts >
+                    static_cast<int64_t>(kTrajectoryCompletionToleranceCounts)) {
               all_axes_at_target = false;
             }
           }
@@ -3798,10 +3982,13 @@ int main(int argc, char** argv) {
     bool native_home_offset_refresh_complete = !native_home_cfg.valid;
     uint64_t startup_readback_ready_since_ns = 0;
     uint64_t native_home_offset_ready_since_ns = 0;
+    uint64_t absolute_feedback_ready_since_ns = 0;
+    uint64_t absolute_feedback_last_poll_ns = 0;
     bool startup_state_observed = false;
     bool last_startup_ready_flag = false;
     uint32_t last_startup_reset_count = 0;
     constexpr uint64_t kStartupReadbackDelayNs = 500000000ULL; // 500ms after startup_ready
+    constexpr uint64_t kAbsoluteFeedbackPollIntervalNs = 200000000ULL; // 200ms
 
     auto perform_startup_drive_config_readback = [&](uint64_t now_ns, bool startup_ready_flag) {
 #if GRADIENT_HAVE_ECRT
@@ -3956,6 +4143,52 @@ int main(int argc, char** argv) {
 #endif
     };
 
+    auto perform_absolute_feedback_refresh = [&](uint64_t now_ns, bool startup_ready_flag) {
+#if GRADIENT_HAVE_ECRT
+      if (!shared_master || !absolute_feedback_cfg.valid || absolute_feedback_cfg.field_count == 0) {
+        return;
+      }
+      if (!startup_ready_flag) {
+        absolute_feedback_ready_since_ns = 0;
+        absolute_feedback_last_poll_ns = 0;
+        latest_feedback.absolute_feedback.fill(AbsoluteFeedbackAxis{});
+        return;
+      }
+      if (absolute_feedback_ready_since_ns == 0) {
+        absolute_feedback_ready_since_ns = now_ns;
+        return;
+      }
+      if (now_ns - absolute_feedback_ready_since_ns < kStartupReadbackDelayNs) {
+        return;
+      }
+      if (absolute_feedback_last_poll_ns != 0 &&
+          now_ns - absolute_feedback_last_poll_ns < kAbsoluteFeedbackPollIntervalNs) {
+        return;
+      }
+      absolute_feedback_last_poll_ns = now_ns;
+
+      for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+        AbsoluteFeedbackAxis axis_feedback{};
+        for (uint32_t field_i = 0; field_i < absolute_feedback_cfg.field_count; ++field_i) {
+          const auto& field_cfg = absolute_feedback_cfg.fields[field_i];
+          if (!field_cfg.valid || !field_cfg.object.valid) {
+            continue;
+          }
+          (void)read_absolute_feedback_field_axis(
+              i,
+              field_cfg.object.index,
+              field_cfg.object.subindex,
+              field_cfg.object.type,
+              &axis_feedback.fields[field_i]);
+        }
+        latest_feedback.absolute_feedback[i] = axis_feedback;
+      }
+#else
+      (void)now_ns;
+      (void)startup_ready_flag;
+#endif
+    };
+
     while (!g_stop.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       const uint64_t now_ns = now_monotonic_ns();
@@ -4001,6 +4234,7 @@ int main(int argc, char** argv) {
       std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> statusword{};
       std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> error_code{};
       std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> manufacturer_error_code{};
+      std::array<AbsoluteFeedbackAxis, gradient::ipc::v1::GRADIENT_MAX_AXES> absolute_feedback{};
       std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_al_state{};
       std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_online{};
       std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_operational{};
@@ -4034,6 +4268,7 @@ int main(int argc, char** argv) {
         statusword = latest_feedback.statusword;
         error_code = latest_feedback.error_code;
         manufacturer_error_code = latest_feedback.manufacturer_error_code;
+        absolute_feedback = latest_feedback.absolute_feedback;
         slave_al_state = latest_feedback.slave_al_state;
         slave_online = latest_feedback.slave_online;
         slave_operational = latest_feedback.slave_operational;
@@ -4052,6 +4287,15 @@ int main(int argc, char** argv) {
         native_home_offset_refresh_complete = !native_home_cfg.valid;
         startup_readback_ready_since_ns = 0;
         native_home_offset_ready_since_ns = 0;
+        absolute_feedback_ready_since_ns = 0;
+        absolute_feedback_last_poll_ns = 0;
+        latest_feedback.native_home_state.fill(
+            static_cast<uint8_t>(gradient::ipc::v1::NATIVE_HOME_STATE_IDLE));
+        latest_feedback.native_home_last_abort_code.fill(0u);
+        latest_feedback.absolute_feedback.fill(AbsoluteFeedbackAxis{});
+        native_home_state.fill(
+            static_cast<uint8_t>(gradient::ipc::v1::NATIVE_HOME_STATE_IDLE));
+        native_home_last_abort_code.fill(0u);
         logf("EtherCAT startup epoch changed: ready=%u->%u reset_count=%u->%u; rearming startup readback/offset refresh",
              last_startup_ready_flag ? 1u : 0u,
              startup_ready_flag ? 1u : 0u,
@@ -4066,10 +4310,12 @@ int main(int argc, char** argv) {
 
       perform_startup_drive_config_readback(now_ns, startup_ready_flag);
       perform_startup_native_home_offset_refresh(now_ns, startup_ready_flag);
+      perform_absolute_feedback_refresh(now_ns, startup_ready_flag);
       startup_drive_config_readback_valid = latest_feedback.startup_drive_config_readback_valid;
       startup_drive_config_readback = latest_feedback.startup_drive_config_readback;
       startup_drive_config_verified = latest_feedback.startup_drive_config_verified;
       native_home_position_offset = latest_feedback.native_home_position_offset;
+      absolute_feedback = latest_feedback.absolute_feedback;
 
       const uint32_t en_mask = axis_enable_mask.load(std::memory_order_relaxed);
 
@@ -4113,6 +4359,8 @@ int main(int argc, char** argv) {
       oss << "\"rt_overrun_count\":" << overruns << ",";
       oss << "\"armed\":" << (armed.load(std::memory_order_relaxed) ? 1 : 0) << ",";
       oss << "\"axis_enable_mask\":" << en_mask << ",";
+      oss << "\"native_home_active_axis_mask\":"
+          << native_home_active_axis_mask.load(std::memory_order_relaxed) << ",";
       oss << "\"have_feedback\":" << (have_fb ? 1 : 0) << ",";
       oss << "\"wkc_actual\":" << (have_fb ? wkc_actual : 0) << ",";
       oss << "\"wkc_expected\":" << wkc_expected << ",";
@@ -4127,6 +4375,26 @@ int main(int argc, char** argv) {
       oss << "\"startup_elapsed_ms\":" << startup_elapsed_ms << ",";
       oss << "\"startup_reset_count\":" << startup_reset_count << ",";
       oss << "\"axes\":[";
+      auto append_absolute_feedback_json = [&](const AbsoluteFeedbackAxis& axis_feedback) {
+        oss << "\"absolute_feedback\":{";
+        bool first = true;
+        for (uint32_t field_i = 0; field_i < absolute_feedback_cfg.field_count; ++field_i) {
+          const auto& field_cfg = absolute_feedback_cfg.fields[field_i];
+          if (!field_cfg.valid || field_cfg.key.empty()) {
+            continue;
+          }
+          if (!first) {
+            oss << ",";
+          }
+          first = false;
+          const auto& field = axis_feedback.fields[field_i];
+          oss << "\"" << field_cfg.key << "\":{";
+          oss << "\"valid\":" << static_cast<unsigned int>(field.valid) << ",";
+          oss << "\"value\":" << field.value;
+          oss << "}";
+        }
+        oss << "},";
+      };
       for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
         if (i != 0) {
           oss << ",";
@@ -4155,6 +4423,7 @@ int main(int argc, char** argv) {
         oss << "\"native_home_state\":" << static_cast<unsigned int>(native_home_state[i]) << ",";
         oss << "\"native_home_position_offset\":" << native_home_position_offset[i] << ",";
         oss << "\"native_home_last_abort_code\":" << native_home_last_abort_code[i] << ",";
+        append_absolute_feedback_json(absolute_feedback[i]);
         oss << "\"slave_online\":" << static_cast<unsigned int>(slave_online[i]) << ",";
         oss << "\"slave_operational\":" << static_cast<unsigned int>(slave_operational[i]) << ",";
         oss << "\"slave_al_state\":" << static_cast<unsigned int>(slave_al_state[i]);
@@ -4550,6 +4819,7 @@ int main(int argc, char** argv) {
         }
         constexpr auto kServiceStepSleep = std::chrono::milliseconds(50);
         constexpr uint64_t kWaitStatuswordTimeoutNs = 10000000000ULL;
+        constexpr uint64_t kWaitSdoTimeoutNs = 5000000000ULL;
         const uint32_t axis_bit = (1u << axis);
         service_controlword_override[axis].store(0, std::memory_order_relaxed);
         service_mode_override[axis].store(
@@ -4578,6 +4848,7 @@ int main(int argc, char** argv) {
 
         bool succeeded = true;
         bool refreshed_truth = false;
+        bool service_override_released = false;
         for (const NativeHomeOp& step : native_home_cfg.transaction) {
           if (!succeeded) {
             break;
@@ -4647,6 +4918,47 @@ int main(int argc, char** argv) {
               }
               break;
             }
+            case NativeHomeOpKind::kWaitSdo: {
+              bool matched = false;
+              int32_t current_value = 0;
+              uint32_t abort_code = 0;
+              const uint64_t deadline_ns = now_monotonic_ns() + kWaitSdoTimeoutNs;
+              while (now_monotonic_ns() < deadline_ns) {
+                abort_code = 0;
+                if (step.object.valid &&
+                    read_sdo_scalar_axis(axis,
+                                         step.object.index,
+                                         step.object.subindex,
+                                         step.object.type,
+                                         &current_value,
+                                         &abort_code) &&
+                    current_value == step.value_i32) {
+                  matched = true;
+                  break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+              }
+              if (!matched) {
+                latest_feedback.native_home_last_abort_code[axis] = abort_code;
+                latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+                logf("WARNING: native_home wait_sdo timed out axis=%u slave_pos=%u index=0x%04x sub=0x%02x expected=%d last=%d abort=0x%08x",
+                     axis,
+                     static_cast<unsigned int>(opt.slave_position[axis]),
+                     static_cast<unsigned int>(step.object.index),
+                     static_cast<unsigned int>(step.object.subindex),
+                     step.value_i32,
+                     current_value,
+                     static_cast<unsigned int>(abort_code));
+                succeeded = false;
+              }
+              break;
+            }
+            case NativeHomeOpKind::kReleaseServiceOverride:
+              if (!service_override_released) {
+                release_service_override(true);
+                service_override_released = true;
+              }
+              break;
             case NativeHomeOpKind::kRefreshTruth: {
               int32_t refreshed_value = 0;
               if (!read_native_home_truth_axis(axis, &refreshed_value)) {
@@ -4676,7 +4988,9 @@ int main(int argc, char** argv) {
           }
         }
 
-        release_service_override(succeeded);
+        if (!service_override_released) {
+          release_service_override(succeeded);
+        }
         if (!succeeded) {
           if (latest_feedback.native_home_state[axis] !=
               gradient::ipc::v1::NATIVE_HOME_STATE_FAILED) {
@@ -4931,6 +5245,7 @@ int main(int argc, char** argv) {
                       if (next == 0u) {
                         armed.store(false, std::memory_order_relaxed);
                       }
+                      native_home_active_axis_mask.fetch_or(mask, std::memory_order_relaxed);
                       clear_motion_intent(
                           mh->seq,
                           gradient::ipc::v1::EVT_DISARMED,
@@ -4955,6 +5270,7 @@ int main(int argc, char** argv) {
                         logf("WARNING: native_home left requested axes disarmed after failure axis_mask=0x%x",
                              static_cast<unsigned int>(mask));
                       }
+                      native_home_active_axis_mask.fetch_and(~mask, std::memory_order_relaxed);
                     }
                   }
                   break;
@@ -5353,6 +5669,6 @@ int main(int argc, char** argv) {
   close(server_fd);
 
   logf("Stopped.");
-  return 0;
+  return process_exit_code.load(std::memory_order_relaxed);
 }
 

@@ -200,3 +200,197 @@ Use this file as persistent, repo-local execution memory.
 
 ### 2026-04-12 - Canonical SOP updates must include the long-form master file too
 - [self] After promoting the native-home rules into the routed SOP files, the long-form master file `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` still carried the older wording. When a pattern graduates into the canonical skill set, update both the subsystem reference files and the master source document in the same pass.
+
+### 2026-04-12 - Fresh power-cycle retention capture shows pose does not survive reboot yet
+- [tool] Retention experiment `20260412-044300` captured `before_power_down` at `2026-04-12T04:43:00+00:00` and `after_power_up` at `2026-04-12T04:45:43+00:00`; the generated `comparison.md` reported `Raw encoder counts: MISMATCH` and `Logical joint angles: MISMATCH` on all six axes/joints.
+- [tool] The after-power snapshot showed no active battery/multi-turn faults, but all axes jumped to large new `pos_counts` values while `startup_drive_config` remained unverified (`readback_valid=false`, `verified=false`) and each axis was in `SwitchOnDisabled` / `0x1650`.
+- [self] New diagnosis rule: if a cold power cycle changes raw counts on every axis without battery faults, treat the startup absolute-position/encoder-tracking path as untrusted until the startup drive-config verification/readback path is proven and the retained-position mode is confirmed at real power-up.
+
+### 2026-04-12 - Direct post-boot reads ruled out stale home writes and wrong startup mode
+- [tool] Privileged live `ethercat upload` reads after the cold boot showed all axes had `0x2000:08 = 4`, `0x607C = 0`, `0x6064` values matching the after-power retention snapshot, and `0x6041 = 0x1650`.
+- [tool] RTCore journal later logged successful startup readback on all axes (`commanded=4 readback=4 verified=1`), and live `/run/gradient-rt-motion/metrics.json` now shows `startup_drive_config.readback_valid=1` and `verified=1` on every axis.
+- [self] Corrective rule: if cold-boot retention fails while direct reads show `0x2000:08` correct and `0x607C` zero, stop blaming stale software-side writes; the problem is more likely drive-side absolute-reference validity/retention than command-path offset residue.
+
+### 2026-04-12 - Manual review ties the cold-boot delta to HM statusword bit 15
+- [tool] The A6-EC manual states in homing mode that `6041h` bit 15 means `Homing completed` and bit 12 means `Homing completion output`, while `607Ch` is active only when the drive is powered on, homing is complete, and `6041h` bit 15 is 1.
+- [self] New diagnosis rule: the observed `0x9650 -> 0x1650` transition is not random; it is exactly a loss of bit 15 with the other HM-related bits still present. Treat that as evidence that the drive remembers some homing-related status but does not consider homing fully completed/active after cold boot.
+
+### 2026-04-12 - Hidden C10 absolute-position offsets are zero after cold boot
+- [tool] Privileged reads of the EEPROM-backed C10 candidates (`0x2010:11`, `0x2010:13`, `0x2010:1F`) returned `0` on all six axes after the latest power cycle, while `0x6064` still showed the shifted cold-boot positions.
+- [tool] The wrong pose was already present in `logs/startups/20260412-181258/controller.log` on the first startup `GET_POSITION` (`J1..J6 = -1.0527, 2.7765, -0.6963, -0.7260, -1.8808, -5.1380 deg`), before any new home/power-up/jog interaction.
+- [self] Corrective rule: if EEPROM-backed absolute-position offset objects are all zero and the shifted pose appears immediately at boot, stop attributing the drift to a stale software-written offset; the drive is booting into that alternate reference on its own.
+
+### 2026-04-12 - Manual plus live probes point to reference-state loss, not a hidden saved bias
+- [tool] The A6-EC manual says `607Ch` is active only when powered on, homing is complete, and `6041h` bit 15 is 1; the HM statusword table defines bit 15 as `Homing completed` and bit 12 as `Homing completion output`.
+- [tool] The latest wider drive probe showed many live `0x2040:*` position-like channels numerically track the shifted `0x6064` values, while the readable `0x2010:*` bias/limit fields remain zero. That means the shifted pose is coming from the drive's live internal reference state, not from an obvious persisted offset register.
+- [self] New diagnosis rule: when multiple live `0x2040` position channels agree with the cold-boot-shifted `0x6064` counts, treat the shifted pose as the drive's own current truth and debug why the drive re-established that truth after boot instead of looking for more hidden software-written bias slots.
+
+### 2026-04-12 - Fault reset and software reset do not restore HM bit 15
+- [tool] A disarmed live probe showed `/control/reset-faults` leaves all axes at `0x6041 = 0x1650`, `0x607C = 0`, and the same shifted `0x6064` counts; it does not recover the pre-power-cycle pose or reassert HM bit 15.
+- [tool] Writing vendor software reset `0x2031:02 = 1` briefly dropped RTCore startup health (`startup_ready=0`, `wkc_actual=11`) while drives re-enumerated, then recovered to a healthy disarmed bus (`startup_ready=1`, `wkc_actual=18`) with the shifted counts still present and HM bit 15 still absent.
+- [tool] The software-reset probe transiently faulted axis 1 (`0x603F = 0x8700`, `0x203F = 0x0C20`), and a normal `/control/reset-faults` cleared it back to `0x6041 = 0x1650` / zero fault registers on all axes.
+- [self] Diagnostic rule: if both DS402 fault reset and vendor software reset fail to restore bit 15 or the pre-boot pose, stop treating the mismatch as a stale software latch; focus next on manufacturer boot/reference-validity conditions or on whether only a full native-home/HM cycle can re-establish the reference-active state.
+
+### 2026-04-12 - A6-EC rotation mode must not boot with default 1:1 gear ratio
+- [tool] Manual review of Chapter 5 plus live SDO reads showed all axes were booting with `C00.07 = 4` while `C10.18 = 1`, `C10.19 = 1`, `C10.1A = 0`, and `C10.1C = 0`, so the drive was reconstructing rotation-mode absolute position from the vendor default `1:1` model instead of the robot's real reductions.
+- [tool] The robot config already carries the correct per-axis reductions `[100, 100, 100, 18, 31.25, 10]`, which map to startup ratio SDOs `C10.18/C10.19 = [100/1, 100/1, 100/1, 18/1, 125/4, 10/1]`.
+- [self] Implementation rule: for A6-EC absolute rotation mode, program the rotation-mode gear-ratio startup SDOs alongside `C00.07`; otherwise the drive may boot into a valid-but-wrong internal absolute frame even when battery-backed encoder data still exists.
+- [self] Manual caveat: Chapter 5 states changing the electronic gear ratio changes the mechanical position abruptly and requires homing, so this fix needs one explicit post-deployment re-home to seed the corrected EEPROM reference, but should remove the need to re-home on every later cold boot.
+
+### 2026-04-12 - Do not conflate drive reference scaling with encoder retention root cause
+- [user] The robot's gear ratios are intentionally owned in software, and changing drive-side ratio parameters is not an acceptable first-line fix for the cold-boot retention bug.
+- [self] Corrective rule: when a manual parameter seems related to absolute-position math, distinguish "changes drive-side reference-unit scaling" from "changes raw encoder retention/state"; do not ship a startup-parameter fix that crosses that ownership boundary without stronger proof.
+- [self] Follow-up rule: treat the current cold-boot problem as "the drive is not reapplying its saved absolute-reference correction after power loss" until proven otherwise, not as a software gear-ratio mismatch.
+
+### 2026-04-12 - Large PDF-to-Markdown conversions should preserve tables in fenced text blocks
+- [user] Explicit preference reinforced: do not just describe the approach; actually produce the converted artifact in the requested folder.
+- [tool] `pdftotext -layout` preserved the A6-EC chapter table geometry well enough to generate `docs/resources/a6ec_manual_chapter_11_parameter_list.md` without introducing OCR dependencies.
+- [self] Corrective rule: for very wide or multi-page manual tables, do not force lossy Markdown pipe tables. Use normal Markdown headings and notes around fenced `text` blocks so the content stays readable and faithful to the source layout.
+- [self] Cleanup rule: when a conversion requires an intermediate extracted text file, delete that temp artifact before handoff so the repo only keeps the requested deliverable.
+
+### 2026-04-12 - Native home rewrites reference units, not raw encoder channels
+- [tool] On axis 0 after a verified `home-joint-native`, the reference-unit channels (`0x6063`, `0x6064`, `U40.14`, `U40.16`) collapsed from about `38328` counts to about `4`, while the raw encoder-oriented channels (`U40.1C`, `U40.20`) stayed near `38331`.
+- [self] Diagnostic rule: treat the A6-EC native-home transaction as a drive-side reference-frame transform layered on top of the raw absolute encoder state; if cold boot loses the pose, debug the save/restore of that transform, not the raw encoder battery counts.
+- [tool] Direct `F31.10 = 1` (`Read encoder`) and `F31.10 = 2` (`Write encoder`) on the same disarmed axis completed without faults, self-cleared back to `0`, and left the axis back at `0x6041 = 0x9650`.
+- [self] Next-step rule: the decisive proof now requires a real power cycle after `F31.10` read/write to see whether that operation commits or reloads the missing absolute-reference correction across boot.
+
+### 2026-04-12 - `F31.10` read/write preserved the homed reference across drive-only power cycle on one axis
+- [tool] After a drive-only power cycle with the stack left running, axis 0 returned with `0x6041 = 0x1650` but its reference-unit channels still near zero (`0x6063/0x6064/U40.14/U40.16 ~= 1..4`), while its raw encoder-oriented channels stayed near `38330` (`U40.1C/U40.20`).
+- [tool] Untouched axes 1-5 all returned in the old shifted frame, with both reference-unit and raw encoder-oriented channels still near their cold-boot counts (`101087`, `25347`, `4758`, `21396`, `18704`, etc.).
+- [self] Corrective rule: loss of HM bit 15 on cold boot does not by itself explain the wrong pose; axis 0 kept the corrected reference frame even after bit 15 dropped back to `0x1650`.
+- [self] Strongest current hypothesis: an explicit `F31.10` encoder read/write commit or reload step is needed around native home so the drive restores the saved reference transform on later drive-only power cycles.
+
+### 2026-04-12 - Integrated native-home persistence rollout preserves new axes too
+- [tool] With the `F31.10` persistence tail integrated into the A6-EC native-home workflow, untouched axis 2 (`J3`) was brought from the shifted cold-boot frame (`0x6064 ~= 25346`, `U40.16 ~= 25344`) to the wrapped near-zero home frame (`0x6064 ~= 131062`, `U40.16 ~= -13`) through the normal `/control/home-joint-native` endpoint.
+- [tool] After the subsequent drive-only power cycle, axis 2 stayed in that corrected frame (`0x6064 ~= 131060`, `U40.16 ~= 131059`, raw `U40.1C ~= 25334`), while untouched axes 3-5 remained in their shifted cold-boot frames.
+- [self] Rollout rule: the persistence fix should live in the A6-EC native-home flow itself, not as a separate manual maintenance action, because the integrated endpoint now reproduces the same durable behavior as the earlier manual `F31.10` experiment.
+- [self] Follow-up rule: the remaining timeout should be treated only as a deadman ceiling. Terminal success/failure should be driven by explicit signals (`native_home_state`, abort code, or statusword bit 15 on a fresh snapshot), not by the wall-clock alone.
+
+### 2026-04-12 - Native-home result fields must reset on startup epoch and UI should prefer live proof over stale result
+- [tool] After the integrated rollout, controller logs for `J2`/`J3` reported verified native-home success while `/run/gradient-rt-motion/metrics.json` still carried stale `native_home_state=3` and the old abort code until the next startup epoch.
+- [self] Corrective rule: `native_home_state` and `native_home_last_abort_code` are last-operation fields, not durable drive state. Clear them when a new startup epoch begins so a drive reboot cannot keep an old red failure badge alive in the UI.
+- [self] UI-facing telemetry rule: when the live statusword shows HM bit 15 with no current fault, prefer that fresh wire-state over a stale failed native-home result when building operator-facing drive-home status.
+- [tool] After the cleanup rollout and stack restart, the live `driveFaults` snapshot for `J2` and `J3` reports `native_home_state_name = idle` and zero abort code, matching the persisted good frame instead of the earlier false `failed` badge.
+
+### 2026-04-13 - A6-EC persisted-home feedback counts need signed single-turn normalization
+- [tool] After the persistence rollout, `J2`/`J3` came back with `0x6064 ~= 131060` and `U40.16 ~= 131059`, which software had been converting to about `±3.6°` even though they semantically represented near-zero wrapped counts.
+- [self] Corrective rule: for `a6ec_ds402`, normalize controller-facing feedback counts into a signed single-turn range using the encoder counts-per-rev before converting to joint radians; otherwise wrapped persisted-home values near `131072` render as false multi-degree joint offsets.
+- [tool] After reloading the backend with that normalization, `/info/joints-detailed`, `/info/pose`, and the `/monitor` SSE stream all report `J2/J3` near zero (`about -0.00036° / +0.00033°`) instead of `±3.6°`.
+- [self] Diagnostic rule: if the visualizer still appears to flicker after backend joint feeds are stable within a few encoder counts, the remaining bug is in the viewer layer rather than the controller/RTCore data path.
+
+### 2026-04-13 - Native-home completion must wait for RTCore tail, not just early statusword success
+- [tool] The `J5 -> J6` re-home issue lines up with a real race: the backend could return success as soon as statusword bit 15 appeared, even if RTCore was still executing the post-home `F31.10` persistence tail.
+- [self] Corrective rule: treat native-home completion as "fresh success signal AND no native-home transaction still active for that axis", not just "statusword looks good once".
+- [tool] Added an RTCore `native_home_active_axis_mask` metric and updated the Python wait logic so statusword-based success fallback is only allowed after that active mask clears.
+- [self] Follow-up rule: fast consecutive Drive Home clicks on different joints should now naturally serialize because the first request stays pending until RTCore truly finishes the tail, instead of clearing early on a partial success signal.
+
+### 2026-04-13 - PDF table conversions need presentation review, not just text completeness
+- [user] Explicit correction: a manual-to-Markdown conversion that is text-complete but visibly messy is not acceptable; review the rendered presentation and fix extraction artifacts, not just the raw content.
+- [self] Mistake: preserving wide manual tables as fenced raw text kept the chapter content but produced a poor reading experience and hid row-misalignment bugs.
+- [self] Corrective rule: for PDF manuals with repeated column layouts, rebuild tables into real HTML/Markdown tables when possible, then spot-check rendered output for row drift, missing grouped-object rows, and page-number/header leakage.
+- [tool] Working pattern: `pdftotext -tsv` provides enough positional data to reconstruct table rows, but grouped vendor objects (for example `607D`) may need special handling when the PDF drops the trailing `h` or merges subindex `0` with the object title.
+
+### 2026-04-13 - Persist in-flight home state through existing driveFaults path only
+- [user] Preference reinforced: reuse existing data pathways and avoid bloat; do not add a parallel frontend/API status channel just to carry home-in-progress state.
+- [self] Corrective rule: route in-flight native-home status through the existing `drive_faults` snapshot (`metrics -> build_drive_fault_snapshot -> /monitor -> driveFaults prop`) rather than adding a new endpoint or frontend-only cache.
+- [tool] The frontend now gets `native_home_active_axis_mask` and per-axis `native_home_active` from the existing `driveFaults` payload, uses that to show a persistent “still running” banner, and disables all Drive Home buttons until RTCore’s active mask clears.
+
+### 2026-04-13 - Final all-axis power-cycle proof needs tolerance- and wrap-aware interpretation
+- [tool] The formal retention comparison artifact for experiment `20260413-010728` still reports mismatch because it uses exact equality on controller-axis counts and logical angles.
+- [tool] The raw post-power SDO snapshot shows the persisted-home frame survived on all axes within a few counts, and `J6` crossed the single-turn wrap boundary (`0x6064: 131071 -> 4`) while the underlying raw single-turn/multi-turn encoder channels stayed effectively unchanged (`U40.1C/U40.20: 18702/18701 -> 18704/18703`).
+- [self] Corrective rule: for A6-EC persisted-home validation, interpret success using tolerance plus wrap equivalence, not strict equality of the reference-unit position channel.
+- [self] Follow-up rule: if we keep the formal retention report as an operator artifact, update it to understand small count drift and modulo-equivalent near-zero values so it does not falsely mark a successful power-cycle proof as failed.
+
+### 2026-04-13 - Backend native-home results must match live driveFaults semantics
+- [self] The remaining `J2` false-failure existed because `_native_home_metrics_result()` only allowed statusword-bit15 fallback when the raw metrics did not already say `failed` and the abort code was zero, while `drive_faults` already treated the same clean live wire-state as effective success.
+- [self] Corrective rule: once `native_home_active_axis_mask` has cleared, treat a clean live wire-state (`statusword` HM bit 15 set, `error_code == 0`, `manufacturer_error_code == 0`) as authoritative for backend command-result semantics too; preserve the stale reported failure state and abort code separately for debugging instead of surfacing a hard failure.
+- [tool] Efficient validation pattern: when a safety-critical commissioning bug is already captured in `/run/gradient-rt-motion/metrics.json`, prove the semantic fix against that live snapshot directly instead of re-triggering another physical home cycle.
+
+### 2026-04-13 - Display-friendly A6-EC feedback must stay out of the motion command frame
+- [tool] During the `J6` jog regression, live RTCore status showed `state=faulted`, `active_traj_id=3`, `queue_depth=24`, and faulted axes `0/1/3` while `/info/joints-detailed` still reported display-normalized near-zero angles for wrapped raw counts like `130908` and `130694`.
+- [self] Root-cause rule: A6-EC single-turn normalization / continuous unwrapping is UI-only. Any backend path that feeds `servo_driver.get_current_arm_state_rad()` or queued RTCore targets must preserve the raw-wire-derived count frame so re-queueing the current joint state round-trips back to the same `0x607A` counts after RTCore subtracts `native_home_position_offset`.
+- [self] Corrective rule: keep two explicit feedback paths: motion-safe controller feedback (`raw_to_joint_positions`, `/info/joints`, monitor `joints`) and display-only feedback (`raw_to_display_joint_positions`, `arm_display_*`, monitor `display_joints`). Never reuse display-normalized angles as the baseline for `GET_JOINT_ANGLES` / `APPLY_JOINT_SETPOINT`.
+- [tool] Safe live recovery pattern: use `/control/stop` first to collapse a latched RTCore queue (`active_traj_id -> 0`, `queue_depth -> 0`), then request `/control/power-down` so `armed=0` and `axis_enable_mask=0` before more debugging or code rollout.
+
+### 2026-04-13 - Use `start-stack.sh` recovery paths when preflight faults block restart
+- [tool] After the software fix, `./start-stack.sh` refused to restart the controller/API because startup preflight still saw disarmed drive faults; a cold `stop --hard` / restart reduced the blocker to `J1/axis0 0xff00 Er11.0`, but the preflight reset still would not clear it.
+- [self] Recovery rule: if `start-stack.sh` aborts on startup fault-reset preflight, do not leave RTCore half-up or try to outsmart the launcher with ad-hoc child-process kills. Use `./start-stack.sh stop --hard` to return to a fully inactive state, then treat the remaining drive fault as a hardware/startup blocker for the next live retest.
+
+### 2026-04-13 - Multi-turn display truth should stay raw in RTCore and anchored in Python
+- [user] Preference reinforced: when implementing a staged architecture plan, execute it directly, do not edit the plan file itself, and move through the existing to-dos in order.
+- [self] Corrective rule: publish A6-EC multi-turn objects from RTCore as raw per-axis `absolute_feedback` fields keyed by the actual `U40.*` object names; keep source selection, anchor math, and display semantics in Python so RTCore stays transport-only for this feature.
+- [self] Guardrail: the safe persisted anchor for continuous display is `absolute_axis_q - reference_pre_zero_q`, where `reference_pre_zero_q` is the current raw `0x6064` logical frame before software-zero subtraction. Refresh that anchor on verified native-home completion and on explicit software-zero capture; never derive motion targets from it.
+- [tool] Validation pattern that worked: `make -C src/gradient_rt_motion`, focused `pytest` on backend / drive-fault / API / RTCore runtime suites, and `cd /home/pi/GradientOS/web-ui && npm test -- src/ControlPanel.test.tsx`.
+- [self] Mistake caught quickly: after inserting the new absolute-feedback helpers into `drive_faults.py`, the `native_home_state_name()` return was accidentally left below the new helper block. A focused regression rerun caught the broken labels immediately; after helper insertions, re-read the surrounding function boundaries before moving on.
+
+### 2026-04-13 - Absolute-feedback descriptors must stay in the drive profile
+- [user] Preference reinforced: do not hardcode vendor-specific items into shared OS/controller code; keep manufacturer object maps, labels, and source policy in drive/profile modules.
+- [self] Mistake: I initially hardcoded A6-EC `U40.*` field names/source priority in `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`, `src/gradient_os/telemetry/drive_faults.py`, and literal SDO reads in `src/gradient_rt_motion/main.cpp`, which violated the profile boundary even though the motion/display split was otherwise correct.
+- [self] Corrective rule: RTCore should accept a profile-rendered `GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG` descriptor, export generic per-field metrics keyed by profile-provided semantic names, and let the drive-profile registry normalize/resolve absolute display truth for Python consumers.
+- [tool] Validation that caught the last gap: focused `pytest` failed when `test_build_drive_fault_snapshot_normalizes_absolute_feedback` stubbed a fake drive profile; routing the test through the real `a6ec_ds402` profile verified the new registry-based normalization path.
+- [self] Supersedes the narrower rule above: raw absolute feedback still belongs in RTCore transport, but the field names/object map must be descriptor-driven from the drive profile rather than hardcoded as `U40.*` keys in shared code.
+
+### 2026-04-13 - After hard stop + drive power cycle, separate healthy bus state from missing startup verification telemetry
+- [tool] `./start-stack.sh probe` after the hard stop/power-cycle showed a clean live state: `physical_state=BUS_UP_DISARMED`, `armed=0`, `enable_mask=0x0`, `master_al=0x8`, `responding/online/operational=6/6`, and all axes `SwitchOnDisabled` with `err=0x0000`.
+- [tool] RTCore journal confirmed the startup SDO write `a6ec_encoder_position_tracking_mode=4` succeeded on all six axes and the bus converged to OP in about `8.7s`, with native-home truth refresh reading `0` offsets on all axes immediately after startup.
+- [self] Guardrail: when post-restart health looks good but `metrics.json` still shows `startup_drive_config.readback_valid=0` and `verified=0` for every axis minutes later, treat that as a startup-verification telemetry/readback gap, not as evidence that the bus or drives are faulted.
+- [tool] Live `/info/joints-detailed` showed every axis using `display_source=raw_feedback_fallback` with no `absolute_home_anchor_*` fields, so the UI is not currently applying a persisted absolute-home anchor after this restart.
+
+### 2026-04-13 - Judge live jogs by display delta plus absolute-count delta, not by wrapped raw counts alone
+- [tool] After `SAFE_POWER_UP`, the controller logged a J4 jog from `-19.943 deg` to `-20.943 deg`, then timed out waiting for RTCore trajectory `1` to report complete, even though the post-jog live probe showed all six axes still `OperationEnabled` with `err=0x0000`.
+- [tool] Comparing pre-jog vs post-jog live snapshots: J4 `arm_rad` appeared to jump by about `+19.0 deg` because `pos_counts` wrapped from `130692 -> 6179`, but J4 `arm_display_rad` changed by `-1.001 deg` and `absolute_counts` changed by `+6559`, which is the real commanded small move.
+- [self] Corrective rule: when a powered-on jog seems to change many displayed numbers, compare `arm_display_rad` and `absolute_counts` before concluding there was a multi-axis physical move; the raw motion-safe frame can wrap on a single axis and look dramatic while the operator-facing delta is correct.
+- [tool] Residual issue: the controller-side open-loop executor can still raise `TimeoutError: Timed out waiting for RTCore trajectory 1 to complete` even when the live end state is healthy and enabled, so trajectory-completion bookkeeping still needs investigation separately from drive faults or display wrapping.
+
+### 2026-04-13 - Wrapped motion completion must be profile-owned and modulo-aware
+- [self] If a drive keeps the motion wire frame in wrapped single-turn `0x6064` / `0x607A` counts, RTCore trajectory completion must compare final target error modulo `counts_per_rev`; otherwise a boundary-crossing jog can physically finish yet stay latched in `executing`, which blocks the commissioning UI.
+- [self] Keep that behavior profile-owned: expose a generic motion-feedback-wrap capability from the drive profile, render it into RTCore runtime env/CLI, and let generic RTCore code apply shortest-periodic-error math only when the active drive profile opts in.
+- [tool] Local validation after adding `GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK` / `--feedback-wrap-axis-mask`: `pytest -q tests/test_rtcore_runtime.py` and `pytest -q tests/test_gradient05_limits_and_backends.py -k wait_for_trajectory_complete` both passed.
+
+### 2026-04-13 - A stale RTCore D-state thread can keep EtherCAT master reserved across restarts
+- [tool] After syncing the new RTCore binary, the old deleted-binary instance remained as a `metrics` thread in `D` state plus a live `EtherCAT-OP` kernel thread, while fresh RTCore instances logged `ecrt_request_master(0) failed` with `Device or resource busy`.
+- [tool] `sudo ethercat master` still showed `Active: yes` and 1 kHz frame traffic even when the fresh RTCore instance reported `ethercat_master_state=DOWN`, which proved the stale master owner lived outside the new process.
+- [self] Recovery rule: if `ps -L` shows an old deleted-binary RTCore thread stuck in `D` and repeated `ethercat.service` / `gradient-rt-motion.service` restarts do not clear master ownership, stop looping service restarts and escalate to a host reboot or deeper kernel/driver recovery.
+
+### 2026-04-13 - `start-stack.sh stop --hard` can be correct even when RTCore survives
+- [tool] The launcher hard-stop path does call `systemctl stop` on `gradient-rt-motion.service`, waits, escalates with `systemctl kill --signal=SIGKILL`, and then warns if RTCore/ethercat are still not inactive.
+- [self] Corrective rule: if `stop --hard` appears not to stop RTCore, inspect `journalctl` and `ps -L` before blaming the launcher. In this failure mode, the launcher logic was correct; the real blocker was a kernel-blocked RTCore thread in `D` state that systemd could not reap.
+- [tool] A full Pi reboot cleared that stale owner; afterward `gradient-rt-motion.service`, `ethercat.service`, and the launcher stack all came back up cleanly on fresh PIDs.
+
+### 2026-04-13 - Operator-facing web pose must use `display_joints`, not wrapped motion-safe `joints`
+- [tool] A 30 s live capture of `http://127.0.0.1:4000/monitor` recorded 1389 packets; raw `joints` jumped between wrap-adjacent poses on every axis (for example max single-step deltas `0.062831`, `0.349063`, `0.201060`, `0.628314` rad) while `display_joints` stayed stable within micro-radians for the entire trace.
+- [tool] A 6 s poll of `/info/joints-detailed` showed `axis_counts` rapidly alternating among `0`, `1`, `131071`, and `131070` after reboot/power-up, confirming the visible jump was modulo-boundary dithering in the raw `pos_counts` frame rather than the robot physically moving.
+- [self] Corrective rule: for A6-EC wrapped feedback near zero, keep `/monitor.joints` as the motion-safe/debug channel only. Any operator-facing UI pose (3D stage, commissioning readout, telemetry chart) must prefer `/monitor.display_joints` or `/info/joints{,-detailed}.arm_display_*`.
+- [tool] Minimal UI fix that worked: parse `display_joints` in `web-ui/src/App.tsx` and route the preferred display pose into the visualizer/telemetry widgets; leave the raw `joints` payload intact for non-display consumers.
+
+### 2026-04-13 - J3 commissioning jogs are driven by unstable raw baseline, not by display telemetry leaking into motion
+- [tool] Controller logs for the live J3 jog sequence show bounded moves computed from raw `current_deg` values that jumped between `-3.569`, `-0.970`, `-1.970`, `-2.970`, and `-0.371` on successive commands, while each target remained just `-1.0 deg` from that current sample.
+- [self] Corrective rule: when diagnosing wild commissioning motion on EtherCAT RTCore, distinguish "display stream leaked into controller" from "controller is using raw motion-safe feedback that is itself unstable." The current code path still uses raw `GET_JOINT_ANGLES` / `get_current_arm_state_rad()` for motion.
+- [tool] Code proof: `/control/joint-jog` previously built its relative target from controller `GET_JOINT_ANGLES`, `GET_JOINT_ANGLES` came from `_build_joint_state_snapshot().arm_deg`, and `handle_apply_joint_setpoint(... max_motor_rpm=...)` built the bounded path from a fresh `servo_driver.get_current_arm_state_rad()` sample.
+- [tool] Live J3 snapshot after the investigation still reports `absolute_source=encoder_multi_turn_counts` but `display_source=raw_feedback_fallback`; there is no persisted `.gradient_absolute_encoder_anchors.json` file yet, so the fully anchored absolute display path is not active on this boot.
+- [self] Safe implementation rule: improve jog observability first. The updated `/control/joint-jog` now uses `GET_JOINT_STATE` for its pre-command snapshot and logs/returns selected-joint raw-vs-display diagnostics (`current_raw_deg`, `current_display_deg`, `raw_minus_display_deg`, `display_source`, `absolute_source`, counts) without changing motion-target semantics.
+
+### 2026-04-13 - Canonical anchored joint truth now supersedes the temporary display-truth workaround
+- [self] Supersedes the earlier `display_joints`-preferred workaround for operator pose: once `EthercatRTCoreBackend.raw_to_joint_positions()` / `get_joint_positions()` publish anchored absolute truth, `arm_rad/deg` and `/monitor.joints` become the canonical operator/controller fields and `arm_display_*` / `display_joints` should be treated as compatibility aliases only.
+- [self] New guardrail: if anchored absolute truth cannot be reconstructed (`absolute_feedback` missing or no persisted absolute-home anchor), fail closed with `canonical_joint_truth_available=false` and block `POST /control/joint-jog` baselining instead of silently reusing wrapped raw counts or cached fallback state.
+- [tool] Regression coverage that now matters most for this contract lives in `tests/test_gradient05_limits_and_backends.py`, `tests/test_api_endpoints.py`, and `web-ui/src/ControlPanel.test.tsx`; targeted pytest/vitest/build checks passed on this machine after the change.
+
+### 2026-04-13 - Startup should classify RTCore-up/master-down before launching the controller
+- [self] If `sync-runtime.sh --ensure-active` reports `gradient-rt-motion.service already active; runtime config is current`, do not assume the RTCore is usable. Check the live probe: `rtcore_state=UP` combined with `ethercat_master_state=DOWN`, `physical_state=INACTIVE`, and `startup_ready=0` is an unhealthy prelaunch signature, not normal bus convergence.
+- [self] Corrective rule: for that signature, attempt exactly one launcher-driven RTCore/EtherCAT recycle before controller startup, and only escalate to "reboot required" if the post-recycle journal still shows `Failed to reserve master: Device or resource busy` / `ecrt_request_master(0) failed`.
+- [self] RTCore should fail fast on `ecrt_request_master(0)` failure so systemd/launchers see a real service failure instead of an "active but dead" process that leaves `/run/gradient-rt-motion/ipc.sock` and misleading `rtcore_state=UP` behind.
+
+### 2026-04-13 - Operator CLI banner belongs in `start-stack.sh`, not low-level launch helpers
+- [user] Preference: the boot/start CLI should feel polished, with a big `GradientOS` banner plus useful live info instead of plain startup logs only.
+- [self] Implementation rule: put operator-facing terminal chrome in `start-stack.sh`, because that is the staged stack launcher users see directly. Keep `run.sh` and lower-level helpers minimal so systemd/manual subprocess logs do not get decorative noise.
+- [tool] A good startup banner should carry actual operational context, not just art: mode, robot, IK/backend/drive profile, ports, log path, and the common control commands (`probe`, `status`, `stop`, `stop --hard`).
+- [self] Color rule: auto-enable ANSI color only when a real interactive terminal is present, respect `NO_COLOR`, and offer a simple `GRADIENT_STACK_COLOR=auto|0|1` override so startup output stays readable in logs and non-interactive launches.
+- [user] Design preference: terminal styling should lean industrial/cinematic, not generic devtool output. Use highlighted caution/status bars and give urgent operator actions like `REBOOT HOST` or `stop --hard` their own visibly separated callouts rather than burying them inside long prose log lines.
+- [user] Success-state preference: startup should celebrate a truly ready system, not just failures. Add a clear bright-green success indicator only after the controller, RTCore/bus, API, and optional web UI have all passed readiness.
+- [self] Keep terminal animation tty-only. For `start-stack.sh`, write spinners/loading indicators only to the live terminal and keep the launcher log factual; otherwise carriage-return animation pollutes the durable startup logs.
+- [self] If a lower-level helper like `start.sh` already prints plain bootstrap text, add a quiet-mode env flag and let the staged launcher present a single branded flow instead of mixing two output styles.
+- [self] Shell guardrail: with `set -u`, any styled logger wrapper that passes `${UI_*}` or `${BANNER_*}` into another function will crash if those globals have not been initialized yet. Predeclare all palette globals near the top of `start-stack.sh` before the first `log()` call.
+- [tool] Real staged timing data matters more than guessed spinner placement. Live startup timing showed `environment` around `66-68ms`, first `RTCORE SYNC COMPLETE` around `17.3s`, `ethercat.service stopped` around `38.7s`, and full recovery recycle around `42.0s`; those are the stages worth keeping animated/high-visibility.
+- [self] ASCII logo guardrail: keep every art row indented consistently. A one-character left shift on the middle lines makes the `GradientOS` mark look broken even if the glyphs themselves are correct.
+- [user] Probe output preference: when the launcher dumps a live probe snapshot during failure/recovery, it should stay in the same visual language as the rest of the terminal UI. Avoid raw `probe: key=value ...` lines once styled panels/status colors exist.
+- [self] Animation rule: a single `ui_loading_status(...)` repaint is not a true animated loader for blocking shell commands. For long one-shot operations like RTCore sync or `systemctl stop`, use a background tty-only spinner process that redraws in place until the command exits.

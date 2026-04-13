@@ -1677,7 +1677,7 @@ def create_app() -> FastAPI:
         ok, detail = await run_in_threadpool(
             _send_controller_command,
             f"NATIVE_HOME_JOINT,{joint}",
-            5.0,
+            25.0,
             True,
         )
         if ok:
@@ -1711,27 +1711,87 @@ def create_app() -> FastAPI:
 
         detail = await run_in_threadpool(
             _controller_call_or_503,
-            "GET_JOINT_ANGLES",
+            "GET_JOINT_STATE",
             timeout=1.0,
             expect_response=True,
         )
-        parts = detail.split(",")
-        if not parts or parts[0] != "JOINT_ANGLES":
-            raise HTTPException(status_code=502, detail=f"Malformed joint reply: {detail}")
         try:
-            angles = list(map(float, parts[1:]))
+            joint_state = _parse_joint_state_response(detail)
         except ValueError as exc:
-            raise HTTPException(status_code=502, detail=f"Invalid joint data: {exc}") from exc
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        read_source = str(joint_state.get("read_source", "live_feedback")).strip().lower()
+        if read_source != "live_feedback":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
+                    "message": "Live canonical joint feedback is unavailable; refusing to baseline joint jog from cached state.",
+                    "read_source": joint_state.get("read_source"),
+                    "canonical_joint_truth_available": bool(
+                        joint_state.get("canonical_joint_truth_available", False)
+                    ),
+                },
+            )
+        if joint_state.get("canonical_joint_truth_available") is False:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
+                    "message": "Live canonical joint feedback is unavailable; refusing to baseline joint jog without anchored absolute truth.",
+                    "read_source": joint_state.get("read_source"),
+                    "canonical_joint_truth_available": False,
+                    "canonical_joint_truth_unavailable_axes": joint_state.get(
+                        "canonical_joint_truth_unavailable_axes", []
+                    ),
+                    "canonical_joint_truth_unavailable_joints": joint_state.get(
+                        "canonical_joint_truth_unavailable_joints", []
+                    ),
+                },
+            )
+        angles = joint_state.get("arm_deg")
+        if not isinstance(angles, list):
+            raise HTTPException(status_code=502, detail=f"Malformed joint reply: {detail}")
         if len(angles) < joint:
             raise HTTPException(
                 status_code=400,
                 detail=f"Joint {joint} unavailable in controller feedback.",
             )
+        display_angles = joint_state.get("arm_display_deg")
+        selected_joint_feedback = _selected_joint_feedback_snapshot(joint_state, joint=joint)
+        raw_deg = selected_joint_feedback.get("current_raw_deg")
+        display_deg = selected_joint_feedback.get("current_display_deg")
+        display_source = selected_joint_feedback.get("display_source")
+        absolute_source = selected_joint_feedback.get("absolute_source")
+        axis_counts = selected_joint_feedback.get("axis_counts")
+        absolute_counts = selected_joint_feedback.get("absolute_counts")
+        truth_available = bool(selected_joint_feedback.get("truth_available", True))
+        if not truth_available:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
+                    "message": "Selected joint is missing anchored absolute truth; refusing to baseline joint jog.",
+                    "joint": joint,
+                    "selected_joint_feedback": selected_joint_feedback,
+                },
+            )
+        if display_source == "truth_unavailable":
+            logger.warning(
+                "Joint jog baseline snapshot joint=%s canonical_deg=%s display_deg=%s "
+                "display_source=%s absolute_source=%s axis_counts=%s absolute_counts=%s",
+                joint,
+                None if raw_deg is None else round(float(raw_deg), 6),
+                None if display_deg is None else round(float(display_deg), 6),
+                display_source,
+                absolute_source,
+                axis_counts,
+                absolute_counts,
+            )
 
         target_arm_deg = list(angles[:6])
         target_arm_deg[joint - 1] = float(target_arm_deg[joint - 1]) + float(delta_deg)
         # Raw comma-separated joint commands are interpreted by the controller as radians.
-        # `GET_JOINT_ANGLES` returns degrees for UI/API consumption, so convert back to
+        # The joint snapshot carries degrees for UI/API consumption, so convert back to
         # radians here before handing the command to the controller.
         target_arm_rad = [float(np.deg2rad(value)) for value in target_arm_deg]
         try:
@@ -1756,6 +1816,14 @@ def create_app() -> FastAPI:
             "status": "ok",
             "joint": joint,
             "delta_deg": delta_deg,
+            "feedback_snapshot_source": "GET_JOINT_STATE",
+            "current_arm_deg": [float(value) for value in angles[:6]],
+            "current_arm_display_deg": (
+                [float(value) if value is not None else None for value in display_angles[:6]]
+                if isinstance(display_angles, list)
+                else None
+            ),
+            "selected_joint_feedback": selected_joint_feedback,
             "target_arm_deg": target_arm_deg,
             "target_arm_rad": target_arm_rad,
             "detail": detail,
@@ -2254,19 +2322,29 @@ def create_app() -> FastAPI:
 
     @api.get("/info/joints", summary="Current joint angles")
     async def info_joints():
-        detail = await run_in_threadpool(_controller_call_or_503, "GET_JOINT_ANGLES")
+        detail = await run_in_threadpool(_controller_call_or_503, "GET_JOINT_STATE", timeout=1.0)
         try:
-            arm, gripper = _parse_joint_angles_response(detail)
-        except ValueError as exc:
+            payload = _parse_joint_state_response(detail)
+        except (ValueError, HTTPException) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        payload = {
-            "arm_deg": arm,
-            "arm_rad": [float(np.deg2rad(value)) for value in arm],
+        arm_deg = payload.get("arm_deg")
+        arm_rad = payload.get("arm_rad")
+        if not isinstance(arm_deg, list) or not isinstance(arm_rad, list):
+            raise HTTPException(status_code=502, detail=f"Malformed joint reply: {detail}")
+        response = {
+            "arm_deg": arm_deg,
+            "arm_rad": arm_rad,
         }
-        if gripper is not None:
-            payload["gripper_deg"] = gripper
-            payload["gripper_rad"] = float(np.deg2rad(gripper))
-        return payload
+        arm_display_deg = payload.get("arm_display_deg")
+        arm_display_rad = payload.get("arm_display_rad")
+        if isinstance(arm_display_deg, list) and isinstance(arm_display_rad, list):
+            response["arm_display_deg"] = arm_display_deg
+            response["arm_display_rad"] = arm_display_rad
+        if payload.get("gripper_deg") is not None:
+            response["gripper_deg"] = payload["gripper_deg"]
+        if payload.get("gripper_rad") is not None:
+            response["gripper_rad"] = payload["gripper_rad"]
+        return response
 
     @api.get("/info/joints-detailed", summary="Current joint angles with raw feedback detail")
     async def info_joints_detailed():
@@ -3118,6 +3196,10 @@ def _parse_joint_state_response(detail: str) -> dict[str, Any]:
         normalized["arm_deg"] = _coerce_float_list(normalized["arm_deg"])
     if "arm_rad" in normalized:
         normalized["arm_rad"] = _coerce_float_list(normalized["arm_rad"])
+    if "arm_display_deg" in normalized:
+        normalized["arm_display_deg"] = _coerce_float_list(normalized["arm_display_deg"])
+    if "arm_display_rad" in normalized:
+        normalized["arm_display_rad"] = _coerce_float_list(normalized["arm_display_rad"])
     if "axis_counts" in normalized and isinstance(normalized["axis_counts"], list):
         normalized["axis_counts"] = [
             (int(item) if item is not None else None) for item in normalized["axis_counts"]
@@ -3147,6 +3229,99 @@ def _parse_joint_state_response(detail: str) -> dict[str, Any]:
     if "gripper_rad" in normalized and normalized["gripper_rad"] is not None:
         normalized["gripper_rad"] = float(normalized["gripper_rad"])
     return normalized
+
+
+def _selected_joint_feedback_snapshot(payload: dict[str, Any], *, joint: int) -> dict[str, Any]:
+    joint_number = int(joint)
+    joint_index = joint_number - 1
+    snapshot: dict[str, Any] = {"joint": joint_number}
+    snapshot["canonical_joint_truth_available"] = bool(
+        payload.get("canonical_joint_truth_available", False)
+    )
+
+    arm_deg = payload.get("arm_deg")
+    if isinstance(arm_deg, list) and 0 <= joint_index < len(arm_deg):
+        canonical_deg = arm_deg[joint_index]
+        if canonical_deg is not None:
+            snapshot["current_joint_deg"] = float(canonical_deg)
+            snapshot["current_canonical_deg"] = float(canonical_deg)
+            snapshot["current_raw_deg"] = float(canonical_deg)
+
+    arm_display_deg = payload.get("arm_display_deg")
+    if isinstance(arm_display_deg, list) and 0 <= joint_index < len(arm_display_deg):
+        display_deg = arm_display_deg[joint_index]
+        if display_deg is not None:
+            snapshot["current_display_deg"] = float(display_deg)
+
+    raw_deg = snapshot.get("current_raw_deg")
+    display_deg = snapshot.get("current_display_deg")
+    if raw_deg is not None and display_deg is not None:
+        snapshot["raw_minus_display_deg"] = float(raw_deg) - float(display_deg)
+
+    axis_index = None
+    axis_to_joint = payload.get("axis_to_joint")
+    if isinstance(axis_to_joint, list):
+        for idx, mapped_joint in enumerate(axis_to_joint):
+            try:
+                if int(mapped_joint) == joint_index:
+                    axis_index = idx
+                    break
+            except Exception:
+                continue
+    if axis_index is None:
+        axis_counts = payload.get("axis_counts")
+        if isinstance(axis_counts, list) and len(axis_counts) > joint_index:
+            axis_index = joint_index
+    if axis_index is not None:
+        snapshot["axis_index"] = int(axis_index)
+        axis_counts = payload.get("axis_counts")
+        if isinstance(axis_counts, list) and 0 <= axis_index < len(axis_counts):
+            axis_counts_value = axis_counts[axis_index]
+            if axis_counts_value is not None:
+                snapshot["axis_counts"] = int(axis_counts_value)
+
+    axis_absolute_feedback = payload.get("axis_absolute_feedback")
+    if isinstance(axis_absolute_feedback, list):
+        matched_entry = None
+        for entry in axis_absolute_feedback:
+            if not isinstance(entry, dict):
+                continue
+            logical_joint = entry.get("logical_joint")
+            try:
+                if logical_joint is not None and int(logical_joint) == joint_number:
+                    matched_entry = entry
+                    break
+            except Exception:
+                pass
+            if axis_index is not None:
+                try:
+                    if int(entry.get("axis", -1)) == int(axis_index):
+                        matched_entry = entry
+                        break
+                except Exception:
+                    continue
+        if isinstance(matched_entry, dict):
+            for key in (
+                "display_source",
+                "absolute_source",
+                "absolute_home_anchor_source",
+                "truth_status",
+                "truth_reason",
+                "truth_source",
+            ):
+                value = matched_entry.get(key)
+                if isinstance(value, str) and value.strip():
+                    snapshot[key] = value.strip()
+            if "truth_available" in matched_entry:
+                snapshot["truth_available"] = bool(matched_entry.get("truth_available"))
+            for key in ("absolute_counts",):
+                value = matched_entry.get(key)
+                if value is not None:
+                    try:
+                        snapshot[key] = int(value)
+                    except Exception:
+                        pass
+    return snapshot
 
 
 def _build_encoder_retention_capture_payload(*, phase: str, notes: str | None = None) -> dict[str, Any]:

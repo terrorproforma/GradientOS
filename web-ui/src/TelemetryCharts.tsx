@@ -32,8 +32,19 @@ type ServoSample = {
 export type TelemetryEvent = {
   timestamp: number;
   joints?: number[];
+  display_joints?: number[];
   servos?: Record<string, ServoSample>;
 };
+
+function preferredTelemetryJointSeries(latest: TelemetryEvent | null | undefined): number[] | null {
+  if (Array.isArray(latest?.joints) && latest.joints.length > 0) {
+    return latest.joints;
+  }
+  if (Array.isArray(latest?.display_joints) && latest.display_joints.length > 0) {
+    return latest.display_joints;
+  }
+  return null;
+}
 
 const TELEMETRY_PANEL_VISIBILITY_KEY = "gradient.telemetry.panelVisibility.v1";
 
@@ -431,11 +442,12 @@ export function TelemetryCharts({ latest }: { latest: TelemetryEvent | null }) {
   useEffect(() => {
     if (!latest) return;
     // Joints (radians -> degrees)
-    if (Array.isArray(latest.joints) && latest.joints.length > 0) {
+    const jointSeries = preferredTelemetryJointSeries(latest);
+    if (Array.isArray(jointSeries) && jointSeries.length > 0) {
       setJointsDeg((prev) => {
         const next = [...prev.map((arr) => [...arr])];
         for (let i = 0; i < 6; i++) {
-          const valRad = latest.joints?.[i];
+          const valRad = jointSeries[i];
           const valDeg =
             typeof valRad === "number" ? (valRad * 180) / Math.PI : undefined;
           if (typeof valDeg === "number") {

@@ -123,6 +123,48 @@ def get_drive_native_home_config(profile_id: str | None) -> dict[str, Any] | Non
     return None
 
 
+def get_drive_absolute_feedback_config(profile_id: str | None) -> dict[str, Any] | None:
+    module = get_drive_profile(profile_id)
+    getter = getattr(module, "get_absolute_feedback_config", None) if module is not None else None
+    if callable(getter):
+        payload = getter()
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def get_drive_motion_feedback_config(profile_id: str | None) -> dict[str, Any] | None:
+    module = get_drive_profile(profile_id)
+    getter = getattr(module, "get_motion_feedback_config", None) if module is not None else None
+    if callable(getter):
+        payload = getter()
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def normalize_drive_absolute_feedback(
+    profile_id: str | None,
+    raw_feedback: object,
+) -> dict[str, Any] | None:
+    module = get_drive_profile(profile_id)
+    normalizer = getattr(module, "normalize_absolute_feedback", None) if module is not None else None
+    if callable(normalizer):
+        payload = normalizer(raw_feedback)
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def resolve_drive_absolute_feedback_counts(
+    profile_id: str | None,
+    raw_feedback: object,
+) -> dict[str, Any] | None:
+    module = get_drive_profile(profile_id)
+    resolver = getattr(module, "resolve_absolute_feedback_counts", None) if module is not None else None
+    if callable(resolver):
+        payload = resolver(raw_feedback)
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
 def decode_fieldbus_state(profile_id: str | None, value: int) -> dict[str, Any] | None:
     module = get_fieldbus_profile(profile_id)
     decoder = getattr(module, "decode_al_state", None) if module is not None else None

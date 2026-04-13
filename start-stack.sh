@@ -54,6 +54,7 @@ PROBE_INTERVAL_S="${GRADIENT_STACK_PROBE_INTERVAL_S:-0.25}"
 BUS_READY_TIMEOUT_S="${GRADIENT_STACK_BUS_READY_TIMEOUT_S:-20}"
 STARTUP_FAULT_RESET_TIMEOUT_S="${GRADIENT_STACK_STARTUP_FAULT_RESET_TIMEOUT_S:-3}"
 INTERACTIVE_CONSOLE_MODE="${GRADIENT_STACK_INTERACTIVE_CONSOLE:-auto}"
+GRADIENT_STACK_COLOR_MODE="${GRADIENT_STACK_COLOR:-auto}"
 
 START_RESULT="not_started"
 START_FAILURE=""
@@ -72,6 +73,28 @@ CONTROLLER_LOG=""
 API_LOG=""
 WEB_LOG=""
 STARTED_PID=""
+UI_STATUS_ACTIVE=0
+UI_SPINNER_INDEX=0
+UI_SPINNER_PID=""
+BANNER_RESET=""
+BANNER_BORDER=""
+BANNER_TITLE_PRIMARY=""
+BANNER_TITLE_SECONDARY=""
+BANNER_LABEL=""
+BANNER_VALUE=""
+BANNER_MUTED=""
+UI_DANGER=""
+UI_WARN=""
+UI_OK=""
+UI_INFO=""
+UI_CMD=""
+UI_PANEL=""
+BOOT_SUMMARY_ROBOT=""
+BOOT_SUMMARY_IK=""
+BOOT_SUMMARY_SERVO=""
+BOOT_SUMMARY_DRIVE=""
+BOOT_SUMMARY_TOOL=""
+BOOT_SUMMARY_RT_MAX_RPM=""
 
 usage() {
   cat <<'EOF'
@@ -104,6 +127,7 @@ Environment:
   GRADIENT_STACK_WEB_TIMEOUT_S         Web readiness timeout (default: 20)
   GRADIENT_STACK_PROBE_INTERVAL_S      Probe interval seconds (default: 0.25)
   GRADIENT_STACK_STARTUP_FAULT_RESET_TIMEOUT_S  Wait time after startup auto-reset before aborting (default: 3)
+  GRADIENT_STACK_COLOR                Banner color mode: auto|0|1 (default: auto)
 EOF
 }
 
@@ -111,16 +135,349 @@ timestamp() {
   date '+%Y-%m-%d %H:%M:%S%z'
 }
 
+now_ms() {
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local sec="${EPOCHREALTIME%.*}"
+    local frac="${EPOCHREALTIME#*.}"
+    frac="${frac:0:3}"
+    while [[ "${#frac}" -lt 3 ]]; do
+      frac="${frac}0"
+    done
+    printf '%s\n' "$((10#${sec} * 1000 + 10#${frac}))"
+    return 0
+  fi
+  "${SYSTEM_PYTHON}" - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+}
+
+format_duration_ms() {
+  local total_ms="${1:-0}"
+  if (( total_ms < 1000 )); then
+    printf '%dms' "${total_ms}"
+    return 0
+  fi
+
+  local seconds=$(( total_ms / 1000 ))
+  local millis=$(( total_ms % 1000 ))
+  if (( seconds < 60 )); then
+    printf '%d.%03ds' "${seconds}" "${millis}"
+    return 0
+  fi
+
+  local minutes=$(( seconds / 60 ))
+  local rem_seconds=$(( seconds % 60 ))
+  printf '%dm %02d.%03ds' "${minutes}" "${rem_seconds}" "${millis}"
+}
+
+init_banner_palette() {
+  BANNER_RESET=""
+  BANNER_BORDER=""
+  BANNER_TITLE_PRIMARY=""
+  BANNER_TITLE_SECONDARY=""
+  BANNER_LABEL=""
+  BANNER_VALUE=""
+  BANNER_MUTED=""
+  UI_DANGER=""
+  UI_WARN=""
+  UI_OK=""
+  UI_INFO=""
+  UI_CMD=""
+  UI_PANEL=""
+
+  local mode="${GRADIENT_STACK_COLOR_MODE,,}"
+  local enable=0
+  case "${mode}" in
+    1|true|yes|on|always)
+      enable=1
+      ;;
+    0|false|no|off|never)
+      enable=0
+      ;;
+    *)
+      if [[ -z "${NO_COLOR:-}" && -n "${TTY_DEVICE}" && "${TTY_DEVICE}" != "not a tty" && "${TERM:-}" != "dumb" ]]; then
+        enable=1
+      fi
+      ;;
+  esac
+
+  if [[ "${enable}" -eq 1 ]]; then
+    BANNER_RESET=$'\033[0m'
+    BANNER_BORDER=$'\033[38;5;45m'
+    BANNER_TITLE_PRIMARY=$'\033[1;38;5;226m'
+    BANNER_TITLE_SECONDARY=$'\033[1;38;5;51m'
+    BANNER_LABEL=$'\033[1;38;5;111m'
+    BANNER_VALUE=$'\033[38;5;255m'
+    BANNER_MUTED=$'\033[38;5;244m'
+    UI_DANGER=$'\033[1;38;5;196m'
+    UI_WARN=$'\033[1;38;5;226m'
+    UI_OK=$'\033[1;38;5;82m'
+    UI_INFO=$'\033[1;38;5;45m'
+    UI_CMD=$'\033[1;38;5;118m'
+    UI_PANEL=$'\033[38;5;240m'
+  fi
+}
+
+ui_can_render() {
+  [[ -n "${TTY_DEVICE}" && "${TTY_DEVICE}" != "not a tty" && -w "${TTY_DEVICE}" && "${TERM:-}" != "dumb" ]]
+}
+
+ui_next_spinner_frame() {
+  local frames=("[=   ]" "[==  ]" "[=== ]" "[ ===]" "[  ==]" "[   =]")
+  local frame="${frames[$((UI_SPINNER_INDEX % ${#frames[@]}))]}"
+  UI_SPINNER_INDEX=$((UI_SPINNER_INDEX + 1))
+  printf '%s' "${frame}"
+}
+
+ui_status_clear() {
+  if [[ -n "${UI_SPINNER_PID}" ]] && kill -0 "${UI_SPINNER_PID}" 2>/dev/null; then
+    kill "${UI_SPINNER_PID}" 2>/dev/null || true
+    wait "${UI_SPINNER_PID}" 2>/dev/null || true
+  fi
+  UI_SPINNER_PID=""
+  if ui_can_render && [[ "${UI_STATUS_ACTIVE}" -eq 1 ]]; then
+    printf '\r\033[2K' > "${TTY_DEVICE}"
+    UI_STATUS_ACTIVE=0
+  fi
+}
+
+ui_loading_begin() {
+  local stage="$1"
+  local detail="$2"
+  local started_ms="${3:-}"
+  init_banner_palette
+  ui_status_clear
+  if ! ui_can_render; then
+    return 0
+  fi
+  if [[ -z "${started_ms}" ]]; then
+    started_ms="$(now_ms)"
+  fi
+  local tty_device="${TTY_DEVICE}"
+  local warn_style="${UI_WARN}"
+  local info_style="${UI_INFO}"
+  local reset_style="${BANNER_RESET}"
+  (
+    trap 'exit 0' TERM INT
+    local frames=("[=   ]" "[==  ]" "[=== ]" "[ ===]" "[  ==]" "[   =]")
+    local index=0
+    while true; do
+      local current_ms
+      local elapsed_ms
+      current_ms="$(now_ms)"
+      elapsed_ms=$(( current_ms - started_ms ))
+      printf '\r\033[2K  %b%s%b %b%-18s%b %s  t+%s' \
+        "${warn_style}" "${frames[$((index % ${#frames[@]}))]}" "${reset_style}" \
+        "${info_style}" "${stage}" "${reset_style}" \
+        "${detail}" "$(format_duration_ms "${elapsed_ms}")" > "${tty_device}"
+      index=$((index + 1))
+      sleep 0.12
+    done
+  ) &
+  UI_SPINNER_PID="$!"
+  UI_STATUS_ACTIVE=1
+}
+
+ui_loading_status() {
+  local stage="$1"
+  local detail="$2"
+  local started_ms="${3:-}"
+  init_banner_palette
+  if ! ui_can_render; then
+    return 0
+  fi
+  local frame=""
+  local elapsed_suffix=""
+  frame="$(ui_next_spinner_frame)"
+  if [[ -n "${started_ms}" ]]; then
+    local current_ms=""
+    local elapsed_ms=0
+    current_ms="$(now_ms)"
+    elapsed_ms=$(( current_ms - started_ms ))
+    elapsed_suffix="  t+$(format_duration_ms "${elapsed_ms}")"
+  fi
+  printf '\r\033[2K  %b%s%b %b%-18s%b %s' \
+    "${UI_WARN}" "${frame}" "${BANNER_RESET}" \
+    "${UI_INFO}" "${stage}" "${BANNER_RESET}" \
+    "${detail}${elapsed_suffix}" > "${TTY_DEVICE}"
+  UI_STATUS_ACTIVE=1
+}
+
+run_with_loading_capture() {
+  local __out_var="$1"
+  local stage="$2"
+  local detail="$3"
+  shift 3
+  local output=""
+  local rc=0
+  local started_ms
+  started_ms="$(now_ms)"
+  ui_loading_begin "${stage}" "${detail}" "${started_ms}"
+  output="$("$@" 2>&1)" || rc=$?
+  ui_status_clear
+  printf -v "${__out_var}" '%s' "${output}"
+  return "${rc}"
+}
+
+style_text() {
+  init_banner_palette
+  local style="$1"
+  local text="$2"
+  printf '%b%s%b' "${style}" "${text}" "${BANNER_RESET}"
+}
+
+print_log_line() {
+  local level="$1"
+  local accent="$2"
+  local fd="$3"
+  local message="$4"
+  init_banner_palette
+  ui_status_clear
+
+  local ts=""
+  local tag=""
+  local level_prefix=""
+  ts="$(style_text "${BANNER_MUTED}" "[$(timestamp)]")"
+  tag="$(style_text "${UI_INFO}" "[start-stack]")"
+  if [[ -n "${level}" ]]; then
+    level_prefix=" $(style_text "${accent}" "${level}:")"
+  fi
+
+  if [[ "${fd}" == "2" ]]; then
+    printf '%s %s%s %s\n' "${ts}" "${tag}" "${level_prefix}" "${message}" >&2
+  else
+    printf '%s %s%s %s\n' "${ts}" "${tag}" "${level_prefix}" "${message}"
+  fi
+}
+
 log() {
-  printf '[%s] [start-stack] %s\n' "$(timestamp)" "$*"
+  print_log_line "" "${UI_INFO}" "1" "$*"
+}
+
+info() {
+  print_log_line "INFO" "${UI_INFO}" "1" "$*"
+}
+
+success() {
+  print_log_line "SUCCESS" "${UI_OK}" "1" "$*"
 }
 
 warn() {
-  printf '[%s] [start-stack] WARNING: %s\n' "$(timestamp)" "$*" >&2
+  print_log_line "WARNING" "${UI_WARN}" "2" "$*"
 }
 
 error() {
-  printf '[%s] [start-stack] ERROR: %s\n' "$(timestamp)" "$*" >&2
+  print_log_line "ERROR" "${UI_DANGER}" "2" "$*"
+}
+
+style_danger() {
+  style_text "${UI_DANGER}" "$1"
+}
+
+style_warn() {
+  style_text "${UI_WARN}" "$1"
+}
+
+style_ok() {
+  style_text "${UI_OK}" "$1"
+}
+
+style_info() {
+  style_text "${UI_INFO}" "$1"
+}
+
+style_cmd() {
+  style_text "${UI_CMD}" "$1"
+}
+
+style_probe_state() {
+  local raw="${1:-unknown}"
+  local state="${raw^^}"
+  case "${state}" in
+    OP|UP|READY|ONLINE|ACTIVE)
+      style_ok "${raw}"
+      ;;
+    BUS_UP_DISARMED|DISARMED)
+      style_info "${raw}"
+      ;;
+    UNKNOWN|INACTIVE|STARTING|PREOP|SAFEOP)
+      style_warn "${raw}"
+      ;;
+    DOWN|FAULTED|FAILED|ERROR)
+      style_danger "${raw}"
+      ;;
+    *)
+      style_text "${BANNER_VALUE}" "${raw}"
+      ;;
+  esac
+}
+
+style_probe_ratio() {
+  local actual="${1:-0}"
+  local expected="${2:-0}"
+  local rendered="${actual}/${expected}"
+  if [[ "${expected}" =~ ^[0-9]+$ ]] && [[ "${actual}" =~ ^[0-9]+$ ]] && (( expected > 0 )); then
+    if (( actual >= expected )); then
+      style_ok "${rendered}"
+    else
+      style_warn "${rendered}"
+    fi
+    return 0
+  fi
+  style_text "${BANNER_VALUE}" "${rendered}"
+}
+
+print_callout_block() {
+  init_banner_palette
+  ui_status_clear
+  local accent="$1"
+  local title="$2"
+  shift 2
+
+  printf '\n%b%s%b\n' "${UI_PANEL}" "  ----------------------------------------------------------------------" "${BANNER_RESET}"
+  printf '  %b// %s //%b\n' "${accent}" "${title}" "${BANNER_RESET}"
+  while [[ "$#" -gt 0 ]]; do
+    printf '  %s\n' "$1"
+    shift
+  done
+  printf '%b%s%b\n' "${UI_PANEL}" "  ----------------------------------------------------------------------" "${BANNER_RESET}"
+}
+
+print_boot_success_block() {
+  local mode_label="full stack"
+  local web_status
+  local control_hint
+  if [[ "${HEADLESS}" -eq 1 ]]; then
+    mode_label="headless"
+    web_status="$(style_warn 'DISABLED (--headless)')"
+  else
+    web_status="$(style_ok "ONLINE at http://127.0.0.1:${WEB_PORT}")"
+  fi
+  control_hint="$(style_cmd 'probe') / $(style_cmd 'status') / $(style_cmd 'stop') / $(style_cmd 'stop --hard')"
+
+  print_callout_block "${UI_OK}" "SYSTEM ONLINE" \
+    "  status: $(style_ok 'GRADIENTOS BOOT COMPLETE')" \
+    "  mode:   ${mode_label}" \
+    "  robot:  ${BOOT_SUMMARY_ROBOT:-unknown}" \
+    "  stack:  $(style_ok "${BOOT_SUMMARY_IK:-unknown}") / $(style_ok "${BOOT_SUMMARY_SERVO:-unknown}") / $(style_ok "${BOOT_SUMMARY_DRIVE:-unknown}")" \
+    "  bus:    $(style_ok 'READY') and $(style_ok 'DISARMED')" \
+    "  api:    $(style_ok "ONLINE at http://127.0.0.1:${API_PORT}")" \
+    "  web:    ${web_status}" \
+    "  logs:   ${LOG_DIR}" \
+    "  ops:    ${control_hint}"
+}
+
+banner_stat_line() {
+  local left_label="$1"
+  local left_value="$2"
+  local right_label="$3"
+  local right_value="$4"
+  printf '  %b%-11s%b %b%-20s%b %b%-11s%b %b%s%b\n' \
+    "${BANNER_LABEL}" "${left_label}" "${BANNER_RESET}" \
+    "${BANNER_VALUE}" "${left_value}" "${BANNER_RESET}" \
+    "${BANNER_LABEL}" "${right_label}" "${BANNER_RESET}" \
+    "${BANNER_VALUE}" "${right_value}" "${BANNER_RESET}"
 }
 
 pid_is_live() {
@@ -981,23 +1338,33 @@ capture_probe_json() {
 
 log_probe_snapshot() {
   local payload="$1"
-  "${SYSTEM_PYTHON}" - "${payload}" <<'PY'
-import json
-import sys
+  local physical_state=""
+  local driver_state=""
+  local ethercat_master_state=""
+  local rtcore_state=""
+  local armed=""
+  local enable_mask=""
+  local op_enabled_axes=""
+  local num_axes=""
+  local wkc_actual=""
+  local wkc_expected=""
 
-data = json.loads(sys.argv[1])
-print(
-    "[start-stack] probe:"
-    f" physical_state={data.get('physical_state')}"
-    f" driver_state={data.get('driver_state')}"
-    f" ethercat_master_state={data.get('ethercat_master_state')}"
-    f" rtcore_state={data.get('rtcore_state')}"
-    f" armed={data.get('armed')}"
-    f" enable_mask=0x{int(data.get('axis_enable_mask', 0)):x}"
-    f" op_enabled_axes={data.get('op_enabled_axes')}/{data.get('num_axes')}"
-    f" wkc={data.get('wkc_actual')}/{data.get('wkc_expected')}"
-)
-PY
+  physical_state="$(probe_json_field "${payload}" "physical_state")"
+  driver_state="$(probe_json_field "${payload}" "driver_state")"
+  ethercat_master_state="$(probe_json_field "${payload}" "ethercat_master_state")"
+  rtcore_state="$(probe_json_field "${payload}" "rtcore_state")"
+  armed="$(probe_json_field "${payload}" "armed")"
+  enable_mask="$(probe_json_field "${payload}" "axis_enable_mask")"
+  op_enabled_axes="$(probe_json_field "${payload}" "op_enabled_axes")"
+  num_axes="$(probe_json_field "${payload}" "num_axes")"
+  wkc_actual="$(probe_json_field "${payload}" "wkc_actual")"
+  wkc_expected="$(probe_json_field "${payload}" "wkc_expected")"
+
+  print_callout_block "${UI_INFO}" "PROBE SNAPSHOT" \
+    "  physical: $(style_probe_state "${physical_state}")   driver: $(style_probe_state "${driver_state}")" \
+    "  ethercat: $(style_probe_state "${ethercat_master_state}")   rtcore: $(style_probe_state "${rtcore_state}")" \
+    "  armed:    $(style_text "${BANNER_VALUE}" "${armed}")   enable_mask: $(style_cmd "0x$(printf '%x' "${enable_mask:-0}")")   op_enabled: $(style_probe_ratio "${op_enabled_axes:-0}" "${num_axes:-0}")" \
+    "  wkc:      $(style_probe_ratio "${wkc_actual:-0}" "${wkc_expected:-0}")"
 }
 
 probe_is_soft_stop_safe() {
@@ -1022,6 +1389,31 @@ safe = (
     )
 )
 raise SystemExit(0 if safe else 1)
+PY
+}
+
+probe_is_bus_ready() {
+  local payload="$1"
+  "${SYSTEM_PYTHON}" - "${payload}" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+metrics_available = int(data.get("metrics_available", 0) or 0)
+num_axes = int(data.get("num_axes", 0) or 0)
+responding = int(data.get("responding", 0) or 0)
+online = int(data.get("online", 0) or 0)
+operational = int(data.get("operational", 0) or 0)
+startup_ready = int(data.get("startup_ready", 0) or 0)
+ready = (
+    metrics_available == 1
+    and num_axes > 0
+    and responding >= num_axes
+    and online >= num_axes
+    and operational >= num_axes
+    and startup_ready == 1
+)
+raise SystemExit(0 if ready else 1)
 PY
 }
 
@@ -1058,11 +1450,42 @@ else:
 PY
 }
 
+capture_rtcore_recent_journal() {
+  run_journalctl -u "${RTCORE_SERVICE_NAME}" -n 120 --no-pager 2>/dev/null || true
+}
+
+probe_rtcore_startup_recovery_plan() {
+  local payload="$1"
+  local recent_log="$2"
+  local recovery_attempted="${3:-0}"
+  PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}" "${PROBE_PYTHON}" - "${payload}" "${recent_log}" "${recovery_attempted}" <<'PY'
+import json
+import sys
+
+from gradient_os.telemetry.startup_recovery import build_rtcore_startup_recovery_plan
+
+payload = json.loads(sys.argv[1])
+recent_log = sys.argv[2]
+recovery_attempted = bool(int(sys.argv[3]))
+print(
+    json.dumps(
+        build_rtcore_startup_recovery_plan(
+            payload,
+            recent_log=recent_log,
+            recovery_attempted=recovery_attempted,
+        )
+    )
+)
+PY
+}
+
 wait_for_probe_state() {
   local desired_state="$1"
   local timeout_s="$2"
   local started_at
+  local started_ms
   started_at="$(date +%s)"
+  started_ms="$(now_ms)"
 
   while true; do
     local payload=""
@@ -1071,14 +1494,17 @@ wait_for_probe_state() {
       local current_state=""
       current_state="$(probe_json_field "${payload}" "physical_state")"
       if [[ "${current_state}" == "${desired_state}" ]]; then
-        log "hardware reached ${desired_state}"
+        ui_status_clear
+        success "hardware reached ${desired_state} in $(format_duration_ms $(( $(now_ms) - started_ms )))"
         return 0
       fi
+      ui_loading_status "hardware" "Waiting for physical_state=${desired_state} (current=${current_state})" "${started_ms}"
     fi
 
     local now
     now="$(date +%s)"
     if (( now - started_at >= timeout_s )); then
+      ui_status_clear
       return 1
     fi
     sleep "${PROBE_INTERVAL_S}"
@@ -1088,19 +1514,26 @@ wait_for_probe_state() {
 wait_for_probe_soft_stop_safe() {
   local timeout_s="$1"
   local started_at
+  local started_ms
   started_at="$(date +%s)"
+  started_ms="$(now_ms)"
 
   while true; do
     local payload=""
     payload="$(capture_probe_json || true)"
     if [[ -n "${payload}" ]] && probe_is_soft_stop_safe "${payload}"; then
-      log "hardware reached safe soft-stop state: $(describe_probe_soft_stop_state "${payload}")"
+      ui_status_clear
+      success "hardware reached safe soft-stop state in $(format_duration_ms $(( $(now_ms) - started_ms ))): $(describe_probe_soft_stop_state "${payload}")"
       return 0
+    fi
+    if [[ -n "${payload}" ]]; then
+      ui_loading_status "soft stop" "$(describe_probe_soft_stop_state "${payload}")" "${started_ms}"
     fi
 
     local now
     now="$(date +%s)"
     if (( now - started_at >= timeout_s )); then
+      ui_status_clear
       return 1
     fi
     sleep "${PROBE_INTERVAL_S}"
@@ -1109,7 +1542,9 @@ wait_for_probe_soft_stop_safe() {
 
 wait_for_bus_operational() {
   local started_at
+  local started_ms
   started_at="$(date +%s)"
+  started_ms="$(now_ms)"
   local last_detail=""
 
   while true; do
@@ -1134,10 +1569,12 @@ wait_for_bus_operational() {
 
       if [[ "${metrics_available}" == "1" && -n "${num_axes}" && "${num_axes}" != "0" ]]; then
         if [[ "${responding}" == "${num_axes}" && "${online}" == "${num_axes}" && "${operational}" == "${num_axes}" && "${startup_ready}" == "1" ]]; then
-          log "bus ready: responding=${responding}/${num_axes} online=${online}/${num_axes} operational=${operational}/${num_axes} wkc=${wkc_actual}"
+          ui_status_clear
+          success "BUS READY in $(format_duration_ms $(( $(now_ms) - started_ms ))): responding=${responding}/${num_axes} online=${online}/${num_axes} operational=${operational}/${num_axes} wkc=${wkc_actual}"
           return 0
         fi
         local detail="responding=${responding}/${num_axes} online=${online}/${num_axes} operational=${operational}/${num_axes} startup_ready=${startup_ready} wkc=${wkc_actual}"
+        ui_loading_status "fieldbus" "${detail}" "${started_ms}"
         if [[ "${detail}" != "${last_detail}" ]]; then
           log "Waiting for full bus readiness: ${detail}"
           last_detail="${detail}"
@@ -1148,6 +1585,7 @@ wait_for_bus_operational() {
     local now
     now="$(date +%s)"
     if (( now - started_at >= BUS_READY_TIMEOUT_S )); then
+      ui_status_clear
       if [[ -n "${payload}" ]]; then
         log_probe_snapshot "${payload}"
       fi
@@ -1311,6 +1749,14 @@ run_systemctl() {
   fi
 }
 
+run_journalctl() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    journalctl "$@"
+  else
+    sudo -n journalctl "$@"
+  fi
+}
+
 systemd_service_is_active() {
   run_systemctl is-active --quiet "$1" >/dev/null 2>&1
 }
@@ -1350,22 +1796,27 @@ wait_for_systemd_service_inactive() {
 
 stop_systemd_service_if_active() {
   local service_name="$1"
+  local started_ms
+  started_ms="$(now_ms)"
   if ! systemd_service_is_active "${service_name}"; then
     return 1
   fi
   log "Stopping systemd service ${service_name}"
-  if run_systemctl stop "${service_name}" >/dev/null 2>&1; then
+  local stop_output=""
+  if run_with_loading_capture stop_output "service stop" "Stopping ${service_name} via systemd" run_systemctl stop "${service_name}"; then
     if wait_for_systemd_service_inactive "${service_name}" 12; then
+      success "${service_name} stopped in $(format_duration_ms $(( $(now_ms) - started_ms )))"
       return 0
     fi
     warn "Escalating ${service_name} stop via systemctl kill"
     run_systemctl kill --signal=SIGKILL "${service_name}" >/dev/null 2>&1 || true
     run_systemctl stop "${service_name}" >/dev/null 2>&1 || true
     if wait_for_systemd_service_inactive "${service_name}" 5; then
+      success "${service_name} force-stopped in $(format_duration_ms $(( $(now_ms) - started_ms )))"
       return 0
     fi
   fi
-  warn "Failed to stop ${service_name} via systemd"
+  warn "Failed to stop ${service_name} via systemd after $(format_duration_ms $(( $(now_ms) - started_ms )))"
   return 1
 }
 
@@ -1496,16 +1947,20 @@ wait_for_probe() {
   local probe_func="$3"
 
   local started_at
+  local started_ms
   started_at="$(date +%s)"
+  started_ms="$(now_ms)"
   local last_detail=""
 
   while true; do
     local detail=""
     if detail="$(${probe_func} 2>&1)"; then
-      log "${name} ready: ${detail}"
+      ui_status_clear
+      success "${name} ready in $(format_duration_ms $(( $(now_ms) - started_ms ))): ${detail}"
       return 0
     fi
 
+    ui_loading_status "${name}" "${detail:-awaiting response}" "${started_ms}"
     if [[ "${detail}" != "${last_detail}" ]]; then
       log "Waiting for ${name}: ${detail}"
       last_detail="${detail}"
@@ -1514,6 +1969,7 @@ wait_for_probe() {
     local now
     now="$(date +%s)"
     if (( now - started_at >= timeout_s )); then
+      ui_status_clear
       error "${name} failed readiness within ${timeout_s}s: ${detail}"
       return 1
     fi
@@ -1524,21 +1980,26 @@ wait_for_probe() {
 
 wait_for_controller_readiness() {
   local started_at
+  local started_ms
   started_at="$(date +%s)"
+  started_ms="$(now_ms)"
   local last_detail=""
 
   while true; do
     if ! pid_is_live "${CONTROLLER_PID}"; then
+      ui_status_clear
       error "controller exited before readiness completed"
       return 1
     fi
 
     local detail=""
     if detail="$(probe_controller 2>&1)"; then
-      log "controller ready: ${detail}"
+      ui_status_clear
+      success "controller online in $(format_duration_ms $(( $(now_ms) - started_ms ))): ${detail}"
       return 0
     fi
 
+    ui_loading_status "controller" "${detail:-starting controller process}" "${started_ms}"
     if [[ "${detail}" != "${last_detail}" ]]; then
       log "Waiting for controller: ${detail}"
       last_detail="${detail}"
@@ -1547,6 +2008,7 @@ wait_for_controller_readiness() {
     local now
     now="$(date +%s)"
     if (( now - started_at >= CONTROLLER_TIMEOUT_S )); then
+      ui_status_clear
       error "controller failed readiness within ${CONTROLLER_TIMEOUT_S}s: ${detail}"
       return 1
     fi
@@ -1556,6 +2018,8 @@ wait_for_controller_readiness() {
 }
 
 wait_for_api_readiness() {
+  local started_ms
+  started_ms="$(now_ms)"
   wait_for_probe "api health" "${API_TIMEOUT_S}" probe_api_health || return 1
 
   local runtime_payload
@@ -1569,26 +2033,34 @@ wait_for_api_readiness() {
     error "runtime-config sanity check failed: ${runtime_summary}"
     return 1
   fi
-  log "runtime-config sanity: ${runtime_summary}"
+  success "api runtime-config sanity after $(format_duration_ms $(( $(now_ms) - started_ms ))): ${runtime_summary}"
 
   wait_for_probe "api joints" 10 probe_api_joints >/dev/null || return 1
   wait_for_probe "api pose" 10 probe_api_pose >/dev/null || return 1
+  success "$(style_ok 'API ONLINE') in $(format_duration_ms $(( $(now_ms) - started_ms ))) at http://127.0.0.1:${API_PORT}"
   return 0
 }
 
 wait_for_web_readiness() {
-  wait_for_probe "web UI" "${WEB_TIMEOUT_S}" probe_web >/dev/null
+  local started_ms
+  started_ms="$(now_ms)"
+  wait_for_probe "web UI" "${WEB_TIMEOUT_S}" probe_web >/dev/null || return 1
+  success "$(style_ok 'WEB UI ONLINE') in $(format_duration_ms $(( $(now_ms) - started_ms ))) at http://127.0.0.1:${WEB_PORT}"
+  return 0
 }
 
 start_process() {
   local name="$1"
   local log_file="$2"
+  local started_ms
   shift 2
+  started_ms="$(now_ms)"
 
   : > "${log_file}"
   start_tail "${name}" "${log_file}"
 
-  log "Starting ${name}: $*"
+  info "Launching ${name} process"
+  ui_loading_status "launch ${name}" "Starting process and binding stdout to ${log_file}"
   if command -v setsid >/dev/null 2>&1; then
     if command -v stdbuf >/dev/null 2>&1; then
       setsid stdbuf -oL -eL "$@" >> "${log_file}" 2>&1 &
@@ -1603,7 +2075,8 @@ start_process() {
 
   local pid=$!
   CHILD_PIDS+=("${pid}")
-  log "${name} started with pid=${pid}, log=${log_file}"
+  ui_status_clear
+  success "${name} process started in $(format_duration_ms $(( $(now_ms) - started_ms ))): pid=${pid}, log=${log_file}"
   STARTED_PID="${pid}"
 }
 
@@ -1650,36 +2123,287 @@ ensure_required_files() {
 }
 
 bootstrap_environment() {
+  local started_ms
+  started_ms="$(now_ms)"
   if [[ ! -f "${START_SH}" ]]; then
     error "missing ${START_SH}"
     return 1
   fi
 
-  log "Bootstrapping environment via ${START_SH}"
+  info "Environment bootstrap: loading ${START_SH}"
+  ui_loading_status "environment" "Activating .venv, project paths, and system camera libraries" "${started_ms}"
+  local previous_start_quiet="${GRADIENT_START_QUIET:-}"
+  export GRADIENT_START_QUIET=1
   # shellcheck disable=SC1090
-  source "${START_SH}"
+  if ! source "${START_SH}"; then
+    ui_status_clear
+    if [[ -n "${previous_start_quiet}" ]]; then
+      export GRADIENT_START_QUIET="${previous_start_quiet}"
+    else
+      unset GRADIENT_START_QUIET
+    fi
+    error "environment bootstrap failed via ${START_SH}"
+    return 1
+  fi
+  if [[ -n "${previous_start_quiet}" ]]; then
+    export GRADIENT_START_QUIET="${previous_start_quiet}"
+  else
+    unset GRADIENT_START_QUIET
+  fi
 
   export PYTHONUNBUFFERED=1
   export GRADIENT_RTCORE_READY_TIMEOUT_S="${GRADIENT_RTCORE_READY_TIMEOUT_S:-30}"
+  ui_status_clear
+
+  local cli_status=""
+  local elapsed_ms
+  elapsed_ms=$(( $(now_ms) - started_ms ))
+  if command -v gradient-controller >/dev/null 2>&1; then
+    cli_status="$(style_ok 'CLI COMMANDS READY')"
+  else
+    cli_status="$(style_warn 'ALIASES READY')"
+  fi
+  print_callout_block "${UI_INFO}" "ENVIRONMENT READY" \
+    "  status: $(style_ok '.VENV ACTIVE') and $(style_ok 'PYTHONPATH INJECTED')" \
+    "  python: ${PROBE_PYTHON}" \
+    "  cli:    ${cli_status}" \
+    "  timing: $(style_ok "$(format_duration_ms "${elapsed_ms}")")" \
+    "  repo:   ${REPO_ROOT}"
+  return 0
+}
+
+render_runtime_banner_summary() {
+  PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}" "${PROBE_PYTHON}" - "${REPO_ROOT}" <<'PY'
+import io
+import sys
+from contextlib import redirect_stdout
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+sys.path.insert(0, str(repo_root / "src"))
+
+try:
+    with redirect_stdout(io.StringIO()):
+        from gradient_os import runtime_config
+    desired_config = runtime_config.load_runtime_config()
+    desired = desired_config.get("desired", {}) if isinstance(desired_config, dict) else {}
+    desired_overrides = desired.get("overrides", {}) if isinstance(desired.get("overrides"), dict) else {}
+    allow_unsafe = runtime_config.resolve_allow_unsafe_overrides(
+        cli_flag=False,
+        desired_flag=bool(desired.get("allow_unsafe_overrides", False)),
+    )
+    resolved = runtime_config.resolve_effective_runtime(
+        robot_name=str(desired.get("robot", "gradient05")),
+        sim_mode=False,
+        requested_ik_solver_backend=desired_overrides.get("ik_solver_backend"),
+        requested_servo_backend=desired_overrides.get("servo_backend"),
+        requested_drive_profile=desired_overrides.get("drive_profile"),
+        requested_rt_max_rpm=desired_overrides.get("rt_max_rpm"),
+        requested_active_tool_id=desired.get("active_tool_id"),
+        allow_unsafe_overrides=allow_unsafe,
+    )
+    robot_name = str(resolved.get("robot", {}).get("name", "unknown")).strip() or "unknown"
+    ik_name = str(resolved.get("ik_solver", {}).get("effective_backend", "unknown")).strip() or "unknown"
+    servo_name = str(resolved.get("servo_backend", {}).get("effective_backend", "unknown")).strip() or "unknown"
+    drive_name = str(resolved.get("drive_profile", {}).get("configured_profile", "unknown")).strip() or "unknown"
+    tool_name = str(resolved.get("robot", {}).get("active_tool_id", "none")).strip() or "none"
+    max_rpm = resolved.get("rtcore", {}).get("configured_max_rpm")
+    max_rpm_label = str(int(max_rpm)) if isinstance(max_rpm, (int, float)) and float(max_rpm).is_integer() else str(max_rpm or "default")
+    print(f"robot={robot_name}")
+    print(f"ik={ik_name}")
+    print(f"servo={servo_name}")
+    print(f"drive={drive_name}")
+    print(f"tool={tool_name}")
+    print(f"rt_max_rpm={max_rpm_label}")
+except Exception as exc:
+    print("robot=unknown")
+    print("ik=unknown")
+    print("servo=unknown")
+    print("drive=unknown")
+    print("tool=unknown")
+    print("rt_max_rpm=unknown")
+    print(f"runtime_error={exc}")
+PY
+}
+
+print_start_banner() {
+  init_banner_palette
+
+  local runtime_summary=""
+  runtime_summary="$(render_runtime_banner_summary 2>/dev/null || true)"
+
+  local robot="unknown"
+  local ik="unknown"
+  local servo="unknown"
+  local drive="unknown"
+  local tool_id="unknown"
+  local rt_max_rpm="unknown"
+  local runtime_error=""
+
+  if [[ -n "${runtime_summary}" ]]; then
+    robot="$(printf '%s\n' "${runtime_summary}" | awk -F= '/^robot=/{print substr($0, index($0, "=")+1)}' | tail -n 1)"
+    ik="$(printf '%s\n' "${runtime_summary}" | awk -F= '/^ik=/{print substr($0, index($0, "=")+1)}' | tail -n 1)"
+    servo="$(printf '%s\n' "${runtime_summary}" | awk -F= '/^servo=/{print substr($0, index($0, "=")+1)}' | tail -n 1)"
+    drive="$(printf '%s\n' "${runtime_summary}" | awk -F= '/^drive=/{print substr($0, index($0, "=")+1)}' | tail -n 1)"
+    tool_id="$(printf '%s\n' "${runtime_summary}" | awk -F= '/^tool=/{print substr($0, index($0, "=")+1)}' | tail -n 1)"
+    rt_max_rpm="$(printf '%s\n' "${runtime_summary}" | awk -F= '/^rt_max_rpm=/{print substr($0, index($0, "=")+1)}' | tail -n 1)"
+    runtime_error="$(printf '%s\n' "${runtime_summary}" | awk -F= '/^runtime_error=/{print substr($0, index($0, "=")+1)}' | tail -n 1)"
+  fi
+
+  BOOT_SUMMARY_ROBOT="${robot}"
+  BOOT_SUMMARY_IK="${ik}"
+  BOOT_SUMMARY_SERVO="${servo}"
+  BOOT_SUMMARY_DRIVE="${drive}"
+  BOOT_SUMMARY_TOOL="${tool_id}"
+  BOOT_SUMMARY_RT_MAX_RPM="${rt_max_rpm}"
+
+  local mode_label="full stack"
+  local web_label="http://127.0.0.1:${WEB_PORT}"
+  if [[ "${HEADLESS}" -eq 1 ]]; then
+    mode_label="headless"
+    web_label="disabled (--headless)"
+  fi
+
+  printf '\n%b%s%b\n' "${BANNER_BORDER}" "========================================================================" "${BANNER_RESET}"
+  printf '  %b%s%b\n' "${UI_WARN}" "// FOR INDUSTRIAL USE ONLY // LIVE STACK INITIALIZATION //" "${BANNER_RESET}"
+  printf '%b%s%b\n' "${BANNER_TITLE_PRIMARY}" '    ____               _ _            _    ___  ____' "${BANNER_RESET}"
+  printf '%b%s%b\n' "${BANNER_TITLE_PRIMARY}" '   / ___|_ __ __ _  __| (_) ___ _ __ | |_ / _ \/ ___|' "${BANNER_RESET}"
+  printf '%b%s%b\n' "${BANNER_TITLE_SECONDARY}" "  | |  _| '__/ _\` |/ _\` | |/ _ \\ '_ \\| __| | | \\___ \\" "${BANNER_RESET}"
+  printf '%b%s%b\n' "${BANNER_TITLE_SECONDARY}" '  | |_| | | | (_| | (_| | |  __/ | | | |_| |_| |___) |' "${BANNER_RESET}"
+  printf '%b%s%b\n' "${BANNER_TITLE_SECONDARY}" '   \____|_|  \__,_|\__,_|_|\___|_| |_|\__|\___/|____/' "${BANNER_RESET}"
+  printf '\n'
+  printf '  %b%s%b\n' "${BANNER_MUTED}" "Gradient Industrial Robotics // Stack launcher" "${BANNER_RESET}"
+  banner_stat_line "mode:" "${mode_label}" "run:" "${RUN_ID}"
+  banner_stat_line "robot:" "${robot}" "tool:" "${tool_id}"
+  banner_stat_line "ik:" "${ik}" "servo:" "${servo}"
+  banner_stat_line "drive:" "${drive}" "rt max rpm:" "${rt_max_rpm}"
+  printf '  %b%-11s%b %b%s%b\n' "${BANNER_LABEL}" "controller:" "${BANNER_RESET}" "${BANNER_VALUE}" "udp://${CONTROLLER_HOST}:${CONTROLLER_PORT}" "${BANNER_RESET}"
+  printf '  %b%-11s%b %b%s%b\n' "${BANNER_LABEL}" "api:" "${BANNER_RESET}" "${BANNER_VALUE}" "http://127.0.0.1:${API_PORT}" "${BANNER_RESET}"
+  printf '  %b%-11s%b %b%s%b\n' "${BANNER_LABEL}" "web:" "${BANNER_RESET}" "${BANNER_VALUE}" "${web_label}" "${BANNER_RESET}"
+  printf '  %b%-11s%b %b%s%b\n' "${BANNER_LABEL}" "logs:" "${BANNER_RESET}" "${BANNER_VALUE}" "${LOG_DIR}" "${BANNER_RESET}"
+  printf '  %b%s%b %s %b|%b %s %b|%b %s %b|%b %s\n' \
+    "${BANNER_LABEL}" "commands:" "${BANNER_RESET}" \
+    "$(style_cmd 'probe')" "${BANNER_MUTED}" "${BANNER_RESET}" \
+    "$(style_cmd 'status')" "${BANNER_MUTED}" "${BANNER_RESET}" \
+    "$(style_cmd 'stop')" "${BANNER_MUTED}" "${BANNER_RESET}" \
+    "$(style_cmd 'stop --hard')"
+  printf '%b%s%b\n' "${BANNER_BORDER}" "========================================================================" "${BANNER_RESET}"
+
+  if [[ -n "${runtime_error}" ]]; then
+    warn "banner runtime summary fallback: ${runtime_error}"
+  fi
+}
+
+sync_rtcore_runtime_once() {
+  local started_ms
+  started_ms="$(now_ms)"
+  info "RTCore sync: ensuring unit, binary, and runtime env match the selected robot scaling"
+  local detail=""
+  if run_with_loading_capture detail "rtcore sync" "Verifying service unit, binary install, and EtherCAT runtime env" "${RTCORE_SYNC_SCRIPT}" --ensure-active; then
+    ui_status_clear
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      info "${line}"
+    done <<< "${detail}"
+    local elapsed_ms
+    elapsed_ms=$(( $(now_ms) - started_ms ))
+    success "$(style_ok 'RTCORE SYNC COMPLETE') in $(format_duration_ms "${elapsed_ms}")"
+    return 0
+  fi
+  ui_status_clear
+  local elapsed_ms
+  elapsed_ms=$(( $(now_ms) - started_ms ))
+  print_callout_block "${UI_DANGER}" "RTCORE SYNC FAILURE" \
+    "  status:  $(style_danger 'RTCORE SERVICE DID NOT START CLEANLY')" \
+    "  timing:  $(style_warn "$(format_duration_ms "${elapsed_ms}")")" \
+    "  inspect: $(style_cmd 'systemctl status gradient-rt-motion.service')" \
+    "           $(style_cmd 'journalctl -xeu gradient-rt-motion.service')"
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    warn "rtcore sync detail: ${line}"
+  done <<< "${detail}"
+  error "RTCore runtime sync failed; refusing to start with potentially stale scaling."
+  return 1
+}
+
+attempt_rtcore_startup_recovery_once() {
+  local started_ms
+  started_ms="$(now_ms)"
+  log "Attempting $(style_warn 'HARD RTCORE/ETHERCAT RECYCLE') before controller launch"
+  stop_rtcore_runtime || true
+  stop_ethercat_master_runtime
+  sleep 1
+  sync_rtcore_runtime_once || return 1
+  sleep 1
+  success "recovery recycle finished in $(format_duration_ms $(( $(now_ms) - started_ms )))"
   return 0
 }
 
 ensure_rtcore_runtime_sync() {
-  log "Ensuring RTCore unit/env match the selected robot scaling"
-  local detail=""
-  if detail="$("${RTCORE_SYNC_SCRIPT}" --ensure-active 2>&1)"; then
-    while IFS= read -r line; do
-      [[ -n "${line}" ]] || continue
-      log "${line}"
-    done <<< "${detail}"
+  sync_rtcore_runtime_once || return 1
+
+  local recovery_attempted=0
+  while true; do
+    local payload=""
+    payload="$(capture_probe_json || true)"
+    if [[ -z "${payload}" ]]; then
+      return 0
+    fi
+    if probe_is_bus_ready "${payload}"; then
+      return 0
+    fi
+
+    local recent_journal=""
+    recent_journal="$(capture_rtcore_recent_journal)"
+    local plan=""
+    if ! plan="$(probe_rtcore_startup_recovery_plan "${payload}" "${recent_journal}" "${recovery_attempted}" 2>/dev/null)"; then
+      return 0
+    fi
+
+    local should_recover=""
+    local reboot_required=""
+    local reason=""
+    local detail=""
+    local journal_signatures=""
+    should_recover="$(probe_json_field "${plan}" "should_recover")"
+    reboot_required="$(probe_json_field "${plan}" "reboot_required")"
+    reason="$(probe_json_field "${plan}" "reason")"
+    detail="$(probe_json_field "${plan}" "detail")"
+    journal_signatures="$(probe_json_field "${plan}" "journal_signatures")"
+
+    if [[ "${reboot_required}" == "1" ]]; then
+      log_probe_snapshot "${payload}"
+      if [[ -n "${journal_signatures}" ]]; then
+        warn "RTCore startup recovery signatures: ${journal_signatures}"
+      fi
+      print_callout_block "${UI_DANGER}" "REBOOT REQUIRED" \
+        "  detail: ${detail}" \
+        "  status: $(style_danger 'STALE RTCORE OWNER STILL HOLDS ETHERCAT MASTER')" \
+        "  action: $(style_danger 'REBOOT HOST')" \
+        "  next:   after boot, rerun $(style_cmd './start-stack.sh') and use $(style_cmd 'probe') or $(style_cmd 'status') to confirm clean startup"
+      error "${detail}"
+      error "RTCore/EtherCAT ownership did not clear after one recycle attempt; $(style_danger 'REBOOT HOST') before retrying startup."
+      return 1
+    fi
+
+    if [[ "${should_recover}" == "1" && "${recovery_attempted}" == "0" ]]; then
+      log_probe_snapshot "${payload}"
+      print_callout_block "${UI_WARN}" "STARTUP RECOVERY PLAN" \
+        "  classification: $(style_warn "${reason}")" \
+        "  detail:         ${detail}" \
+        "  action:         $(style_warn 'ONE HARD RTCORE/ETHERCAT RECYCLE')" \
+        "  if it still fails: expect $(style_danger 'REBOOT REQUIRED') rather than looping restarts"
+      log "RTCore startup recovery classified $(style_warn "${reason}")"
+      recovery_attempted=1
+      attempt_rtcore_startup_recovery_once || return 1
+      continue
+    fi
+
+    if [[ "${recovery_attempted}" == "1" && -n "${detail}" && "${reason}" != "healthy" && "${reason}" != "no_action" ]]; then
+      log "RTCore startup status after one recycle attempt: ${detail}"
+    fi
     return 0
-  fi
-  while IFS= read -r line; do
-    [[ -n "${line}" ]] || continue
-    warn "${line}"
-  done <<< "${detail}"
-  error "RTCore runtime sync failed; refusing to start with potentially stale scaling."
-  return 1
+  done
 }
 
 detect_external_services() {
@@ -2144,7 +2868,7 @@ supervise_children() {
   fi
 
   log "Startup complete. Interactive console attached to this terminal."
-  log "Type stop, stop --hard, probe, status, help, or press Ctrl-C."
+  log "Type $(style_cmd 'stop'), $(style_cmd 'stop --hard'), $(style_cmd 'probe'), $(style_cmd 'status'), $(style_cmd 'help'), or press Ctrl-C."
   stop_tailers
 
   local console_rc=0
@@ -2235,6 +2959,8 @@ parse_args() {
 }
 
 start_stack() {
+  local boot_started_ms
+  boot_started_ms="$(now_ms)"
   if [[ -f "${ACTIVE_STATE}" ]]; then
     local existing_launcher_pid=""
     existing_launcher_pid="$(
@@ -2255,6 +2981,7 @@ start_stack() {
   ensure_required_files
   detect_external_services
   bootstrap_environment
+  print_start_banner
   ensure_rtcore_runtime_sync
   startup_fault_reset_preflight
 
@@ -2284,6 +3011,8 @@ start_stack() {
     wait_for_web_readiness
   fi
 
+  success "$(style_ok 'STACK BOOT COMPLETE') in $(format_duration_ms $(( $(now_ms) - boot_started_ms )))"
+  print_boot_success_block
   supervise_children
 }
 

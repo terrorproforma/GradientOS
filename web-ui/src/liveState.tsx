@@ -75,6 +75,12 @@ export type DriveStartupConfig = {
   verified?: boolean;
 };
 
+export type AbsoluteFeedbackField = {
+  label?: string;
+  valid?: boolean;
+  value?: number;
+};
+
 export type DriveFaultAxis = {
   axis: number;
   logical_joint?: number | null;
@@ -90,8 +96,10 @@ export type DriveFaultAxis = {
   slave_al_state?: number;
   slave_al_state_name?: string;
   pos_counts?: number;
+  absolute_feedback?: Record<string, AbsoluteFeedbackField> | null;
   native_home_state?: number;
   native_home_state_name?: string;
+  native_home_active?: boolean;
   native_home_position_offset?: number;
   native_home_last_abort_code?: number;
   native_home_last_abort_code_hex?: string;
@@ -114,6 +122,8 @@ export type DriveFaultSnapshot = {
   armed?: number;
   axis_enable_mask?: number;
   axis_enable_mask_hex?: string;
+  native_home_active_axis_mask?: number;
+  native_home_active_axis_mask_hex?: string;
   enable_requested?: boolean;
   requested_axes?: number;
   op_enabled_axes?: number;
@@ -197,6 +207,7 @@ export type LiveTelemetryEvent = {
   timestamp: number;
   raw: string;
   joints?: number[];
+  display_joints?: number[];
   gripper?: number;
   servos?: Record<string, ServoSample>;
   alerts?: Alert[];

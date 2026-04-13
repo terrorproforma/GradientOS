@@ -9,10 +9,14 @@ import socket
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+from ....absolute_encoder_anchors import (
+    load_absolute_encoder_anchors,
+    save_absolute_encoder_anchor,
+)
 from ...actuator_interface import ActuatorBackend
 from ...profiles import registry as drive_profile_registry
 from .runtime import (
@@ -83,7 +87,7 @@ _SERVICE_SDO_VALUE_U16 = 1
 _POWER_TRANSITION_WAIT_POLL_INTERVAL_S = 0.01
 _POWER_TRANSITION_DEFAULT_TIMEOUT_S = 1.0
 _NATIVE_HOME_WAIT_POLL_INTERVAL_S = 0.05
-_NATIVE_HOME_WAIT_TIMEOUT_S = 10.0
+_NATIVE_HOME_WAIT_TIMEOUT_S = 20.0
 _RTCORE_METRICS_PATH = Path("/run/gradient-rt-motion/metrics.json")
 
 _HELLO_STRUCT = struct.Struct("<IHHIIQ4Q")  # 56 bytes
@@ -195,6 +199,58 @@ class _AxisConfig:
     num_axes: int
     counts_per_unit: list[float]
     sign: list[int]
+    counts_per_rev: list[int] = field(default_factory=lambda: [0] * _GRADIENT_MAX_AXES)
+
+
+@dataclass(frozen=True)
+class _AbsoluteFeedbackField:
+    valid: bool = False
+    value: int = 0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "valid": bool(self.valid),
+            "value": int(self.value),
+        }
+
+
+def _absolute_feedback_field_from_mapping(raw: object) -> _AbsoluteFeedbackField:
+    if not isinstance(raw, dict):
+        return _AbsoluteFeedbackField()
+    try:
+        valid = bool(int(raw.get("valid", 0)))
+    except Exception:
+        valid = False
+    try:
+        value = int(raw.get("value", 0))
+    except Exception:
+        value = 0
+    return _AbsoluteFeedbackField(valid=valid, value=value)
+
+
+@dataclass(frozen=True)
+class _AbsoluteFeedbackAxisMetrics:
+    fields: dict[str, _AbsoluteFeedbackField] = field(default_factory=dict)
+
+    @classmethod
+    def from_mapping(cls, raw: object) -> "_AbsoluteFeedbackAxisMetrics":
+        if not isinstance(raw, dict):
+            return cls()
+        fields: dict[str, _AbsoluteFeedbackField] = {}
+        for key, value in raw.items():
+            if not isinstance(key, str):
+                continue
+            fields[str(key)] = _absolute_feedback_field_from_mapping(value)
+        return cls(fields=fields)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            str(key): field.to_dict()
+            for key, field in self.fields.items()
+        }
+
+    def has_any_valid(self) -> bool:
+        return any(field.valid for field in self.fields.values())
 
 
 @dataclass(frozen=True)
@@ -335,7 +391,16 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._axis_fault_flags: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_brake_state: list[int] = [0] * _GRADIENT_MAX_AXES
         self._native_home_offset_counts: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._absolute_feedback_by_axis: list[_AbsoluteFeedbackAxisMetrics] = [
+            _AbsoluteFeedbackAxisMetrics() for _ in range(_GRADIENT_MAX_AXES)
+        ]
+        self._absolute_encoder_home_anchors: list[dict[str, Any] | None] = load_absolute_encoder_anchors(
+            self._robot_id,
+            num_joints=self._num_joints,
+        )
         self._native_home_metrics_mtime_ns = -1
+        self._feedback_unwrapped_counts: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._feedback_unwrapped_valid: list[bool] = [False] * _GRADIENT_MAX_AXES
         self._rt_drive_profile_code = 0
         self._rt_drive_profile_id: Optional[str] = None
         self._last_wkc_expected = 0
@@ -453,6 +518,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
         with self._status_lock:
             self._rt_drive_profile_code = 0
             self._rt_drive_profile_id = None
+            self._feedback_unwrapped_counts = [0] * _GRADIENT_MAX_AXES
+            self._feedback_unwrapped_valid = [False] * _GRADIENT_MAX_AXES
             self._last_submitted_traj_id = 0
             self._execution_status = RTCoreExecutionStatus(
                 active_mode=RTCORE_MOTION_MODE_IDLE,
@@ -1145,6 +1212,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
             ),
         )
         if bool(wait_result.get("verified", False)):
+            try:
+                self._capture_absolute_home_anchor_for_joint(
+                    joint_i,
+                    actor=f"ethercat_rtcore:joint{joint_i + 1}:native_home",
+                )
+            except Exception:
+                pass
             print(
                 "[EtherCAT RTCore] Native drive-home verified:"
                 f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
@@ -1352,24 +1426,129 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         return {i: int(self._axis_counts[i]) for i in range(self._rt_num_axes)}
 
-    def raw_to_joint_positions(self, raw_positions: dict[int, int]) -> list[float]:
+    def _canonical_joint_positions_from_raw_feedback(
+        self,
+        raw_positions: dict[int, int],
+    ) -> dict[str, object]:
         positions = self._copy_last_joint_setpoint_rad()
+        axis_truth_details: list[dict[str, object]] = []
+        unavailable_axes: list[int] = []
+        unavailable_joints: list[int] = []
         for axis_i, joint_i in enumerate(self._axis_to_joint):
             raw = raw_positions.get(axis_i)
-            if raw is None or not (0 <= joint_i < self._num_joints):
+            logical_joint = joint_i + 1 if 0 <= joint_i < self._num_joints else None
+            metrics = self._absolute_feedback_metrics_for_axis(axis_i)
+            normalized_absolute_feedback = self._normalize_absolute_feedback_metrics(metrics)
+            absolute_result = self._absolute_axis_q_from_metrics(axis_i, metrics)
+            anchor_entry = (
+                self._absolute_home_anchor_for_joint(joint_i)
+                if 0 <= joint_i < self._num_joints
+                else None
+            )
+            detail: dict[str, object] = {
+                "axis": int(axis_i),
+                "logical_joint": logical_joint,
+                "absolute_feedback": normalized_absolute_feedback,
+            }
+            if raw is not None:
+                detail["raw_counts"] = int(raw)
+                reference_q = self._reference_q_before_master_offset_for_axis(axis_i, int(raw))
+                if reference_q is not None:
+                    detail["reference_pre_zero_rad"] = float(reference_q)
+            if anchor_entry is not None:
+                detail["absolute_home_anchor_rad"] = float(anchor_entry["home_anchor_rad"])
+                if anchor_entry.get("source") is not None:
+                    detail["absolute_home_anchor_source"] = anchor_entry["source"]
+            if absolute_result is not None:
+                absolute_axis_q, absolute_source, absolute_counts = absolute_result
+                detail["absolute_counts"] = int(absolute_counts)
+                detail["absolute_source"] = str(absolute_source)
+                detail["absolute_axis_q_rad"] = float(absolute_axis_q)
+            else:
+                absolute_axis_q = None
+                absolute_source = None
+
+            truth_reason = None
+            if raw is None:
+                truth_reason = "raw_feedback_missing"
+            elif joint_i < 0 or joint_i >= self._num_joints:
+                truth_reason = "logical_joint_unmapped"
+            elif absolute_axis_q is None:
+                truth_reason = "absolute_feedback_unavailable"
+            elif anchor_entry is None:
+                truth_reason = "absolute_home_anchor_missing"
+
+            if truth_reason is not None:
+                detail["truth_available"] = False
+                detail["truth_status"] = "unavailable"
+                detail["truth_reason"] = truth_reason
+                detail["display_source"] = "truth_unavailable"
+                unavailable_axes.append(int(axis_i))
+                if logical_joint is not None:
+                    unavailable_joints.append(int(logical_joint))
+                axis_truth_details.append(detail)
                 continue
-            physical_q = self._axis_q_from_counts(axis_i, int(raw))
-            if physical_q is None:
-                continue
-            # Controller-facing joint feedback remains in the logical commissioning
-            # frame: scaled feedback plus the drive's persisted native-home offset,
-            # then minus the software zero offset.
-            positions[joint_i] = (
-                physical_q
-                + self._native_home_offset_q_for_axis(axis_i)
+
+            canonical_q = (
+                float(absolute_axis_q)
+                - float(anchor_entry["home_anchor_rad"])
                 - self._master_offset_for_joint(joint_i)
             )
-        return positions
+            positions[joint_i] = float(canonical_q)
+            detail["truth_available"] = True
+            detail["truth_status"] = "available"
+            detail["truth_source"] = "absolute_encoder_anchor"
+            detail["canonical_rad"] = float(canonical_q)
+            # Keep the legacy display fields as diagnostics/compatibility aliases
+            # while the rest of the stack is migrated onto the canonical fields.
+            detail["display_source"] = "absolute_encoder_anchor"
+            detail["display_rad"] = float(canonical_q)
+            axis_truth_details.append(detail)
+
+        unavailable_axes = sorted(set(unavailable_axes))
+        unavailable_joints = sorted(set(unavailable_joints))
+        return {
+            "joint_positions_rad": [float(value) for value in positions],
+            "axis_absolute_feedback": axis_truth_details,
+            "truth_available": len(unavailable_axes) == 0,
+            "truth_unavailable_axes": unavailable_axes,
+            "truth_unavailable_joints": unavailable_joints,
+        }
+
+    def _canonical_joint_positions_or_raise(self, raw_positions: dict[int, int]) -> list[float]:
+        snapshot = self._canonical_joint_positions_from_raw_feedback(raw_positions)
+        if bool(snapshot.get("truth_available")):
+            positions = snapshot.get("joint_positions_rad")
+            if isinstance(positions, list) and positions:
+                return [float(value) for value in positions]
+        unavailable_axes = snapshot.get("truth_unavailable_axes")
+        unavailable_joints = snapshot.get("truth_unavailable_joints")
+        raise RuntimeError(
+            "Canonical joint truth unavailable"
+            f" (axes={list(unavailable_axes) if isinstance(unavailable_axes, list) else []},"
+            f" joints={list(unavailable_joints) if isinstance(unavailable_joints, list) else []})"
+        )
+
+    def raw_to_joint_positions(self, raw_positions: dict[int, int]) -> list[float]:
+        # Canonical controller truth now comes from anchored multi-turn absolute
+        # feedback. RTCore's raw 0x6064/0x607A frame remains a derived transport
+        # encoding used only when translating queued targets back into wire counts.
+        return self._canonical_joint_positions_or_raise(raw_positions)
+
+    def get_display_feedback_snapshot(
+        self,
+        raw_positions: dict[int, int] | None = None,
+    ) -> dict[str, object] | None:
+        if raw_positions is None:
+            raw_positions = self.sync_read_positions()
+        if not isinstance(raw_positions, dict) or not raw_positions:
+            return None
+        return self._canonical_joint_positions_from_raw_feedback(raw_positions)
+
+    def raw_to_display_joint_positions(self, raw_positions: dict[int, int]) -> list[float]:
+        # Legacy compatibility alias: operator display truth is now the same
+        # canonical logical joint truth that the controller uses everywhere else.
+        return self._canonical_joint_positions_or_raise(raw_positions)
 
     def set_single_actuator_position(
         self,
@@ -1431,7 +1610,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
         for axis_i, mapped_joint in enumerate(self._axis_to_joint):
             if mapped_joint != joint_i:
                 continue
-            physical_q = self._axis_q_from_counts(axis_i, int(self._axis_counts[axis_i]))
+            physical_q = self._display_axis_q_from_raw_feedback_counts(
+                axis_i,
+                int(self._axis_counts[axis_i]),
+            )
             if physical_q is not None:
                 physical_samples.append(physical_q)
 
@@ -1458,6 +1640,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
             self._master_offsets_rad,
             actor=f"ethercat_rtcore:joint{joint_i + 1}",
         )
+        try:
+            self._capture_absolute_home_anchor_for_joint(
+                joint_i,
+                actor=f"ethercat_rtcore:joint{joint_i + 1}:software_zero",
+            )
+        except Exception:
+            pass
         print(
             "[EtherCAT RTCore] Captured logical zero:"
             f" joint={joint_i + 1} physical_q={new_offset:.6f} rad"
@@ -1836,6 +2025,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             *rest,
         ) = _AXIS_CONFIG_STRUCT.unpack_from(payload, 0)
         idx = 0
+        counts_per_rev = [int(x) for x in rest[idx : idx + _GRADIENT_MAX_AXES]]
         idx += _GRADIENT_MAX_AXES  # counts_per_rev
         idx += _GRADIENT_MAX_AXES  # gear_ratio
         sign = [int(x) for x in rest[idx : idx + _GRADIENT_MAX_AXES]]
@@ -1846,6 +2036,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             num_axes=int(num_axes),
             counts_per_unit=counts_per_unit,
             sign=sign,
+            counts_per_rev=counts_per_rev,
         )
 
     def _parse_status_hello(self, payload: bytes) -> tuple[Optional[str], int, int]:
@@ -1961,8 +2152,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
     def _build_axis_config_from_robot_config(self, robot_config: dict) -> Optional[_AxisConfig]:
         counts_per_radian = list(robot_config.get("actuator_counts_per_radian", []))
+        counts_per_rev = list(robot_config.get("actuator_encoder_counts_per_rev", []))
         if not counts_per_radian:
-            counts_per_rev = list(robot_config.get("actuator_encoder_counts_per_rev", []))
             gear_ratios = list(robot_config.get("actuator_gear_ratios", []))
             counts_per_radian = []
             for idx in range(max(len(counts_per_rev), len(gear_ratios))):
@@ -1991,16 +2182,62 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         counts_per_unit = [0.0] * _GRADIENT_MAX_AXES
         signs = [0] * _GRADIENT_MAX_AXES
+        runtime_counts_per_rev = [0] * _GRADIENT_MAX_AXES
         for idx in range(min(num_axes, _GRADIENT_MAX_AXES)):
             counts_per_unit[idx] = float(counts_per_radian[idx])
             raw_sign = int(signs_raw[idx]) if idx < len(signs_raw) else 1
             signs[idx] = 1 if raw_sign >= 0 else -1
+            runtime_counts_per_rev[idx] = int(counts_per_rev[idx]) if idx < len(counts_per_rev) else 0
 
         return _AxisConfig(
             num_axes=min(num_axes, _GRADIENT_MAX_AXES),
             counts_per_unit=counts_per_unit,
             sign=signs,
+            counts_per_rev=runtime_counts_per_rev,
         )
+
+    def _effective_drive_profile_id(self) -> Optional[str]:
+        live_profile_id = self.get_live_drive_profile_id()
+        if not live_profile_id and self._rt_drive_profile_code:
+            live_profile_id = rtcore_drive_profile_id_to_name(self._rt_drive_profile_code)
+        return live_profile_id
+
+    def _normalize_feedback_counts_for_axis(self, axis_i: int, raw_counts: int) -> int:
+        cfg = self._axis_config
+        if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
+            return int(raw_counts)
+        if self._effective_drive_profile_id() != "a6ec_ds402":
+            return int(raw_counts)
+        counts_per_rev = int(cfg.counts_per_rev[axis_i]) if axis_i < len(cfg.counts_per_rev) else 0
+        if counts_per_rev <= 0:
+            return int(raw_counts)
+        half_turn = counts_per_rev // 2
+        if half_turn <= 0:
+            return int(raw_counts)
+        return ((int(raw_counts) + half_turn) % counts_per_rev) - half_turn
+
+    def _display_feedback_counts_for_axis(self, axis_i: int, raw_counts: int) -> int:
+        normalized_counts = self._normalize_feedback_counts_for_axis(axis_i, raw_counts)
+        cfg = self._axis_config
+        if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
+            return int(normalized_counts)
+        if self._effective_drive_profile_id() != "a6ec_ds402":
+            return int(normalized_counts)
+        counts_per_rev = int(cfg.counts_per_rev[axis_i]) if axis_i < len(cfg.counts_per_rev) else 0
+        if counts_per_rev <= 0:
+            return int(normalized_counts)
+        with self._status_lock:
+            if axis_i >= len(self._feedback_unwrapped_counts) or axis_i >= len(self._feedback_unwrapped_valid):
+                return int(normalized_counts)
+            if not self._feedback_unwrapped_valid[axis_i]:
+                self._feedback_unwrapped_counts[axis_i] = int(normalized_counts)
+                self._feedback_unwrapped_valid[axis_i] = True
+                return int(normalized_counts)
+            previous = int(self._feedback_unwrapped_counts[axis_i])
+            turns = round((float(previous) - float(normalized_counts)) / float(counts_per_rev))
+            unwrapped = int(normalized_counts) + (int(turns) * counts_per_rev)
+            self._feedback_unwrapped_counts[axis_i] = int(unwrapped)
+            return int(unwrapped)
 
     def _maybe_warn_runtime_axis_config_mismatch(self, runtime_cfg: _AxisConfig) -> None:
         if self._robot_axis_config is None or self._axis_config_mismatch_logged:
@@ -2074,6 +2311,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if not isinstance(axes, list):
             return
         offsets = [0] * _GRADIENT_MAX_AXES
+        absolute_feedback = [_AbsoluteFeedbackAxisMetrics() for _ in range(_GRADIENT_MAX_AXES)]
         for axis_i, axis in enumerate(axes[:_GRADIENT_MAX_AXES]):
             if not isinstance(axis, dict):
                 continue
@@ -2081,8 +2319,12 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 offsets[axis_i] = int(axis.get("native_home_position_offset", 0))
             except Exception:
                 offsets[axis_i] = 0
+            absolute_feedback[axis_i] = _AbsoluteFeedbackAxisMetrics.from_mapping(
+                axis.get("absolute_feedback")
+            )
         with self._status_lock:
             self._native_home_offset_counts = offsets
+            self._absolute_feedback_by_axis = absolute_feedback
             self._native_home_metrics_mtime_ns = stat.st_mtime_ns
 
     def _load_rtcore_metrics_snapshot(self) -> dict[str, object] | None:
@@ -2105,11 +2347,175 @@ class EthercatRTCoreBackend(ActuatorBackend):
             return []
         return [axis for axis in axes if isinstance(axis, dict)]
 
+    def _absolute_feedback_metrics_for_axis(self, axis_i: int) -> _AbsoluteFeedbackAxisMetrics:
+        self._refresh_native_home_offsets_from_metrics()
+        with self._status_lock:
+            if axis_i < 0 or axis_i >= len(self._absolute_feedback_by_axis):
+                return _AbsoluteFeedbackAxisMetrics()
+            return self._absolute_feedback_by_axis[axis_i]
+
+    def _normalize_absolute_feedback_metrics(
+        self,
+        metrics: _AbsoluteFeedbackAxisMetrics,
+    ) -> dict[str, object]:
+        raw_feedback = metrics.to_dict()
+        normalized = drive_profile_registry.normalize_drive_absolute_feedback(
+            self._effective_drive_profile_id(),
+            raw_feedback,
+        )
+        return normalized if isinstance(normalized, dict) else raw_feedback
+
+    def _absolute_axis_counts_from_metrics(
+        self,
+        axis_i: int,
+        metrics: _AbsoluteFeedbackAxisMetrics,
+    ) -> tuple[int, str] | None:
+        del axis_i
+        payload = drive_profile_registry.resolve_drive_absolute_feedback_counts(
+            self._effective_drive_profile_id(),
+            metrics.to_dict(),
+        )
+        if not isinstance(payload, dict):
+            return None
+        try:
+            counts = int(payload.get("counts"))
+        except Exception:
+            return None
+        source_key = str(payload.get("source_key", "")).strip()
+        if not source_key:
+            return None
+        return int(counts), source_key
+
+    def _absolute_axis_q_from_metrics(
+        self,
+        axis_i: int,
+        metrics: _AbsoluteFeedbackAxisMetrics,
+    ) -> tuple[float, str, int] | None:
+        counts_and_source = self._absolute_axis_counts_from_metrics(axis_i, metrics)
+        if counts_and_source is None:
+            return None
+        absolute_counts, source = counts_and_source
+        axis_q = self._axis_q_from_counts(axis_i, int(absolute_counts))
+        if axis_q is None:
+            return None
+        return float(axis_q), str(source), int(absolute_counts)
+
+    def _absolute_home_anchor_for_joint(self, logical_joint_idx: int) -> dict[str, Any] | None:
+        with self._status_lock:
+            if logical_joint_idx < 0 or logical_joint_idx >= len(self._absolute_encoder_home_anchors):
+                return None
+            raw_entry = self._absolute_encoder_home_anchors[logical_joint_idx]
+        if not isinstance(raw_entry, dict):
+            return None
+        try:
+            home_anchor_rad = float(raw_entry.get("home_anchor_rad"))
+        except Exception:
+            return None
+        axis_indices_raw = raw_entry.get("axis_indices")
+        axis_indices: list[int] = []
+        if isinstance(axis_indices_raw, list):
+            for value in axis_indices_raw:
+                try:
+                    axis_indices.append(int(value))
+                except Exception:
+                    continue
+        source_raw = raw_entry.get("source")
+        updated_at_raw = raw_entry.get("updated_at")
+        updated_by_raw = raw_entry.get("updated_by")
+        return {
+            "home_anchor_rad": float(home_anchor_rad),
+            "source": str(source_raw).strip() if source_raw is not None else None,
+            "axis_indices": axis_indices,
+            "updated_at": str(updated_at_raw).strip() if updated_at_raw is not None else None,
+            "updated_by": str(updated_by_raw).strip() if updated_by_raw is not None else None,
+        }
+
+    def _reference_q_before_master_offset_for_axis(
+        self,
+        axis_i: int,
+        raw_counts: int,
+    ) -> float | None:
+        physical_q = self._axis_q_from_counts(axis_i, int(raw_counts))
+        if physical_q is None:
+            return None
+        return float(physical_q) + self._native_home_offset_q_for_axis(axis_i)
+
+    def _capture_absolute_home_anchor_for_joint(
+        self,
+        logical_joint_index: int,
+        *,
+        raw_positions: dict[int, int] | None = None,
+        actor: str = "unknown",
+    ) -> dict[str, Any] | None:
+        joint_i = int(logical_joint_index)
+        if joint_i < 0 or joint_i >= self._num_joints:
+            return None
+        if raw_positions is None:
+            with self._status_lock:
+                raw_positions = {
+                    axis_i: int(self._axis_counts[axis_i])
+                    for axis_i in range(min(self._rt_num_axes, len(self._axis_counts)))
+                }
+        anchor_samples: list[float] = []
+        axis_indices: list[int] = []
+        source_labels: list[str] = []
+        for axis_i, mapped_joint in enumerate(self._axis_to_joint):
+            if mapped_joint != joint_i:
+                continue
+            raw_counts = raw_positions.get(axis_i)
+            if raw_counts is None:
+                continue
+            metrics = self._absolute_feedback_metrics_for_axis(axis_i)
+            absolute_result = self._absolute_axis_q_from_metrics(axis_i, metrics)
+            reference_q = self._reference_q_before_master_offset_for_axis(axis_i, int(raw_counts))
+            if absolute_result is None or reference_q is None:
+                continue
+            absolute_axis_q, source, _absolute_counts = absolute_result
+            anchor_samples.append(float(absolute_axis_q) - float(reference_q))
+            axis_indices.append(int(axis_i))
+            source_labels.append(str(source))
+        if not anchor_samples:
+            return None
+        source = source_labels[0] if source_labels and len(set(source_labels)) == 1 else "mixed"
+        home_anchor_rad = float(sum(anchor_samples) / len(anchor_samples))
+        saved_entry = save_absolute_encoder_anchor(
+            self._robot_id,
+            num_joints=self._num_joints,
+            logical_joint_index=joint_i,
+            home_anchor_rad=home_anchor_rad,
+            source=source,
+            axis_indices=axis_indices,
+            actor=actor,
+        )
+        normalized_entry = (
+            {
+                "home_anchor_rad": float(saved_entry.get("home_anchor_rad", home_anchor_rad)),
+                "source": str(saved_entry.get("source", source)).strip() or source,
+                "axis_indices": [int(value) for value in list(saved_entry.get("axis_indices", axis_indices))],
+                "updated_at": str(saved_entry.get("updated_at", "")).strip() or None,
+                "updated_by": str(saved_entry.get("updated_by", actor)).strip() or actor,
+            }
+            if isinstance(saved_entry, dict)
+            else {
+                "home_anchor_rad": float(home_anchor_rad),
+                "source": source,
+                "axis_indices": [int(value) for value in axis_indices],
+                "updated_at": None,
+                "updated_by": actor,
+            }
+        )
+        if normalized_entry is not None:
+            with self._status_lock:
+                if 0 <= joint_i < len(self._absolute_encoder_home_anchors):
+                    self._absolute_encoder_home_anchors[joint_i] = normalized_entry
+        return normalized_entry
+
     def _native_home_metrics_result(
         self,
         target_axes: list[int],
         *,
         snapshot: dict[str, object],
+        allow_statusword_fallback: bool = True,
     ) -> dict[str, object]:
         axes = snapshot.get("axes")
         axis_results: list[dict[str, object]] = []
@@ -2127,18 +2533,53 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 abort_code = int(axis_payload.get("native_home_last_abort_code", 0))
             except Exception:
                 abort_code = 0
+            try:
+                statusword = int(axis_payload.get("statusword", 0))
+            except Exception:
+                statusword = 0
+            try:
+                error_code = int(axis_payload.get("error_code", 0))
+            except Exception:
+                error_code = 0
+            try:
+                manufacturer_error_code = int(axis_payload.get("manufacturer_error_code", 0))
+            except Exception:
+                manufacturer_error_code = 0
+            effective_state = int(state)
+            effective_abort_code = int(abort_code)
+            verification_source = "native_home_state"
+            if (
+                allow_statusword_fallback
+                and effective_state not in {1, 2}
+                and error_code == 0
+                and manufacturer_error_code == 0
+                and (statusword & 0x8000) != 0
+            ):
+                # Keep the command-result semantics aligned with the live driveFaults
+                # view: once RTCore's native-home tail is done, a clean live wire-state
+                # with HM bit 15 set should override stale last-operation failure fields.
+                effective_state = 2
+                effective_abort_code = 0
+                verification_source = "statusword_bit15"
             axis_results.append(
                 {
                     "axis": int(axis_i),
-                    "native_home_state": int(state),
-                    "native_home_state_name": _native_home_state_name(state),
-                    "native_home_last_abort_code": int(abort_code),
-                    "native_home_last_abort_code_hex": f"0x{abort_code & 0xFFFFFFFF:08X}",
+                    "native_home_state": int(effective_state),
+                    "native_home_state_name": _native_home_state_name(effective_state),
+                    "native_home_state_reported": int(state),
+                    "native_home_state_reported_name": _native_home_state_name(state),
+                    "native_home_last_abort_code": int(effective_abort_code),
+                    "native_home_last_abort_code_hex": f"0x{effective_abort_code & 0xFFFFFFFF:08X}",
+                    "native_home_last_abort_code_reported": int(abort_code),
+                    "native_home_last_abort_code_reported_hex": f"0x{abort_code & 0xFFFFFFFF:08X}",
+                    "statusword": int(statusword),
+                    "statusword_hex": f"0x{statusword & 0xFFFF:04X}",
+                    "verification_source": verification_source,
                 }
             )
-            if state == 3:
+            if effective_state == 3:
                 any_failed = True
-            elif state != 2:
+            elif effective_state != 2:
                 all_succeeded = False
 
         terminal_state = "pending"
@@ -2191,6 +2632,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         last_result: dict[str, object] | None = None
         saw_fresh_snapshot = False
+        saw_active_mask = False
         while time.monotonic() <= deadline:
             snapshot = self._load_rtcore_metrics_snapshot()
             if isinstance(snapshot, dict):
@@ -2198,8 +2640,22 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 snapshot_mtime_ns = int(snapshot.get("_mtime_ns", 0) or 0)
                 if snapshot_time_ns > int(min_metrics_time_ns) or snapshot_mtime_ns > int(min_metrics_mtime_ns):
                     saw_fresh_snapshot = True
-                    last_result = self._native_home_metrics_result(target_axes, snapshot=snapshot)
-                    if str(last_result.get("terminal_state", "pending")) in {"failed", "succeeded"}:
+                    try:
+                        active_mask = int(snapshot.get("native_home_active_axis_mask", 0) or 0)
+                    except Exception:
+                        active_mask = 0
+                    active_for_target = (active_mask & int(axis_mask)) != 0
+                    if active_for_target:
+                        saw_active_mask = True
+                    last_result = self._native_home_metrics_result(
+                        target_axes,
+                        snapshot=snapshot,
+                        allow_statusword_fallback=saw_active_mask and not active_for_target,
+                    )
+                    if (
+                        not active_for_target
+                        and str(last_result.get("terminal_state", "pending")) in {"failed", "succeeded"}
+                    ):
                         return last_result
             time.sleep(_NATIVE_HOME_WAIT_POLL_INTERVAL_S)
         if not saw_fresh_snapshot:
@@ -2265,7 +2721,14 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 axis_qd[axis_i] = float(joint_velocities_rad_s[joint_i])
         return axis_qd
 
+    def _display_axis_q_from_raw_feedback_counts(self, axis_i: int, raw_counts: int) -> Optional[float]:
+        display_counts = self._display_feedback_counts_for_axis(axis_i, raw_counts)
+        return self._axis_q_from_counts(axis_i, int(display_counts))
+
     def _axis_q_from_counts(self, axis_i: int, raw_counts: int) -> Optional[float]:
+        # Convert raw RTCore/drive counts into axis-space radians without
+        # display normalization. This preserves the motion frame that RTCore
+        # expects when queued targets are converted back into 0x607A counts.
         cfg = self._axis_config
         if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
             return None

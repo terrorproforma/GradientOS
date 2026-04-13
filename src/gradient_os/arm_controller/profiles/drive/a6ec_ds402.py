@@ -17,6 +17,11 @@ STARTUP_SETTING_LABEL = "A6-EC encoder position tracking mode"
 STARTUP_SETTING_OBJECT = "C00.07 / 0x2000:08"
 STARTUP_SETTING_ENV_VAR = "GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG"
 NATIVE_HOME_CONFIG_ENV_VAR = "GRADIENT_RT_NATIVE_HOME_CONFIG"
+ABSOLUTE_FEEDBACK_CONFIG_ENV_VAR = "GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG"
+MOTION_FEEDBACK_CONFIG = {
+    "profile_id": PROFILE_ID,
+    "feedback_counts_wrap": True,
+}
 STARTUP_SETTING_VALUE_LABELS = {
     0: "Incremental encoder mode",
     1: "Absolute position linear mode",
@@ -47,6 +52,11 @@ NATIVE_HOME_CONFIG = {
         {"op": "wait_statusword", "all_set_mask": 0x9000, "all_clear_mask": 0x2000},
         {"op": "refresh_truth"},
         {"op": "restore_mode", "value": 8},
+        {"op": "release_service_override"},
+        {"op": "write_sdo", "index": 0x2031, "subindex": 0x11, "type": "u16", "value": 1},
+        {"op": "wait_sdo", "index": 0x2031, "subindex": 0x11, "type": "u16", "value": 0},
+        {"op": "write_sdo", "index": 0x2031, "subindex": 0x11, "type": "u16", "value": 2},
+        {"op": "wait_sdo", "index": 0x2031, "subindex": 0x11, "type": "u16", "value": 0},
     ],
 }
 ENCODER_DATA_RESET_OPERATION = {
@@ -61,6 +71,95 @@ ENCODER_DATA_RESET_OPERATION = {
     "requires_power_cycle": True,
     "requires_rehome": True,
 }
+
+ABSOLUTE_FEEDBACK_FIELDS = [
+    {
+        "key": "absolute_position_reference",
+        "label": "Absolute position feedback (reference unit)",
+        "object": "U40.16 / 0x2040:17",
+        "index": 0x2040,
+        "subindex": 0x17,
+        "type": "i32",
+    },
+    {
+        "key": "encoder_single_turn_data",
+        "label": "Encoder single-turn data",
+        "object": "U40.1C / 0x2040:1D",
+        "index": 0x2040,
+        "subindex": 0x1D,
+        "type": "i32",
+    },
+    {
+        "key": "encoder_multi_turn_position",
+        "label": "Encoder multi-turn position data",
+        "object": "U40.1E / 0x2040:1F",
+        "index": 0x2040,
+        "subindex": 0x1F,
+        "type": "u16",
+    },
+    {
+        "key": "encoder_multi_turn_low",
+        "label": "Encoder multi-turn data low 32 bits",
+        "object": "U40.20 / 0x2040:21",
+        "index": 0x2040,
+        "subindex": 0x21,
+        "type": "i32",
+    },
+    {
+        "key": "encoder_multi_turn_high",
+        "label": "Encoder multi-turn data high 32 bits",
+        "object": "U40.22 / 0x2040:23",
+        "index": 0x2040,
+        "subindex": 0x23,
+        "type": "i32",
+    },
+    {
+        "key": "rotation_mode_position_reference",
+        "label": "Rotation-mode position feedback (reference unit)",
+        "object": "U40.28 / 0x2040:29",
+        "index": 0x2040,
+        "subindex": 0x29,
+        "type": "i32",
+    },
+    {
+        "key": "rotation_mode_encoder_low",
+        "label": "Rotation-mode encoder feedback low 32 bits",
+        "object": "U40.2A / 0x2040:2B",
+        "index": 0x2040,
+        "subindex": 0x2B,
+        "type": "i32",
+    },
+    {
+        "key": "rotation_mode_encoder_high",
+        "label": "Rotation-mode encoder feedback high 32 bits",
+        "object": "U40.2C / 0x2040:2D",
+        "index": 0x2040,
+        "subindex": 0x2D,
+        "type": "i32",
+    },
+]
+
+ABSOLUTE_FEEDBACK_SOURCES = [
+    {
+        "key": "encoder_multi_turn_counts",
+        "label": "Combined encoder multi-turn counts",
+        "kind": "signed_i64_pair",
+        "low_key": "encoder_multi_turn_low",
+        "high_key": "encoder_multi_turn_high",
+    },
+    {
+        "key": "rotation_mode_encoder_counts",
+        "label": "Combined rotation-mode encoder counts",
+        "kind": "signed_i64_pair",
+        "low_key": "rotation_mode_encoder_low",
+        "high_key": "rotation_mode_encoder_high",
+    },
+]
+
+ABSOLUTE_FEEDBACK_DISPLAY_SOURCE_KEYS = [
+    "encoder_multi_turn_counts",
+    "rotation_mode_encoder_counts",
+]
 
 _DRIVE_FAULT_CODEBOOK_CACHE: dict[str, Any] | None = None
 
@@ -246,6 +345,18 @@ def _render_native_home_config_spec(config: Mapping[str, Any]) -> str:
                 f"{int(step.get('value', 0))}"
             )
             continue
+        if op == "wait_sdo":
+            parts.append(
+                "op|wait_sdo|"
+                f"0x{int(step.get('index', 0)) & 0xFFFF:04X}|"
+                f"0x{int(step.get('subindex', 0)) & 0xFF:02X}|"
+                f"{str(step.get('type', 'u16')).strip().lower()}|"
+                f"{int(step.get('value', 0))}"
+            )
+            continue
+        if op == "release_service_override":
+            parts.append("op|release_service_override")
+            continue
         if op == "controlword_sequence":
             rendered_values = ",".join(str(int(value)) for value in list(step.get("values", [])))
             parts.append(f"op|controlword_sequence|{rendered_values}")
@@ -260,6 +371,58 @@ def _render_native_home_config_spec(config: Mapping[str, Any]) -> str:
         if op == "refresh_truth":
             parts.append("op|refresh_truth")
     return ";".join(parts)
+
+
+def _render_absolute_feedback_config_spec(config: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    for raw_field in list(config.get("fields", [])):
+        if not isinstance(raw_field, Mapping):
+            continue
+        key = str(raw_field.get("key", "")).strip()
+        field_type = str(raw_field.get("type", "")).strip().lower()
+        if not key or not field_type:
+            continue
+        parts.append(
+            f"{key}|"
+            f"0x{int(raw_field.get('index', 0)) & 0xFFFF:04X}|"
+            f"0x{int(raw_field.get('subindex', 0)) & 0xFF:02X}|"
+            f"{field_type}"
+        )
+    return ";".join(parts)
+
+
+def _normalize_absolute_feedback_field(
+    raw: object,
+    *,
+    label: str,
+    object_label: str,
+) -> dict[str, Any]:
+    field = raw if isinstance(raw, Mapping) else {}
+    try:
+        valid = bool(int(field.get("valid", 0)))
+    except Exception:
+        valid = False
+    try:
+        value = int(field.get("value", 0))
+    except Exception:
+        value = 0
+    return {
+        "label": str(label),
+        "object": str(object_label),
+        "valid": bool(valid),
+        "value": int(value),
+    }
+
+
+def _combine_signed_i64_pair(low_field: Mapping[str, Any], high_field: Mapping[str, Any]) -> int | None:
+    if not bool(low_field.get("valid")) or not bool(high_field.get("valid")):
+        return None
+    combined = ((int(high_field.get("value", 0)) & 0xFFFFFFFF) << 32) | (
+        int(low_field.get("value", 0)) & 0xFFFFFFFF
+    )
+    if combined >= (1 << 63):
+        combined -= 1 << 64
+    return int(combined)
 
 
 def build_startup_config(raw_entries: object, *, num_axes: int) -> dict[str, Any]:
@@ -341,6 +504,76 @@ def extract_startup_config_axis(axis: Mapping[str, Any]) -> dict[str, Any] | Non
 
 def get_encoder_data_reset_operation() -> dict[str, Any]:
     return dict(ENCODER_DATA_RESET_OPERATION)
+
+
+def get_absolute_feedback_config() -> dict[str, Any]:
+    payload = {
+        "profile_id": PROFILE_ID,
+        "fields": [dict(field) for field in ABSOLUTE_FEEDBACK_FIELDS],
+        "sources": [dict(source) for source in ABSOLUTE_FEEDBACK_SOURCES],
+        "preferred_display_source_keys": list(ABSOLUTE_FEEDBACK_DISPLAY_SOURCE_KEYS),
+    }
+    payload["env"] = {
+        ABSOLUTE_FEEDBACK_CONFIG_ENV_VAR: _render_absolute_feedback_config_spec(payload),
+    }
+    return payload
+
+
+def get_motion_feedback_config() -> dict[str, Any]:
+    return dict(MOTION_FEEDBACK_CONFIG)
+
+
+def normalize_absolute_feedback(raw_feedback: object) -> dict[str, Any] | None:
+    if not isinstance(raw_feedback, Mapping):
+        return None
+    normalized: dict[str, Any] = {}
+    for field in ABSOLUTE_FEEDBACK_FIELDS:
+        key = str(field.get("key", "")).strip()
+        if not key:
+            continue
+        normalized[key] = _normalize_absolute_feedback_field(
+            raw_feedback.get(key),
+            label=str(field.get("label", key)),
+            object_label=str(field.get("object", "")).strip(),
+        )
+    for source in ABSOLUTE_FEEDBACK_SOURCES:
+        kind = str(source.get("kind", "")).strip().lower()
+        source_key = str(source.get("key", "")).strip()
+        if kind != "signed_i64_pair" or not source_key:
+            continue
+        low_key = str(source.get("low_key", "")).strip()
+        high_key = str(source.get("high_key", "")).strip()
+        low_field = normalized.get(low_key)
+        high_field = normalized.get(high_key)
+        combined = _combine_signed_i64_pair(
+            low_field if isinstance(low_field, Mapping) else {},
+            high_field if isinstance(high_field, Mapping) else {},
+        )
+        if combined is None:
+            continue
+        normalized[source_key] = {
+            "label": str(source.get("label", source_key)),
+            "kind": kind,
+            "valid": True,
+            "value": int(combined),
+        }
+    return normalized
+
+
+def resolve_absolute_feedback_counts(raw_feedback: object) -> dict[str, Any] | None:
+    normalized = normalize_absolute_feedback(raw_feedback)
+    if not isinstance(normalized, Mapping):
+        return None
+    for source_key in ABSOLUTE_FEEDBACK_DISPLAY_SOURCE_KEYS:
+        source_field = normalized.get(source_key)
+        if not isinstance(source_field, Mapping) or not bool(source_field.get("valid")):
+            continue
+        return {
+            "source_key": str(source_key),
+            "source_label": str(source_field.get("label", source_key)),
+            "counts": int(source_field.get("value", 0)),
+        }
+    return None
 
 
 def get_native_home_config() -> dict[str, Any]:

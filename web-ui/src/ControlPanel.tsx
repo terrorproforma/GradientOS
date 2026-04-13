@@ -36,10 +36,34 @@ type RuntimeHeaderProps = {
 type JointInfoResponse = {
 	arm_deg?: number[];
 	arm_rad?: number[];
+	arm_display_deg?: number[];
+	arm_display_rad?: number[];
 	gripper_deg?: number;
 	gripper_rad?: number;
 	read_source?: string;
 };
+
+function preferredJointAnglesDeg(payload: JointInfoResponse | null | undefined): number[] | null {
+	if (Array.isArray(payload?.arm_deg) && payload.arm_deg.length > 0) {
+		return payload.arm_deg.map((value) => Number(value));
+	}
+	if (Array.isArray(payload?.arm_display_deg) && payload.arm_display_deg.length > 0) {
+		return payload.arm_display_deg.map((value) => Number(value));
+	}
+	return null;
+}
+
+function preferredTelemetryJointAnglesRad(
+	telemetry: { display_joints?: number[]; joints?: number[] } | null | undefined,
+): number[] | null {
+	if (Array.isArray(telemetry?.joints) && telemetry.joints.length > 0) {
+		return telemetry.joints.map((value) => Number(value));
+	}
+	if (Array.isArray(telemetry?.display_joints) && telemetry.display_joints.length > 0) {
+		return telemetry.display_joints.map((value) => Number(value));
+	}
+	return null;
+}
 
 type MotionExecutionPayload = {
 	controller_motion_state?: string;
@@ -168,6 +192,12 @@ type DriveStartupConfig = {
 	verified?: boolean;
 };
 
+type AbsoluteFeedbackField = {
+	label?: string;
+	valid?: boolean;
+	value?: number;
+};
+
 type DriveFaultAxis = {
 	axis: number;
 	logical_joint?: number | null;
@@ -178,8 +208,10 @@ type DriveFaultAxis = {
 	manufacturer_error_code?: number;
 	manufacturer_error_code_hex?: string;
 	startup_drive_config?: DriveStartupConfig | null;
+	absolute_feedback?: Record<string, AbsoluteFeedbackField> | null;
 	native_home_state?: number;
 	native_home_state_name?: string;
+	native_home_active?: boolean;
 	native_home_position_offset?: number;
 	native_home_last_abort_code?: number;
 	native_home_last_abort_code_hex?: string;
@@ -208,6 +240,8 @@ type DriveFaultSnapshot = {
 	armed?: number;
 	axis_enable_mask?: number;
 	axis_enable_mask_hex?: string;
+	native_home_active_axis_mask?: number;
+	native_home_active_axis_mask_hex?: string;
 	enable_requested?: boolean;
 	requested_axes?: number;
 	op_enabled_axes?: number;
@@ -314,6 +348,11 @@ function formatNativeHomeStatus(
 ): string | null {
 	if (!axis) {
 		return null;
+	}
+	const activeMask = driveFaults?.native_home_active_axis_mask ?? 0;
+	const activeForAxis = Boolean(axis.native_home_active) || ((activeMask & (1 << axis.axis)) !== 0);
+	if (activeForAxis) {
+		return "Drive Home requested...";
 	}
 	const stateName = (axis.native_home_state_name ?? "").trim().toLowerCase();
 	if (!stateName || stateName === "idle") {
@@ -492,6 +531,28 @@ export function ControlPanelRuntimeHeader({
 		}
 		return mapping;
 	}, [driveFaults]);
+	const nativeHomeActiveAxisMask = driveFaults?.native_home_active_axis_mask ?? 0;
+	const nativeHomeActiveAxes = useMemo(
+		() =>
+			(driveFaults?.axes ?? []).filter(
+				(axis) => Boolean(axis.native_home_active) || ((nativeHomeActiveAxisMask & (1 << axis.axis)) !== 0),
+			),
+		[driveFaults, nativeHomeActiveAxisMask],
+	);
+	const nativeHomeBusy = nativeHomeActiveAxisMask !== 0 || nativeHomeActiveAxes.length > 0;
+	const nativeHomeInProgressMessage = useMemo(() => {
+		if (!nativeHomeBusy) {
+			return null;
+		}
+		const labels = nativeHomeActiveAxes
+			.map((axis) => (typeof axis.logical_joint === "number" ? `J${axis.logical_joint}` : `axis${axis.axis}`));
+		const uniqueLabels = Array.from(new Set(labels));
+		if (uniqueLabels.length === 0) {
+			return "Drive-native home still running. Wait for the persistence step to finish before starting another home.";
+		}
+		const targets = uniqueLabels.join(", ");
+		return `Drive-native home still running for ${targets}. Wait for the persistence step to finish before starting another home.`;
+	}, [nativeHomeActiveAxes, nativeHomeBusy]);
 	const driveControlBackend = (driveFaults?.servo_backend ?? activeServoBackend ?? "").trim().toLowerCase();
 	const requiresExplicitDrivePower = driveControlBackend === "ethercat_rtcore";
 	const drivePowerRequested = Boolean(
@@ -564,11 +625,12 @@ export function ControlPanelRuntimeHeader({
 				throw new Error(msg || `${res.status} ${res.statusText}`);
 			}
 			const payload = await res.json() as JointInfoResponse;
-			if (!Array.isArray(payload.arm_deg)) {
+			const nextAngles = preferredJointAnglesDeg(payload);
+			if (!nextAngles) {
 				return false;
 			}
 			onJointFeedback?.(
-				payload.arm_deg,
+				nextAngles,
 				typeof payload.gripper_deg === "number" ? payload.gripper_deg : undefined,
 			);
 			return true;
@@ -842,6 +904,28 @@ export function ControlPanel({
 		}
 		return mapping;
 	}, [driveFaults]);
+	const nativeHomeActiveAxisMask = driveFaults?.native_home_active_axis_mask ?? 0;
+	const nativeHomeActiveAxes = useMemo(
+		() =>
+			(driveFaults?.axes ?? []).filter(
+				(axis) => Boolean(axis.native_home_active) || ((nativeHomeActiveAxisMask & (1 << axis.axis)) !== 0),
+			),
+		[driveFaults, nativeHomeActiveAxisMask],
+	);
+	const nativeHomeBusy = nativeHomeActiveAxisMask !== 0 || nativeHomeActiveAxes.length > 0;
+	const nativeHomeInProgressMessage = useMemo(() => {
+		if (!nativeHomeBusy) {
+			return null;
+		}
+		const labels = nativeHomeActiveAxes
+			.map((axis) => (typeof axis.logical_joint === "number" ? `J${axis.logical_joint}` : `axis${axis.axis}`));
+		const uniqueLabels = Array.from(new Set(labels));
+		if (uniqueLabels.length === 0) {
+			return "Drive-native home still running. Wait for the persistence step to finish before starting another home.";
+		}
+		const targets = uniqueLabels.join(", ");
+		return `Drive-native home still running for ${targets}. Wait for the persistence step to finish before starting another home.`;
+	}, [nativeHomeActiveAxes, nativeHomeBusy]);
 	const driveControlBackend = (driveFaults?.servo_backend ?? activeServoBackend ?? "").trim().toLowerCase();
 	const requiresExplicitDrivePower = driveControlBackend === "ethercat_rtcore";
 	const drivePowerRequested = Boolean(
@@ -978,7 +1062,8 @@ export function ControlPanel({
 
 	const refreshJointAngles = useCallback(async (silent = true) => {
 		const payload = await getJson<JointInfoResponse>("/info/joints-detailed", silent);
-		if (!payload || !Array.isArray(payload.arm_deg)) {
+		const nextAngles = preferredJointAnglesDeg(payload);
+		if (!payload || !nextAngles) {
 			setJointAnglesDeg([]);
 			try {
 				onJointFeedback?.([], undefined);
@@ -1000,7 +1085,6 @@ export function ControlPanel({
 			setJointFeedbackError("Live joint feedback unavailable; controller only has cached joint state.");
 			return false;
 		}
-		const nextAngles = payload.arm_deg.map((value) => Number(value));
 		setJointAnglesDeg(nextAngles);
 		try {
 			onJointFeedback?.(
@@ -1040,10 +1124,11 @@ export function ControlPanel({
 	}, [refreshJointAngles]);
 
 	useEffect(() => {
-		if (!isMonitorFresh || !Array.isArray(latestTelemetry?.joints) || latestTelemetry.joints.length === 0) {
+		const telemetryAnglesRad = preferredTelemetryJointAnglesRad(latestTelemetry);
+		if (!isMonitorFresh || !telemetryAnglesRad) {
 			return;
 		}
-		const nextAngles = latestTelemetry.joints.map((value) => Number((value * 180) / Math.PI));
+		const nextAngles = telemetryAnglesRad.map((value) => Number((value * 180) / Math.PI));
 		setJointAnglesDeg((current) => {
 			if (current.length === nextAngles.length) {
 				let changed = false;
@@ -1063,7 +1148,7 @@ export function ControlPanel({
 	}, [isMonitorFresh, latestTelemetry]);
 
 	useEffect(() => {
-		if (isMonitorFresh && Array.isArray(latestTelemetry?.joints) && latestTelemetry.joints.length > 0) {
+		if (isMonitorFresh && preferredTelemetryJointAnglesRad(latestTelemetry)) {
 			return;
 		}
 		let disposed = false;
@@ -2721,6 +2806,11 @@ export function ControlPanel({
 								{commissioningStatus.message}
 							</div>
 						) : null}
+						{nativeHomeInProgressMessage ? (
+							<div className="mb-2 rounded border border-amber-500/30 bg-amber-400/10 px-2 py-1.5 text-[11px] text-amber-100">
+								{nativeHomeInProgressMessage}
+							</div>
+						) : null}
 						<div className="space-y-1">
 							{Array.from({ length: jointAnglesDeg.length > 0 ? jointAnglesDeg.length : 6 }, (_, jointIndex) => {
 								const jointNumber = jointIndex + 1;
@@ -2728,6 +2818,8 @@ export function ControlPanel({
 								const angleLabel = Number.isFinite(angleDeg) ? `${angleDeg.toFixed(2)}°` : "--";
 								const driveAxis = commissioningDriveAxesByJoint.get(jointNumber);
 								const nativeHomeStatus = formatNativeHomeStatus(driveAxis, driveFaults);
+								const nativeHomeActiveForJoint = Boolean(driveAxis?.native_home_active)
+									|| (driveAxis ? ((nativeHomeActiveAxisMask & (1 << driveAxis.axis)) !== 0) : false);
 								const isPending = pendingJointAction === `jog-${jointIndex}`
 									|| pendingJointAction === `zero-${jointIndex}`
 									|| pendingJointAction === `native-home-${jointIndex}`;
@@ -2809,11 +2901,17 @@ export function ControlPanel({
 												onClick={() => {
 													void handleJointNativeHome(jointIndex);
 												}}
-												disabled={zeroDisabled}
+												disabled={zeroDisabled || nativeHomeBusy}
 												title={
-													hasLiveFeedback
-														? `Run commissioning drive-native home for J${jointNumber} at the current pose`
-														: `Live joint feedback is required before commissioning drive-native home on J${jointNumber}`
+													nativeHomeBusy
+														? (
+															nativeHomeActiveForJoint
+																? `Drive-native home is still running for J${jointNumber}. Wait for the persistence step to finish.`
+																: `Another drive-native home is still running. Wait for it to finish before homing J${jointNumber}.`
+														)
+														: hasLiveFeedback
+															? `Run commissioning drive-native home for J${jointNumber} at the current pose`
+															: `Live joint feedback is required before commissioning drive-native home on J${jointNumber}`
 												}
 											>
 												{isPending && pendingJointAction === `native-home-${jointIndex}` ? "..." : "Drive Home"}
