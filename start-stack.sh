@@ -52,6 +52,8 @@ API_TIMEOUT_S="${GRADIENT_STACK_API_TIMEOUT_S:-20}"
 WEB_TIMEOUT_S="${GRADIENT_STACK_WEB_TIMEOUT_S:-20}"
 PROBE_INTERVAL_S="${GRADIENT_STACK_PROBE_INTERVAL_S:-0.25}"
 BUS_READY_TIMEOUT_S="${GRADIENT_STACK_BUS_READY_TIMEOUT_S:-20}"
+BUS_READY_PROGRESS_GRACE_S="${GRADIENT_STACK_BUS_PROGRESS_GRACE_S:-15}"
+BUS_READY_MAX_TIMEOUT_S="${GRADIENT_STACK_BUS_MAX_TIMEOUT_S:-60}"
 STARTUP_FAULT_RESET_TIMEOUT_S="${GRADIENT_STACK_STARTUP_FAULT_RESET_TIMEOUT_S:-3}"
 INTERACTIVE_CONSOLE_MODE="${GRADIENT_STACK_INTERACTIVE_CONSOLE:-auto}"
 GRADIENT_STACK_COLOR_MODE="${GRADIENT_STACK_COLOR:-auto}"
@@ -126,6 +128,8 @@ Environment:
   GRADIENT_STACK_API_TIMEOUT_S         API readiness timeout (default: 20)
   GRADIENT_STACK_WEB_TIMEOUT_S         Web readiness timeout (default: 20)
   GRADIENT_STACK_PROBE_INTERVAL_S      Probe interval seconds (default: 0.25)
+  GRADIENT_STACK_BUS_PROGRESS_GRACE_S  Extra seconds to keep waiting after positive bus progress (default: 15)
+  GRADIENT_STACK_BUS_MAX_TIMEOUT_S     Hard cap for bus readiness wait, including progress grace (default: 60)
   GRADIENT_STACK_STARTUP_FAULT_RESET_TIMEOUT_S  Wait time after startup auto-reset before aborting (default: 3)
   GRADIENT_STACK_COLOR                Banner color mode: auto|0|1 (default: auto)
 EOF
@@ -224,7 +228,7 @@ ui_can_render() {
 }
 
 ui_next_spinner_frame() {
-  local frames=("[=   ]" "[==  ]" "[=== ]" "[ ===]" "[  ==]" "[   =]")
+  local frames=("[#---]" "[-#--]" "[--#-]" "[---#]" "[--#-]" "[-#--]")
   local frame="${frames[$((UI_SPINNER_INDEX % ${#frames[@]}))]}"
   UI_SPINNER_INDEX=$((UI_SPINNER_INDEX + 1))
   printf '%s' "${frame}"
@@ -246,6 +250,7 @@ ui_loading_begin() {
   local stage="$1"
   local detail="$2"
   local started_ms="${3:-}"
+  local timeout_s="${4:-}"
   init_banner_palette
   ui_status_clear
   if ! ui_can_render; then
@@ -257,20 +262,35 @@ ui_loading_begin() {
   local tty_device="${TTY_DEVICE}"
   local warn_style="${UI_WARN}"
   local info_style="${UI_INFO}"
+  local muted_style="${BANNER_MUTED}"
   local reset_style="${BANNER_RESET}"
   (
     trap 'exit 0' TERM INT
-    local frames=("[=   ]" "[==  ]" "[=== ]" "[ ===]" "[  ==]" "[   =]")
+    local frames=("[#---]" "[-#--]" "[--#-]" "[---#]" "[--#-]" "[-#--]")
     local index=0
     while true; do
       local current_ms
       local elapsed_ms
+      local elapsed_label
+      local countdown=""
       current_ms="$(now_ms)"
       elapsed_ms=$(( current_ms - started_ms ))
+      elapsed_label="$(format_duration_ms "${elapsed_ms}")"
+      if [[ -n "${timeout_s}" ]]; then
+        local timeout_ms=$(( timeout_s * 1000 ))
+        local remaining_ms=$(( timeout_ms - elapsed_ms ))
+        if (( remaining_ms < 0 )); then
+          remaining_ms=0
+        fi
+        countdown="  ${timeout_s}s timeout :: left $(format_duration_ms "${remaining_ms}")"
+      fi
       printf '\r\033[2K  %b%s%b %b%-18s%b %s  t+%s' \
         "${warn_style}" "${frames[$((index % ${#frames[@]}))]}" "${reset_style}" \
         "${info_style}" "${stage}" "${reset_style}" \
-        "${detail}" "$(format_duration_ms "${elapsed_ms}")" > "${tty_device}"
+        "${detail}" "${elapsed_label}" > "${tty_device}"
+      if [[ -n "${countdown}" ]]; then
+        printf '  %b%s%b' "${muted_style}" "${countdown}" "${reset_style}" > "${tty_device}"
+      fi
       index=$((index + 1))
       sleep 0.12
     done
@@ -283,12 +303,14 @@ ui_loading_status() {
   local stage="$1"
   local detail="$2"
   local started_ms="${3:-}"
+  local timeout_s="${4:-}"
   init_banner_palette
   if ! ui_can_render; then
     return 0
   fi
   local frame=""
   local elapsed_suffix=""
+  local timeout_suffix=""
   frame="$(ui_next_spinner_frame)"
   if [[ -n "${started_ms}" ]]; then
     local current_ms=""
@@ -296,11 +318,19 @@ ui_loading_status() {
     current_ms="$(now_ms)"
     elapsed_ms=$(( current_ms - started_ms ))
     elapsed_suffix="  t+$(format_duration_ms "${elapsed_ms}")"
+    if [[ -n "${timeout_s}" ]]; then
+      local timeout_ms=$(( timeout_s * 1000 ))
+      local remaining_ms=$(( timeout_ms - elapsed_ms ))
+      if (( remaining_ms < 0 )); then
+        remaining_ms=0
+      fi
+      timeout_suffix="  ${timeout_s}s timeout :: left $(format_duration_ms "${remaining_ms}")"
+    fi
   fi
   printf '\r\033[2K  %b%s%b %b%-18s%b %s' \
     "${UI_WARN}" "${frame}" "${BANNER_RESET}" \
     "${UI_INFO}" "${stage}" "${BANNER_RESET}" \
-    "${detail}${elapsed_suffix}" > "${TTY_DEVICE}"
+    "${detail}${elapsed_suffix}${timeout_suffix}" > "${TTY_DEVICE}"
   UI_STATUS_ACTIVE=1
 }
 
@@ -308,12 +338,16 @@ run_with_loading_capture() {
   local __out_var="$1"
   local stage="$2"
   local detail="$3"
+  local timeout_s="${4:-}"
   shift 3
+  if [[ -n "${timeout_s}" ]]; then
+    shift
+  fi
   local output=""
   local rc=0
   local started_ms
   started_ms="$(now_ms)"
-  ui_loading_begin "${stage}" "${detail}" "${started_ms}"
+  ui_loading_begin "${stage}" "${detail}" "${started_ms}" "${timeout_s}"
   output="$("$@" 2>&1)" || rc=$?
   ui_status_clear
   printf -v "${__out_var}" '%s' "${output}"
@@ -462,6 +496,7 @@ print_boot_success_block() {
     "  robot:  ${BOOT_SUMMARY_ROBOT:-unknown}" \
     "  stack:  $(style_ok "${BOOT_SUMMARY_IK:-unknown}") / $(style_ok "${BOOT_SUMMARY_SERVO:-unknown}") / $(style_ok "${BOOT_SUMMARY_DRIVE:-unknown}")" \
     "  bus:    $(style_ok 'READY') and $(style_ok 'DISARMED')" \
+    "  truth:  $(style_warn 'MONITORING')" \
     "  api:    $(style_ok "ONLINE at http://127.0.0.1:${API_PORT}")" \
     "  web:    ${web_status}" \
     "  logs:   ${LOG_DIR}" \
@@ -710,13 +745,32 @@ import time
 
 label = sys.argv[1]
 path = sys.argv[2]
+try:
+    with io.StringIO() as _sink:
+        from contextlib import redirect_stdout
+        with redirect_stdout(_sink):
+            from gradient_os.telemetry.terminal_dashboard import (
+                TerminalDashboardState,
+                process_service_log_line,
+            )
+except Exception:
+    TerminalDashboardState = None
+    process_service_log_line = None
+
+state = TerminalDashboardState() if TerminalDashboardState is not None else None
 
 with open(path, "r", encoding="utf-8", errors="replace") as handle:
     while True:
         line = handle.readline()
         if line:
-            sys.stdout.write(f"[{label}] {line}")
-            sys.stdout.flush()
+            if state is not None and callable(process_service_log_line):
+                emitted = process_service_log_line(label, line, state)
+                for output_line in emitted:
+                    sys.stdout.write(output_line + "\n")
+                    sys.stdout.flush()
+            else:
+                sys.stdout.write(f"[{label}] {line}")
+                sys.stdout.flush()
             continue
         time.sleep(0.1)
 PY
@@ -1498,7 +1552,7 @@ wait_for_probe_state() {
         success "hardware reached ${desired_state} in $(format_duration_ms $(( $(now_ms) - started_ms )))"
         return 0
       fi
-      ui_loading_status "hardware" "Waiting for physical_state=${desired_state} (current=${current_state})" "${started_ms}"
+      ui_loading_status "hardware" "Waiting for physical_state=${desired_state} (current=${current_state})" "${started_ms}" "${timeout_s}"
     fi
 
     local now
@@ -1527,7 +1581,7 @@ wait_for_probe_soft_stop_safe() {
       return 0
     fi
     if [[ -n "${payload}" ]]; then
-      ui_loading_status "soft stop" "$(describe_probe_soft_stop_state "${payload}")" "${started_ms}"
+      ui_loading_status "soft stop" "$(describe_probe_soft_stop_state "${payload}")" "${started_ms}" "${timeout_s}"
     fi
 
     local now
@@ -1543,8 +1597,14 @@ wait_for_probe_soft_stop_safe() {
 wait_for_bus_operational() {
   local started_at
   local started_ms
+  local deadline_at
+  local hard_deadline_at
+  local best_progress_score=-1
+  local extension_logged=0
   started_at="$(date +%s)"
   started_ms="$(now_ms)"
+  deadline_at=$(( started_at + BUS_READY_TIMEOUT_S ))
+  hard_deadline_at=$(( started_at + BUS_READY_MAX_TIMEOUT_S ))
   local last_detail=""
 
   while true; do
@@ -1558,6 +1618,7 @@ wait_for_bus_operational() {
       local operational=""
       local startup_ready=""
       local wkc_actual=""
+      local link_up=""
 
       metrics_available="$(probe_json_field "${payload}" "metrics_available")"
       num_axes="$(probe_json_field "${payload}" "num_axes")"
@@ -1566,6 +1627,7 @@ wait_for_bus_operational() {
       operational="$(probe_json_field "${payload}" "operational")"
       startup_ready="$(probe_json_field "${payload}" "startup_ready")"
       wkc_actual="$(probe_json_field "${payload}" "wkc_actual")"
+      link_up="$(probe_json_field "${payload}" "link_up")"
 
       if [[ "${metrics_available}" == "1" && -n "${num_axes}" && "${num_axes}" != "0" ]]; then
         if [[ "${responding}" == "${num_axes}" && "${online}" == "${num_axes}" && "${operational}" == "${num_axes}" && "${startup_ready}" == "1" ]]; then
@@ -1574,7 +1636,32 @@ wait_for_bus_operational() {
           return 0
         fi
         local detail="responding=${responding}/${num_axes} online=${online}/${num_axes} operational=${operational}/${num_axes} startup_ready=${startup_ready} wkc=${wkc_actual}"
-        ui_loading_status "fieldbus" "${detail}" "${started_ms}"
+        local now_for_progress
+        local progress_score
+        local remaining_s
+        now_for_progress="$(date +%s)"
+        progress_score=$(( ${responding:-0} + ${online:-0} + ${operational:-0} + (${startup_ready:-0} * ${num_axes:-0}) + ${link_up:-0} ))
+        if (( progress_score > best_progress_score )); then
+          best_progress_score="${progress_score}"
+          if (( progress_score > 0 )); then
+            local candidate_deadline=$(( now_for_progress + BUS_READY_PROGRESS_GRACE_S ))
+            if (( candidate_deadline > deadline_at )); then
+              deadline_at="${candidate_deadline}"
+              if (( deadline_at > hard_deadline_at )); then
+                deadline_at="${hard_deadline_at}"
+              fi
+              if (( extension_logged == 0 )) || [[ "${detail}" != "${last_detail}" ]]; then
+                info "Fieldbus progress detected; extending readiness window to $(format_duration_ms $(( (deadline_at - started_at) * 1000 ))) total."
+                extension_logged=1
+              fi
+            fi
+          fi
+        fi
+        remaining_s=$(( deadline_at - now_for_progress ))
+        if (( remaining_s < 1 )); then
+          remaining_s=1
+        fi
+        ui_loading_status "fieldbus" "${detail}" "${started_ms}" "${remaining_s}"
         if [[ "${detail}" != "${last_detail}" ]]; then
           log "Waiting for full bus readiness: ${detail}"
           last_detail="${detail}"
@@ -1584,12 +1671,12 @@ wait_for_bus_operational() {
 
     local now
     now="$(date +%s)"
-    if (( now - started_at >= BUS_READY_TIMEOUT_S )); then
+    if (( now >= deadline_at )); then
       ui_status_clear
       if [[ -n "${payload}" ]]; then
         log_probe_snapshot "${payload}"
       fi
-      error "bus failed readiness within ${BUS_READY_TIMEOUT_S}s"
+      error "bus failed readiness after $(format_duration_ms $(( $(now_ms) - started_ms ))); base_timeout=${BUS_READY_TIMEOUT_S}s progress_grace=${BUS_READY_PROGRESS_GRACE_S}s hard_cap=${BUS_READY_MAX_TIMEOUT_S}s"
       return 1
     fi
     sleep "${PROBE_INTERVAL_S}"
@@ -1803,7 +1890,7 @@ stop_systemd_service_if_active() {
   fi
   log "Stopping systemd service ${service_name}"
   local stop_output=""
-  if run_with_loading_capture stop_output "service stop" "Stopping ${service_name} via systemd" run_systemctl stop "${service_name}"; then
+  if run_with_loading_capture stop_output "service stop" "Stopping ${service_name} via systemd" 12 run_systemctl stop "${service_name}"; then
     if wait_for_systemd_service_inactive "${service_name}" 12; then
       success "${service_name} stopped in $(format_duration_ms $(( $(now_ms) - started_ms )))"
       return 0
@@ -1960,7 +2047,7 @@ wait_for_probe() {
       return 0
     fi
 
-    ui_loading_status "${name}" "${detail:-awaiting response}" "${started_ms}"
+    ui_loading_status "${name}" "${detail:-awaiting response}" "${started_ms}" "${timeout_s}"
     if [[ "${detail}" != "${last_detail}" ]]; then
       log "Waiting for ${name}: ${detail}"
       last_detail="${detail}"
@@ -1999,7 +2086,7 @@ wait_for_controller_readiness() {
       return 0
     fi
 
-    ui_loading_status "controller" "${detail:-starting controller process}" "${started_ms}"
+    ui_loading_status "controller" "${detail:-starting controller process}" "${started_ms}" "${CONTROLLER_TIMEOUT_S}"
     if [[ "${detail}" != "${last_detail}" ]]; then
       log "Waiting for controller: ${detail}"
       last_detail="${detail}"
@@ -2036,7 +2123,12 @@ wait_for_api_readiness() {
   success "api runtime-config sanity after $(format_duration_ms $(( $(now_ms) - started_ms ))): ${runtime_summary}"
 
   wait_for_probe "api joints" 10 probe_api_joints >/dev/null || return 1
-  wait_for_probe "api pose" 10 probe_api_pose >/dev/null || return 1
+  local pose_detail=""
+  if pose_detail="$(probe_api_pose 2>&1)"; then
+    success "api pose ready: ${pose_detail}"
+  else
+    warn "API pose probe unavailable during startup; continuing to web bring-up: ${pose_detail}"
+  fi
   success "$(style_ok 'API ONLINE') in $(format_duration_ms $(( $(now_ms) - started_ms ))) at http://127.0.0.1:${API_PORT}"
   return 0
 }
@@ -2299,7 +2391,7 @@ sync_rtcore_runtime_once() {
   started_ms="$(now_ms)"
   info "RTCore sync: ensuring unit, binary, and runtime env match the selected robot scaling"
   local detail=""
-  if run_with_loading_capture detail "rtcore sync" "Verifying service unit, binary install, and EtherCAT runtime env" "${RTCORE_SYNC_SCRIPT}" --ensure-active; then
+  if run_with_loading_capture detail "rtcore sync" "Verifying service unit, binary install, and EtherCAT runtime env" 45 "${RTCORE_SYNC_SCRIPT}" --ensure-active; then
     ui_status_clear
     while IFS= read -r line; do
       [[ -n "${line}" ]] || continue
@@ -2618,6 +2710,15 @@ script_path = repo_root / "start-stack.sh"
 prompt_prefix = "command> "
 help_text = "Commands: stop | stop --hard | probe | status | help | clear"
 
+try:
+    from gradient_os.telemetry.terminal_dashboard import (
+        TerminalDashboardState,
+        process_service_log_line,
+    )
+except Exception:
+    TerminalDashboardState = None
+    process_service_log_line = None
+
 if tty_device and tty_device != "not a tty":
     tty_fd = os.open(tty_device, os.O_RDWR)
     try:
@@ -2648,7 +2749,7 @@ class TailReader:
             line = self.handle.readline()
             if not line:
                 break
-            out.append(f"[{self.label}] {line.rstrip()}")
+            out.append(line.rstrip())
         return out
 
 
@@ -2689,6 +2790,7 @@ input_active = threading.Event()
 stop_evt = threading.Event()
 child_failure_evt = threading.Event()
 failed_children: list[str] = []
+dashboard_state = TerminalDashboardState() if TerminalDashboardState is not None else None
 
 
 def safe_print_line(line: str) -> None:
@@ -2729,7 +2831,11 @@ def monitor_loop() -> None:
     while not stop_evt.is_set():
         for tail in tails:
             for line in tail.poll():
-                safe_print_line(line)
+                if dashboard_state is not None and callable(process_service_log_line):
+                    for output_line in process_service_log_line(tail.label, line, dashboard_state):
+                        safe_print_line(output_line)
+                else:
+                    safe_print_line(line)
 
         failed: list[str] = []
         if controller_pid and not pid_alive(controller_pid):
@@ -2752,6 +2858,9 @@ safe_print_block(
     [
         "[start-stack] Interactive line console active.",
         "[start-stack] Commands: stop | stop --hard | probe | status | help | clear",
+        "[dashboard] controller=ONLINE api=ONLINE"
+        + ("" if headless else " web=ONLINE")
+        + " canonical_truth=MONITORING",
     ]
 )
 

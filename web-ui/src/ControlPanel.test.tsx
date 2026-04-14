@@ -435,6 +435,43 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(screen.getByText(/axis currently disarmed/i)).toBeTruthy();
 	});
 
+	it("does not show success when statusword fallback masks a reported native-home failure", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axis_enable_mask: 0x0,
+					axes: [
+						{
+							axis: 1,
+							logical_joint: 2,
+							ds402_state: "SwitchOnDisabled",
+							statusword: 0x9650,
+							error_code: 0,
+							native_home_state: 2,
+							native_home_state_name: "succeeded",
+							native_home_position_offset: 0,
+							native_home_last_abort_code: 0,
+							native_home_last_abort_code_hex: "0x00000000",
+							native_home_state_reported: 3,
+							native_home_state_reported_name: "failed",
+							native_home_last_abort_code_reported: 0x06010002,
+							native_home_last_abort_code_reported_hex: "0x06010002",
+							native_home_verification_source: "statusword_bit15",
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+		expect(screen.getByText(/Drive Home verification conflicted/i)).toBeTruthy();
+		expect(screen.getByText(/reported failed 0x06010002/i)).toBeTruthy();
+		expect(screen.queryByText(/Drive Home succeeded/i)).toBeNull();
+	});
+
 	it("blocks drive-home buttons while a native-home transaction is still active", async () => {
 		render(
 			<ControlPanel

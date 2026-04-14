@@ -1,3 +1,37 @@
+## 2026-04-13 plan refinement
+
+- Task summary:
+  - Integrated the latest canonical-truth regression lessons into the lossless startup dashboard plan and repo memory.
+- Changes:
+  - Updated `/home/pi/.cursor/plans/lossless_startup_dashboard_422d79b5.plan.md`:
+    - promoted single canonical truth and explicit no-fallback semantics into plan decisions
+    - added integrated lessons covering startup anchor bootstrap, explicit unavailable states, compatibility-alias handling, and anchor-aware write-frame integrity
+    - expanded the event-ledger shape to record canonical truth lifecycle and anchor-bootstrap events
+    - expanded validation to cover no `cached_fallback`, blocked motion baselining without truth, and the nonzero-anchor inversion bug class behind the J3/J4 snap-back regression
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with durable guardrails from the latest regression thread.
+- Validation:
+  - Read the current lossless dashboard plan and the linked transcript to extract the stable lessons and fixes.
+  - Confirmed the plan now explicitly distinguishes canonical truth from diagnostics and requires startup repair paths instead of encoder fallbacks.
+- Follow-up notes / risks:
+  - The later implementation pass should make the dashboard/event schema reflect these rules directly so operator-visible status cannot drift back into blank telemetry, hidden fallback, or misleading dual-truth presentation.
+
+## 2026-04-13 00:00 +0000
+
+- Task summary:
+  - Extended the startup dashboard plan to make lossless recording a first-class design constraint.
+- Changes:
+  - Updated `/home/pi/.cursor/plans/lossless_startup_dashboard_422d79b5.plan.md`:
+    - marked the recording contract todo complete and the split-view layout todo in progress
+    - added non-negotiable invariants that dashboard cleanup must never discard evidence
+    - defined the planned artifact set: raw service logs, rendered launcher transcript, structured dashboard events, and session metadata
+    - added failure-proofing, retention shape, and validation criteria focused on postmortem reconstruction
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the new user requirement that live dashboard filtering must remain a presentation-only layer.
+- Validation:
+  - Read the current plan, scratchpad, and latest devlog context before refining the plan.
+  - Confirmed the plan now explicitly requires reconstructability of both raw process output and operator-facing dashboard state.
+- Follow-up notes / risks:
+  - The next implementation pass must preserve this contract in `start-stack.sh` and `src/gradient_os/telemetry/terminal_dashboard.py`; readability improvements must not be coupled to any data-dropping path.
+
 ## 2026-04-08 17:49 +0000
 
 - Task summary:
@@ -1563,6 +1597,90 @@
   - This was validated with focused local tests/builds only; no live hardware proof was run in this pass, so the bench still needs the canonical truth / no-wrap / no-cross-axis-motion sequence from the plan.
   - Older mock-based API tests still allow `arm_display_*` to differ from `arm_*` because the API intentionally preserves legacy payload fields during transition; the real controller/runtime path now aliases them to the canonical truth instead.
 
+## 2026-04-13 20:51 +0000
+
+- Task summary:
+  - Fixed the live canonical-truth regression by restoring anchor availability at startup instead of weakening the no-fallback contract.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - added `_bootstrap_missing_absolute_home_anchors(...)`
+    - call that bootstrap from `initialize()` after RTCore feedback is ready so missing `absolute_home_anchor_*` state is reconstructed from live raw-frame alignment plus absolute multi-turn counts
+    - removed the attempted raw-live fallback path so `get_joint_positions()` still depends on canonical truth rather than a second read contract
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - added coverage that startup bootstrap creates missing anchors when raw + absolute alignment is sufficient
+    - kept fail-closed coverage when bootstrap cannot reconstruct canonical truth
+- Validation:
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py -q -k 'startup_bootstraps_missing_absolute_home_anchor or anchor_bootstrap_cannot_reconstruct_truth or canonical or connected_reads or native_home_offsets_to_feedback_but_not_command_targets'`
+    - result: `7 passed, 45 deselected`
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_gradient05_limits_and_backends.py`
+  - Live stack cycle:
+    - `./start-stack.sh stop --hard`
+    - `./start-stack.sh`
+  - Live startup evidence:
+    - controller log: `Bootstrapped absolute-home anchors from live raw/absolute alignment: joints=[1, 2, 3, 4, 5, 6] actor=ethercat_rtcore:startup_alignment`
+    - startup banner: `// LIVE STATE // canonical truth: AVAILABLE`
+  - Live API checks:
+    - `curl -sf http://127.0.0.1:4000/info/joints-detailed`
+      - result: `read_source="live_feedback"`, `canonical_joint_truth_available=true`, per-axis `absolute_home_anchor_*` populated
+    - `curl -sf http://127.0.0.1:4000/info/pose`
+      - result: `200 OK` with nonzero pose/joint payload
+  - `ReadLints` on touched files reported no diagnostics
+- Follow-up notes / risks:
+  - Startup bootstrap currently trusts the live raw frame as the migration bridge when anchors are absent; if bench evidence later shows a case where the raw frame is not already the intended logical truth at startup, tighten the bootstrap preconditions rather than reintroducing a read fallback.
+
+## 2026-04-13 21:38 +0000
+
+- Task summary:
+  - Investigated the remaining J3/J4 erratic commissioning behavior, traced it to a canonical-read / raw-write frame mismatch, and removed the last Python-side encoder fallback paths.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - fixed `_axis_q_from_joint_positions()` so canonical targets now re-apply both `absolute_home_anchor_rad` and software zero before RTCore converts into raw wire counts
+    - updated `_store_last_axis_target_q()` to translate raw reference-frame targets back into canonical joint space using the same anchor-aware inverse
+    - kept the no-anchor fail-close contract by raising if command conversion is attempted without an absolute-home anchor
+  - Updated `src/gradient_os/run_controller.py`:
+    - removed `GET_JOINT_STATE` downgrade to `cached_fallback`; encoder truth is now `live_feedback` or explicit `unavailable`
+  - Updated `src/gradient_os/arm_controller/trajectory_execution.py`:
+    - removed the secondary fallback from failed `raw_to_joint_positions()` conversion to `backend.get_joint_positions()`
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - changed the canonical->raw-wire regression test to use a nonzero absolute-home anchor
+    - added a guard test that command conversion raises when no absolute-home anchor exists
+- Validation:
+  - Reviewed live controller logs from `logs/startups/20260413-205037/controller.log`
+    - J4 jogs moved from about `-18.988 -> -23.990 deg`, then later back toward `-19.966 deg`
+    - J3 jogs then targeted about `-1.718 -> -3.717 deg` while J4 held at about `-19.966 deg`
+    - these commands were single-joint targets, which pointed away from obvious multi-joint command chatter and toward frame conversion mismatch
+  - Compared live startup anchors in `.gradient_absolute_encoder_anchors.json`
+    - J4 startup anchor about `0.3364 rad` (`~19.27 deg`)
+    - J3 startup anchor about `0.1135 rad` (`~6.50 deg`)
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py -q -k 'translates_canonical_truth_back_into_raw_wire_counts or refuses_command_conversion_without_absolute_home_anchor or startup_bootstraps_missing_absolute_home_anchor or anchor_bootstrap_cannot_reconstruct_truth or native_home_offsets_to_feedback_but_not_command_targets'`
+    - result: `5 passed, 48 deselected`
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/run_controller.py src/gradient_os/arm_controller/trajectory_execution.py tests/test_gradient05_limits_and_backends.py`
+  - `ReadLints` on touched files reported no diagnostics
+- Follow-up notes / risks:
+  - I could not live-retest the new write-frame fix because the post-edit stack reload hit the known host-level stale-RTCore-owner failure: `./start-stack.sh` escalated to `REBOOT REQUIRED` after one recycle attempt (`master_device_busy`, `request_master_failed`, `leftover_process`, `sigkill_survivor`).
+  - The code fix is ready, but the next meaningful proof requires a host reboot, then a fresh J4/J3 jog retest on the restarted stack.
+
+## 2026-04-13 21:47 +0000
+
+- Task summary:
+  - Reviewed the startup-stack cleanup regression and fixed the newly introduced false-positive reboot path in RTCore startup recovery.
+- Changes:
+  - Updated `src/gradient_os/telemetry/startup_recovery.py`:
+    - removed the immediate `rtcore_not_up` hard-recycle condition
+    - replaced it with a non-recovering `rtcore_starting_or_down` classification that tells the launcher to continue normal startup/readiness waits unless real stale-owner/master-busy signatures are present
+  - Updated `tests/test_startup_recovery.py`:
+    - added regression coverage that `rtcore_state=UNKNOWN`, `ethercat_master_state=DOWN`, `physical_state=INACTIVE` does **not** trigger an automatic recycle without busy signatures
+- Validation:
+  - Reviewed the referenced transcript and current `start-stack.sh` flow:
+    - transcript intent: recycle only the `RTCore UP / EtherCAT DOWN / master busy` class
+    - current regression: `ensure_rtcore_runtime_sync()` called the classifier immediately after `sync-runtime.sh --ensure-active`, and the classifier treated `rtcore not up yet` as a hard-recycle case
+  - `source ./start.sh && python -m pytest tests/test_startup_recovery.py -q`
+    - result: `5 passed`
+  - `source ./start.sh && python -m py_compile src/gradient_os/telemetry/startup_recovery.py tests/test_startup_recovery.py`
+  - `ReadLints` on touched files reported no diagnostics
+- Follow-up notes / risks:
+  - The current machine is still in the stale-owner state shown in `terminals/1.txt`; that host-level condition can still genuinely require a reboot. This fix prevents the launcher from creating/escalating that state on normal slow startups, but it cannot retroactively clear the already-stuck owner without a clean reboot.
+
 ## 2026-04-13 18:45 +0000
 
 - Task summary:
@@ -1762,3 +1880,505 @@
     - confirms the long blocking sync stage is now a genuine spinner candidate rather than a one-frame status line
 - Follow-up notes / risks:
   - The animated spinner is tty-only and redraws in place, so it will not appear as an animation in static screenshots or persisted terminal transcripts; only the live terminal shows the moving frames.
+
+## 2026-04-13 20:29 +0000
+
+- Task summary:
+  - Investigated why the latest startup run did not complete and patched the launcher so active bus convergence extends the readiness deadline instead of tripping the generic 20 s timeout.
+- Changes:
+  - Updated `start-stack.sh`:
+    - added `GRADIENT_STACK_BUS_PROGRESS_GRACE_S` (default `15`) and `GRADIENT_STACK_BUS_MAX_TIMEOUT_S` (default `60`)
+    - changed `wait_for_bus_operational()` to track fieldbus progress (`responding`, `online`, `operational`, `startup_ready`, `link_up`)
+    - when progress increases, extend the readiness window up to the hard cap instead of failing immediately at the base timeout
+    - updated the timeout error to report total elapsed wait plus the base/grace/hard-cap values
+    - passed dynamic remaining time into the live timeout counter so the fieldbus spinner reflects the extended deadline
+- Validation:
+  - `bash -n start-stack.sh`
+  - `ReadLints` on `start-stack.sh`, `src/gradient_os/telemetry/startup_recovery.py`, and `tests/test_startup_recovery.py`
+    - result: no diagnostics
+- Follow-up notes / risks:
+  - This patch addresses the specific run where the bus was still converging (`0/6 -> 5/6 -> BUS_UP_DISARMED`) as the old 20 s deadline expired. Live hardware validation is still needed to confirm the extended deadline now gives the bus enough time to reach `startup_ready=1` instead of falling out on the generic timeout.
+
+## 2026-04-13 20:40 +0000
+
+- Task summary:
+  - Fixed the remaining startup blocker so `start-stack.sh` no longer exits before the web UI when canonical pose truth is unavailable during bring-up, and confirmed the full controller/API/web stack now stays live.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/command_api.py`:
+    - wrapped `handle_get_position()` joint sampling in a local exception handler
+    - when canonical joint truth is unavailable, the controller now sends `ERROR,GET_POSITION,...` back to the caller instead of throwing a traceback through the main loop
+  - Updated `start-stack.sh`:
+    - changed `wait_for_api_readiness()` so `/info/pose` is best-effort during startup rather than a hard gate for web bring-up
+    - API health, runtime-config sanity, and joints readiness still remain required
+- Validation:
+  - `bash -n start-stack.sh`
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py -q -k 'info_pose'`
+    - result: `2 passed, 67 deselected`
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/command_api.py src/gradient_os/api/main.py`
+  - `ReadLints` on `start-stack.sh`, `src/gradient_os/arm_controller/command_api.py`, and `tests/test_api_endpoints.py`
+    - result: no diagnostics
+  - `./start-stack.sh status`
+    - result: launcher `running`, `controller: up`, `api: up`, `web: up`
+- Follow-up notes / risks:
+  - The stack is now staying live through web bring-up, but canonical joint truth is still unavailable on the bench, so the controller continues to log `GET_JOINT_STATE` warnings. That is a real backend/absolute-truth issue to solve next, separate from the launcher completion bug.
+
+## 2026-04-13 22:25 +0000
+
+- Task summary:
+  - Tightened the EtherCAT RTCore joint-read contract so the backend fails closed instead of silently returning the last commanded setpoint when live canonical truth is unavailable.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - changed `get_joint_positions()` to raise `Canonical joint truth unavailable (...)` when RTCore is disconnected or feedback config is not ready
+    - removed the getter path that returned `_last_joint_setpoint_rad` as pseudo-feedback
+    - clarified the `_last_joint_setpoint_rad` comment so it is explicitly command bookkeeping only, not read truth
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - kept the corrected canonical-to-raw command-frame regression coverage intact
+    - added fail-closed tests for disconnected reads and connected-but-feedback-not-ready reads
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md`:
+    - marked the earlier same-day "re-apply anchor on writes" note as superseded
+    - recorded the corrected transform algebra and the new fail-closed getter guardrail
+- Validation:
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py -q -k 'translates_canonical_truth_back_into_raw_wire_counts or connected_reads_return_canonical_feedback or disconnected_get_joint_positions_fails_closed or connected_without_feedback_config_fails_closed or startup_bootstraps_missing_absolute_home_anchor or anchor_bootstrap_cannot_reconstruct_truth or native_home_offsets_to_feedback_but_not_command_targets'`
+    - result: `7 passed, 47 deselected`
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_gradient05_limits_and_backends.py`
+  - `ReadLints` on `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` and `tests/test_gradient05_limits_and_backends.py`
+    - result: no diagnostics
+- Follow-up notes / risks:
+  - The repo now enforces the single-source/fail-closed read contract locally, but live hardware proof after the already-reverted anchor write-path fix is still outstanding.
+  - I did not restart the stack or command the robot in this pass; the next meaningful validation is a controlled J4-only then J3-only live jog proof against fresh `/info/joints-detailed` snapshots.
+
+## 2026-04-13 22:50 +0000
+
+- Task summary:
+  - Investigated the newer live regression run and hardened the backend so anchored absolute feedback is only considered motion-safe when it round-trips back into the current raw/reference command frame.
+- Changes:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - added per-axis command-frame roundtrip diagnostics (`command_roundtrip_*`) inside `_canonical_joint_positions_from_raw_feedback()`
+    - fail-closes canonical truth with `truth_reason=command_frame_roundtrip_mismatch` when `canonical -> command frame` does not reconstruct the current `reference_pre_zero_rad` within about one count
+    - factored the command transform through `_command_axis_q_for_joint_value()` / `_canonical_joint_q_from_command_axis_q()` so the diagnostic uses the exact same math as the upload path
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - added a regression test that marks truth unavailable when `absolute_feedback + anchor` is present but does not round-trip into the current raw/reference motion frame
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md`:
+    - recorded the live roundtrip-mismatch diagnosis and the new rule that canonical truth must be proven motion-safe, not merely present
+- Validation:
+  - Live inspection on the already-running stack:
+    - `curl -s http://127.0.0.1:4000/info/joints-detailed`
+    - `curl -s http://127.0.0.1:4000/info/pose`
+    - `logs/startups/20260413-224227/controller.log`
+    - key evidence: the controller sent a J4-only target, but the live snapshot simultaneously reported `canonical_joint_truth_available=true` while exposing a frame inconsistency (`J1 canonical_rad=0.21456`, `reference_pre_zero_rad=-0.03677`, zero software offsets), which means the current anchored absolute source was not command-frame-safe
+  - Local focused tests:
+    - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py -q -k 'translates_canonical_truth_back_into_raw_wire_counts or connected_reads_return_canonical_feedback or marks_truth_unavailable_when_absolute_anchor_does_not_roundtrip or disconnected_get_joint_positions_fails_closed or connected_without_feedback_config_fails_closed or startup_bootstraps_missing_absolute_home_anchor or anchor_bootstrap_cannot_reconstruct_truth or native_home_offsets_to_feedback_but_not_command_targets'`
+    - result: `8 passed, 47 deselected`
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_gradient05_limits_and_backends.py`
+  - `ReadLints` on the touched backend/test files
+    - result: no diagnostics
+- Follow-up notes / risks:
+  - The running stack has not picked up this guardrail yet; a controller/backend restart is required before the live API will stop advertising the current inconsistent anchored source as motion-safe.
+  - This change intentionally blocks motion when the chosen `encoder_multi_turn_counts` source and current native-home/reference frame are semantically inconsistent. It does not yet prove which underlying source is wrong; it only prevents the stack from trusting it for motion until that proof exists.
+
+## 2026-04-13 23:33 +0000
+
+- Task summary:
+  - Attempted the requested clean restart and gathered a fresh disarmed proof snapshot plus manual-backed conclusions about which A6-EC objects are raw encoder-unit state versus drive reference/home state.
+- Changes:
+  - No additional source-code changes in this pass beyond the earlier roundtrip guard; this pass focused on runtime verification and manual interpretation.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the manual-confirmed frame split and the failed-restart fieldbus blocker.
+- Validation:
+  - `./start-stack.sh status`
+    - result before restart: stack fully down
+  - `./start-stack.sh`
+    - result: failed during bus readiness on run `20260413-233217`
+    - observed progress: `responding=6/6`, then stalled at `online=5/6 operational=5/6 startup_ready=0`
+  - `./start-stack.sh probe`
+    - result: `J5/axis4` offline (`slave_online=False`, `slave_operational=False`, `sw=0x1640`) while the other five axes were `SwitchOnDisabled` / `0x1650`
+  - Manual/source review:
+    - `docs/resources/a6ec_manual_chapter_11_parameter_list.md`
+    - confirmed `C00.07=4` label (`Absolute position rotation mode`)
+    - confirmed `U40.20/.22` are encoder-unit multi-turn data
+    - confirmed `U40.16`, `6064h`, `607Ah`, and `607Ch` are reference/home-frame quantities
+    - confirmed `607Ch` is active only when powered on, homing complete, and `6041h bit 15 = 1`, and that after homing `6064h = 607Ch`
+- Follow-up notes / risks:
+  - Because the fieldbus never reached `startup_ready=1`, the controller/API never launched and the new Python fail-closed truth guard is not active in the live stack yet.
+  - The strongest current conclusion is not "raw encoder unstable" but "raw encoder-unit state and reference/home-frame state are being conflated"; vendor confirmation is still needed for the exact manufacturer-intended canonical source and homing/reference workflow.
+
+## 2026-04-14 00:17 +0000
+
+- Task summary:
+  - Completed the fresh-boot disarmed object comparison and verified that the guarded stack now blocks unsafe joint truth instead of feeding false positions to the frontend.
+- Changes:
+  - No new source edits in this pass.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the fresh-boot SDO comparison findings.
+- Validation:
+  - Successful guarded restart on run `20260413-235354` after the user hard-stopped and power-cycled the drives.
+  - Live API checks:
+    - `curl -s http://127.0.0.1:4000/info/joints-detailed`
+    - `curl -s -i http://127.0.0.1:4000/info/pose`
+    - result: `canonical_joint_truth_available=false`, `command_frame_roundtrip_mismatch`, and `GET /info/pose` `503`
+  - Direct disarmed EtherCAT SDO comparison (two snapshots one second apart) for every axis:
+    - `0x6041`, `0x6064`, `0x607C`, `0x2040:17`, `0x2040:21`, `0x2040:23`, `0x2040:2B`, `0x2040:2D`
+    - result highlights:
+      - all axes `0x6041 = 0x1650`, `bit15 = 0`, `bit12 = 1`
+      - all axes `0x607C = 0`
+      - `0x6064`, `U40.16`, and `U40.2A/.2C` were mutually close and stable
+      - `U40.20/.22` were also stable (`0..3` count drift over 1 s), so the raw multi-turn source does not currently look noisy
+      - the large mismatch remains semantic/frame-related rather than transport noise
+- Follow-up notes / risks:
+  - The frontend is blank because the backend intentionally returns empty joint arrays when canonical truth is unsafe; this is expected fail-closed behavior, not a separate frontend transport bug.
+  - The fresh-boot evidence now points away from "unstable encoder reads" and toward "stable raw encoder data but wrong/inactive relationship to the drive's reference/home frame after boot."
+
+## 2026-04-14 00:17 +0000
+
+- Task summary:
+  - Ran the first controlled per-axis native-home experiment on `J4` to test whether the drive's home/reference-valid state is something startup should merely expose or something the native-home transaction actively establishes.
+- Changes:
+  - No new code changes in this pass.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the J4 before/after findings.
+- Validation:
+  - Pre-home `J4` snapshot:
+    - direct SDOs (`axis3`): `6041=0x1650`, `bit15=0`, `607C=0`, `6064=28359`, `U40.16=28359`, `U40.20=163933`, `U40.2A=28358`
+    - live API axis detail: `truth_reason=command_frame_roundtrip_mismatch`
+  - Command:
+    - `curl -s -X POST http://127.0.0.1:4000/control/home-joint-native -H 'Content-Type: application/json' -d '{"joint":4}'`
+    - result: `verified=true`, `terminal_state=succeeded`, `native_home_state=2`, `disarmed_after_home=true`
+  - Post-home `J4` snapshot:
+    - direct SDOs (`axis3`): `6041=0x9650`, `bit15=1`, `bit12=1`, `607C=0`, `6064≈131063`, `U40.16≈-8`, `U40.20≈32852`, `U40.2A≈131064`
+    - one-second stability re-read stayed within a few counts
+    - live API axis detail: `truth_available=true`, `command_roundtrip_consistent=true` for axis 3
+    - global API status still unavailable because other axes remain mismatched
+- Follow-up notes / risks:
+  - This strongly suggests native home changes the drive's actual state for that axis rather than us merely "using" an already-present startup-valid flag.
+  - Persistence across a later power cycle is still the key unresolved test; J4 is now the cleanest candidate for that follow-up.
+
+## 2026-04-14 00:38 +0000
+
+- Task summary:
+  - Completed the `J4` persistence follow-up after a real drive power cycle and confirmed that J4's corrected frame survived reboot even though HM bit 15 did not stay set.
+- Changes:
+  - No source edits in this pass.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the post-restart J4 persistence finding.
+- Validation:
+  - Post-restart stack/probe on run `20260414-003639`:
+    - all 6 axes online/operational, disarmed
+    - `J4/axis3 pos_counts=131062`
+  - Direct post-restart `J4` SDO snapshot:
+    - `6041=0x1650` (`bit15=0`, `bit12=1`)
+    - `607C=0`
+    - `6064=131063`
+    - `U40.16=131062`
+    - `U40.20=32848`
+    - `U40.2A=131061`
+  - Live API snapshot after restart:
+    - `axis 3` remained `command_roundtrip_consistent=true` / `truth_available=true`
+    - global unavailable axes shrank to `[0, 1, 2]`
+- Follow-up notes / risks:
+  - This disproves the simpler hypothesis that persistence requires HM bit 15 to remain high after reboot. The semantic/reference-frame correction for J4 persisted, but the statusword dropped back to `0x1650`.
+  - `607C` stayed zero throughout the successful J4 home and reboot, so the current workflow's persisted effect is not obviously witnessed by nonzero `607C`.
+  - The next systematic tests should repeat the same sequence on another failing axis (best candidates: `J3`, then `J1/J2`) and keep separating frame persistence from status-bit persistence.
+
+## 2026-04-14 01:02 +0000
+
+- Task summary:
+  - Correlated the user's selected Group 6000 manual clauses with live `J3`/`J4` reads to see which parts match the observed behavior and which parts do not.
+- Changes:
+  - No code edits in this pass.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the manual/live-correlation findings.
+- Validation:
+  - Manual extracts reviewed from `docs/resources/a6ec_manual_chapter_11_parameter_list.md`:
+    - `607Ch` home offset
+    - `6099.02h` speed during search for zero
+    - `60E3.01h` supported homing method semantics
+    - `60E6h` actual position calculation method
+    - `60F4h`, `60FCh`, `60FDh`
+    - `U40.16` and `U40.28` descriptions
+  - Live object reads on `J3/axis2` and `J4/axis3`:
+    - `6098=35`
+    - `60E6=0`
+    - `60F4=0`
+    - `60FD=0`
+    - `60FC` closely matched the drive-facing rotation/reference frame (`J3 52562`, `J4 131061`)
+    - `60E3` supported-method entries include `35`, and every listed method currently reports both relative and absolute support bits set
+- Follow-up notes / risks:
+  - The manual strongly supports focusing on `60E6` and `60FC` for the canonical-truth question.
+  - The short `607C` paragraph does not fully explain the successful J4 path, because J4 still shows `607C=0` while the corrected frame persisted and round-tripped safely.
+
+## 2026-04-14 02:42 +0000
+
+- Task summary:
+  - Ran the full controlled `J3` native-home persistence sequence: pre-home snapshot, native-home transaction, immediate post-home capture, soft-stop while keeping RTCore/EtherCAT up, real drive power cycle, guarded restart, and post-restart verification.
+- Changes:
+  - No source-code edits in this pass.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the new `J3` persistence findings.
+  - Stored runtime artifacts under `logs/encoder-retention/20260414-020640-j3-native-home-sequence`.
+- Validation:
+  - Pre-home `J3` snapshot:
+    - `6041=0x1650`, `bit15=0`, `607C=0`, `6064=52564`, `U40.16=52563`, `60FC=52562`, `U40.20=-446379`
+    - API reported `truth_reason=command_frame_roundtrip_mismatch` for axis 2
+  - Native-home command:
+    - `curl -s -X POST http://127.0.0.1:4000/control/home-joint-native -H 'Content-Type: application/json' -d '{"joint":3}'`
+    - result: `verified=true`, `terminal_state=succeeded`, `native_home_state=2`, `disarmed_after_home=true`
+  - Immediate post-home `J3` snapshot:
+    - `6041=0x9650`, `bit15=1`, `607C=0`, `6064~=131041..131042`, `U40.16~=-30..-32`, `60FC~=131041..131042`, `U40.20=77880`
+    - API initially accepted axis 2 with anchor `0.02548325583875021`
+  - Post-home truth poll:
+    - both `J3` and `J4` flickered between accepted and rejected as roundtrip error moved between `1` and `2-3` counts
+  - Soft-stop / power-cycle staging:
+    - first `./start-stack.sh stop` removed the launcher only
+    - second `./start-stack.sh stop` performed the intended soft stop, leaving `rtcore_state=UP`, `ethercat_master_state=OP`, and `physical_state=BUS_UP_DISARMED`
+  - Direct post-power-cycle pre-restart snapshot:
+    - `J3` came back with `6041=0x1650`, `bit15=0`, `607C=0`, but the corrected frame persisted: `6064=131042`, `U40.16=131041`, `60FC=131041`, `U40.28=131041`, `U40.2A=131041`, `U40.20=77882`
+  - Guarded restart on run `20260414-024152`:
+    - full stack reached `STACK BOOT COMPLETE`
+    - startup banner still reported global canonical truth unavailable because some other axes remain unresolved
+  - Post-restart API and SDO snapshot:
+    - global unavailable joints `[1, 2, 6]` / axes `[0, 1, 5]`
+    - `J3`: `6041=0x1650`, `bit15=0`, `607C=0`, `6064=131042`, `U40.16=131040`, `60FC=131041`, `U40.20=77881`, API `truth_available=true`, near-zero roundtrip error
+    - `J4`: `6041=0x1650`, `bit15=0`, `607C=0`, `6064=131051`, `U40.16=131053`, `60FC=131053`, `U40.20=32840`, API `truth_available=true`, near-zero roundtrip error
+  - Post-restart truth poll:
+    - `J3` still flickered (`true,true,true,true,true,true,true,false,false,true,false,true`) as error hopped between `0/1` and `2` counts
+    - `J4` also flickered early before settling mostly true
+- Follow-up notes / risks:
+  - `J3` now matches `J4` on the persistence question: the corrected reference/frame effect survives real power loss even though `6041 bit15` clears after reboot and `607C` remains `0`.
+  - The remaining issue for `J3/J4` is no longer "does the native-home frame persist?" but "why does the roundtrip guard ride a 1-2 count edge and intermittently reject otherwise semantically-correct axes?"
+
+## 2026-04-14 02:48 +0000
+
+- Task summary:
+  - Re-reviewed the live motion read/write path in code to answer which counts are actually used for motion versus canonical truth reconstruction.
+- Changes:
+  - No source-code edits in this pass.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the code-level transform conclusion.
+- Validation:
+  - Confirmed in `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - `sync_read_positions()` returns RTCore `_axis_counts`
+    - `raw_to_joint_positions()` reconstructs canonical truth from absolute feedback plus persisted anchor and then roundtrip-checks against the motion/reference frame
+    - `_command_axis_q_for_joint_value()` adds only software zero
+    - `_canonical_joint_q_from_command_axis_q()` subtracts only software zero
+    - `_reference_q_before_master_offset_for_axis()` applies `native_home_offset` on the read/reference side
+  - Confirmed in `src/gradient_rt_motion/ipc_v1.hpp` and `src/gradient_rt_motion/main.cpp`:
+    - RTCore `AxisStatusV1.pos_counts` is documented as `0x6064`
+    - queued CSP targets are stored in the same raw wire-count frame the drive publishes on `0x6064` and expects on `0x607A`
+    - RTCore subtracts `native_home_offset_counts` exactly once when converting controller targets to CSP wire counts
+  - Confirmed in `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - preferred absolute source order remains `encoder_multi_turn_counts` (`U40.20/.22`) first, `rotation_mode_encoder_counts` (`U40.2A/.2C`) second
+  - Confirmed in `tests/test_gradient05_limits_and_backends.py`:
+    - canonical truth translates back into the same raw wire counts
+    - native-home offsets apply to feedback but not command targets
+- Follow-up notes / risks:
+  - The motion command path is now clean and does not re-apply the persisted absolute-home anchor.
+  - The remaining open question is not command-path math but whether `U40.20/.22 + anchor` is the right long-term canonical host truth for all axes/states, or whether the corrected rotation/reference frame should eventually replace it.
+
+## 2026-04-14 02:55 +0000
+
+- Task summary:
+  - Verified the manual/math around 17-bit encoder resolution versus the exposed multi-turn objects and answered why large gear ratios do not require commanding raw multi-turn encoder counts directly.
+- Changes:
+  - No source-code edits in this pass.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the clarified numeric/manual conclusion.
+- Validation:
+  - Manual checks in `docs/resources/a6ec_manual_chapter_11_parameter_list.md`:
+    - `C00.07=4` is `Absolute position rotation mode`
+    - `6064h` is position actual value in `user-defined unit`
+    - `607Ah` target position unit is `Reference unit`
+    - `6091h` states motor position feedback in encoder units is load/reference feedback times gear ratio
+    - `60FCh` states encoder-unit position reference is derived from reference-unit position reference via `6091h`
+    - `U40.1E` (`Encoder multi-turn position data`) is `U16`, range `0-65535 Rev`
+    - `U40.20` / `U40.22` are low/high 32-bit halves of encoder multi-turn data in encoder units
+  - Conclusion verified:
+    - `2^32 / 2^17 = 32768` is only the span of a hypothetical unsigned 32-bit encoder-count accumulator
+    - it is not a manufacturer-verified limit for the actual exposed A6-EC multi-turn objects we are reading
+- Follow-up notes / risks:
+  - The current open problem remains semantic frame selection for canonical truth, not insufficient turn range on the CSP motion path.
+  - If we want the exact physical retained multi-turn limit of the encoder hardware itself, the parameter-list extract does not state it cleanly; that may require a deeper Chapter 5/manual lookup or vendor confirmation.
+
+## 2026-04-14 04:22 +0000
+
+- Task summary:
+  - Read Chapter 5 more deeply, verified the current live gear-ratio objects, and added a read-only Chapter 5 probe script so future before/after-home/restart checks can test the frame model directly.
+- Changes:
+  - Added `scripts/a6ec_chapter5_probe.py`.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the new Chapter 5 probe findings.
+- Validation:
+  - Manual findings from `docs/resources/chapter 5 absolute system - extract from A6-EC_series_servo_drive_manual (2).pdf`:
+    - absolute encoder is `131072 (2^17)` counts/rev with `16-bit multi-turn data saved`
+    - `U40.1E` is `0..65535 Rev`
+    - rotation mode applies when unidirectional load revolutions are `<32767`
+  - Live SDO verification on `J3` and `J6`:
+    - `6091.01 = 1`, `6091.02 = 1`
+    - `C10.18 = 1`, `C10.19 = 1`
+    - current live stack is not using drive-side gear-ratio mapping
+  - Spot checks on `J1/J2/J3/J6`:
+    - `combined(U40.20/.22)` matches `sign_extend16(U40.1E) * 131072 + (U40.1C mod 131072)` within `0..1` count
+  - Script validation:
+    - `python -m py_compile scripts/a6ec_chapter5_probe.py`
+    - `python scripts/a6ec_chapter5_probe.py snapshot --label current --axes J3 J6`
+    - result artifact: `logs/encoder-retention/20260414-042146-a6ec-ch5-probe/current.json`
+    - result summary:
+      - `J3` and `J6` both show `6091 = 1:1`
+      - `J3` and `J6` both show `C10.18/C10.19 = 1:1`
+      - `6063 ~= 6064*6091`, `60FC ~= 6062*6091`, and `U40.2A/.2C ~= U40.28*(C10.18/C10.19)` all matched within `0..1` count
+- Follow-up notes / risks:
+  - The raw multi-turn formula is now supported both by Chapter 5 structure and by live data, but the remaining architectural question is still which frame should be host canonical truth after native home.
+  - The new script is the right harness for the next manual-backed experiment: capture the same axes across boot, native-home, and restart and compare which of the raw/reference/rotation bridges remain stable.
+
+## 2026-04-14 05:29 +0000
+
+- Task summary:
+  - Ran the new Chapter 5 probe on `J6` first, as requested, and verified the manual-derived formulas there with both a single snapshot and a short repeated poll.
+- Changes:
+  - No source-code edits in this pass beyond the earlier script addition.
+  - Stored new `J6` artifacts under `logs/encoder-retention/20260414-052921-a6ec-ch5-probe/`.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the `J6` verification result.
+- Validation:
+  - Probe command:
+    - `python scripts/a6ec_chapter5_probe.py snapshot --label j6-current --axes J6`
+  - Artifact:
+    - `logs/encoder-retention/20260414-052921-a6ec-ch5-probe/j6-current.json`
+    - `logs/encoder-retention/20260414-052921-a6ec-ch5-probe/j6-current.md`
+  - Single-snapshot `J6` result:
+    - `6091.01=1`, `6091.02=1`
+    - `C10.18=1`, `C10.19=1`
+    - raw formula `combined(U40.20/.22) ~= sign_extend16(U40.1E)*131072 + (U40.1C mod 131072)` matched with `delta=+1`
+    - `6063 ~= 6064*6091` matched with `delta=-1`
+    - `60FC ~= 6062*6091` matched with `delta=0`
+    - `U40.2A/.2C ~= U40.28*(C10.18/C10.19)` landed at `delta=+2` on that sample
+  - Repeated poll:
+    - saved as `logs/encoder-retention/20260414-052921-a6ec-ch5-probe/j6-bridge-poll.json`
+    - observed jitter bands:
+      - raw formula delta `-2 .. +2`
+      - `6063 - 6064*6091` delta `-1 .. +2`
+      - `60FC - 6062*6091` delta `-3 .. +2`
+      - rotation-mode bridge delta `-2 .. +2`
+- Follow-up notes / risks:
+  - `J6` does support the Chapter 5 frame model semantically.
+  - The practical verification lesson is the same as with the roundtrip guard work: live reads wander by a couple of counts, so a single `2-count` miss should be treated as jitter unless it persists systematically.
+
+## 2026-04-14 05:44 +0000
+
+- Task summary:
+  - Completed the requested `J6` native-home persistence sequence after the user's drive power cycle, then compared the result against the earlier `J3` and `J4` power-cycle proofs and wrote a consolidated evidence table into `.cursor/memory/AGENT_SCRATCHPAD.md`.
+- Changes:
+  - No production source-code changes in this pass.
+  - Captured new experiment artifacts under `logs/encoder-retention/20260414-053539-j6-ch5-persistence-controls/`.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with a three-axis persistence table covering `J3`, `J4`, and `J6`.
+- Validation:
+  - Pre-restart disarmed probe after the user's power cycle:
+    - `./start-stack.sh probe`
+    - result: RTCore/EtherCAT stayed up and disarmed; `J6/axis5` returned `sw=0x1650` and `pos_counts=0`
+  - Snapshot sequence:
+    - `python scripts/a6ec_chapter5_probe.py snapshot --label post-power-cycle-pre-restart --axes J3 J4 J6 --experiment-id 20260414-053539-j6-ch5-persistence-controls`
+    - `python scripts/a6ec_chapter5_probe.py snapshot --label post-restart --axes J3 J4 J6 --experiment-id 20260414-053539-j6-ch5-persistence-controls`
+  - Restart run:
+    - `./start-stack.sh`
+    - startup run id: `20260414-053857`
+  - Post-restart truth poll:
+    - saved to `logs/encoder-retention/20260414-053539-j6-ch5-persistence-controls/post-restart-truth-poll.json`
+    - acceptance counts over 12 samples:
+      - `J3`: `11/12` true
+      - `J4`: `9/12` true
+      - `J6`: `7/12` true
+    - all three axes stayed inside the previously observed `0..3` count roundtrip/jitter band rather than showing a large semantic mismatch
+- Follow-up notes / risks:
+  - `J6` now matches the same persistence pattern already seen on `J3` and `J4`: the corrected reference frame survives a real drive power cycle, while `6041 bit15` clears after boot and `607C` remains `0`.
+  - The remaining live issue is not missing persistence on these tested axes; it is that the current one-count roundtrip acceptance threshold flickers on otherwise semantically-correct axes when live reads wander by `1..3` counts.
+  - Global truth still remains unavailable on this restart because unresolved axes plus that tolerance-edge flicker keep some joints marked unavailable at any given sample.
+
+## 2026-04-14 05:50 +0000
+
+- Task summary:
+  - Re-read the latest scratchpad/devlog plus commissioning safety guidance and turned the new `J3/J4/J6` evidence into a concrete recommendation for how to validate the remaining unverified joints.
+- Changes:
+  - No production code changes.
+  - Added a procedural recommendation to `.cursor/memory/AGENT_SCRATCHPAD.md` for batching the remaining native-home proofs in one shared power-cycle session while keeping homes strictly sequential.
+- Validation:
+  - Re-read latest evidence entries in `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md`.
+  - Re-read `.cursor/skills/gradientos-sop/commissioning-safety.md` to keep the recommendation aligned with the current commissioning rule set.
+- Follow-up notes / risks:
+  - Recommendation is to batch the remaining target axes in one session, but only with `home -> snapshot/poll` done one axis at a time and a single shared power cycle after all immediate post-home captures.
+  - A previously persisted axis should be included as a control in shared pre/post-power-cycle captures when practical.
+  - This batching recommendation applies to persistence validation only; it does not resolve the separate roundtrip-guard jitter issue that still affects global truth/frontend stability.
+
+## 2026-04-14 06:05 +0000
+
+- Task summary:
+  - Started the all-joints batch experiment, homed `J5` and `J1` successfully, then retried `J2` under explicitly idle RTCore conditions to test whether the earlier `J2` failure was just "too soon after `J1`".
+- Changes:
+  - No production code changes.
+  - Captured new all-joints artifacts under `logs/encoder-retention/20260414-055631-all-joints-native-home-batch/`, including `pre-home`, `post-home-j5`, `post-home-j1`, `post-home-j2-failed`, `pre-retry-j2`, and `post-retry-j2-failed` plus truth-poll JSONs.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the new `J2` retry conclusion.
+- Validation:
+  - `J5` home:
+    - `POST /control/home-joint-native {"joint":5}` -> `verified=true`
+    - immediate truth poll summary: `J5 true 7/8`
+  - `J1` home:
+    - `POST /control/home-joint-native {"joint":1}` -> `verified=true`
+    - immediate truth poll summary: `J1 true 5/8`
+  - `J2` first attempt in this batch:
+    - `POST /control/home-joint-native {"joint":2}` -> `verified=false`, abort `0x06010002`
+    - immediate `/info/joints-detailed` still showed `J2` with a large stable roundtrip mismatch around `-52184` counts
+  - Serialized retry preconditions:
+    - `./start-stack.sh probe` showed `BUS_UP_DISARMED`
+    - `/run/gradient-rt-motion/metrics.json` showed `native_home_active_axis_mask = 0`
+  - `J2` serialized retry:
+    - second `POST /control/home-joint-native {"joint":2}` -> same abort `0x06010002`
+    - follow-up probe showed axis 1 faulted with `sw=0x9638`, `err=0xff00`, `Er11.0`
+  - Fault cleanup attempt:
+    - `POST /control/reset-faults` was accepted
+    - immediate follow-up probe still showed axis 1 faulted, controller state `FAULTED`, drives disarmed
+- Follow-up notes / risks:
+  - The clean retry strongly argues this is not just a "frontend guardrail / clicked too soon after `J1`" issue; RTCore idle was confirmed before the retry and the same `J2` abort reproduced.
+  - `J2` is now the blocker for the shared batch. Do not continue to the shared power-cycle stage until `J2` is either recovered cleanly or explicitly excluded from this run.
+  - The experiment currently left the stack disarmed but faulted on axis 1 after the retry sequence.
+
+## 2026-04-14 06:15 +0000
+
+- Task summary:
+  - Investigated the contradictory frontend success message reported by the user, confirmed that the per-joint row was deriving success from fallback telemetry instead of surfacing the contradiction, and patched the UI to fail safe.
+- Changes:
+  - Updated `web-ui/src/ControlPanel.tsx` so a row that is only "successful" via `statusword_bit15` fallback but still has a reported failed native-home result with nonzero abort code now renders `Drive Home verification conflicted | reported failed ...` instead of `Drive Home succeeded`.
+  - Added a targeted regression test to `web-ui/src/ControlPanel.test.tsx`.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the new UI/root-cause rule and the user's observation that `J2` audibly de-energised much faster than the other axes.
+- Validation:
+  - `npm run test -- --run src/ControlPanel.test.tsx` in `web-ui`
+  - result: `13 passed`
+  - `ReadLints` on the changed frontend files returned no diagnostics.
+- Follow-up notes / risks:
+  - This UI fix addresses the misleading success message only; it does not solve the underlying `J2` native-home failure/retry behavior.
+  - The user's audible timing clue supports the idea that `J2` is aborting early rather than completing the normal post-home tail.
+
+## 2026-04-14 06:30 +0000
+
+- Task summary:
+  - Restarted from the user's soft-stopped state, explained the stale-anchor hypothesis against live `J2` data, and ran a focused `J2` trace to see whether a clean restarted epoch could home `J2` successfully.
+- Changes:
+  - No production backend changes in this pass.
+  - Captured a focused `J2` experiment under `logs/encoder-retention/20260414-062709-j2-focused-trace/`.
+  - Updated `.cursor/memory/AGENT_SCRATCHPAD.md` with the new `J2` stale-anchor interpretation and successful focused retry result.
+- Validation:
+  - Soft-stopped pre-restart probe:
+    - `./start-stack.sh probe`
+    - result: `J2 sw=0x9650 err=0x0000 pos_counts=178`, launcher absent, RTCore/EtherCAT still up
+  - Pre-restart and pre-home snapshots:
+    - `python scripts/a6ec_chapter5_probe.py snapshot --label pre-restart --axes J2 --experiment-id 20260414-062709-j2-focused-trace`
+    - `python scripts/a6ec_chapter5_probe.py snapshot --label pre-home-post-restart --axes J2 --experiment-id 20260414-062709-j2-focused-trace`
+  - Restart run:
+    - `./start-stack.sh`
+    - startup run id: `20260414-062712`
+  - Pre-home API state after restart:
+    - `/info/joints-detailed` still showed `J2 command_roundtrip_reference_error_counts ~= -52159` with old anchor `0.04842154167659891`
+  - Focused trace:
+    - saved to `logs/encoder-retention/20260414-062709-j2-focused-trace/j2-home-trace.json`
+    - result summary:
+      - `native_home_active_axis_mask` was seen active for `J2`
+      - statuswords seen: `0x8233`, `0x9650`
+      - error codes seen: `0x0000`
+      - command result: `NATIVE_HOME_VERIFIED`
+      - command finished at about `4.9s`
+  - Post-home verification:
+    - `./start-stack.sh probe` -> `J2 sw=0x9650 err=0x0000 pos_counts=27`
+    - `python scripts/a6ec_chapter5_probe.py snapshot --label post-home-success --axes J2 --experiment-id 20260414-062709-j2-focused-trace`
+    - post-home API poll saved to `post-home-success-poll.json`
+    - poll result: `J2 true 10/12`, roundtrip error `-1 .. +2` counts, refreshed anchor `0.02350346188438531`
+- Follow-up notes / risks:
+  - This strongly supports the stale-anchor explanation for the huge software-side mismatch we saw before the focused retry.
+  - A clean restarted epoch can still home `J2` successfully, so the earlier repeated batch failures were not enough to conclude that `J2` is fundamentally broken.
+  - The earlier `Er11.0` event still needs caution; the new result does not prove that fault was benign, only that the current clean single-axis retry path can succeed.

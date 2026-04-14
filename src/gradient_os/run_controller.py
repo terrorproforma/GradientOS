@@ -85,6 +85,14 @@ _CONTROLLER_PERF: dict[str, object] = {
         "per_command": {},
     }
 }
+_CANONICAL_TRUTH_MONITOR_LOCK = threading.Lock()
+_CANONICAL_TRUTH_MONITOR_STATE: dict[str, object] = {
+    "available": None,
+    "reason": None,
+    "axes": (),
+    "joints": (),
+    "read_source": None,
+}
 
 
 def _update_rolling_metric(metric: dict[str, object], value_ms: float) -> None:
@@ -391,9 +399,8 @@ def _build_joint_state_snapshot() -> dict[str, object]:
     try:
         current_angles_rad = servo_driver.get_current_arm_state_rad(verbose=False)
     except Exception as exc:
-        print(f"[Controller] WARNING: joint snapshot live read failed: {exc}")
-        current_angles_rad = list(utils.current_logical_joint_angles_rad)
-        read_source = "cached_fallback"
+        current_angles_rad = []
+        read_source = "unavailable"
         truth_error = str(exc)
 
     arm_rad = [float(value) for value in current_angles_rad]
@@ -449,6 +456,20 @@ def _build_joint_state_snapshot() -> dict[str, object]:
                 axis_absolute_feedback = display_snapshot.get("axis_absolute_feedback")
                 if isinstance(axis_absolute_feedback, list):
                     snapshot["axis_absolute_feedback"] = axis_absolute_feedback
+                    truth_reasons = sorted(
+                        {
+                            str(entry.get("truth_reason")).strip()
+                            for entry in axis_absolute_feedback
+                            if isinstance(entry, dict)
+                            and not bool(entry.get("truth_available", False))
+                            and isinstance(entry.get("truth_reason"), str)
+                            and str(entry.get("truth_reason")).strip()
+                        }
+                    )
+                    if len(truth_reasons) == 1:
+                        snapshot["canonical_joint_truth_reason"] = truth_reasons[0]
+                    elif truth_reasons:
+                        snapshot["canonical_joint_truth_reasons"] = truth_reasons
 
         axis_to_joint = getattr(backend, "_axis_to_joint", None)
         if isinstance(axis_to_joint, list) and axis_to_joint:
@@ -494,6 +515,17 @@ def _build_joint_state_snapshot() -> dict[str, object]:
         if isinstance(axis_brake_state, list) and axis_brake_state:
             snapshot["axis_brake_state"] = [int(value) for value in axis_brake_state[: len(axis_brake_state)]]
 
+    if "canonical_joint_truth_reason" not in snapshot and truth_error:
+        if "Canonical joint truth unavailable" in truth_error:
+            snapshot["canonical_joint_truth_reason"] = "canonical_truth_unavailable"
+        else:
+            snapshot["canonical_joint_truth_reason"] = "joint_state_read_failed"
+    snapshot["canonical_joint_truth_status"] = (
+        "available"
+        if bool(snapshot.get("canonical_joint_truth_available", False))
+        else "unavailable"
+    )
+    _emit_canonical_truth_monitor_transition(snapshot)
     return snapshot
 
 
@@ -725,6 +757,47 @@ def _build_monitor_motion_status_payload() -> dict[str, object] | None:
     if not isinstance(payload, dict):
         return None
     return payload
+
+
+def _emit_canonical_truth_monitor_transition(snapshot: dict[str, object]) -> None:
+    available = bool(snapshot.get("canonical_joint_truth_available", False))
+    reason_raw = snapshot.get("canonical_joint_truth_reason")
+    reason = str(reason_raw).strip() if isinstance(reason_raw, str) and reason_raw.strip() else None
+    axes_raw = snapshot.get("canonical_joint_truth_unavailable_axes", [])
+    joints_raw = snapshot.get("canonical_joint_truth_unavailable_joints", [])
+    axes = tuple(int(value) for value in axes_raw) if isinstance(axes_raw, list) else ()
+    joints = tuple(int(value) for value in joints_raw) if isinstance(joints_raw, list) else ()
+    read_source_raw = snapshot.get("read_source")
+    read_source = (
+        str(read_source_raw).strip()
+        if isinstance(read_source_raw, str) and read_source_raw.strip()
+        else None
+    )
+    next_state = {
+        "available": available,
+        "reason": reason,
+        "axes": axes,
+        "joints": joints,
+        "read_source": read_source,
+    }
+    with _CANONICAL_TRUTH_MONITOR_LOCK:
+        if next_state == _CANONICAL_TRUTH_MONITOR_STATE:
+            return
+        _CANONICAL_TRUTH_MONITOR_STATE.update(next_state)
+
+    if available:
+        print(
+            "[Controller] Canonical joint truth monitor:"
+            f" AVAILABLE read_source={read_source or 'unknown'}"
+        )
+        return
+
+    print(
+        "[Controller] Canonical joint truth monitor:"
+        f" UNAVAILABLE reason={reason or 'unknown'}"
+        f" axes={list(axes)} joints={list(joints)}"
+        f" read_source={read_source or 'unknown'}"
+    )
 
 
 def _rtcore_metrics_ready(metrics: dict[str, object] | None, *, expected_axes: int) -> tuple[bool, str]:

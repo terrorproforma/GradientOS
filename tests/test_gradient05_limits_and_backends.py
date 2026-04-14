@@ -472,7 +472,7 @@ def test_ethercat_backend_translates_canonical_truth_back_into_raw_wire_counts(m
         [
             {
                 "absolute_feedback": {
-                    "encoder_multi_turn_low": {"valid": 1, "value": 131060},
+                    "encoder_multi_turn_low": {"valid": 1, "value": 1234},
                     "encoder_multi_turn_high": {"valid": 1, "value": 0},
                 },
             }
@@ -488,18 +488,18 @@ def test_ethercat_backend_translates_canonical_truth_back_into_raw_wire_counts(m
     )
     backend._rt_num_axes = 1
     backend._rt_drive_profile_id = "a6ec_ds402"
-    backend._absolute_encoder_home_anchors[0] = {"home_anchor_rad": 0.0, "source": "pytest", "axis_indices": [0]}
+    backend._absolute_encoder_home_anchors[0] = {"home_anchor_rad": 10.0, "source": "pytest", "axis_indices": [0]}
 
-    controller_positions = backend.raw_to_joint_positions({0: 131060})
-    display_positions = backend.raw_to_display_joint_positions({0: 131060})
+    controller_positions = backend.raw_to_joint_positions({0: 234})
+    display_positions = backend.raw_to_display_joint_positions({0: 234})
 
     controller_axis_q = backend._axis_q_from_joint_positions(controller_positions)
     display_axis_q = backend._axis_q_from_joint_positions(display_positions)
 
-    assert controller_positions[0] == pytest.approx(1310.6)
-    assert display_positions[0] == pytest.approx(1310.6)
-    assert round(controller_axis_q[0] * 100.0) == 131060
-    assert round(display_axis_q[0] * 100.0) == 131060
+    assert controller_positions[0] == pytest.approx(2.34)
+    assert display_positions[0] == pytest.approx(2.34)
+    assert round(controller_axis_q[0] * 100.0) == 234
+    assert round(display_axis_q[0] * 100.0) == 234
 
 
 def test_ethercat_backend_uses_absolute_encoder_anchor_for_display_feedback(monkeypatch, tmp_path):
@@ -737,8 +737,76 @@ def test_ethercat_backend_connected_reads_return_canonical_feedback(monkeypatch,
     assert backend.get_joint_positions()[:2] == pytest.approx([0.25, 0.5])
 
 
-def test_ethercat_backend_connected_reads_fail_closed_when_anchor_missing(monkeypatch, tmp_path):
+def test_ethercat_backend_marks_truth_unavailable_when_absolute_anchor_does_not_roundtrip(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": 0,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 1234},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[100.0] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[131072] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    backend._axis_counts[0] = 234
+    backend._absolute_encoder_home_anchors[0] = {"home_anchor_rad": 0.0, "source": "pytest", "axis_indices": [0]}
+
+    snapshot = backend.get_display_feedback_snapshot({0: 234})
+
+    assert isinstance(snapshot, dict)
+    assert snapshot["truth_available"] is False
+    axis_detail = snapshot["axis_absolute_feedback"][0]
+    assert axis_detail["truth_reason"] == "command_frame_roundtrip_mismatch"
+    assert axis_detail["command_roundtrip_consistent"] is False
+    with pytest.raises(RuntimeError, match="Canonical joint truth unavailable"):
+        backend.get_joint_positions()
+
+
+def test_ethercat_backend_disconnected_get_joint_positions_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._store_last_joint_setpoint_rad([1.0] * backend.num_joints)
+
+    with pytest.raises(RuntimeError, match="Canonical joint truth unavailable"):
+        backend.get_joint_positions()
+
+
+def test_ethercat_backend_connected_without_feedback_config_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._axis_config = None
+    backend._store_last_joint_setpoint_rad([1.0] * backend.num_joints)
+    monkeypatch.setattr(backend, "_wait_for_feedback_ready", lambda **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match="Canonical joint truth unavailable"):
+        backend.get_joint_positions()
+
+
+def test_ethercat_backend_startup_bootstraps_missing_absolute_home_anchor(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
     metrics_path = tmp_path / "metrics.json"
     monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
     _write_rtcore_metrics_snapshot(
@@ -764,6 +832,41 @@ def test_ethercat_backend_connected_reads_fail_closed_when_anchor_missing(monkey
     backend._axis_counts[0] = 25
     backend._rt_drive_profile_id = "a6ec_ds402"
 
+    result = backend._bootstrap_missing_absolute_home_anchors(actor="pytest:startup_alignment")
+
+    anchors = load_absolute_encoder_anchors(backend._robot_id, num_joints=backend._num_joints)
+    assert result == {"created_joints": [1], "missing_joints": []}
+    assert anchors[0] is not None
+    assert anchors[0]["home_anchor_rad"] == pytest.approx(0.0)
+    assert backend.get_joint_positions()[0] == pytest.approx(0.25)
+
+
+def test_ethercat_backend_connected_reads_fail_closed_when_anchor_bootstrap_cannot_reconstruct_truth(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    _write_rtcore_metrics_snapshot(metrics_path, [{}])
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[100.0] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+    )
+    backend._axis_counts[0] = 25
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    result = backend._bootstrap_missing_absolute_home_anchors(actor="pytest:startup_alignment")
+
+    assert result == {"created_joints": [], "missing_joints": [1]}
     with pytest.raises(RuntimeError, match="Canonical joint truth unavailable"):
         backend.get_joint_positions()
 

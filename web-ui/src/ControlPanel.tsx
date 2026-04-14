@@ -215,6 +215,11 @@ type DriveFaultAxis = {
 	native_home_position_offset?: number;
 	native_home_last_abort_code?: number;
 	native_home_last_abort_code_hex?: string;
+	native_home_state_reported?: number;
+	native_home_state_reported_name?: string;
+	native_home_last_abort_code_reported?: number;
+	native_home_last_abort_code_reported_hex?: string;
+	native_home_verification_source?: string;
 	fault?: DriveFaultDetail | null;
 	manufacturer_fault?: DriveFaultDetail | null;
 };
@@ -361,13 +366,28 @@ function formatNativeHomeStatus(
 	if (stateName === "requested") {
 		return "Drive Home requested...";
 	}
+	const reportedStateName = (axis.native_home_state_reported_name ?? "").trim().toLowerCase();
+	const reportedAbortCode = (axis.native_home_last_abort_code_reported_hex ?? "").trim() || "0x00000000";
+	const verificationSource = (axis.native_home_verification_source ?? "").trim().toLowerCase();
+	const axisMask = driveFaults?.axis_enable_mask ?? 0;
+	const axisCurrentlyDisarmed = (axisMask & (1 << axis.axis)) === 0;
 	if (stateName === "succeeded") {
+		if (
+			verificationSource === "statusword_bit15"
+			&& reportedStateName === "failed"
+			&& reportedAbortCode !== "0x00000000"
+		) {
+			const parts = ["Drive Home verification conflicted", `reported failed ${reportedAbortCode}`];
+			if (axisCurrentlyDisarmed) {
+				parts.push("axis currently disarmed");
+			}
+			return parts.join(" | ");
+		}
 		const parts = ["Drive Home succeeded"];
 		if (typeof axis.native_home_position_offset === "number") {
 			parts.push(`offset ${axis.native_home_position_offset} cnt`);
 		}
-		const axisMask = driveFaults?.axis_enable_mask ?? 0;
-		if ((axisMask & (1 << axis.axis)) === 0) {
+		if (axisCurrentlyDisarmed) {
 			parts.push("axis currently disarmed");
 		}
 		return parts.join(" | ");

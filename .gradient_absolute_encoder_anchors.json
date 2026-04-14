@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "robots": {
+    "gradient-05": {
+      "logical_joint_absolute_home_anchors": [
+        {
+          "home_anchor_rad": -0.05516338723935631,
+          "source": "encoder_multi_turn_counts",
+          "axis_indices": [
+            0
+          ],
+          "updated_at": "2026-04-14T05:57:44+00:00",
+          "updated_by": "ethercat_rtcore:joint1:native_home"
+        },
+        {
+          "home_anchor_rad": 0.02350346188438531,
+          "source": "encoder_multi_turn_counts",
+          "axis_indices": [
+            1
+          ],
+          "updated_at": "2026-04-14T06:28:24+00:00",
+          "updated_by": "ethercat_rtcore:joint2:native_home"
+        },
+        {
+          "home_anchor_rad": 0.02548325583875021,
+          "source": "encoder_multi_turn_counts",
+          "axis_indices": [
+            2
+          ],
+          "updated_at": "2026-04-14T02:06:51+00:00",
+          "updated_by": "ethercat_rtcore:joint3:native_home"
+        },
+        {
+          "home_anchor_rad": 0.26155437697886214,
+          "source": "encoder_multi_turn_counts",
+          "axis_indices": [
+            3
+          ],
+          "updated_at": "2026-04-14T00:25:26+00:00",
+          "updated_by": "ethercat_rtcore:joint4:native_home"
+        },
+        {
+          "home_anchor_rad": -0.09880523652850202,
+          "source": "encoder_multi_turn_counts",
+          "axis_indices": [
+            4
+          ],
+          "updated_at": "2026-04-14T05:57:16+00:00",
+          "updated_by": "ethercat_rtcore:joint5:native_home"
+        },
+        {
+          "home_anchor_rad": -0.2690698175750657,
+          "source": "encoder_multi_turn_counts",
+          "axis_indices": [
+            5
+          ],
+          "updated_at": "2026-04-14T05:36:01+00:00",
+          "updated_by": "ethercat_rtcore:joint6:native_home"
+        }
+      ],
+      "updated_at": "2026-04-14T06:28:24+00:00",
+      "updated_by": "ethercat_rtcore:joint2:native_home"
+    }
+  }
+}

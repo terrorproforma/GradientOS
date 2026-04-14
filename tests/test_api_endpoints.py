@@ -1311,6 +1311,20 @@ def test_info_pose(client):
     assert body["joints_deg"] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 
 
+def test_info_pose_returns_503_when_controller_pose_sample_fails(client, monkeypatch):
+    original_send = api_main._send_controller_command
+
+    def fake_send(message: str, timeout: float = 1.0, expect_response: bool = True):
+        if message == "GET_POSITION":
+            return False, "ERROR,GET_POSITION,CANONICAL_JOINT_TRUTH_UNAVAILABLE,Canonical joint truth unavailable"
+        return original_send(message, timeout=timeout, expect_response=expect_response)
+
+    monkeypatch.setattr(api_main, "_send_controller_command", fake_send)
+    resp = client.get("/info/pose")
+    assert resp.status_code == 503
+    assert "CANONICAL_JOINT_TRUTH_UNAVAILABLE" in resp.json()["detail"]
+
+
 def test_info_joints(client):
     resp = client.get("/info/joints")
     assert resp.status_code == 200

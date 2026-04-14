@@ -83,3 +83,23 @@ def test_startup_recovery_plan_does_not_recycle_normal_bus_convergence():
     assert plan["healthy"] is False
     assert plan["should_recover"] is False
     assert plan["reboot_required"] is False
+
+
+def test_startup_recovery_plan_does_not_recycle_rtcore_not_up_without_busy_signatures():
+    plan = build_rtcore_startup_recovery_plan(
+        {
+            "physical_state": "INACTIVE",
+            "driver_state": "INACTIVE",
+            "ethercat_master_state": "DOWN",
+            "rtcore_state": "UNKNOWN",
+            "startup_ready": 0,
+            "responding": 0,
+            "online": 0,
+            "operational": 0,
+            "num_axes": 6,
+        }
+    )
+    assert plan["healthy"] is False
+    assert plan["should_recover"] is False
+    assert plan["reboot_required"] is False
+    assert plan["reason"] == "rtcore_starting_or_down"

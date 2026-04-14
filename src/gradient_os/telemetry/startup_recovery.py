@@ -115,12 +115,12 @@ def build_rtcore_startup_recovery_plan(
                 "RTCore still reports UP with EtherCAT DOWN after one recycle attempt, but no "
                 "explicit master-busy signature was found. Continue with normal readiness checks."
             )
-    elif rtcore_state != "UP" and physical_state == "INACTIVE" and not recovery_attempted:
-        should_recover = True
-        reason = "rtcore_not_up"
+    elif rtcore_state != "UP" and physical_state == "INACTIVE":
+        reason = "rtcore_starting_or_down"
         detail = (
-            "RTCore does not appear healthy after sync. Attempt one hard RTCore/EtherCAT recycle "
-            "before controller launch."
+            "RTCore is not healthy yet after sync, but there is no explicit stale-owner or "
+            "master-busy signature. Allow normal startup/readiness waits instead of forcing an "
+            "immediate recycle."
         )
     elif recovery_attempted and stale_owner_seen and master_busy_seen:
         reboot_required = True

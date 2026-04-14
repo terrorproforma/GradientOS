@@ -451,7 +451,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
             output_target_velocity_counts_per_s=[0] * _GRADIENT_MAX_AXES,
         )
 
-        # Latest commanded joint positions (radians) as a safe fallback for getters.
+        # Latest commanded joint positions (radians) for command bookkeeping and
+        # diagnostics. These values must never masquerade as live encoder truth.
         self._last_joint_setpoint_rad: list[float] = [0.0] * self._num_joints
 
         self._status_thread: Optional[threading.Thread] = None
@@ -464,6 +465,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def initialize(self) -> bool:
         try:
             ok = self._connect_ipc()
+            if ok:
+                try:
+                    self._bootstrap_missing_absolute_home_anchors(
+                        actor="ethercat_rtcore:startup_alignment",
+                    )
+                except Exception as exc:
+                    print(f"[EtherCAT RTCore] WARNING: absolute-home anchor bootstrap failed: {exc}")
             self._initialized = bool(ok)
             return bool(ok)
         except Exception as e:
@@ -1381,15 +1389,15 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if self._connected and self._axis_config is None:
             # Give the status thread a brief chance to receive scaling data.
             self._wait_for_feedback_ready(timeout_s=0.25, require_live_wkc=False)
-        if self._connected and self._axis_config is not None:
-            positions = self.raw_to_joint_positions(self.sync_read_positions())
-            if verbose:
-                print("[EtherCAT RTCore] get_joint_positions() (connected) -> live feedback")
-            return positions
+        if not self._connected:
+            raise RuntimeError("Canonical joint truth unavailable (rtcore_disconnected)")
+        if self._axis_config is None:
+            raise RuntimeError("Canonical joint truth unavailable (rtcore_feedback_not_ready)")
+
+        positions = self.raw_to_joint_positions(self.sync_read_positions())
         if verbose:
-            state = "connected" if self._connected else "disconnected"
-            print(f"[EtherCAT RTCore] get_joint_positions() ({state}) -> last setpoint")
-        return self._copy_last_joint_setpoint_rad()
+            print("[EtherCAT RTCore] get_joint_positions() (connected) -> live feedback")
+        return positions
 
     def prepare_sync_write_commands(
         self,
@@ -1440,6 +1448,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             metrics = self._absolute_feedback_metrics_for_axis(axis_i)
             normalized_absolute_feedback = self._normalize_absolute_feedback_metrics(metrics)
             absolute_result = self._absolute_axis_q_from_metrics(axis_i, metrics)
+            reference_q: float | None = None
             anchor_entry = (
                 self._absolute_home_anchor_for_joint(joint_i)
                 if 0 <= joint_i < self._num_joints
@@ -1473,6 +1482,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 truth_reason = "raw_feedback_missing"
             elif joint_i < 0 or joint_i >= self._num_joints:
                 truth_reason = "logical_joint_unmapped"
+            elif reference_q is None:
+                truth_reason = "reference_frame_unavailable"
             elif absolute_axis_q is None:
                 truth_reason = "absolute_feedback_unavailable"
             elif anchor_entry is None:
@@ -1494,6 +1505,23 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 - float(anchor_entry["home_anchor_rad"])
                 - self._master_offset_for_joint(joint_i)
             )
+            roundtrip_detail = self._command_roundtrip_detail_for_axis(
+                axis_i=axis_i,
+                logical_joint_idx=joint_i,
+                canonical_q=float(canonical_q),
+                reference_q=float(reference_q),
+            )
+            detail.update(roundtrip_detail)
+            if not bool(roundtrip_detail.get("command_roundtrip_consistent", False)):
+                detail["truth_available"] = False
+                detail["truth_status"] = "unavailable"
+                detail["truth_reason"] = "command_frame_roundtrip_mismatch"
+                detail["display_source"] = "truth_unavailable"
+                unavailable_axes.append(int(axis_i))
+                if logical_joint is not None:
+                    unavailable_joints.append(int(logical_joint))
+                axis_truth_details.append(detail)
+                continue
             positions[joint_i] = float(canonical_q)
             detail["truth_available"] = True
             detail["truth_status"] = "available"
@@ -2293,7 +2321,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         joint_i = self._axis_to_joint[axis_i]
         if joint_i < 0 or joint_i >= self._num_joints:
             return
-        logical_q = float(target_axis_q) - self._master_offset_for_joint(joint_i)
+        logical_q = self._canonical_joint_q_from_command_axis_q(joint_i, float(target_axis_q))
         self._store_last_joint_index_setpoint(joint_i, logical_q)
 
     def _refresh_native_home_offsets_from_metrics(self) -> None:
@@ -2440,6 +2468,48 @@ class EthercatRTCoreBackend(ActuatorBackend):
             return None
         return float(physical_q) + self._native_home_offset_q_for_axis(axis_i)
 
+    def _command_axis_q_for_joint_value(self, logical_joint_idx: int, canonical_q: float) -> float:
+        return float(canonical_q) + self._master_offset_for_joint(logical_joint_idx)
+
+    def _canonical_joint_q_from_command_axis_q(self, logical_joint_idx: int, target_axis_q: float) -> float:
+        return float(target_axis_q) - self._master_offset_for_joint(logical_joint_idx)
+
+    def _command_roundtrip_tolerance_rad_for_axis(self, axis_i: int) -> float:
+        cfg = self._axis_config
+        if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
+            return 1e-9
+        counts_per_unit = float(cfg.counts_per_unit[axis_i])
+        if counts_per_unit <= 0.0:
+            return 1e-9
+        return (1.0 / counts_per_unit) + 1e-9
+
+    def _command_roundtrip_detail_for_axis(
+        self,
+        *,
+        axis_i: int,
+        logical_joint_idx: int,
+        canonical_q: float,
+        reference_q: float,
+    ) -> dict[str, object]:
+        roundtrip_reference_q = self._command_axis_q_for_joint_value(logical_joint_idx, canonical_q)
+        error_rad = float(roundtrip_reference_q) - float(reference_q)
+        tolerance_rad = self._command_roundtrip_tolerance_rad_for_axis(axis_i)
+        detail: dict[str, object] = {
+            "command_roundtrip_reference_rad": float(roundtrip_reference_q),
+            "command_roundtrip_reference_error_rad": float(error_rad),
+            "command_roundtrip_tolerance_rad": float(tolerance_rad),
+            "command_roundtrip_consistent": abs(float(error_rad)) <= float(tolerance_rad),
+        }
+        cfg = self._axis_config
+        if cfg is not None and 0 <= axis_i < int(cfg.num_axes):
+            counts_per_unit = float(cfg.counts_per_unit[axis_i])
+            sign = int(cfg.sign[axis_i])
+            if counts_per_unit > 0.0 and sign in (-1, 1):
+                detail["command_roundtrip_reference_error_counts"] = float(
+                    float(error_rad) * float(sign) * float(counts_per_unit)
+                )
+        return detail
+
     def _capture_absolute_home_anchor_for_joint(
         self,
         logical_joint_index: int,
@@ -2509,6 +2579,57 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 if 0 <= joint_i < len(self._absolute_encoder_home_anchors):
                     self._absolute_encoder_home_anchors[joint_i] = normalized_entry
         return normalized_entry
+
+    def _bootstrap_missing_absolute_home_anchors(self, *, actor: str) -> dict[str, object]:
+        target_joint_indices = sorted({joint_i for joint_i in self._axis_to_joint if 0 <= joint_i < self._num_joints})
+        if not target_joint_indices:
+            target_joint_indices = list(range(self._num_joints))
+        if not self._connected:
+            return {
+                "created_joints": [],
+                "missing_joints": [joint_i + 1 for joint_i in target_joint_indices],
+            }
+        if self._axis_config is None and not self._wait_for_feedback_ready(timeout_s=0.25, require_live_wkc=False):
+            return {
+                "created_joints": [],
+                "missing_joints": [joint_i + 1 for joint_i in target_joint_indices],
+            }
+        raw_positions = self.sync_read_positions()
+        if not raw_positions:
+            return {
+                "created_joints": [],
+                "missing_joints": [joint_i + 1 for joint_i in target_joint_indices],
+            }
+
+        created_joints: list[int] = []
+        missing_joints: list[int] = []
+        for joint_i in target_joint_indices:
+            if self._absolute_home_anchor_for_joint(joint_i) is not None:
+                continue
+            captured = self._capture_absolute_home_anchor_for_joint(
+                joint_i,
+                raw_positions=raw_positions,
+                actor=actor,
+            )
+            if captured is not None:
+                created_joints.append(joint_i + 1)
+            else:
+                missing_joints.append(joint_i + 1)
+
+        if created_joints:
+            print(
+                "[EtherCAT RTCore] Bootstrapped absolute-home anchors from live raw/absolute alignment:"
+                f" joints={created_joints} actor={actor}"
+            )
+        if missing_joints:
+            print(
+                "[EtherCAT RTCore] Absolute-home anchors still missing after bootstrap:"
+                f" joints={missing_joints}"
+            )
+        return {
+            "created_joints": created_joints,
+            "missing_joints": missing_joints,
+        }
 
     def _native_home_metrics_result(
         self,
@@ -2701,13 +2822,14 @@ class EthercatRTCoreBackend(ActuatorBackend):
         axis_q: list[float] = [0.0] * self._rt_num_axes
         for axis_i, joint_i in enumerate(self._axis_to_joint):
             if 0 <= joint_i < len(positions_rad):
-                # Queue trajectory points in the same controller/logical frame that
-                # `raw_to_joint_positions()` publishes. RTCore converts those queued
-                # targets once into raw CSP wire counts (the same 0x6064/0x607A
-                # frame the drive uses) by subtracting the persisted native-home
-                # offset during trajectory-point latch, so Python must not subtract
-                # the drive-home offset here.
-                axis_q[axis_i] = float(positions_rad[joint_i]) + self._master_offset_for_joint(joint_i)
+                # The persisted absolute-home anchor is defined as:
+                #   absolute_axis_q - reference_q
+                # so canonical truth becomes:
+                #   absolute_axis_q - absolute_home_anchor - software_zero
+                # = reference_q - software_zero
+                # The command path therefore still inverts back to the same
+                # reference frame by re-applying only the software-zero offset.
+                axis_q[axis_i] = self._command_axis_q_for_joint_value(joint_i, float(positions_rad[joint_i]))
         return axis_q
 
     def _axis_qd_from_joint_velocities(self, joint_velocities_rad_s: list[float]) -> list[float]:

@@ -2186,11 +2186,7 @@ def _closed_loop_executor_thread(
                     actual_joint_positions = list(backend.raw_to_joint_positions(raw_positions))
                 except Exception as exc:
                     print(f"[Pi CLC] WARNING: Backend joint feedback conversion failed: {exc}")
-                    try:
-                        actual_joint_positions = list(backend.get_joint_positions(verbose=False))
-                    except Exception as fallback_exc:
-                        print(f"[Pi CLC] WARNING: Backend joint feedback fallback failed: {fallback_exc}")
-                        actual_joint_positions = []
+                    actual_joint_positions = []
 
             # ------------------------------------------------------------
             #  Feedback synthesis for twin-motor joints

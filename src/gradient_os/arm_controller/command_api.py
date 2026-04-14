@@ -3105,7 +3105,17 @@ def handle_get_position(sock: 'socket.socket', addr: tuple):
     print(f"[Pi] Received GET_POSITION from {addr}.")
 
     # Fetch the latest joint angles directly from the physical servos
-    current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
+    try:
+        current_angles = servo_driver.get_current_arm_state_rad(verbose=False)
+    except Exception as exc:
+        message = str(exc).strip() or exc.__class__.__name__
+        code = "CANONICAL_JOINT_TRUTH_UNAVAILABLE" if "Canonical joint truth unavailable" in message else "GET_POSITION_FAILED"
+        print(f"[Pi] ERROR: Could not fetch current position joints: {message}")
+        try:
+            sock.sendto(f"ERROR,GET_POSITION,{code},{message.replace(',', ';')}".encode("utf-8"), addr)
+        except Exception as send_exc:
+            print(f"[Pi] Error sending GET_POSITION failure to {addr}: {send_exc}")
+        return
     
     # Get the current full pose using Forward Kinematics (matrix)
     pose_mx = ik_solver.get_fk_matrix(current_angles)
