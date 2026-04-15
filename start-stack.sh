@@ -1301,6 +1301,17 @@ print(
 )
 print(f"  physical_state: {data.get('physical_state')}")
 print(f"  metrics_path: {data.get('metrics_path')}")
+if any(key in data for key in (
+    "metrics_startup_readback_enabled",
+    "metrics_native_home_refresh_enabled",
+    "metrics_absolute_feedback_poll_enabled",
+)):
+    print(
+        "  rtcore_metrics_sdo:"
+        f" startup_readback={data.get('metrics_startup_readback_enabled')}"
+        f" native_home_refresh={data.get('metrics_native_home_refresh_enabled')}"
+        f" absolute_feedback_poll={data.get('metrics_absolute_feedback_poll_enabled')}"
+    )
 for axis in data.get("axes", []):
     fault = axis.get("fault") if isinstance(axis, dict) else None
     fault_suffix = ""
@@ -1508,6 +1519,127 @@ capture_rtcore_recent_journal() {
   run_journalctl -u "${RTCORE_SERVICE_NAME}" -n 120 --no-pager 2>/dev/null || true
 }
 
+capture_fieldbus_failure_diagnostics() {
+  local payload="${1:-}"
+  local started_ms="${2:-0}"
+  if [[ -z "${LOG_DIR}" ]]; then
+    return 0
+  fi
+
+  local diag_dir="${LOG_DIR}/fieldbus-failure-diagnostics"
+  mkdir -p "${diag_dir}"
+
+  if [[ -n "${payload}" ]]; then
+    printf '%s\n' "${payload}" > "${diag_dir}/probe.json"
+  fi
+
+  local since_arg=""
+  if [[ "${started_ms}" =~ ^[0-9]+$ ]] && (( started_ms > 0 )); then
+    since_arg="@$(( started_ms / 1000 ))"
+  fi
+
+  run_systemctl status "${RTCORE_SERVICE_NAME}" "${ETHERCAT_SERVICE_NAME}" --no-pager \
+    > "${diag_dir}/systemd-status.txt" 2>&1 || true
+  if [[ -n "${since_arg}" ]]; then
+    run_journalctl -u "${RTCORE_SERVICE_NAME}" -u "${ETHERCAT_SERVICE_NAME}" -S "${since_arg}" --no-pager \
+      > "${diag_dir}/unit-journal.txt" 2>&1 || true
+    run_journalctl -k -S "${since_arg}" --no-pager \
+      > "${diag_dir}/kernel-journal.txt" 2>&1 || true
+  else
+    run_journalctl -u "${RTCORE_SERVICE_NAME}" -u "${ETHERCAT_SERVICE_NAME}" -n 200 --no-pager \
+      > "${diag_dir}/unit-journal.txt" 2>&1 || true
+    run_journalctl -k -n 200 --no-pager \
+      > "${diag_dir}/kernel-journal.txt" 2>&1 || true
+  fi
+  ps -eo pid,ppid,state,wchan:32,cmd | awk '
+    NR == 1 { print; next }
+    index($0, "gradient-rt-motion") || index($0, "gradient-rt-mot") || index($0, "metrics") || index($0, "ethercat") { print }
+  ' > "${diag_dir}/processes.txt" 2>&1 || true
+  lsmod | awk '$1 ~ /^ec_/' > "${diag_dir}/kernel-modules.txt" 2>&1 || true
+
+  "${SYSTEM_PYTHON}" - "${diag_dir}" "${RUN_ID:-unknown}" <<'PY' > "${diag_dir}/summary.txt"
+from pathlib import Path
+import json
+import re
+import sys
+
+diag_dir = Path(sys.argv[1])
+run_id = sys.argv[2]
+
+def read_text(name: str) -> str:
+    path = diag_dir / name
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+probe_summary = "probe_unavailable"
+probe_path = diag_dir / "probe.json"
+if probe_path.exists():
+    try:
+        probe = json.loads(probe_path.read_text(encoding="utf-8", errors="replace"))
+        probe_summary = (
+            f"physical_state={probe.get('physical_state')} "
+            f"driver_state={probe.get('driver_state')} "
+            f"ethercat_master_state={probe.get('ethercat_master_state')} "
+            f"rtcore_state={probe.get('rtcore_state')} "
+            f"responding={probe.get('responding')}/{probe.get('num_axes')} "
+            f"online={probe.get('online')}/{probe.get('num_axes')} "
+            f"operational={probe.get('operational')}/{probe.get('num_axes')} "
+            f"startup_ready={probe.get('startup_ready')} "
+            f"wkc={probe.get('wkc_actual')}/{probe.get('wkc_expected')}"
+        )
+    except Exception:
+        probe_summary = "probe_parse_failed"
+
+unit_journal = read_text("unit-journal.txt")
+kernel_journal = read_text("kernel-journal.txt")
+systemd_status = read_text("systemd-status.txt")
+processes = read_text("processes.txt")
+modules = read_text("kernel-modules.txt")
+
+summary = [
+    f"run_id={run_id}",
+    f"probe={probe_summary}",
+]
+
+if (
+    "Failed to reserve master" in unit_journal
+    or "ecrt_request_master(0) failed" in unit_journal
+    or "Failed to reserve master" in systemd_status
+    or "ecrt_request_master(0) failed" in systemd_status
+):
+    summary.append("likely_cause=rtcore_master_reservation_failed")
+if "Master already in use!" in kernel_journal:
+    summary.append("kernel_master_already_in_use=1")
+if "left-over process" in unit_journal or "left-over process" in systemd_status:
+    summary.append("systemd_leftover_rtcore_process=1")
+if "ec_generic is in use" in unit_journal or "ec_generic is in use" in systemd_status:
+    summary.append("ethercat_kernel_module_busy=1")
+if re.search(r"task metrics:\d+ blocked for more than", kernel_journal):
+    match = re.search(r"task (metrics:\d+) blocked for more than", kernel_journal)
+    summary.append(f"hung_kernel_task={match.group(1) if match else 'metrics'}")
+if "[gradient-rt-mot] <defunct>" in processes:
+    summary.append("rtcore_zombie_marker_present=1")
+if "ec_generic" in modules or "ec_master" in modules:
+    summary.append("ethercat_modules_loaded=1")
+
+if len(summary) == 2:
+    summary.append("likely_cause=unknown")
+
+for line in summary:
+    print(line)
+PY
+
+  local summary_path="${diag_dir}/summary.txt"
+  warn "Captured fieldbus failure diagnostics in ${diag_dir}"
+  if [[ -f "${summary_path}" ]]; then
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      warn "fieldbus diagnostic: ${line}"
+    done < "${summary_path}"
+  fi
+}
+
 probe_rtcore_startup_recovery_plan() {
   local payload="$1"
   local recent_log="$2"
@@ -1676,6 +1808,7 @@ wait_for_bus_operational() {
       if [[ -n "${payload}" ]]; then
         log_probe_snapshot "${payload}"
       fi
+      capture_fieldbus_failure_diagnostics "${payload}" "${started_ms}"
       error "bus failed readiness after $(format_duration_ms $(( $(now_ms) - started_ms ))); base_timeout=${BUS_READY_TIMEOUT_S}s progress_grace=${BUS_READY_PROGRESS_GRACE_S}s hard_cap=${BUS_READY_MAX_TIMEOUT_S}s"
       return 1
     fi

@@ -33,37 +33,66 @@ type RuntimeHeaderProps = {
 	className?: string;
 };
 
+type JointInfoValue = number | null;
+
 type JointInfoResponse = {
-	arm_deg?: number[];
-	arm_rad?: number[];
-	arm_display_deg?: number[];
-	arm_display_rad?: number[];
+	arm_deg?: JointInfoValue[];
+	arm_rad?: JointInfoValue[];
+	arm_display_deg?: JointInfoValue[];
+	arm_display_rad?: JointInfoValue[];
 	gripper_deg?: number;
 	gripper_rad?: number;
 	read_source?: string;
 };
 
-function preferredJointAnglesDeg(payload: JointInfoResponse | null | undefined): number[] | null {
-	if (Array.isArray(payload?.arm_deg) && payload.arm_deg.length > 0) {
-		return payload.arm_deg.map((value) => Number(value));
-	}
-	if (Array.isArray(payload?.arm_display_deg) && payload.arm_display_deg.length > 0) {
-		return payload.arm_display_deg.map((value) => Number(value));
+function normalizeJointAngles(values: JointInfoValue[] | null | undefined): number[] | null {
+	if (Array.isArray(values) && values.length > 0) {
+		return values.map((value) => (typeof value === "number" && Number.isFinite(value) ? Number(value) : Number.NaN));
 	}
 	return null;
 }
 
+function preferredJointAnglesDeg(payload: JointInfoResponse | null | undefined): number[] | null {
+	return normalizeJointAngles(payload?.arm_display_deg);
+}
+
 function preferredTelemetryJointAnglesRad(
-	telemetry: { display_joints?: number[]; joints?: number[] } | null | undefined,
+	telemetry: { display_joints?: JointInfoValue[]; joints?: JointInfoValue[] } | null | undefined,
 ): number[] | null {
-	if (Array.isArray(telemetry?.joints) && telemetry.joints.length > 0) {
-		return telemetry.joints.map((value) => Number(value));
-	}
 	if (Array.isArray(telemetry?.display_joints) && telemetry.display_joints.length > 0) {
-		return telemetry.display_joints.map((value) => Number(value));
+		return normalizeJointAngles(telemetry.display_joints);
 	}
 	return null;
 }
+
+function hasAnyFiniteJointAngles(values: number[] | null | undefined): values is number[] {
+	return Array.isArray(values) && values.some((value) => Number.isFinite(value));
+}
+
+function hasAllFiniteJointAngles(values: number[] | null | undefined): values is number[] {
+	return Array.isArray(values) && values.length > 0 && values.every((value) => Number.isFinite(value));
+}
+
+function jointAngleArraysMatch(current: number[], next: number[]): boolean {
+	if (current.length !== next.length) {
+		return false;
+	}
+	for (let index = 0; index < next.length; index += 1) {
+		const currentValue = current[index];
+		const nextValue = next[index];
+		const currentFinite = Number.isFinite(currentValue);
+		const nextFinite = Number.isFinite(nextValue);
+		if (currentFinite !== nextFinite) {
+			return false;
+		}
+		if (currentFinite && Math.abs(currentValue - nextValue) > 1e-3) {
+			return false;
+		}
+	}
+	return true;
+}
+
+const POWER_TRANSITION_SAFE_STABLE_MS = 600;
 
 type MotionExecutionPayload = {
 	controller_motion_state?: string;
@@ -369,11 +398,13 @@ function formatNativeHomeStatus(
 	const reportedStateName = (axis.native_home_state_reported_name ?? "").trim().toLowerCase();
 	const reportedAbortCode = (axis.native_home_last_abort_code_reported_hex ?? "").trim() || "0x00000000";
 	const verificationSource = (axis.native_home_verification_source ?? "").trim().toLowerCase();
+	const statuswordVerificationSuccess = verificationSource === "statusword_bit15"
+		|| verificationSource === "statusword_bits12_15_clear13";
 	const axisMask = driveFaults?.axis_enable_mask ?? 0;
 	const axisCurrentlyDisarmed = (axisMask & (1 << axis.axis)) === 0;
 	if (stateName === "succeeded") {
 		if (
-			verificationSource === "statusword_bit15"
+			statuswordVerificationSuccess
 			&& reportedStateName === "failed"
 			&& reportedAbortCode !== "0x00000000"
 		) {
@@ -592,8 +623,65 @@ export function ControlPanelRuntimeHeader({
 		?? powerTransitionExecution?.power_transition_blocker_details
 		?? []
 	) as PowerTransitionBlocker[];
-	const powerTransitionSafe = powerTransitionStatus?.safe_for_power_transition ?? powerTransitionExecution?.safe_for_power_transition;
-	const powerTransitionKnown = typeof powerTransitionSafe === "boolean";
+	const powerTransitionSafeRaw = powerTransitionStatus?.safe_for_power_transition
+		?? powerTransitionExecution?.safe_for_power_transition;
+	const powerTransitionKnown = typeof powerTransitionSafeRaw === "boolean";
+	const powerTransitionBlockerCodes = useMemo(
+		() => powerTransitionBlockerDetails
+			.map((detail) => (typeof detail.code === "string" ? detail.code.trim().toLowerCase() : ""))
+			.filter((value) => value.length > 0),
+		[powerTransitionBlockerDetails],
+	);
+	const showConservativeSafetyStatus = requiresExplicitDrivePower
+		&& !isDrivePowerActive
+		&& !drivePowerRequested
+		&& pendingPowerAction === null;
+	const onlySyncBlockers = powerTransitionBlockerCodes.length > 0
+		&& powerTransitionBlockerCodes.every((code) => code === "not_synchronized");
+	const [stableDisarmedPowerTransitionSafe, setStableDisarmedPowerTransitionSafe] = useState<boolean>(false);
+	const stablePowerTransitionTimerRef = useRef<number | null>(null);
+	useEffect(() => {
+		if (stablePowerTransitionTimerRef.current !== null) {
+			window.clearTimeout(stablePowerTransitionTimerRef.current);
+			stablePowerTransitionTimerRef.current = null;
+		}
+		if (!powerTransitionKnown) {
+			setStableDisarmedPowerTransitionSafe(false);
+			return;
+		}
+		if (!showConservativeSafetyStatus) {
+			setStableDisarmedPowerTransitionSafe(powerTransitionSafeRaw === true);
+			return;
+		}
+		if (powerTransitionSafeRaw !== true) {
+			setStableDisarmedPowerTransitionSafe(false);
+			return;
+		}
+		if (stableDisarmedPowerTransitionSafe) {
+			return;
+		}
+		stablePowerTransitionTimerRef.current = window.setTimeout(() => {
+			setStableDisarmedPowerTransitionSafe(true);
+			stablePowerTransitionTimerRef.current = null;
+		}, POWER_TRANSITION_SAFE_STABLE_MS);
+		return () => {
+			if (stablePowerTransitionTimerRef.current !== null) {
+				window.clearTimeout(stablePowerTransitionTimerRef.current);
+				stablePowerTransitionTimerRef.current = null;
+			}
+		};
+	}, [
+		powerTransitionKnown,
+		powerTransitionSafeRaw,
+		showConservativeSafetyStatus,
+		stableDisarmedPowerTransitionSafe,
+	]);
+	const powerTransitionSafe = powerTransitionKnown
+		&& (
+			showConservativeSafetyStatus
+				? stableDisarmedPowerTransitionSafe
+				: powerTransitionSafeRaw === true
+		);
 	const powerUpBlocked =
 		activeDriveFaultAxes.length > 0
 		|| (powerTransitionKnown ? powerTransitionSafe !== true : true);
@@ -646,13 +734,17 @@ export function ControlPanelRuntimeHeader({
 			}
 			const payload = await res.json() as JointInfoResponse;
 			const nextAngles = preferredJointAnglesDeg(payload);
-			if (!nextAngles) {
+			if (!hasAnyFiniteJointAngles(nextAngles)) {
 				return false;
 			}
-			onJointFeedback?.(
-				nextAngles,
-				typeof payload.gripper_deg === "number" ? payload.gripper_deg : undefined,
-			);
+			if (hasAllFiniteJointAngles(nextAngles)) {
+				onJointFeedback?.(
+					nextAngles,
+					typeof payload.gripper_deg === "number" ? payload.gripper_deg : undefined,
+				);
+			} else {
+				onJointFeedback?.([], undefined);
+			}
 			return true;
 		} catch (err) {
 			reportRequestError(err, "Joint feedback unavailable.", true);
@@ -753,9 +845,19 @@ export function ControlPanelRuntimeHeader({
 			: motionStateName === "completed"
 				? "DONE"
 				: formatMotionStateLabel(motionStateName);
-	const safetyStatusLabel = powerTransitionKnown
-		? (powerTransitionSafe ? "SAFE" : "BLOCKED")
-		: "CHECK";
+	const safetyStatusPendingCheck = !powerTransitionKnown
+		|| (
+			showConservativeSafetyStatus
+			&& (
+				(powerTransitionSafeRaw === true && !stableDisarmedPowerTransitionSafe)
+				|| (!powerTransitionSafe && onlySyncBlockers)
+			)
+		);
+	const safetyStatusLabel = powerTransitionSafe
+		? "SAFE"
+		: safetyStatusPendingCheck
+			? "CHECK"
+			: "BLOCKED";
 	const driveStatusTitle = requiresExplicitDrivePower
 		? (
 			driveFaults
@@ -766,8 +868,10 @@ export function ControlPanelRuntimeHeader({
 	const motionStatusTitle = motionStatus
 		? `Motion ${formatMotionStateLabel(motionStateName)}. Source ${motionStatus.source_of_truth ?? "controller"} | scope ${motionStatus.completion_scope ?? "unknown"} | mode ${motionStatus.execution?.active_mode_name ?? "n/a"} | queue ${motionStatus.execution?.queue_depth ?? 0}/${motionStatus.execution?.queue_capacity ?? 0}`
 		: "Waiting for controller motion status.";
-	const safetyStatusTitle = powerTransitionKnown && powerTransitionSafe
+	const safetyStatusTitle = powerTransitionSafe
 		? "Runtime is neutral and synchronized; explicit drive enable is allowed."
+		: safetyStatusPendingCheck
+			? "Waiting for live feedback to remain synchronized long enough for a stable explicit drive-enable indication."
 		: powerUpBlockerMessage;
 	return (
 		<div className={`flex min-w-0 h-full items-stretch gap-1.5 ${className ?? ""}`}>
@@ -802,12 +906,14 @@ export function ControlPanelRuntimeHeader({
 			<span
 				title={safetyStatusTitle}
 				className={`inline-flex shrink-0 h-full items-center gap-1 border px-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] ${
-					powerTransitionKnown && powerTransitionSafe
+					powerTransitionSafe
 						? "border-emerald-500/40 bg-emerald-400/10 text-emerald-100"
-						: "border-amber-500/40 bg-amber-400/10 text-amber-100"
+						: safetyStatusPendingCheck
+							? "border-slate-600/70 bg-slate-900/70 text-slate-300"
+							: "border-amber-500/40 bg-amber-400/10 text-amber-100"
 				}`}
 			>
-				{powerTransitionKnown && powerTransitionSafe ? <ShieldCheck size={11} /> : <ShieldAlert size={11} />}
+				{powerTransitionSafe ? <ShieldCheck size={11} /> : <ShieldAlert size={11} />}
 				{safetyStatusLabel}
 			</span>
 			{activeDriveFaultAxes.length > 0 ? (
@@ -1083,7 +1189,7 @@ export function ControlPanel({
 	const refreshJointAngles = useCallback(async (silent = true) => {
 		const payload = await getJson<JointInfoResponse>("/info/joints-detailed", silent);
 		const nextAngles = preferredJointAnglesDeg(payload);
-		if (!payload || !nextAngles) {
+		if (!payload || !hasAnyFiniteJointAngles(nextAngles)) {
 			setJointAnglesDeg([]);
 			try {
 				onJointFeedback?.([], undefined);
@@ -1095,22 +1201,18 @@ export function ControlPanel({
 			}
 			return false;
 		}
-		if (String(payload.read_source ?? "live_feedback").trim().toLowerCase() !== "live_feedback") {
-			setJointAnglesDeg([]);
-			try {
-				onJointFeedback?.([], undefined);
-			} catch {
-				// Ignore visualizer sync errors so commissioning feedback stays usable.
-			}
-			setJointFeedbackError("Live joint feedback unavailable; controller only has cached joint state.");
-			return false;
-		}
+		// `read_source` reports canonical/raw truth. The commissioning pane should still
+		// show explicit operator display truth when the backend publishes it per-joint.
 		setJointAnglesDeg(nextAngles);
 		try {
-			onJointFeedback?.(
-				nextAngles,
-				typeof payload.gripper_deg === "number" ? Number(payload.gripper_deg) : undefined,
-			);
+			if (hasAllFiniteJointAngles(nextAngles)) {
+				onJointFeedback?.(
+					nextAngles,
+					typeof payload.gripper_deg === "number" ? Number(payload.gripper_deg) : undefined,
+				);
+			} else {
+				onJointFeedback?.([], undefined);
+			}
 		} catch {
 			// Ignore visualizer sync errors so commissioning feedback stays usable.
 		}
@@ -1145,22 +1247,15 @@ export function ControlPanel({
 
 	useEffect(() => {
 		const telemetryAnglesRad = preferredTelemetryJointAnglesRad(latestTelemetry);
-		if (!isMonitorFresh || !telemetryAnglesRad) {
+		if (!isMonitorFresh || !hasAnyFiniteJointAngles(telemetryAnglesRad)) {
 			return;
 		}
-		const nextAngles = telemetryAnglesRad.map((value) => Number((value * 180) / Math.PI));
+		const nextAngles = telemetryAnglesRad.map((value) => (
+			Number.isFinite(value) ? Number((value * 180) / Math.PI) : Number.NaN
+		));
 		setJointAnglesDeg((current) => {
-			if (current.length === nextAngles.length) {
-				let changed = false;
-				for (let index = 0; index < nextAngles.length; index += 1) {
-					if (Math.abs((current[index] ?? 0) - nextAngles[index]) > 1e-3) {
-						changed = true;
-						break;
-					}
-				}
-				if (!changed) {
-					return current;
-				}
+			if (jointAngleArraysMatch(current, nextAngles)) {
+				return current;
 			}
 			return nextAngles;
 		});
@@ -1168,7 +1263,7 @@ export function ControlPanel({
 	}, [isMonitorFresh, latestTelemetry]);
 
 	useEffect(() => {
-		if (isMonitorFresh && preferredTelemetryJointAnglesRad(latestTelemetry)) {
+		if (isMonitorFresh && hasAnyFiniteJointAngles(preferredTelemetryJointAnglesRad(latestTelemetry))) {
 			return;
 		}
 		let disposed = false;

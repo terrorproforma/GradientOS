@@ -3,6 +3,7 @@ from gradient_os.telemetry.drive_faults import (
     build_drive_fault_snapshot,
     build_startup_fault_reset_plan,
 )
+from gradient_os.telemetry.native_home_status import statusword_indicates_valid_native_home_reference
 
 
 def test_build_startup_fault_reset_plan_targets_disarmed_faulted_axes():
@@ -35,6 +36,19 @@ def test_build_startup_fault_reset_plan_targets_disarmed_faulted_axes():
     assert plan["faulted_axis_mask_hex"] == "0x4"
     assert "J3/axis2" in plan["faulted_summary"]
     assert "0x8700" in plan["faulted_summary"]
+
+
+def test_drive_faults_and_ethercat_backend_import_without_circular_dependency():
+    from gradient_os.arm_controller.backends.ethercat_rtcore.backend import EthercatRTCoreBackend
+
+    assert callable(build_startup_fault_reset_plan)
+    assert EthercatRTCoreBackend is not None
+
+
+def test_statusword_indicates_valid_native_home_reference_requires_vendor_success_bits():
+    assert statusword_indicates_valid_native_home_reference(0x9650) is True
+    assert statusword_indicates_valid_native_home_reference(0x8650) is False
+    assert statusword_indicates_valid_native_home_reference(0xB650) is False
 
 
 def test_build_startup_fault_reset_plan_blocks_when_fault_is_not_disarmed():
@@ -357,7 +371,7 @@ def test_build_drive_fault_snapshot_prefers_live_statusword_for_native_home_succ
     assert axis["native_home_state_reported"] == 3
     assert axis["native_home_state_reported_name"] == "failed"
     assert axis["native_home_last_abort_code_reported"] == 0x06010002
-    assert axis["native_home_verification_source"] == "statusword_bit15"
+    assert axis["native_home_verification_source"] == "statusword_bits12_15_clear13"
 
 
 def test_build_drive_fault_snapshot_normalizes_absolute_feedback(monkeypatch):

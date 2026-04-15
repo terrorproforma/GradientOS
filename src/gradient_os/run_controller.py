@@ -23,6 +23,7 @@ import threading
 import subprocess
 import json
 import base64
+import re
 
 try:
     # Import the backend registry FIRST - it must be configured before other modules
@@ -393,6 +394,36 @@ def _backend_display_feedback_snapshot(
     }
 
 
+_CANONICAL_TRUTH_DETAILS_RE = re.compile(
+    r"\(axes=\[(?P<axes>[^\]]*)\],\s*joints=\[(?P<joints>[^\]]*)\]\)"
+)
+
+
+def _parse_canonical_truth_error_details(error_message: str | None) -> dict[str, list[int]] | None:
+    if not isinstance(error_message, str) or "Canonical joint truth unavailable" not in error_message:
+        return None
+    match = _CANONICAL_TRUTH_DETAILS_RE.search(error_message)
+    if match is None:
+        return None
+
+    def _parse_int_list(raw: str) -> list[int]:
+        values: list[int] = []
+        for part in str(raw).split(","):
+            token = part.strip()
+            if not token:
+                continue
+            try:
+                values.append(int(token))
+            except Exception:
+                continue
+        return values
+
+    return {
+        "axes": _parse_int_list(match.group("axes")),
+        "joints": _parse_int_list(match.group("joints")),
+    }
+
+
 def _build_joint_state_snapshot() -> dict[str, object]:
     read_source = "live_feedback"
     truth_error: str | None = None
@@ -408,14 +439,21 @@ def _build_joint_state_snapshot() -> dict[str, object]:
     snapshot: dict[str, object] = {
         "arm_rad": arm_rad,
         "arm_deg": arm_deg,
-        "arm_display_rad": list(arm_rad),
-        "arm_display_deg": list(arm_deg),
+        "arm_display_rad": [],
+        "arm_display_deg": [],
         "read_source": read_source,
+        "raw_canonical_joint_truth_available": read_source == "live_feedback",
+        "display_joint_truth_available": False,
         "canonical_joint_truth_available": read_source == "live_feedback",
         "numeric_precision": "float64",
     }
     if truth_error:
         snapshot["canonical_joint_truth_error"] = truth_error
+        snapshot["raw_canonical_joint_truth_error"] = truth_error
+        parsed_truth_details = _parse_canonical_truth_error_details(truth_error)
+        if isinstance(parsed_truth_details, dict):
+            snapshot["canonical_joint_truth_unavailable_axes"] = list(parsed_truth_details.get("axes", []))
+            snapshot["canonical_joint_truth_unavailable_joints"] = list(parsed_truth_details.get("joints", []))
 
     if utils.gripper_present:
         gripper_rad = float(utils.current_gripper_angle_rad)
@@ -439,20 +477,41 @@ def _build_joint_state_snapshot() -> dict[str, object]:
             display_snapshot = _backend_display_feedback_snapshot(backend, raw_positions)
             if isinstance(display_snapshot, dict):
                 truth_available = bool(display_snapshot.get("truth_available", True))
+                snapshot["display_joint_truth_available"] = truth_available
                 snapshot["canonical_joint_truth_available"] = (
                     bool(snapshot.get("canonical_joint_truth_available", False))
                     and truth_available
                 )
+                display_positions = display_snapshot.get("joint_positions_rad")
+                partial_display_positions = display_snapshot.get("joint_positions_rad_partial")
+                if truth_available and isinstance(display_positions, list):
+                    arm_display_rad = [float(value) for value in display_positions]
+                    snapshot["arm_display_rad"] = arm_display_rad
+                    snapshot["arm_display_deg"] = [float(np.rad2deg(value)) for value in arm_display_rad]
+                elif isinstance(partial_display_positions, list) and any(
+                    value is not None for value in partial_display_positions
+                ):
+                    arm_display_rad = [
+                        float(value) if value is not None else None
+                        for value in partial_display_positions
+                    ]
+                    snapshot["arm_display_rad"] = arm_display_rad
+                    snapshot["arm_display_deg"] = [
+                        float(np.rad2deg(value)) if value is not None else None
+                        for value in arm_display_rad
+                    ]
                 truth_unavailable_axes = display_snapshot.get("truth_unavailable_axes")
                 if isinstance(truth_unavailable_axes, list):
-                    snapshot["canonical_joint_truth_unavailable_axes"] = [
+                    unavailable_axes = [
                         int(value) for value in truth_unavailable_axes
                     ]
+                    snapshot["display_joint_truth_unavailable_axes"] = list(unavailable_axes)
                 truth_unavailable_joints = display_snapshot.get("truth_unavailable_joints")
                 if isinstance(truth_unavailable_joints, list):
-                    snapshot["canonical_joint_truth_unavailable_joints"] = [
+                    unavailable_joints = [
                         int(value) for value in truth_unavailable_joints
                     ]
+                    snapshot["display_joint_truth_unavailable_joints"] = list(unavailable_joints)
                 axis_absolute_feedback = display_snapshot.get("axis_absolute_feedback")
                 if isinstance(axis_absolute_feedback, list):
                     snapshot["axis_absolute_feedback"] = axis_absolute_feedback
@@ -467,9 +526,9 @@ def _build_joint_state_snapshot() -> dict[str, object]:
                         }
                     )
                     if len(truth_reasons) == 1:
-                        snapshot["canonical_joint_truth_reason"] = truth_reasons[0]
+                        snapshot["display_joint_truth_reason"] = truth_reasons[0]
                     elif truth_reasons:
-                        snapshot["canonical_joint_truth_reasons"] = truth_reasons
+                        snapshot["display_joint_truth_reasons"] = truth_reasons
 
         axis_to_joint = getattr(backend, "_axis_to_joint", None)
         if isinstance(axis_to_joint, list) and axis_to_joint:
@@ -520,6 +579,16 @@ def _build_joint_state_snapshot() -> dict[str, object]:
             snapshot["canonical_joint_truth_reason"] = "canonical_truth_unavailable"
         else:
             snapshot["canonical_joint_truth_reason"] = "joint_state_read_failed"
+    snapshot["raw_canonical_joint_truth_status"] = (
+        "available"
+        if bool(snapshot.get("raw_canonical_joint_truth_available", False))
+        else "unavailable"
+    )
+    snapshot["display_joint_truth_status"] = (
+        "available"
+        if bool(snapshot.get("display_joint_truth_available", False))
+        else "unavailable"
+    )
     snapshot["canonical_joint_truth_status"] = (
         "available"
         if bool(snapshot.get("canonical_joint_truth_available", False))

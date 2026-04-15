@@ -24,6 +24,14 @@ Use this file after substantive changes or when debugging controller, RTCore, Et
 
 Choose the narrowest command set that actually proves the change.
 
+## Live Bring-Up Loops
+
+- For iterative live EtherCAT testing, prefer `./start-stack.sh probe`, then `./start-stack.sh stop --hard`, then `./start-stack.sh` over rebooting between every healthy cycle.
+- A reboot is not required when `stop --hard` tears the host down cleanly and the post-stop probe lands `physical_state=INACTIVE`, `ethercat_master_state=DOWN`, and `rtcore_state=DOWN`.
+- Use `./start-stack.sh probe` before and after each cycle to distinguish a healthy teardown from a poisoned host.
+- If a run leaves stale-owner symptoms such as `ecrt_request_master(0)` busy, `Master already in use`, a hung kernel task in the RTCore/metrics path, or `stop --hard` failing to clear EtherCAT ownership, treat the host as poisoned and reboot before the next live bring-up attempt.
+- A single launcher-managed RTCore/EtherCAT recycle during startup recovery is acceptable if the stack still reaches `BUS_UP_DISARMED`; do not treat that recovery path alone as proof that a reboot is required.
+
 ## Debug by Layer
 
 - Fieldbus bring-up issue: inspect EtherCAT host, RTCore readiness, and metrics before blaming Python.
@@ -43,6 +51,7 @@ Choose the narrowest command set that actually proves the change.
 
 - Prefer current logs, metrics, and existing status payloads before adding new debug channels.
 - When possible, add or extend focused tests that lock down the discovered failure mode.
+- For the active A6-EC frame-semantics workstream, use `scripts/a6ec_chapter5_probe.py` plus [../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md](../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md) to capture raw, reference, rotation-mode, and API truth views in one snapshot across `boot -> native-home -> power cycle -> restart`.
 
 ## First Files
 

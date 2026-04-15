@@ -50,6 +50,12 @@ Read the file that matches the task:
 - [validation-and-debugging.md](./validation-and-debugging.md)
   Use for validation strategy, build/test commands, and debugging by layer.
 
+## Active Workstream Notes
+
+- [../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md](../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md)
+  Use for the active A6-EC frame-semantics and native-home workstream: probe rationale, raw vs reference vs rotation frame separation, anchor math, persistence lessons, UI trust implications, and open verification risks.
+  Treat this as a durable WIP note referenced by the skill, not as fully-settled canonical SOP.
+
 ## Non-Negotiable Rules
 
 - Do not duplicate comms or telemetry pathways if an existing payload can carry the new data.

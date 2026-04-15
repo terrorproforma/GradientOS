@@ -13,30 +13,30 @@
           "updated_by": "ethercat_rtcore:joint1:native_home"
         },
         {
-          "home_anchor_rad": 0.02350346188438531,
+          "home_anchor_rad": 0.008503047254848595,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             1
           ],
-          "updated_at": "2026-04-14T06:28:24+00:00",
+          "updated_at": "2026-04-15T09:25:59+00:00",
           "updated_by": "ethercat_rtcore:joint2:native_home"
         },
         {
-          "home_anchor_rad": 0.02548325583875021,
+          "home_anchor_rad": -0.037317917617287935,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             2
           ],
-          "updated_at": "2026-04-14T02:06:51+00:00",
+          "updated_at": "2026-04-15T06:59:50+00:00",
           "updated_by": "ethercat_rtcore:joint3:native_home"
         },
         {
-          "home_anchor_rad": 0.26155437697886214,
+          "home_anchor_rad": -0.08791893706678588,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             3
           ],
-          "updated_at": "2026-04-14T00:25:26+00:00",
+          "updated_at": "2026-04-15T07:05:07+00:00",
           "updated_by": "ethercat_rtcore:joint4:native_home"
         },
         {
@@ -58,7 +58,7 @@
           "updated_by": "ethercat_rtcore:joint6:native_home"
         }
       ],
-      "updated_at": "2026-04-14T06:28:24+00:00",
+      "updated_at": "2026-04-15T09:25:59+00:00",
       "updated_by": "ethercat_rtcore:joint2:native_home"
     }
   }

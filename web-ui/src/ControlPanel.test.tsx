@@ -58,6 +58,7 @@ describe("ControlPanel jog session lifecycle", () => {
 			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
 				return mockJsonResponse({
 					arm_deg: [0, 0, 0, 0, 0, 0],
+					arm_display_deg: [0, 0, 0, 0, 0, 0],
 					gripper_deg: 0,
 					read_source: "live_feedback",
 				});
@@ -160,7 +161,7 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(jogPosts[jogPosts.length - 1]?.pathname).toBe("/control/jog/session/stop");
 	});
 
-	it("prefers canonical joint angles for frontend feedback", async () => {
+	it("uses operator display joint angles for frontend feedback", async () => {
 		const onJointFeedback = vi.fn();
 		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 			const url = typeof input === "string"
@@ -173,6 +174,54 @@ describe("ControlPanel jog session lifecycle", () => {
 				return mockJsonResponse({
 					arm_deg: [10, 20, 30, 40, 50, 60],
 					arm_display_deg: [1, 2, 3, 4, 5, 6],
+					gripper_deg: 7,
+					read_source: "unavailable",
+				});
+			}
+			if (parsed.pathname === "/control/motion-status") {
+				return mockJsonResponse({
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						controller_thread_running: false,
+						rtcore_status_present: true,
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				});
+			}
+			return mockJsonResponse({});
+		}));
+
+		render(<ControlPanel apiHost="" onJointFeedback={onJointFeedback} />);
+
+		await waitFor(() => {
+			expect(onJointFeedback).toHaveBeenCalledWith([1, 2, 3, 4, 5, 6], 7);
+		});
+	});
+
+	it("does not fall back to canonical joint angles when display angles are missing", async () => {
+		const onJointFeedback = vi.fn();
+		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+			const parsed = new URL(url, "http://localhost");
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
+				return mockJsonResponse({
+					arm_deg: [10, 20, 30, 40, 50, 60],
 					gripper_deg: 7,
 					read_source: "live_feedback",
 				});
@@ -205,8 +254,134 @@ describe("ControlPanel jog session lifecycle", () => {
 		render(<ControlPanel apiHost="" onJointFeedback={onJointFeedback} />);
 
 		await waitFor(() => {
+			expect(onJointFeedback).toHaveBeenCalledWith([], undefined);
+		});
+		expect(onJointFeedback).not.toHaveBeenCalledWith([10, 20, 30, 40, 50, 60], 7);
+	});
+
+	it("shows partial operator display truth without falling back when raw canonical truth is unavailable", async () => {
+		const onJointFeedback = vi.fn();
+		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+			const parsed = new URL(url, "http://localhost");
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
+				return mockJsonResponse({
+					arm_deg: [10, 20, 30, 40, 50, 60],
+					arm_display_deg: [1, null, 3, null, 5, 6],
+					gripper_deg: 7,
+					read_source: "unavailable",
+				});
+			}
+			if (parsed.pathname === "/control/motion-status") {
+				return mockJsonResponse({
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						controller_thread_running: false,
+						rtcore_status_present: true,
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				});
+			}
+			return mockJsonResponse({});
+		}));
+
+		render(<ControlPanel apiHost="" onJointFeedback={onJointFeedback} />);
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		await waitFor(() => {
+			const driveHomeButtons = screen.getAllByRole("button", { name: "Drive Home" });
+			expect(driveHomeButtons).toHaveLength(6);
+			expect(driveHomeButtons[0].hasAttribute("disabled")).toBe(false);
+			expect(driveHomeButtons[1].hasAttribute("disabled")).toBe(true);
+			expect(driveHomeButtons[2].hasAttribute("disabled")).toBe(false);
+			expect(driveHomeButtons[3].hasAttribute("disabled")).toBe(true);
+			expect(driveHomeButtons[4].hasAttribute("disabled")).toBe(false);
+			expect(driveHomeButtons[5].hasAttribute("disabled")).toBe(false);
+		});
+		expect(screen.getAllByText("1.00°").length).toBeGreaterThan(0);
+		expect(screen.getAllByText("3.00°").length).toBeGreaterThan(0);
+		expect(screen.getAllByText("5.00°").length).toBeGreaterThan(0);
+		expect(screen.getAllByText("6.00°").length).toBeGreaterThan(0);
+		expect(screen.getAllByText("--").length).toBeGreaterThan(0);
+		expect(onJointFeedback).toHaveBeenCalledWith([], undefined);
+		expect(onJointFeedback).not.toHaveBeenCalledWith([10, 20, 30, 40, 50, 60], 7);
+	});
+
+	it("clears joint feedback when the detailed endpoint drops out", async () => {
+		const onJointFeedback = vi.fn();
+		let jointFetchCount = 0;
+		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+			const parsed = new URL(url, "http://localhost");
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
+				jointFetchCount += 1;
+				if (jointFetchCount === 1) {
+					return mockJsonResponse({
+						arm_deg: [10, 20, 30, 40, 50, 60],
+						arm_display_deg: [10, 20, 30, 40, 50, 60],
+						gripper_deg: 7,
+						read_source: "live_feedback",
+					});
+				}
+				return mockJsonResponse({ detail: "temporary dropout" }, 503);
+			}
+			if (parsed.pathname === "/control/motion-status") {
+				return mockJsonResponse({
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						controller_thread_running: false,
+						rtcore_status_present: true,
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				});
+			}
+			return mockJsonResponse({});
+		}));
+
+		render(<ControlPanel apiHost="" onJointFeedback={onJointFeedback} />);
+
+		await waitFor(() => {
 			expect(onJointFeedback).toHaveBeenCalledWith([10, 20, 30, 40, 50, 60], 7);
 		});
+		await sleep(700);
+
+		const clearedFeedback = onJointFeedback.mock.calls.some((call) =>
+			Array.isArray(call[0]) && call[0].length === 0,
+		);
+		expect(jointFetchCount).toBeGreaterThan(1);
+		expect(clearedFeedback).toBe(true);
 	});
 
 	it("blocks drive power-up when the runtime is unsafe", async () => {
@@ -373,6 +548,90 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(screen.queryByRole("button", { name: "Arm" })).toBeNull();
 	});
 
+	it("shows CHECK instead of BLOCKED when only synchronization is unsettled while drives are disarmed", async () => {
+		render(
+			<ControlPanelRuntimeHeader
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [],
+				}}
+				motionStatus={{
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: false,
+					power_transition_blockers: ["not_synchronized"],
+					power_transition_blocker_details: [
+						{
+							code: "not_synchronized",
+							message: "Live feedback is not synchronized yet; keep the drives disarmed.",
+						},
+					],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: false,
+						power_transition_blockers: ["not_synchronized"],
+						power_transition_blocker_details: [
+							{
+								code: "not_synchronized",
+								message: "Live feedback is not synchronized yet; keep the drives disarmed.",
+							},
+						],
+					},
+				}}
+			/>,
+		);
+
+		expect(screen.getByText("CHECK")).toBeTruthy();
+		expect(screen.queryByText("BLOCKED")).toBeNull();
+	});
+
+	it("waits for a stable safe signal before showing SAFE in the runtime header while drives are disarmed", async () => {
+		render(
+			<ControlPanelRuntimeHeader
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [],
+				}}
+				motionStatus={{
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				}}
+			/>,
+		);
+
+		expect(screen.getByText("CHECK")).toBeTruthy();
+		expect(screen.queryByText("SAFE")).toBeNull();
+
+		await sleep(650);
+
+		await waitFor(() => {
+			expect(screen.getByText("SAFE")).toBeTruthy();
+		});
+	});
+
 	it("hides software zero by default and only shows it when enabled", async () => {
 		const { rerender } = render(
 			<ControlPanel
@@ -459,7 +718,7 @@ describe("ControlPanel jog session lifecycle", () => {
 							native_home_state_reported_name: "failed",
 							native_home_last_abort_code_reported: 0x06010002,
 							native_home_last_abort_code_reported_hex: "0x06010002",
-							native_home_verification_source: "statusword_bit15",
+							native_home_verification_source: "statusword_bits12_15_clear13",
 						},
 					],
 				}}
@@ -520,6 +779,7 @@ describe("ControlPanel jog session lifecycle", () => {
 			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
 				return mockJsonResponse({
 					arm_deg: [0, 0, 0, 0, 0, 0],
+					arm_display_deg: [0, 0, 0, 0, 0, 0],
 					gripper_deg: 0,
 					read_source: "live_feedback",
 				});

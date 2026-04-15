@@ -6,6 +6,7 @@
 #include <csignal>
 #include <cstdarg>
 #include <cstdint>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <grp.h>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -333,6 +335,27 @@ bool parse_u32(const char* s, uint32_t* out) {
   }
   *out = static_cast<uint32_t>(v);
   return true;
+}
+
+bool parse_env_flag(const char* name, bool default_value) {
+  if (!name || !*name) {
+    return default_value;
+  }
+  const char* raw = std::getenv(name);
+  if (!raw || !*raw) {
+    return default_value;
+  }
+  std::string value(raw);
+  for (char& ch : value) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  if (value == "1" || value == "true" || value == "yes" || value == "on") {
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "no" || value == "off") {
+    return false;
+  }
+  return default_value;
 }
 
 bool parse_u64(const char* s, uint64_t* out) {
@@ -1724,6 +1747,12 @@ int main(int argc, char** argv) {
     logf("ERROR: invalid --native-home-config");
     return 2;
   }
+  const bool metrics_startup_readback_enabled =
+      parse_env_flag("GRADIENT_RT_METRICS_STARTUP_READBACK_ENABLED", true);
+  const bool metrics_native_home_refresh_enabled =
+      parse_env_flag("GRADIENT_RT_METRICS_NATIVE_HOME_REFRESH_ENABLED", true);
+  const bool metrics_absolute_feedback_poll_enabled =
+      parse_env_flag("GRADIENT_RT_METRICS_ABSOLUTE_FEEDBACK_POLL_ENABLED", true);
   if (opt.slave_vendor_id == 0 || opt.slave_product_code == 0) {
     logf("ERROR: EtherCAT slave identity is incomplete "
          "(provide --slave-vendor-id and --slave-product-code)");
@@ -1982,6 +2011,9 @@ int main(int argc, char** argv) {
   std::atomic<uint64_t> motion_last_update_ns{0};
 #if GRADIENT_HAVE_ECRT
   ec_master_t* shared_master = nullptr;
+  // Serialize non-RT SDO traffic against master teardown so the metrics/helper
+  // threads cannot race ecrt_release_master() during stop/start cycles.
+  std::mutex shared_master_sdo_mutex;
 #endif
 
   for (uint32_t i = 0; i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
@@ -1997,7 +2029,8 @@ int main(int argc, char** argv) {
                                    int32_t value,
                                    uint32_t* abort_out) {
 #if GRADIENT_HAVE_ECRT
-    if (!shared_master) {
+    std::lock_guard<std::mutex> lock(shared_master_sdo_mutex);
+    if (g_stop.load(std::memory_order_relaxed) || !shared_master) {
       return false;
     }
     uint8_t raw[sizeof(int32_t)] = {};
@@ -2064,7 +2097,8 @@ int main(int argc, char** argv) {
                                   int32_t* value_out,
                                   uint32_t* abort_out) {
 #if GRADIENT_HAVE_ECRT
-    if (!value_out || !shared_master) {
+    std::lock_guard<std::mutex> lock(shared_master_sdo_mutex);
+    if (!value_out || g_stop.load(std::memory_order_relaxed) || !shared_master) {
       return false;
     }
     uint8_t raw[sizeof(int32_t)] = {};
@@ -2197,6 +2231,7 @@ int main(int argc, char** argv) {
 #endif
   };
 
+  constexpr int kExitCodeMasterReservationFailed = 75;
   std::atomic<int> process_exit_code{0};
 
   std::thread rt_thread([&]() {
@@ -2393,6 +2428,10 @@ int main(int argc, char** argv) {
          opt.startup_passive_ms,
          opt.startup_skip_domain_queue_ms,
          static_cast<unsigned long long>(startup_detailed_diag_ns / 1000000ULL));
+    logf("Metrics SDO toggles: startup_readback=%u native_home_refresh=%u absolute_feedback_poll=%u",
+         metrics_startup_readback_enabled ? 1u : 0u,
+         metrics_native_home_refresh_enabled ? 1u : 0u,
+         metrics_absolute_feedback_poll_enabled ? 1u : 0u);
     for (uint32_t i = 0; i < opt.num_axes; ++i) {
       logf("Axis%u -> EtherCAT slave position %u",
            i,
@@ -2743,8 +2782,9 @@ int main(int argc, char** argv) {
 
     master = ecrt_request_master(0);
     if (!master) {
-      logf("ERROR: ecrt_request_master(0) failed");
-      process_exit_code.store(3, std::memory_order_relaxed);
+      logf("ERROR: ecrt_request_master(0) failed; exit_code=%d (master reservation failed, likely stale owner or hung EtherCAT kernel task)",
+           kExitCodeMasterReservationFailed);
+      process_exit_code.store(kExitCodeMasterReservationFailed, std::memory_order_relaxed);
       g_stop.store(true, std::memory_order_relaxed);
       return;
     } else {
@@ -3959,8 +3999,11 @@ int main(int argc, char** argv) {
     // Best-effort cleanup. This is not RT-critical (we're shutting down), and it
     // allows IgH to deactivate the master configuration cleanly.
     if (master) {
-      ecrt_release_master(master); // deactivates if active
-      master = nullptr;
+      std::lock_guard<std::mutex> lock(shared_master_sdo_mutex);
+      if (master) {
+        ecrt_release_master(master); // deactivates if active
+        master = nullptr;
+      }
     }
 #endif
   });
@@ -3978,8 +4021,10 @@ int main(int argc, char** argv) {
     uint64_t last_cycles = rt_cycle_counter.load(std::memory_order_relaxed);
     uint64_t last_time_ns = now_monotonic_ns();
     uint64_t last_warn_ns = 0;
-    bool startup_readback_complete = !startup_sdo.valid;
-    bool native_home_offset_refresh_complete = !native_home_cfg.valid;
+    bool startup_readback_complete =
+        !startup_sdo.valid || !metrics_startup_readback_enabled;
+    bool native_home_offset_refresh_complete =
+        !native_home_cfg.valid || !metrics_native_home_refresh_enabled;
     uint64_t startup_readback_ready_since_ns = 0;
     uint64_t native_home_offset_ready_since_ns = 0;
     uint64_t absolute_feedback_ready_since_ns = 0;
@@ -3992,10 +4037,14 @@ int main(int argc, char** argv) {
 
     auto perform_startup_drive_config_readback = [&](uint64_t now_ns, bool startup_ready_flag) {
 #if GRADIENT_HAVE_ECRT
+      if (!metrics_startup_readback_enabled) {
+        startup_readback_complete = true;
+        return;
+      }
       if (startup_readback_complete || !startup_sdo.valid) {
         return;
       }
-      if (startup_sdo.type != StartupSdoValueType::kU16 || !shared_master) {
+      if (startup_sdo.type != StartupSdoValueType::kU16) {
         startup_readback_complete = true;
         return;
       }
@@ -4023,15 +4072,22 @@ int main(int argc, char** argv) {
           uint8_t readback_raw[sizeof(uint16_t)] = {};
           size_t readback_size = 0;
           uint32_t abort_code = 0;
-          const int rc = ecrt_master_sdo_upload(
-              shared_master,
-              opt.slave_position[i],
-              startup_sdo.index,
-              startup_sdo.subindex,
-              readback_raw,
-              sizeof(readback_raw),
-              &readback_size,
-              &abort_code);
+          int rc = -1;
+          {
+            std::lock_guard<std::mutex> lock(shared_master_sdo_mutex);
+            if (g_stop.load(std::memory_order_relaxed) || !shared_master) {
+              return;
+            }
+            rc = ecrt_master_sdo_upload(
+                shared_master,
+                opt.slave_position[i],
+                startup_sdo.index,
+                startup_sdo.subindex,
+                readback_raw,
+                sizeof(readback_raw),
+                &readback_size,
+                &abort_code);
+          }
           if (rc == 0 && readback_size >= sizeof(uint16_t)) {
             const uint16_t readback_value = EC_READ_U16(readback_raw);
             const bool readback_matches =
@@ -4086,7 +4142,11 @@ int main(int argc, char** argv) {
     auto perform_startup_native_home_offset_refresh = [&](uint64_t now_ns,
                                                           bool startup_ready_flag) {
 #if GRADIENT_HAVE_ECRT
-      if (native_home_offset_refresh_complete || !shared_master || !native_home_cfg.valid) {
+      if (!metrics_native_home_refresh_enabled) {
+        native_home_offset_refresh_complete = true;
+        return;
+      }
+      if (native_home_offset_refresh_complete || !native_home_cfg.valid) {
         return;
       }
       if (!startup_ready_flag) {
@@ -4145,7 +4205,13 @@ int main(int argc, char** argv) {
 
     auto perform_absolute_feedback_refresh = [&](uint64_t now_ns, bool startup_ready_flag) {
 #if GRADIENT_HAVE_ECRT
-      if (!shared_master || !absolute_feedback_cfg.valid || absolute_feedback_cfg.field_count == 0) {
+      if (!metrics_absolute_feedback_poll_enabled) {
+        absolute_feedback_ready_since_ns = 0;
+        absolute_feedback_last_poll_ns = 0;
+        latest_feedback.absolute_feedback.fill(AbsoluteFeedbackAxis{});
+        return;
+      }
+      if (!absolute_feedback_cfg.valid || absolute_feedback_cfg.field_count == 0) {
         return;
       }
       if (!startup_ready_flag) {
@@ -4283,8 +4349,10 @@ int main(int argc, char** argv) {
         last_startup_reset_count = startup_reset_count;
       } else if (startup_reset_count != last_startup_reset_count ||
                  (last_startup_ready_flag && !startup_ready_flag)) {
-        startup_readback_complete = !startup_sdo.valid;
-        native_home_offset_refresh_complete = !native_home_cfg.valid;
+        startup_readback_complete =
+            !startup_sdo.valid || !metrics_startup_readback_enabled;
+        native_home_offset_refresh_complete =
+            !native_home_cfg.valid || !metrics_native_home_refresh_enabled;
         startup_readback_ready_since_ns = 0;
         native_home_offset_ready_since_ns = 0;
         absolute_feedback_ready_since_ns = 0;
@@ -4344,6 +4412,12 @@ int main(int argc, char** argv) {
       oss << "\"startup_skip_domain_queue_ms\":" << opt.startup_skip_domain_queue_ms << ",";
       oss << "\"startup_skip_domain_queue_active\":"
           << static_cast<unsigned int>(startup_skip_domain_queue_active) << ",";
+      oss << "\"metrics_startup_readback_enabled\":"
+          << (metrics_startup_readback_enabled ? 1 : 0) << ",";
+      oss << "\"metrics_native_home_refresh_enabled\":"
+          << (metrics_native_home_refresh_enabled ? 1 : 0) << ",";
+      oss << "\"metrics_absolute_feedback_poll_enabled\":"
+          << (metrics_absolute_feedback_poll_enabled ? 1 : 0) << ",";
       oss << "\"slave_positions\":[";
       for (uint32_t i = 0; i < opt.num_axes; ++i) {
         if (i != 0) {
@@ -5021,12 +5095,6 @@ int main(int argc, char** argv) {
                                         uint8_t value_type,
                                         uint32_t value_u32) {
 #if GRADIENT_HAVE_ECRT
-        if (!shared_master) {
-          logf("WARNING: service_sdo_write skipped index=0x%04x sub=0x%02x; master unavailable",
-               static_cast<unsigned int>(index),
-               static_cast<unsigned int>(subindex));
-          return;
-        }
         if (value_type != gradient::ipc::v1::SERVICE_SDO_VALUE_U16) {
           logf("WARNING: service_sdo_write skipped index=0x%04x sub=0x%02x; unsupported value_type=%u",
                static_cast<unsigned int>(index),
@@ -5042,14 +5110,24 @@ int main(int argc, char** argv) {
             continue;
           }
           uint32_t abort_code = 0;
-          const int rc = ecrt_master_sdo_download(
-              shared_master,
-              opt.slave_position[axis],
-              index,
-              subindex,
-              raw,
-              sizeof(raw),
-              &abort_code);
+          int rc = -1;
+          {
+            std::lock_guard<std::mutex> lock(shared_master_sdo_mutex);
+            if (g_stop.load(std::memory_order_relaxed) || !shared_master) {
+              logf("WARNING: service_sdo_write skipped index=0x%04x sub=0x%02x; master unavailable",
+                   static_cast<unsigned int>(index),
+                   static_cast<unsigned int>(subindex));
+              return;
+            }
+            rc = ecrt_master_sdo_download(
+                shared_master,
+                opt.slave_position[axis],
+                index,
+                subindex,
+                raw,
+                sizeof(raw),
+                &abort_code);
+          }
           if (rc != 0) {
             logf("WARNING: service_sdo_write failed axis=%u slave_pos=%u index=0x%04x sub=0x%02x rc=%d abort=0x%08x value=%u type=%u",
                  axis,

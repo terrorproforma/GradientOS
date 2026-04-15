@@ -17,6 +17,10 @@ from ....absolute_encoder_anchors import (
     load_absolute_encoder_anchors,
     save_absolute_encoder_anchor,
 )
+from ....telemetry.native_home_status import (
+    derive_effective_native_home_status,
+    statusword_indicates_valid_native_home_reference,
+)
 from ...actuator_interface import ActuatorBackend
 from ...profiles import registry as drive_profile_registry
 from .runtime import (
@@ -88,6 +92,9 @@ _POWER_TRANSITION_WAIT_POLL_INTERVAL_S = 0.01
 _POWER_TRANSITION_DEFAULT_TIMEOUT_S = 1.0
 _NATIVE_HOME_WAIT_POLL_INTERVAL_S = 0.05
 _NATIVE_HOME_WAIT_TIMEOUT_S = 20.0
+_NATIVE_HOME_POST_SETTLE_TIMEOUT_S = 3.0
+_COMMAND_ROUNDTRIP_TOLERANCE_COUNTS = 15.0
+_ABSOLUTE_HOME_ANCHOR_STALE_TOLERANCE_COUNTS = 8.0
 _RTCORE_METRICS_PATH = Path("/run/gradient-rt-motion/metrics.json")
 
 _HELLO_STRUCT = struct.Struct("<IHHIIQ4Q")  # 56 bytes
@@ -401,6 +408,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._native_home_metrics_mtime_ns = -1
         self._feedback_unwrapped_counts: list[int] = [0] * _GRADIENT_MAX_AXES
         self._feedback_unwrapped_valid: list[bool] = [False] * _GRADIENT_MAX_AXES
+        self._raw_reference_wrap_lift_counts: list[int] = [0] * _GRADIENT_MAX_AXES
         self._rt_drive_profile_code = 0
         self._rt_drive_profile_id: Optional[str] = None
         self._last_wkc_expected = 0
@@ -528,6 +536,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             self._rt_drive_profile_id = None
             self._feedback_unwrapped_counts = [0] * _GRADIENT_MAX_AXES
             self._feedback_unwrapped_valid = [False] * _GRADIENT_MAX_AXES
+            self._raw_reference_wrap_lift_counts = [0] * _GRADIENT_MAX_AXES
             self._last_submitted_traj_id = 0
             self._execution_status = RTCoreExecutionStatus(
                 active_mode=RTCORE_MOTION_MODE_IDLE,
@@ -1116,9 +1125,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
             native_home_state: int = 0,
             native_home_last_abort_code: int = 0,
             metrics_time_ns: int = 0,
+            extra: dict[str, object] | None = None,
         ) -> dict[str, object]:
             abort_code = int(native_home_last_abort_code)
-            return {
+            payload = {
                 "accepted": bool(accepted),
                 "verified": bool(verified),
                 "timed_out": bool(timed_out),
@@ -1134,6 +1144,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 "disarmed_after_home": True,
                 "metrics_time_ns": int(metrics_time_ns),
             }
+            if isinstance(extra, dict):
+                payload.update(extra)
+            return payload
 
         if not self._connected:
             print("[EtherCAT RTCore] WARNING: cannot drive-home a joint while RTCore is disconnected")
@@ -1220,13 +1233,197 @@ class EthercatRTCoreBackend(ActuatorBackend):
             ),
         )
         if bool(wait_result.get("verified", False)):
+            post_home_detail: dict[str, object] = {
+                "absolute_home_anchor_capture_succeeded": False,
+                "absolute_home_anchor_refresh_ok": False,
+            }
             try:
-                self._capture_absolute_home_anchor_for_joint(
+                self._refresh_native_home_offsets_from_metrics()
+                raw_positions = self.sync_read_positions()
+                if not raw_positions:
+                    raise RuntimeError("Live raw feedback was unavailable after native home verification.")
+                captured_anchor = self._capture_absolute_home_anchor_for_joint(
                     joint_i,
+                    raw_positions=raw_positions,
                     actor=f"ethercat_rtcore:joint{joint_i + 1}:native_home",
+                    reference_mode="display",
                 )
-            except Exception:
-                pass
+                if captured_anchor is None:
+                    raise RuntimeError("Could not capture a post-home absolute encoder anchor from live feedback.")
+                post_home_detail["absolute_home_anchor_capture_succeeded"] = True
+                post_home_detail["absolute_home_anchor_rad"] = float(
+                    captured_anchor.get("home_anchor_rad", 0.0)
+                )
+                if captured_anchor.get("source") is not None:
+                    post_home_detail["absolute_home_anchor_source"] = str(captured_anchor.get("source"))
+                validation = self._absolute_home_anchor_validation_for_joint(
+                    joint_i,
+                    raw_positions=raw_positions,
+                    reference_mode="display",
+                )
+                post_home_detail["absolute_home_anchor_refresh_ok"] = bool(validation.get("ok", False))
+                post_home_detail["post_home_truth_available"] = bool(validation.get("truth_available", False))
+                truth_reason = str(validation.get("truth_reason", "") or "").strip()
+                if truth_reason:
+                    post_home_detail["post_home_truth_reason"] = truth_reason
+                for key in (
+                    "axis",
+                    "logical_joint",
+                    "command_roundtrip_reference_error_counts",
+                    "command_roundtrip_reference_error_rad",
+                ):
+                    value = validation.get(key)
+                    if value is not None:
+                        post_home_detail[f"post_home_{key}"] = value
+                if not bool(validation.get("ok", False)):
+                    reason_suffix = (
+                        f" ({truth_reason})"
+                        if truth_reason
+                        else ""
+                    )
+                    raise RuntimeError(
+                        "Refreshed absolute-home anchor did not validate against the live command frame"
+                        f"{reason_suffix}."
+                    )
+                settle_timeout_s = self._env_float(
+                    "GRADIENT_RTCORE_NATIVE_HOME_POST_SETTLE_TIMEOUT_S",
+                    _NATIVE_HOME_POST_SETTLE_TIMEOUT_S,
+                )
+                settle_result = self._wait_for_native_home_post_settle_result(
+                    axis_mask,
+                    timeout_s=settle_timeout_s,
+                    min_metrics_time_ns=int(wait_result.get("metrics_time_ns", 0) or 0),
+                )
+                post_home_detail["post_home_settle_ok"] = bool(settle_result.get("ok", False))
+                post_home_detail["post_home_settle_timed_out"] = bool(settle_result.get("timed_out", False))
+                post_home_detail["post_home_settle_timeout_s"] = float(settle_timeout_s)
+                post_home_detail["post_home_settle_metrics_time_ns"] = int(
+                    settle_result.get("metrics_time_ns", 0) or 0
+                )
+                post_home_detail["post_home_settle_hard_failure"] = bool(
+                    settle_result.get("hard_failure", False)
+                )
+                settle_reason = str(settle_result.get("failure_reason", "") or "").strip()
+                if settle_reason:
+                    post_home_detail["post_home_settle_reason"] = settle_reason
+                settle_axis_results = settle_result.get("axis_results")
+                if isinstance(settle_axis_results, list) and settle_axis_results:
+                    primary_settle = settle_axis_results[0]
+                    for key in (
+                        "axis",
+                        "native_home_state",
+                        "native_home_state_name",
+                        "native_home_last_abort_code",
+                        "native_home_last_abort_code_hex",
+                        "statusword",
+                        "statusword_hex",
+                        "statusword_fault",
+                        "error_code",
+                        "error_code_hex",
+                        "manufacturer_error_code",
+                        "manufacturer_error_code_hex",
+                        "slave_online",
+                        "slave_operational",
+                        "native_home_active",
+                        "failure_reason",
+                        "clean",
+                    ):
+                        value = primary_settle.get(key)
+                        if value is not None:
+                            post_home_detail[f"post_home_settle_{key}"] = value
+                if not bool(settle_result.get("ok", False)):
+                    if bool(settle_result.get("hard_failure", False)):
+                        raise RuntimeError(
+                            "Post-home settle window detected a drive fault or unavailable axis"
+                            + (f" ({settle_reason})." if settle_reason else ".")
+                        )
+                    raise TimeoutError(
+                        "Post-home settle window did not stay clean long enough"
+                        + (f" ({settle_reason})." if settle_reason else ".")
+                    )
+            except Exception as exc:
+                failure_text = str(exc).strip() or "unknown post-home anchor refresh failure"
+                if isinstance(exc, TimeoutError):
+                    post_home_detail["post_home_settle_error"] = failure_text
+                    print(
+                        "[EtherCAT RTCore] WARNING: native drive-home reached a verified terminal state,"
+                        f" but the post-home settle window did not complete cleanly for joint={joint_i + 1}: {failure_text}"
+                    )
+                    return _result(
+                        accepted=True,
+                        verified=False,
+                        timed_out=True,
+                        code="NATIVE_HOME_POST_HOME_SETTLE_PENDING",
+                        message=(
+                            "Drive-native commissioning home reached a verified terminal state and refreshed a "
+                            "coherent absolute-home anchor, but RTCore did not observe a clean post-home settle "
+                            "window before the verification deadline. Keep the axis disabled and confirm the live "
+                            "drive state before powering it back up."
+                        ),
+                        joint=joint_i + 1,
+                        axis_mask=axis_mask,
+                        terminal_state=str(wait_result.get("terminal_state", "succeeded")),
+                        native_home_state=int(wait_result.get("native_home_state", 2)),
+                        native_home_last_abort_code=int(wait_result.get("native_home_last_abort_code", 0)),
+                        metrics_time_ns=int(
+                            post_home_detail.get(
+                                "post_home_settle_metrics_time_ns",
+                                wait_result.get("metrics_time_ns", 0),
+                            )
+                        ),
+                        extra=post_home_detail,
+                    )
+                if post_home_detail.get("post_home_settle_ok") is False:
+                    post_home_detail["post_home_settle_error"] = failure_text
+                    print(
+                        "[EtherCAT RTCore] WARNING: native drive-home reached a verified terminal state,"
+                        f" but the post-home settle window faulted for joint={joint_i + 1}: {failure_text}"
+                    )
+                    return _result(
+                        accepted=True,
+                        verified=False,
+                        code="NATIVE_HOME_POST_HOME_SETTLE_FAILED",
+                        message=(
+                            "Drive-native commissioning home reached a verified terminal state and refreshed a "
+                            "coherent absolute-home anchor, but the axis did not stay clean during the post-home "
+                            "settle window. Keep the axis disabled and inspect the live drive fault before "
+                            "powering it back up."
+                        ),
+                        joint=joint_i + 1,
+                        axis_mask=axis_mask,
+                        terminal_state=str(wait_result.get("terminal_state", "succeeded")),
+                        native_home_state=int(wait_result.get("native_home_state", 2)),
+                        native_home_last_abort_code=int(wait_result.get("native_home_last_abort_code", 0)),
+                        metrics_time_ns=int(
+                            post_home_detail.get(
+                                "post_home_settle_metrics_time_ns",
+                                wait_result.get("metrics_time_ns", 0),
+                            )
+                        ),
+                        extra=post_home_detail,
+                    )
+                post_home_detail["post_home_anchor_refresh_error"] = failure_text
+                print(
+                    "[EtherCAT RTCore] WARNING: native drive-home reached a verified terminal state,"
+                    f" but post-home anchor refresh failed for joint={joint_i + 1}: {failure_text}"
+                )
+                return _result(
+                    accepted=True,
+                    verified=False,
+                    code="NATIVE_HOME_ANCHOR_REFRESH_FAILED",
+                    message=(
+                        "Drive-native commissioning home reached a verified terminal state, but GradientOS "
+                        "could not refresh a coherent absolute-home anchor from live feedback. Keep the "
+                        "axis disabled and inspect the live pose before powering it back up."
+                    ),
+                    joint=joint_i + 1,
+                    axis_mask=axis_mask,
+                    terminal_state=str(wait_result.get("terminal_state", "succeeded")),
+                    native_home_state=int(wait_result.get("native_home_state", 2)),
+                    native_home_last_abort_code=int(wait_result.get("native_home_last_abort_code", 0)),
+                    metrics_time_ns=int(wait_result.get("metrics_time_ns", 0)),
+                    extra=post_home_detail,
+                )
             print(
                 "[EtherCAT RTCore] Native drive-home verified:"
                 f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
@@ -1246,6 +1443,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 native_home_state=int(wait_result.get("native_home_state", 2)),
                 native_home_last_abort_code=int(wait_result.get("native_home_last_abort_code", 0)),
                 metrics_time_ns=int(wait_result.get("metrics_time_ns", 0)),
+                extra=post_home_detail,
             )
 
         if bool(wait_result.get("timed_out", False)):
@@ -1437,15 +1635,28 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def _canonical_joint_positions_from_raw_feedback(
         self,
         raw_positions: dict[int, int],
+        *,
+        reference_mode: str = "raw",
     ) -> dict[str, object]:
         positions = self._copy_last_joint_setpoint_rad()
+        partial_position_samples: list[list[float]] = [[] for _ in range(self._num_joints)]
         axis_truth_details: list[dict[str, object]] = []
         unavailable_axes: list[int] = []
         unavailable_joints: list[int] = []
+        metrics_snapshot = self._load_rtcore_metrics_snapshot()
+        metrics_axes = metrics_snapshot.get("axes") if isinstance(metrics_snapshot, dict) else None
+        normalized_reference_mode = str(reference_mode).strip().lower()
         for axis_i, joint_i in enumerate(self._axis_to_joint):
             raw = raw_positions.get(axis_i)
             logical_joint = joint_i + 1 if 0 <= joint_i < self._num_joints else None
             metrics = self._absolute_feedback_metrics_for_axis(axis_i)
+            axis_snapshot = (
+                metrics_axes[axis_i]
+                if isinstance(metrics_axes, list)
+                and axis_i < len(metrics_axes)
+                and isinstance(metrics_axes[axis_i], dict)
+                else None
+            )
             normalized_absolute_feedback = self._normalize_absolute_feedback_metrics(metrics)
             absolute_result = self._absolute_axis_q_from_metrics(axis_i, metrics)
             reference_q: float | None = None
@@ -1458,10 +1669,15 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 "axis": int(axis_i),
                 "logical_joint": logical_joint,
                 "absolute_feedback": normalized_absolute_feedback,
+                "reference_mode": normalized_reference_mode,
             }
             if raw is not None:
                 detail["raw_counts"] = int(raw)
-                reference_q = self._reference_q_before_master_offset_for_axis(axis_i, int(raw))
+                reference_q = self._reference_q_before_master_offset_for_axis(
+                    axis_i,
+                    int(raw),
+                    reference_mode=normalized_reference_mode,
+                )
                 if reference_q is not None:
                     detail["reference_pre_zero_rad"] = float(reference_q)
             if anchor_entry is not None:
@@ -1490,6 +1706,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 truth_reason = "absolute_home_anchor_missing"
 
             if truth_reason is not None:
+                if normalized_reference_mode == "raw":
+                    self._set_raw_reference_wrap_lift_counts_for_axis(axis_i, 0)
                 detail["truth_available"] = False
                 detail["truth_status"] = "unavailable"
                 detail["truth_reason"] = truth_reason
@@ -1510,19 +1728,44 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 logical_joint_idx=joint_i,
                 canonical_q=float(canonical_q),
                 reference_q=float(reference_q),
+                reference_mode=normalized_reference_mode,
             )
             detail.update(roundtrip_detail)
             if not bool(roundtrip_detail.get("command_roundtrip_consistent", False)):
+                if normalized_reference_mode == "raw":
+                    self._set_raw_reference_wrap_lift_counts_for_axis(axis_i, 0)
+                stale_anchor_detail = self._absolute_home_anchor_diagnostic_for_axis(
+                    axis_i=axis_i,
+                    axis_snapshot=axis_snapshot,
+                    absolute_axis_q=float(absolute_axis_q),
+                    reference_q=(
+                        float(roundtrip_detail.get("command_roundtrip_reference_rad", reference_q))
+                        if normalized_reference_mode == "raw"
+                        else float(reference_q)
+                    ),
+                    anchor_entry=anchor_entry,
+                )
+                detail.update(stale_anchor_detail)
                 detail["truth_available"] = False
                 detail["truth_status"] = "unavailable"
-                detail["truth_reason"] = "command_frame_roundtrip_mismatch"
+                detail["truth_reason"] = (
+                    "absolute_home_anchor_stale"
+                    if bool(stale_anchor_detail.get("absolute_home_anchor_stale", False))
+                    else "command_frame_roundtrip_mismatch"
+                )
                 detail["display_source"] = "truth_unavailable"
                 unavailable_axes.append(int(axis_i))
                 if logical_joint is not None:
                     unavailable_joints.append(int(logical_joint))
                 axis_truth_details.append(detail)
                 continue
+            if normalized_reference_mode == "raw":
+                self._set_raw_reference_wrap_lift_counts_for_axis(
+                    axis_i,
+                    int(roundtrip_detail.get("command_roundtrip_reference_wrap_lift_counts", 0)),
+                )
             positions[joint_i] = float(canonical_q)
+            partial_position_samples[joint_i].append(float(canonical_q))
             detail["truth_available"] = True
             detail["truth_status"] = "available"
             detail["truth_source"] = "absolute_encoder_anchor"
@@ -1535,16 +1778,36 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         unavailable_axes = sorted(set(unavailable_axes))
         unavailable_joints = sorted(set(unavailable_joints))
+        joint_positions_partial: list[float | None] = []
+        for samples in partial_position_samples:
+            if samples:
+                joint_positions_partial.append(float(sum(samples) / len(samples)))
+            else:
+                joint_positions_partial.append(None)
         return {
             "joint_positions_rad": [float(value) for value in positions],
+            # Publish an explicit per-joint truth view alongside the legacy
+            # all-or-nothing list. When truth is unavailable for a joint we keep
+            # it as null instead of leaking cached setpoints back into the
+            # operator display path.
+            "joint_positions_rad_partial": joint_positions_partial,
             "axis_absolute_feedback": axis_truth_details,
             "truth_available": len(unavailable_axes) == 0,
             "truth_unavailable_axes": unavailable_axes,
             "truth_unavailable_joints": unavailable_joints,
         }
 
-    def _canonical_joint_positions_or_raise(self, raw_positions: dict[int, int]) -> list[float]:
-        snapshot = self._canonical_joint_positions_from_raw_feedback(raw_positions)
+    def _canonical_joint_positions_or_raise(
+        self,
+        raw_positions: dict[int, int],
+        *,
+        reference_mode: str = "raw",
+        error_label: str = "Canonical joint truth unavailable",
+    ) -> list[float]:
+        snapshot = self._canonical_joint_positions_from_raw_feedback(
+            raw_positions,
+            reference_mode=reference_mode,
+        )
         if bool(snapshot.get("truth_available")):
             positions = snapshot.get("joint_positions_rad")
             if isinstance(positions, list) and positions:
@@ -1552,7 +1815,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         unavailable_axes = snapshot.get("truth_unavailable_axes")
         unavailable_joints = snapshot.get("truth_unavailable_joints")
         raise RuntimeError(
-            "Canonical joint truth unavailable"
+            f"{error_label}"
             f" (axes={list(unavailable_axes) if isinstance(unavailable_axes, list) else []},"
             f" joints={list(unavailable_joints) if isinstance(unavailable_joints, list) else []})"
         )
@@ -1571,12 +1834,19 @@ class EthercatRTCoreBackend(ActuatorBackend):
             raw_positions = self.sync_read_positions()
         if not isinstance(raw_positions, dict) or not raw_positions:
             return None
-        return self._canonical_joint_positions_from_raw_feedback(raw_positions)
+        return self._canonical_joint_positions_from_raw_feedback(
+            raw_positions,
+            reference_mode="display",
+        )
 
     def raw_to_display_joint_positions(self, raw_positions: dict[int, int]) -> list[float]:
-        # Legacy compatibility alias: operator display truth is now the same
-        # canonical logical joint truth that the controller uses everywhere else.
-        return self._canonical_joint_positions_or_raise(raw_positions)
+        # Operator-facing joint display follows the seam-normalized home contract
+        # rather than the raw 0x6064 transport frame used on the command side.
+        return self._canonical_joint_positions_or_raise(
+            raw_positions,
+            reference_mode="display",
+            error_label="Operator display joint truth unavailable",
+        )
 
     def set_single_actuator_position(
         self,
@@ -1672,6 +1942,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             self._capture_absolute_home_anchor_for_joint(
                 joint_i,
                 actor=f"ethercat_rtcore:joint{joint_i + 1}:software_zero",
+                reference_mode="display",
             )
         except Exception:
             pass
@@ -2321,7 +2592,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         joint_i = self._axis_to_joint[axis_i]
         if joint_i < 0 or joint_i >= self._num_joints:
             return
-        logical_q = self._canonical_joint_q_from_command_axis_q(joint_i, float(target_axis_q))
+        logical_q = self._canonical_joint_q_from_command_axis_q(axis_i, joint_i, float(target_axis_q))
         self._store_last_joint_index_setpoint(joint_i, logical_q)
 
     def _refresh_native_home_offsets_from_metrics(self) -> None:
@@ -2351,9 +2622,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 axis.get("absolute_feedback")
             )
         with self._status_lock:
+            previous_offsets = list(self._native_home_offset_counts)
             self._native_home_offset_counts = offsets
             self._absolute_feedback_by_axis = absolute_feedback
             self._native_home_metrics_mtime_ns = stat.st_mtime_ns
+            for axis_i in range(min(len(previous_offsets), len(offsets), len(self._raw_reference_wrap_lift_counts))):
+                if int(previous_offsets[axis_i]) != int(offsets[axis_i]):
+                    self._raw_reference_wrap_lift_counts[axis_i] = 0
 
     def _load_rtcore_metrics_snapshot(self) -> dict[str, object] | None:
         try:
@@ -2462,26 +2737,117 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self,
         axis_i: int,
         raw_counts: int,
+        *,
+        reference_mode: str = "raw",
     ) -> float | None:
-        physical_q = self._axis_q_from_counts(axis_i, int(raw_counts))
+        normalized_reference_mode = str(reference_mode).strip().lower()
+        if normalized_reference_mode == "display":
+            physical_q = self._display_axis_q_from_raw_feedback_counts(axis_i, int(raw_counts))
+        else:
+            physical_q = self._axis_q_from_counts(axis_i, int(raw_counts))
         if physical_q is None:
             return None
         return float(physical_q) + self._native_home_offset_q_for_axis(axis_i)
 
-    def _command_axis_q_for_joint_value(self, logical_joint_idx: int, canonical_q: float) -> float:
+    def _raw_reference_wrap_period_counts_for_axis(self, axis_i: int) -> int:
+        cfg = self._axis_config
+        if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
+            return 0
+        if self._effective_drive_profile_id() != "a6ec_ds402":
+            return 0
+        counts_per_rev = int(cfg.counts_per_rev[axis_i]) if axis_i < len(cfg.counts_per_rev) else 0
+        return counts_per_rev if counts_per_rev > 0 else 0
+
+    def _raw_reference_wrap_lift_counts_for_axis(self, axis_i: int) -> int:
+        with self._status_lock:
+            if axis_i < 0 or axis_i >= len(self._raw_reference_wrap_lift_counts):
+                return 0
+            return int(self._raw_reference_wrap_lift_counts[axis_i])
+
+    def _set_raw_reference_wrap_lift_counts_for_axis(self, axis_i: int, wrap_lift_counts: int) -> None:
+        period_counts = self._raw_reference_wrap_period_counts_for_axis(axis_i)
+        normalized_lift_counts = int(wrap_lift_counts)
+        if period_counts > 0:
+            normalized_lift_counts = (
+                int(round(float(normalized_lift_counts) / float(period_counts))) * int(period_counts)
+            )
+        with self._status_lock:
+            if axis_i < 0 or axis_i >= len(self._raw_reference_wrap_lift_counts):
+                return
+            self._raw_reference_wrap_lift_counts[axis_i] = int(normalized_lift_counts)
+
+    def _raw_reference_wrap_lift_q_for_axis(self, axis_i: int, wrap_lift_counts: int | None = None) -> float:
+        lift_counts = (
+            self._raw_reference_wrap_lift_counts_for_axis(axis_i)
+            if wrap_lift_counts is None
+            else int(wrap_lift_counts)
+        )
+        if lift_counts == 0:
+            return 0.0
+        lift_q = self._axis_q_from_counts(axis_i, int(lift_counts))
+        return float(lift_q) if lift_q is not None else 0.0
+
+    def _wrap_adjusted_command_axis_q_for_axis(
+        self,
+        axis_i: int,
+        base_axis_q: float,
+        *,
+        observed_reference_q: float | None = None,
+    ) -> tuple[float, int]:
+        cfg = self._axis_config
+        period_counts = self._raw_reference_wrap_period_counts_for_axis(axis_i)
+        if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes) or period_counts <= 0:
+            return float(base_axis_q), 0
+        counts_per_unit = float(cfg.counts_per_unit[axis_i])
+        sign = int(cfg.sign[axis_i])
+        if counts_per_unit <= 0.0 or sign not in (-1, 1):
+            return float(base_axis_q), 0
+        base_counts = float(base_axis_q) * float(sign) * float(counts_per_unit)
+        if observed_reference_q is None:
+            wrap_lift_counts = self._raw_reference_wrap_lift_counts_for_axis(axis_i)
+        else:
+            observed_counts = float(observed_reference_q) * float(sign) * float(counts_per_unit)
+            wrap_turns = int(round((float(observed_counts) - float(base_counts)) / float(period_counts)))
+            wrap_lift_counts = int(wrap_turns * int(period_counts))
+        adjusted_counts = float(base_counts) + float(wrap_lift_counts)
+        adjusted_axis_q = float(adjusted_counts) / (float(sign) * float(counts_per_unit))
+        return float(adjusted_axis_q), int(wrap_lift_counts)
+
+    def _base_command_axis_q_for_joint_value(self, logical_joint_idx: int, canonical_q: float) -> float:
         return float(canonical_q) + self._master_offset_for_joint(logical_joint_idx)
 
-    def _canonical_joint_q_from_command_axis_q(self, logical_joint_idx: int, target_axis_q: float) -> float:
-        return float(target_axis_q) - self._master_offset_for_joint(logical_joint_idx)
+    def _command_axis_q_for_joint_value(self, axis_i: int, logical_joint_idx: int, canonical_q: float) -> float:
+        base_axis_q = self._base_command_axis_q_for_joint_value(logical_joint_idx, canonical_q)
+        adjusted_axis_q, _wrap_lift_counts = self._wrap_adjusted_command_axis_q_for_axis(axis_i, base_axis_q)
+        return float(adjusted_axis_q)
 
-    def _command_roundtrip_tolerance_rad_for_axis(self, axis_i: int) -> float:
+    def _canonical_joint_q_from_command_axis_q(
+        self,
+        axis_i: int,
+        logical_joint_idx: int,
+        target_axis_q: float,
+    ) -> float:
+        base_target_axis_q = float(target_axis_q) - self._raw_reference_wrap_lift_q_for_axis(axis_i)
+        return float(base_target_axis_q) - self._master_offset_for_joint(logical_joint_idx)
+
+    def _counts_tolerance_rad_for_axis(self, axis_i: int, counts: float) -> float:
         cfg = self._axis_config
         if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
             return 1e-9
         counts_per_unit = float(cfg.counts_per_unit[axis_i])
         if counts_per_unit <= 0.0:
             return 1e-9
-        return (1.0 / counts_per_unit) + 1e-9
+        return (float(counts) / counts_per_unit) + 1e-9
+
+    def _command_roundtrip_tolerance_rad_for_axis(self, axis_i: int) -> float:
+        # Live raw/absolute reads are sequential rather than simultaneous, and the
+        # A6-EC probe work established that stationary bridges can wander by several
+        # counts without indicating a semantic frame shift. Post-restart live soak
+        # runs have since shown J6 occasionally spiking into the 7-9 count range
+        # while the robot remains physically stationary, so keep the command-frame
+        # guard above that observed jitter band while still rejecting larger
+        # mismatches.
+        return self._counts_tolerance_rad_for_axis(axis_i, _COMMAND_ROUNDTRIP_TOLERANCE_COUNTS)
 
     def _command_roundtrip_detail_for_axis(
         self,
@@ -2490,8 +2856,19 @@ class EthercatRTCoreBackend(ActuatorBackend):
         logical_joint_idx: int,
         canonical_q: float,
         reference_q: float,
+        reference_mode: str = "raw",
     ) -> dict[str, object]:
-        roundtrip_reference_q = self._command_axis_q_for_joint_value(logical_joint_idx, canonical_q)
+        normalized_reference_mode = str(reference_mode).strip().lower()
+        base_roundtrip_reference_q = self._base_command_axis_q_for_joint_value(logical_joint_idx, canonical_q)
+        wrap_lift_counts = 0
+        if normalized_reference_mode == "raw":
+            roundtrip_reference_q, wrap_lift_counts = self._wrap_adjusted_command_axis_q_for_axis(
+                axis_i,
+                base_roundtrip_reference_q,
+                observed_reference_q=float(reference_q),
+            )
+        else:
+            roundtrip_reference_q = float(base_roundtrip_reference_q)
         error_rad = float(roundtrip_reference_q) - float(reference_q)
         tolerance_rad = self._command_roundtrip_tolerance_rad_for_axis(axis_i)
         detail: dict[str, object] = {
@@ -2500,6 +2877,14 @@ class EthercatRTCoreBackend(ActuatorBackend):
             "command_roundtrip_tolerance_rad": float(tolerance_rad),
             "command_roundtrip_consistent": abs(float(error_rad)) <= float(tolerance_rad),
         }
+        if normalized_reference_mode == "raw":
+            period_counts = self._raw_reference_wrap_period_counts_for_axis(axis_i)
+            detail["command_roundtrip_reference_base_rad"] = float(base_roundtrip_reference_q)
+            detail["command_roundtrip_reference_wrap_lift_counts"] = int(wrap_lift_counts)
+            if period_counts > 0:
+                detail["command_roundtrip_reference_wrap_lift_turns"] = (
+                    float(wrap_lift_counts) / float(period_counts)
+                )
         cfg = self._axis_config
         if cfg is not None and 0 <= axis_i < int(cfg.num_axes):
             counts_per_unit = float(cfg.counts_per_unit[axis_i])
@@ -2510,12 +2895,188 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 )
         return detail
 
+    def _absolute_home_anchor_stale_tolerance_rad_for_axis(self, axis_i: int) -> float:
+        return self._counts_tolerance_rad_for_axis(axis_i, _ABSOLUTE_HOME_ANCHOR_STALE_TOLERANCE_COUNTS)
+
+    def _absolute_home_anchor_diagnostic_for_axis(
+        self,
+        *,
+        axis_i: int,
+        axis_snapshot: dict[str, object] | None,
+        absolute_axis_q: float,
+        reference_q: float,
+        anchor_entry: dict[str, Any],
+    ) -> dict[str, object]:
+        stored_anchor_rad = float(anchor_entry.get("home_anchor_rad", 0.0))
+        implied_anchor_rad = float(absolute_axis_q) - float(reference_q)
+        anchor_delta_rad = float(implied_anchor_rad) - float(stored_anchor_rad)
+        stale_tolerance_rad = self._absolute_home_anchor_stale_tolerance_rad_for_axis(axis_i)
+        detail: dict[str, object] = {
+            "absolute_home_anchor_implied_rad": float(implied_anchor_rad),
+            "absolute_home_anchor_delta_rad": float(anchor_delta_rad),
+            "absolute_home_anchor_stale_tolerance_rad": float(stale_tolerance_rad),
+        }
+        cfg = self._axis_config
+        if cfg is not None and 0 <= axis_i < int(cfg.num_axes):
+            counts_per_unit = float(cfg.counts_per_unit[axis_i])
+            sign = int(cfg.sign[axis_i])
+            if counts_per_unit > 0.0 and sign in (-1, 1):
+                detail["absolute_home_anchor_delta_counts"] = float(
+                    float(anchor_delta_rad) * float(sign) * float(counts_per_unit)
+                )
+                detail["absolute_home_anchor_stale_tolerance_counts"] = float(
+                    float(stale_tolerance_rad) * float(counts_per_unit)
+                )
+
+        axis_payload = axis_snapshot if isinstance(axis_snapshot, dict) else {}
+        try:
+            statusword = int(axis_payload.get("statusword", 0))
+        except Exception:
+            statusword = 0
+        try:
+            error_code = int(axis_payload.get("error_code", 0))
+        except Exception:
+            error_code = 0
+        try:
+            manufacturer_error_code = int(axis_payload.get("manufacturer_error_code", 0))
+        except Exception:
+            manufacturer_error_code = 0
+        native_home_status = derive_effective_native_home_status(
+            axis_payload,
+            statusword=statusword,
+            error_code=error_code,
+            manufacturer_error_code=manufacturer_error_code,
+        )
+        native_home_active = bool(axis_payload.get("native_home_active", False))
+        drive_clean = (
+            statusword != 0
+            and error_code == 0
+            and manufacturer_error_code == 0
+            and int(native_home_status.get("native_home_state", 0)) == 2
+            and not native_home_active
+        )
+        if "slave_online" in axis_payload:
+            drive_clean = drive_clean and bool(axis_payload.get("slave_online"))
+        if "slave_operational" in axis_payload:
+            drive_clean = drive_clean and bool(axis_payload.get("slave_operational"))
+        detail.update(
+            {
+                "statusword": int(statusword),
+                "statusword_hex": f"0x{statusword & 0xFFFF:04X}",
+                "error_code": int(error_code),
+                "error_code_hex": f"0x{error_code & 0xFFFF:04X}",
+                "manufacturer_error_code": int(manufacturer_error_code),
+                "manufacturer_error_code_hex": f"0x{manufacturer_error_code & 0xFFFFFFFF:08X}",
+                "native_home_state": int(native_home_status.get("native_home_state", 0)),
+                "native_home_state_name": str(native_home_status.get("native_home_state_name", "idle")),
+                "native_home_last_abort_code": int(native_home_status.get("native_home_last_abort_code", 0)),
+                "native_home_last_abort_code_hex": str(
+                    native_home_status.get("native_home_last_abort_code_hex", "0x00000000")
+                ),
+                "native_home_verification_source": str(
+                    native_home_status.get("native_home_verification_source", "reported")
+                ),
+                "native_home_active": bool(native_home_active),
+                "absolute_home_anchor_drive_clean": bool(drive_clean),
+                "absolute_home_anchor_stale": bool(
+                    drive_clean and abs(float(anchor_delta_rad)) > float(stale_tolerance_rad)
+                ),
+            }
+        )
+        return detail
+
+    def _absolute_home_anchor_validation_for_joint(
+        self,
+        logical_joint_index: int,
+        *,
+        raw_positions: dict[int, int] | None = None,
+        reference_mode: str = "raw",
+    ) -> dict[str, object]:
+        joint_i = int(logical_joint_index)
+        if joint_i < 0 or joint_i >= self._num_joints:
+            return {
+                "ok": False,
+                "truth_available": False,
+                "truth_reason": "logical_joint_unmapped",
+            }
+        if raw_positions is None:
+            raw_positions = self.sync_read_positions()
+        if not isinstance(raw_positions, dict) or not raw_positions:
+            return {
+                "ok": False,
+                "truth_available": False,
+                "truth_reason": "raw_feedback_missing",
+            }
+        target_axes = [axis_i for axis_i, mapped_joint in enumerate(self._axis_to_joint) if mapped_joint == joint_i]
+        if not target_axes:
+            return {
+                "ok": False,
+                "truth_available": False,
+                "truth_reason": "logical_joint_unmapped",
+            }
+        snapshot = self._canonical_joint_positions_from_raw_feedback(
+            raw_positions,
+            reference_mode=reference_mode,
+        )
+        axis_truth_details = snapshot.get("axis_absolute_feedback")
+        if not isinstance(axis_truth_details, list):
+            return {
+                "ok": False,
+                "truth_available": False,
+                "truth_reason": "truth_snapshot_unavailable",
+            }
+        matching_details = [
+            detail
+            for detail in axis_truth_details
+            if isinstance(detail, dict) and int(detail.get("axis", -1)) in target_axes
+        ]
+        if not matching_details:
+            return {
+                "ok": False,
+                "truth_available": False,
+                "truth_reason": "truth_snapshot_unavailable",
+            }
+        failing_detail = next(
+            (detail for detail in matching_details if not bool(detail.get("truth_available", False))),
+            None,
+        )
+        if failing_detail is not None:
+            result: dict[str, object] = {
+                "ok": False,
+                "truth_available": False,
+                "truth_reason": str(failing_detail.get("truth_reason", "truth_unavailable") or "truth_unavailable"),
+            }
+            for key in (
+                "axis",
+                "logical_joint",
+                "command_roundtrip_reference_error_counts",
+                "command_roundtrip_reference_error_rad",
+                "absolute_home_anchor_delta_counts",
+                "absolute_home_anchor_delta_rad",
+                "absolute_home_anchor_implied_rad",
+            ):
+                value = failing_detail.get(key)
+                if value is not None:
+                    result[key] = value
+            return result
+        primary_detail = matching_details[0]
+        result = {
+            "ok": True,
+            "truth_available": True,
+        }
+        for key in ("axis", "logical_joint", "canonical_rad"):
+            value = primary_detail.get(key)
+            if value is not None:
+                result[key] = value
+        return result
+
     def _capture_absolute_home_anchor_for_joint(
         self,
         logical_joint_index: int,
         *,
         raw_positions: dict[int, int] | None = None,
         actor: str = "unknown",
+        reference_mode: str = "raw",
     ) -> dict[str, Any] | None:
         joint_i = int(logical_joint_index)
         if joint_i < 0 or joint_i >= self._num_joints:
@@ -2537,7 +3098,11 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 continue
             metrics = self._absolute_feedback_metrics_for_axis(axis_i)
             absolute_result = self._absolute_axis_q_from_metrics(axis_i, metrics)
-            reference_q = self._reference_q_before_master_offset_for_axis(axis_i, int(raw_counts))
+            reference_q = self._reference_q_before_master_offset_for_axis(
+                axis_i,
+                int(raw_counts),
+                reference_mode=reference_mode,
+            )
             if absolute_result is None or reference_q is None:
                 continue
             absolute_axis_q, source, _absolute_counts = absolute_result
@@ -2610,6 +3175,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 joint_i,
                 raw_positions=raw_positions,
                 actor=actor,
+                reference_mode="display",
             )
             if captured is not None:
                 created_joints.append(joint_i + 1)
@@ -2618,7 +3184,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         if created_joints:
             print(
-                "[EtherCAT RTCore] Bootstrapped absolute-home anchors from live raw/absolute alignment:"
+                "[EtherCAT RTCore] Bootstrapped absolute-home anchors from live display/absolute alignment:"
                 f" joints={created_joints} actor={actor}"
             )
         if missing_joints:
@@ -2674,14 +3240,15 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 and effective_state not in {1, 2}
                 and error_code == 0
                 and manufacturer_error_code == 0
-                and (statusword & 0x8000) != 0
+                and statusword_indicates_valid_native_home_reference(statusword)
             ):
                 # Keep the command-result semantics aligned with the live driveFaults
                 # view: once RTCore's native-home tail is done, a clean live wire-state
-                # with HM bit 15 set should override stale last-operation failure fields.
+                # with vendor-confirmed HM success bits should override stale
+                # last-operation failure fields.
                 effective_state = 2
                 effective_abort_code = 0
-                verification_source = "statusword_bit15"
+                verification_source = "statusword_bits12_15_clear13"
             axis_results.append(
                 {
                     "axis": int(axis_i),
@@ -2773,9 +3340,12 @@ class EthercatRTCoreBackend(ActuatorBackend):
                         snapshot=snapshot,
                         allow_statusword_fallback=saw_active_mask and not active_for_target,
                     )
+                    terminal_state = str(last_result.get("terminal_state", "pending"))
                     if (
+                        saw_active_mask
+                        and
                         not active_for_target
-                        and str(last_result.get("terminal_state", "pending")) in {"failed", "succeeded"}
+                        and terminal_state in {"failed", "succeeded"}
                     ):
                         return last_result
             time.sleep(_NATIVE_HOME_WAIT_POLL_INTERVAL_S)
@@ -2804,8 +3374,215 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 "axis_results": [],
             }
         last_result = dict(last_result)
-        last_result["timed_out"] = str(last_result.get("terminal_state", "pending")) not in {"failed", "succeeded"}
-        return last_result
+        terminal_state = str(last_result.get("terminal_state", "pending"))
+        if saw_active_mask:
+            last_result["timed_out"] = terminal_state not in {"failed", "succeeded"}
+            return last_result
+        return {
+            "verified": False,
+            "timed_out": True,
+            "terminal_state": "pending",
+            "native_home_state": 1,
+            "native_home_state_name": "requested",
+            "native_home_last_abort_code": 0,
+            "native_home_last_abort_code_hex": "0x00000000",
+            "metrics_time_ns": int(last_result.get("metrics_time_ns", 0) or 0),
+            "axis_results": (
+                [dict(value) for value in last_result.get("axis_results", [])]
+                if isinstance(last_result.get("axis_results"), list)
+                else []
+            ),
+        }
+
+    def _native_home_post_settle_result(
+        self,
+        target_axes: list[int],
+        *,
+        snapshot: dict[str, object],
+    ) -> dict[str, object]:
+        axes = snapshot.get("axes")
+        axis_results: list[dict[str, object]] = []
+        if not isinstance(axes, list):
+            axes = []
+        try:
+            active_mask = int(snapshot.get("native_home_active_axis_mask", 0) or 0)
+        except Exception:
+            active_mask = 0
+
+        all_clean = bool(target_axes)
+        first_nonclean_reason = ""
+        hard_failure = False
+        for axis_i in target_axes:
+            axis_payload = axes[axis_i] if axis_i < len(axes) and isinstance(axes[axis_i], dict) else {}
+            try:
+                statusword = int(axis_payload.get("statusword", 0))
+            except Exception:
+                statusword = 0
+            try:
+                error_code = int(axis_payload.get("error_code", 0))
+            except Exception:
+                error_code = 0
+            try:
+                manufacturer_error_code = int(axis_payload.get("manufacturer_error_code", 0))
+            except Exception:
+                manufacturer_error_code = 0
+            try:
+                state = int(axis_payload.get("native_home_state", 0))
+            except Exception:
+                state = 0
+            try:
+                abort_code = int(axis_payload.get("native_home_last_abort_code", 0))
+            except Exception:
+                abort_code = 0
+
+            reported_active = bool(axis_payload.get("native_home_active", False))
+            active = reported_active or ((active_mask & (1 << axis_i)) != 0)
+            statusword_fault = (statusword & 0x0008) != 0
+            slave_online_raw = axis_payload.get("slave_online")
+            slave_operational_raw = axis_payload.get("slave_operational")
+            slave_online = True if slave_online_raw is None else bool(slave_online_raw)
+            slave_operational = True if slave_operational_raw is None else bool(slave_operational_raw)
+
+            failure_reason = ""
+            if not slave_online:
+                failure_reason = "slave_offline"
+            elif not slave_operational:
+                failure_reason = "slave_not_operational"
+            elif error_code != 0 or manufacturer_error_code != 0 or statusword_fault:
+                failure_reason = "drive_faulted"
+            elif active:
+                failure_reason = "native_home_active"
+
+            axis_clean = not failure_reason
+            if not axis_clean:
+                all_clean = False
+                if not first_nonclean_reason:
+                    first_nonclean_reason = failure_reason or "post_home_unclean"
+                if failure_reason in {"slave_offline", "slave_not_operational", "drive_faulted"}:
+                    hard_failure = True
+
+            axis_results.append(
+                {
+                    "axis": int(axis_i),
+                    "native_home_state": int(state),
+                    "native_home_state_name": _native_home_state_name(state),
+                    "native_home_last_abort_code": int(abort_code),
+                    "native_home_last_abort_code_hex": f"0x{abort_code & 0xFFFFFFFF:08X}",
+                    "statusword": int(statusword),
+                    "statusword_hex": f"0x{statusword & 0xFFFF:04X}",
+                    "statusword_fault": bool(statusword_fault),
+                    "error_code": int(error_code),
+                    "error_code_hex": f"0x{error_code & 0xFFFF:04X}",
+                    "manufacturer_error_code": int(manufacturer_error_code),
+                    "manufacturer_error_code_hex": f"0x{manufacturer_error_code & 0xFFFFFFFF:08X}",
+                    "slave_online": bool(slave_online),
+                    "slave_operational": bool(slave_operational),
+                    "native_home_active": bool(active),
+                    "failure_reason": failure_reason or None,
+                    "clean": bool(axis_clean),
+                }
+            )
+
+        return {
+            "ok": bool(axis_results) and bool(all_clean),
+            "timed_out": False,
+            "hard_failure": bool(hard_failure),
+            "failure_reason": first_nonclean_reason or None,
+            "metrics_time_ns": int(snapshot.get("time_ns", 0) or 0),
+            "axis_results": axis_results,
+        }
+
+    def _wait_for_native_home_post_settle_result(
+        self,
+        axis_mask: int,
+        *,
+        timeout_s: float,
+        min_metrics_time_ns: int = 0,
+        min_metrics_mtime_ns: int = 0,
+    ) -> dict[str, object]:
+        target_axes = [
+            axis_i
+            for axis_i in range(self._rt_num_axes)
+            if (int(axis_mask) & (1 << axis_i)) != 0
+        ]
+        if not target_axes:
+            return {
+                "ok": False,
+                "timed_out": False,
+                "hard_failure": False,
+                "failure_reason": "invalid_axis_mask",
+                "metrics_time_ns": 0,
+                "axis_results": [],
+            }
+
+        settle_timeout_s = max(0.0, float(timeout_s))
+        if settle_timeout_s <= 0.0:
+            return {
+                "ok": True,
+                "timed_out": False,
+                "hard_failure": False,
+                "failure_reason": None,
+                "metrics_time_ns": int(min_metrics_time_ns),
+                "axis_results": [],
+            }
+
+        deadline = time.monotonic() + settle_timeout_s
+        last_result: dict[str, object] | None = None
+        saw_fresh_snapshot = False
+        saw_unclean_snapshot = False
+        first_unclean_reason = ""
+        newest_time_ns = int(min_metrics_time_ns)
+        newest_mtime_ns = int(min_metrics_mtime_ns)
+
+        while time.monotonic() <= deadline:
+            snapshot = self._load_rtcore_metrics_snapshot()
+            if isinstance(snapshot, dict):
+                snapshot_time_ns = int(snapshot.get("time_ns", 0) or 0)
+                snapshot_mtime_ns = int(snapshot.get("_mtime_ns", 0) or 0)
+                if snapshot_time_ns > newest_time_ns or snapshot_mtime_ns > newest_mtime_ns:
+                    newest_time_ns = max(newest_time_ns, snapshot_time_ns)
+                    newest_mtime_ns = max(newest_mtime_ns, snapshot_mtime_ns)
+                    saw_fresh_snapshot = True
+                    last_result = self._native_home_post_settle_result(target_axes, snapshot=snapshot)
+                    if not bool(last_result.get("ok", False)):
+                        saw_unclean_snapshot = True
+                        reason = str(last_result.get("failure_reason", "") or "").strip()
+                        if reason and not first_unclean_reason:
+                            first_unclean_reason = reason
+                    if bool(last_result.get("hard_failure", False)):
+                        return last_result
+            time.sleep(_NATIVE_HOME_WAIT_POLL_INTERVAL_S)
+
+        if not saw_fresh_snapshot:
+            return {
+                "ok": False,
+                "timed_out": True,
+                "hard_failure": False,
+                "failure_reason": "post_home_settle_no_fresh_metrics",
+                "metrics_time_ns": 0,
+                "axis_results": [],
+            }
+        if last_result is None:
+            return {
+                "ok": False,
+                "timed_out": True,
+                "hard_failure": False,
+                "failure_reason": "post_home_settle_unknown",
+                "metrics_time_ns": int(newest_time_ns),
+                "axis_results": [],
+            }
+        if bool(last_result.get("ok", False)) and not saw_unclean_snapshot:
+            return last_result
+        result = dict(last_result)
+        result["ok"] = False
+        result["timed_out"] = True
+        result["hard_failure"] = bool(result.get("hard_failure", False))
+        result["failure_reason"] = (
+            first_unclean_reason
+            or str(result.get("failure_reason", "") or "").strip()
+            or "post_home_settle_unstable"
+        )
+        return result
 
     def _native_home_offset_q_for_axis(self, axis_i: int) -> float:
         self._refresh_native_home_offsets_from_metrics()
@@ -2828,8 +3605,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 #   absolute_axis_q - absolute_home_anchor - software_zero
                 # = reference_q - software_zero
                 # The command path therefore still inverts back to the same
-                # reference frame by re-applying only the software-zero offset.
-                axis_q[axis_i] = self._command_axis_q_for_joint_value(joint_i, float(positions_rad[joint_i]))
+                # reference frame by re-applying the software-zero offset and,
+                # when needed, the current raw-reference wrap lift.
+                axis_q[axis_i] = self._command_axis_q_for_joint_value(
+                    axis_i,
+                    joint_i,
+                    float(positions_rad[joint_i]),
+                )
         return axis_q
 
     def _axis_qd_from_joint_velocities(self, joint_velocities_rad_s: list[float]) -> list[float]:

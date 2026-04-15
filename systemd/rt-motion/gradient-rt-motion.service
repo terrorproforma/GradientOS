@@ -36,6 +36,9 @@ Environment=GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG=
 Environment=GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG=
 Environment=GRADIENT_RT_NATIVE_HOME_CONFIG=
 Environment=GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK=0x0
+Environment=GRADIENT_RT_METRICS_STARTUP_READBACK_ENABLED=1
+Environment=GRADIENT_RT_METRICS_NATIVE_HOME_REFRESH_ENABLED=1
+Environment=GRADIENT_RT_METRICS_ABSOLUTE_FEEDBACK_POLL_ENABLED=1
 EnvironmentFile=-/etc/default/gradient-rt-motion
 ExecStart=/usr/local/bin/gradient-rt-motion --num-axes ${GRADIENT_RT_NUM_AXES} --counts-per-rev ${GRADIENT_RT_COUNTS_PER_REV} --gear-ratio ${GRADIENT_RT_GEAR_RATIO} --sign ${GRADIENT_RT_SIGN} --drive-profile ${GRADIENT_RT_DRIVE_PROFILE} --max-rpm ${GRADIENT_RT_MAX_RPM} --slave-vendor-id ${GRADIENT_RT_DRIVE_VENDOR_ID} --slave-product-code ${GRADIENT_RT_DRIVE_PRODUCT_CODE} --slave-revision-no ${GRADIENT_RT_DRIVE_REVISION_NO} --rx-sync-index ${GRADIENT_RT_DRIVE_RX_SYNC_INDEX} --tx-sync-index ${GRADIENT_RT_DRIVE_TX_SYNC_INDEX} --dc-cycle-multiple-ns ${GRADIENT_RT_DRIVE_DC_CYCLE_MULTIPLE_NS} --rx-pdo ${GRADIENT_RT_DRIVE_RX_PDO} --tx-pdo ${GRADIENT_RT_DRIVE_TX_PDO} --rx-pdo-layout "${GRADIENT_RT_DRIVE_RX_PDO_LAYOUT}" --tx-pdo-layout "${GRADIENT_RT_DRIVE_TX_PDO_LAYOUT}" --startup-sdo-config "${GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG}" --absolute-feedback-config "${GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG}" --native-home-config "${GRADIENT_RT_NATIVE_HOME_CONFIG}" --feedback-wrap-axis-mask ${GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK}
 
@@ -50,8 +53,11 @@ LimitMEMLOCK=infinity
 RuntimeDirectory=gradient-rt-motion
 RuntimeDirectoryMode=0770
 
-Restart=always
+# Keep RTCore available after ordinary failures, but do not thrash the same
+# stuck EtherCAT owner when request_master fails with the dedicated exit code.
+Restart=on-failure
 RestartSec=2
+RestartPreventExitStatus=75
 
 TimeoutStopSec=10
 

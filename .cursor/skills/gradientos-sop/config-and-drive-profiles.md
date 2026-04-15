@@ -16,6 +16,8 @@ Use this file when deciding whether behavior belongs in robot config, backend co
 - Keep drive identity, PDO defaults, sync indices, DC timing, startup SDO defaults, and similar family-level policy out of robot config.
 - The same robot may be paired with different drive families, so robot config must stay manufacturer-neutral.
 - Render RTCore startup env from a merge of robot/runtime policy plus drive-catalog data.
+- For the active A6-EC frame-semantics workstream, keep the raw absolute encoder frame, the rotation-mode bridge frame, and the CSP/reference-home frame explicitly separate.
+- See [../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md](../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md) for the durable workstream note that captures the current equations, object families, probe rationale, and anchor semantics.
 
 ## Backend Rules
 

@@ -1,3 +1,5 @@
+import pytest
+
 from gradient_os import run_controller
 
 
@@ -96,3 +98,203 @@ def test_build_monitor_motion_status_payload_fails_closed(monkeypatch):
 
     monkeypatch.setattr(run_controller.command_api, "get_motion_execution_status", _boom)
     assert run_controller._build_monitor_motion_status_payload() is None
+
+
+def test_build_joint_state_snapshot_uses_backend_display_feedback(monkeypatch):
+    display_positions = [0.11, 0.21, 0.31, 0.41, 0.51, 0.61]
+    canonical_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    backend = object()
+
+    monkeypatch.setattr(
+        run_controller.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: canonical_positions,
+    )
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend", lambda: backend)
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend_name", lambda: "ethercat_rtcore")
+    monkeypatch.setattr(run_controller, "_sync_backend_raw_positions", lambda _backend: {0: 0})
+    monkeypatch.setattr(
+        run_controller,
+        "_backend_display_feedback_snapshot",
+        lambda _backend, _raw_positions: {
+            "truth_available": True,
+            "joint_positions_rad": display_positions,
+            "truth_unavailable_axes": [],
+            "truth_unavailable_joints": [],
+            "axis_absolute_feedback": [],
+        },
+    )
+    monkeypatch.setattr(run_controller.utils, "gripper_present", False, raising=False)
+
+    snapshot = run_controller._build_joint_state_snapshot()
+
+    assert snapshot["arm_rad"] == canonical_positions
+    assert snapshot["arm_display_rad"] == display_positions
+    assert snapshot["arm_display_deg"] == pytest.approx(
+        [float((value * 180.0) / 3.141592653589793) for value in display_positions]
+    )
+
+
+def test_build_joint_state_snapshot_does_not_fallback_display_feedback(monkeypatch):
+    canonical_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    backend = object()
+
+    monkeypatch.setattr(
+        run_controller.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: canonical_positions,
+    )
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend", lambda: backend)
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend_name", lambda: "ethercat_rtcore")
+    monkeypatch.setattr(run_controller, "_sync_backend_raw_positions", lambda _backend: {0: 0})
+    monkeypatch.setattr(
+        run_controller,
+        "_backend_display_feedback_snapshot",
+        lambda _backend, _raw_positions: {
+            "truth_available": False,
+            "joint_positions_rad": [0.11, 0.21, 0.31, 0.41, 0.51, 0.61],
+            "truth_unavailable_axes": [0],
+            "truth_unavailable_joints": [1],
+            "axis_absolute_feedback": [
+                {
+                    "axis": 0,
+                    "logical_joint": 1,
+                    "truth_available": False,
+                    "truth_reason": "command_frame_roundtrip_mismatch",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(run_controller.utils, "gripper_present", False, raising=False)
+
+    snapshot = run_controller._build_joint_state_snapshot()
+
+    assert snapshot["arm_rad"] == canonical_positions
+    assert snapshot["arm_display_rad"] == []
+    assert snapshot["arm_display_deg"] == []
+    assert snapshot["canonical_joint_truth_available"] is False
+
+
+def test_build_joint_state_snapshot_preserves_partial_display_feedback(monkeypatch):
+    canonical_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    partial_display_positions = [0.11, None, 0.31, None, 0.51, 0.61]
+    backend = object()
+
+    monkeypatch.setattr(
+        run_controller.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: canonical_positions,
+    )
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend", lambda: backend)
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend_name", lambda: "ethercat_rtcore")
+    monkeypatch.setattr(run_controller, "_sync_backend_raw_positions", lambda _backend: {0: 0})
+    monkeypatch.setattr(
+        run_controller,
+        "_backend_display_feedback_snapshot",
+        lambda _backend, _raw_positions: {
+            "truth_available": False,
+            "joint_positions_rad": [9.0, 9.0, 9.0, 9.0, 9.0, 9.0],
+            "joint_positions_rad_partial": partial_display_positions,
+            "truth_unavailable_axes": [1, 3],
+            "truth_unavailable_joints": [2, 4],
+            "axis_absolute_feedback": [
+                {
+                    "axis": 0,
+                    "logical_joint": 1,
+                    "truth_available": True,
+                    "canonical_rad": 0.11,
+                },
+                {
+                    "axis": 1,
+                    "logical_joint": 2,
+                    "truth_available": False,
+                    "truth_reason": "absolute_home_anchor_stale",
+                },
+                {
+                    "axis": 2,
+                    "logical_joint": 3,
+                    "truth_available": True,
+                    "canonical_rad": 0.31,
+                },
+                {
+                    "axis": 3,
+                    "logical_joint": 4,
+                    "truth_available": False,
+                    "truth_reason": "command_frame_roundtrip_mismatch",
+                },
+                {
+                    "axis": 4,
+                    "logical_joint": 5,
+                    "truth_available": True,
+                    "canonical_rad": 0.51,
+                },
+                {
+                    "axis": 5,
+                    "logical_joint": 6,
+                    "truth_available": True,
+                    "canonical_rad": 0.61,
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(run_controller.utils, "gripper_present", False, raising=False)
+
+    snapshot = run_controller._build_joint_state_snapshot()
+
+    assert snapshot["arm_rad"] == canonical_positions
+    assert snapshot["arm_display_rad"] == partial_display_positions
+    display_deg = snapshot["arm_display_deg"]
+    assert isinstance(display_deg, list)
+    assert display_deg[0] == pytest.approx(float((0.11 * 180.0) / 3.141592653589793))
+    assert display_deg[1] is None
+    assert display_deg[2] == pytest.approx(float((0.31 * 180.0) / 3.141592653589793))
+    assert display_deg[3] is None
+    assert display_deg[4] == pytest.approx(float((0.51 * 180.0) / 3.141592653589793))
+    assert display_deg[5] == pytest.approx(float((0.61 * 180.0) / 3.141592653589793))
+    assert snapshot["display_joint_truth_available"] is False
+    assert snapshot["display_joint_truth_unavailable_axes"] == [1, 3]
+    assert snapshot["display_joint_truth_unavailable_joints"] == [2, 4]
+    assert snapshot["canonical_joint_truth_available"] is False
+
+
+def test_build_joint_state_snapshot_keeps_raw_blocker_details_when_display_truth_is_available(monkeypatch):
+    display_positions = [0.11, 0.21, 0.31, 0.41, 0.51, 0.61]
+    backend = object()
+
+    def _boom(verbose=False):
+        raise RuntimeError(
+            "Canonical joint truth unavailable (axes=[2, 3, 5], joints=[3, 4, 6])"
+        )
+
+    monkeypatch.setattr(
+        run_controller.servo_driver,
+        "get_current_arm_state_rad",
+        _boom,
+    )
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend", lambda: backend)
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend_name", lambda: "ethercat_rtcore")
+    monkeypatch.setattr(run_controller, "_sync_backend_raw_positions", lambda _backend: {0: 0})
+    monkeypatch.setattr(
+        run_controller,
+        "_backend_display_feedback_snapshot",
+        lambda _backend, _raw_positions: {
+            "truth_available": True,
+            "joint_positions_rad": display_positions,
+            "truth_unavailable_axes": [],
+            "truth_unavailable_joints": [],
+            "axis_absolute_feedback": [],
+        },
+    )
+    monkeypatch.setattr(run_controller.utils, "gripper_present", False, raising=False)
+
+    snapshot = run_controller._build_joint_state_snapshot()
+
+    assert snapshot["read_source"] == "unavailable"
+    assert snapshot["raw_canonical_joint_truth_available"] is False
+    assert snapshot["display_joint_truth_available"] is True
+    assert snapshot["canonical_joint_truth_available"] is False
+    assert snapshot["canonical_joint_truth_unavailable_axes"] == [2, 3, 5]
+    assert snapshot["canonical_joint_truth_unavailable_joints"] == [3, 4, 6]
+    assert snapshot["display_joint_truth_unavailable_axes"] == []
+    assert snapshot["display_joint_truth_unavailable_joints"] == []
+    assert snapshot["arm_display_rad"] == display_positions

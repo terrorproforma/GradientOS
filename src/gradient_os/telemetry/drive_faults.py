@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..arm_controller.backends import registry as backend_registry
+from .native_home_status import derive_effective_native_home_status
 
 
 def coerce_int(value: object, default: int = 0) -> int:
@@ -17,55 +18,6 @@ def axis_snapshot_is_faulted(axis: Mapping[str, object]) -> bool:
     error_code = coerce_int(axis.get("error_code"), 0)
     ds402_state = str(axis.get("ds402_state", axis.get("drive_state", ""))).strip()
     return error_code != 0 or ds402_state in {"Fault", "FaultReactionActive"}
-
-
-def native_home_state_name(value: object) -> str:
-    state = coerce_int(value, 0)
-    labels = {
-        0: "idle",
-        1: "requested",
-        2: "succeeded",
-        3: "failed",
-    }
-    return labels.get(state, f"unknown:{state}")
-
-
-def derive_effective_native_home_status(
-    axis: Mapping[str, object],
-    *,
-    statusword: int,
-    error_code: int,
-    manufacturer_error_code: int,
-) -> dict[str, object]:
-    reported_state = coerce_int(axis.get("native_home_state"), 0)
-    reported_abort_code = coerce_int(axis.get("native_home_last_abort_code"), 0)
-    effective_state = reported_state
-    effective_abort_code = reported_abort_code
-    verification_source = "reported"
-
-    # If the drive currently advertises HM bit 15 with no live fault, trust that
-    # fresh wire-state over a stale last-operation result cached in metrics.
-    if (
-        effective_state not in {1, 2}
-        and error_code == 0
-        and manufacturer_error_code == 0
-        and (int(statusword) & 0x8000) != 0
-    ):
-        effective_state = 2
-        effective_abort_code = 0
-        verification_source = "statusword_bit15"
-
-    return {
-        "native_home_state": int(effective_state),
-        "native_home_state_name": native_home_state_name(effective_state),
-        "native_home_last_abort_code": int(effective_abort_code),
-        "native_home_last_abort_code_hex": f"0x{effective_abort_code & 0xFFFFFFFF:08x}",
-        "native_home_state_reported": int(reported_state),
-        "native_home_state_reported_name": native_home_state_name(reported_state),
-        "native_home_last_abort_code_reported": int(reported_abort_code),
-        "native_home_last_abort_code_reported_hex": f"0x{reported_abort_code & 0xFFFFFFFF:08x}",
-        "native_home_verification_source": verification_source,
-    }
 
 
 def build_startup_fault_reset_plan(probe: Mapping[str, object]) -> dict[str, Any]:
