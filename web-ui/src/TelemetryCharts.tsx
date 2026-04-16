@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { preferredDisplayPoseJoints } from "./poseTelemetry";
 
 type ServoSample = {
   voltage_v?: number;
@@ -35,16 +36,6 @@ export type TelemetryEvent = {
   display_joints?: number[];
   servos?: Record<string, ServoSample>;
 };
-
-function preferredTelemetryJointSeries(latest: TelemetryEvent | null | undefined): number[] | null {
-  if (Array.isArray(latest?.joints) && latest.joints.length > 0) {
-    return latest.joints;
-  }
-  if (Array.isArray(latest?.display_joints) && latest.display_joints.length > 0) {
-    return latest.display_joints;
-  }
-  return null;
-}
 
 const TELEMETRY_PANEL_VISIBILITY_KEY = "gradient.telemetry.panelVisibility.v1";
 
@@ -442,7 +433,7 @@ export function TelemetryCharts({ latest }: { latest: TelemetryEvent | null }) {
   useEffect(() => {
     if (!latest) return;
     // Joints (radians -> degrees)
-    const jointSeries = preferredTelemetryJointSeries(latest);
+    const jointSeries = preferredDisplayPoseJoints(latest);
     if (Array.isArray(jointSeries) && jointSeries.length > 0) {
       setJointsDeg((prev) => {
         const next = [...prev.map((arr) => [...arr])];

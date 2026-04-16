@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Mapping
 from types import ModuleType
 from typing import Any
 
@@ -84,11 +85,16 @@ def build_drive_startup_config(
     raw_entries: object,
     *,
     num_axes: int,
+    robot_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     module = get_drive_profile(profile_id)
     builder = getattr(module, "build_startup_config", None) if module is not None else None
     if callable(builder):
-        payload = builder(raw_entries, num_axes=int(num_axes))
+        payload = builder(
+            raw_entries,
+            num_axes=int(num_axes),
+            robot_config=robot_config,
+        )
         return payload if isinstance(payload, dict) else None
     return None
 
@@ -135,6 +141,15 @@ def get_drive_absolute_feedback_config(profile_id: str | None) -> dict[str, Any]
 def get_drive_motion_feedback_config(profile_id: str | None) -> dict[str, Any] | None:
     module = get_drive_profile(profile_id)
     getter = getattr(module, "get_motion_feedback_config", None) if module is not None else None
+    if callable(getter):
+        payload = getter()
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def get_drive_position_semantics_config(profile_id: str | None) -> dict[str, Any] | None:
+    module = get_drive_profile(profile_id)
+    getter = getattr(module, "get_position_semantics_config", None) if module is not None else None
     if callable(getter):
         payload = getter()
         return payload if isinstance(payload, dict) else None

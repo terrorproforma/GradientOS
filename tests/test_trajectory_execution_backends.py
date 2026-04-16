@@ -42,8 +42,11 @@ class FakeRTCoreTrajectoryBackend(FakeBackend):
         super().__init__(actual_positions)
         self.execute_calls = []
 
-    def execute_joint_trajectory(self, joint_path, frequency):
-        self.execute_calls.append((joint_path, frequency))
+    def logical_joint_indices_to_axis_mask(self, logical_joint_indices):
+        return sum(1 << int(idx) for idx in logical_joint_indices)
+
+    def execute_joint_trajectory(self, joint_path, frequency, axis_mask=None):
+        self.execute_calls.append((joint_path, frequency, axis_mask))
 
         class _Status:
             state_name = "completed"
@@ -143,10 +146,32 @@ def test_open_loop_executor_offloads_rtcore_trajectory_backend(monkeypatch):
         (
             [[0.1, -0.2], [0.2, -0.3], [0.3, -0.4]],
             100,
+            None,
         )
     ]
     assert backend.prepare_calls == []
     assert backend.sync_write_calls == []
+
+
+def test_open_loop_executor_passes_targeted_rtcore_axis_mask(monkeypatch):
+    backend = FakeRTCoreTrajectoryBackend(actual_positions=[0.0, 0.0])
+    _configure_backend_executor_test(monkeypatch, backend)
+
+    trajectory_execution._open_loop_executor_thread(
+        joint_path=[[0.1, -0.2], [0.2, -0.3]],
+        frequency=100,
+        diagnostics=False,
+        owns_trajectory_state=False,
+        target_joint_indices=[1],
+    )
+
+    assert backend.execute_calls == [
+        (
+            [[0.1, -0.2], [0.2, -0.3]],
+            100,
+            0x2,
+        )
+    ]
 
 
 def test_open_loop_executor_resets_motion_state_when_owning_lifecycle(monkeypatch):

@@ -19,8 +19,11 @@ Artifacts are written under:
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
+import os
+import socket
 import subprocess
 import sys
 import time
@@ -32,11 +35,16 @@ from typing import Any
 
 COUNTS_PER_MOTOR_REV = 131072  # 17-bit encoder, per Chapter 5
 DEFAULT_API_URL = "http://127.0.0.1:4000"
+DEFAULT_CONTROLLER_HOST = "127.0.0.1"
+DEFAULT_CONTROLLER_PORT = 3000
+DEFAULT_MONITOR_TIMEOUT_S = 1.0
+CONTROLLER_REPLY_MAX_BYTES = 65535
 AXIS_NAME_TO_INDEX = {f"J{joint}": joint - 1 for joint in range(1, 7)}
 STANDARD_WANDER_COUNTS = 2.0
 MEDIUM_WANDER_COUNTS = 6.0
 LARGE_WANDER_COUNTS = 10.0
 EXTREME_WANDER_COUNTS = 100.0
+RTCORE_METRICS_PATH = Path("/run/gradient-rt-motion/metrics.json")
 
 SDO_OBJECTS: list[tuple[str, str, str, str]] = [
     ("C00.07", "0x2000", "0x08", "uint16"),
@@ -182,12 +190,271 @@ def _read_sdo(axis_index: int, object_index: str, subindex: str, data_type: str)
     }
 
 
-def _fetch_json(url: str) -> dict[str, Any] | None:
+def _fetch_json_capture(url: str, *, timeout_s: float = 2.0) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "url": str(url),
+        "timeout_s": float(timeout_s),
+    }
     try:
-        with urllib.request.urlopen(url, timeout=2.0) as response:
-            return json.load(response)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError):
+        with urllib.request.urlopen(url, timeout=timeout_s) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            status = getattr(response, "status", None)
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        result["status"] = int(exc.code)
+        result["error"] = body or str(exc)
+        return result
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        result["error"] = str(exc)
+        return result
+
+    result["status"] = int(status) if status is not None else None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        result["error"] = f"invalid json payload: {exc}"
+        return result
+
+    result["ok"] = True
+    result["json"] = payload
+    return result
+
+
+def _parse_monitor_event_lines(lines: list[str]) -> dict[str, Any]:
+    event_name: str | None = None
+    data_lines: list[str] = []
+    for raw_line in lines:
+        line = str(raw_line).rstrip("\r\n")
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line[len("event:") :].strip() or None
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:") :].lstrip())
+
+    data = "\n".join(data_lines).strip()
+    payload = None
+    if data:
+        try:
+            payload = json.loads(data)
+        except json.JSONDecodeError:
+            payload = None
+    return {
+        "event": event_name,
+        "data": data or None,
+        "json": payload if isinstance(payload, dict) else None,
+    }
+
+
+def _fetch_monitor_event_capture(url: str, *, timeout_s: float = DEFAULT_MONITOR_TIMEOUT_S) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "url": str(url),
+        "timeout_s": float(timeout_s),
+    }
+    try:
+        with urllib.request.urlopen(url, timeout=timeout_s) as response:
+            status = getattr(response, "status", None)
+            lines: list[str] = []
+            saw_payload = False
+            while True:
+                raw_line = response.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                lines.append(line)
+                if not line:
+                    if saw_payload:
+                        break
+                    continue
+                saw_payload = True
+    except urllib.error.HTTPError as exc:
+        result["status"] = int(exc.code)
+        result["error"] = str(exc)
+        return result
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        result["error"] = str(exc)
+        return result
+
+    result["status"] = int(status) if status is not None else None
+    result["raw"] = "\n".join(lines)
+    parsed = _parse_monitor_event_lines(lines)
+    result.update(parsed)
+    result["ok"] = parsed.get("json") is not None
+    if not result["ok"]:
+        result["error"] = "no monitor event payload captured"
+    return result
+
+
+def _fetch_json(url: str) -> dict[str, Any] | None:
+    capture = _fetch_json_capture(url)
+    return _extract_json_capture(capture)
+
+
+def _resolve_controller_endpoint(
+    *,
+    controller_host: str | None = None,
+    controller_port: int | None = None,
+) -> tuple[str, int]:
+    host = (
+        str(controller_host or os.environ.get("GRADIENT_CONTROLLER_HOST", DEFAULT_CONTROLLER_HOST)).strip()
+        or DEFAULT_CONTROLLER_HOST
+    )
+    raw_port = controller_port
+    if raw_port is None:
+        raw_port = os.environ.get("GRADIENT_CONTROLLER_PORT", str(DEFAULT_CONTROLLER_PORT))
+    try:
+        port = int(raw_port)
+    except Exception:
+        port = DEFAULT_CONTROLLER_PORT
+    return host, port
+
+
+def _send_controller_command_capture(
+    message: str,
+    *,
+    timeout_s: float = 1.0,
+    controller_host: str | None = None,
+    controller_port: int | None = None,
+) -> dict[str, Any]:
+    host, port = _resolve_controller_endpoint(
+        controller_host=controller_host,
+        controller_port=controller_port,
+    )
+    result: dict[str, Any] = {
+        "ok": False,
+        "message": str(message),
+        "timeout_s": float(timeout_s),
+        "endpoint": {
+            "host": host,
+            "port": int(port),
+        },
+    }
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(max(0.05, float(timeout_s)))
+        try:
+            sock.sendto(str(message).encode("utf-8"), (host, port))
+            data, _addr = sock.recvfrom(CONTROLLER_REPLY_MAX_BYTES)
+        except socket.timeout:
+            result["error"] = f"timed out waiting for controller response at {host}:{port}"
+            return result
+        except OSError as exc:
+            result["error"] = str(exc)
+            return result
+    result["ok"] = True
+    result["raw"] = data.decode("utf-8", errors="replace")
+    return result
+
+
+def _parse_joint_state_response(detail: object) -> dict[str, Any] | None:
+    if not isinstance(detail, str):
         return None
+    prefix = "JOINT_STATE_JSON,"
+    if not detail.startswith(prefix):
+        return None
+    try:
+        payload = json.loads(detail[len(prefix) :])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _parse_motion_status_response(detail: object) -> dict[str, Any] | None:
+    if not isinstance(detail, str):
+        return None
+    prefix = "MOTION_STATUS,"
+    if not detail.startswith(prefix):
+        return None
+    token = detail[len(prefix) :].strip()
+    if not token:
+        return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(token.encode("ascii")).decode("utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _capture_controller_views(
+    *,
+    controller_host: str | None = None,
+    controller_port: int | None = None,
+) -> dict[str, Any]:
+    host, port = _resolve_controller_endpoint(
+        controller_host=controller_host,
+        controller_port=controller_port,
+    )
+    joint_state = _send_controller_command_capture(
+        "GET_JOINT_STATE",
+        controller_host=host,
+        controller_port=port,
+    )
+    if bool(joint_state.get("ok")):
+        joint_state["json"] = _parse_joint_state_response(joint_state.get("raw"))
+    motion_status = _send_controller_command_capture(
+        "GET_MOTION_STATUS",
+        controller_host=host,
+        controller_port=port,
+    )
+    if bool(motion_status.get("ok")):
+        motion_status["json"] = _parse_motion_status_response(motion_status.get("raw"))
+    return {
+        "endpoint": {
+            "host": host,
+            "port": int(port),
+        },
+        "joint_state": joint_state,
+        "motion_status": motion_status,
+    }
+
+
+def _load_rtcore_metrics_capture() -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "path": str(RTCORE_METRICS_PATH),
+    }
+    try:
+        raw = RTCORE_METRICS_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        result["error"] = str(exc)
+        return result
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        result["error"] = f"invalid json payload: {exc}"
+        return result
+    result["ok"] = True
+    result["json"] = payload
+    return result
+
+
+def _extract_json_capture(capture: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(capture, dict) or not bool(capture.get("ok")):
+        return None
+    payload = capture.get("json")
+    return payload if isinstance(payload, dict) else None
+
+
+def _capture_api_views(
+    *,
+    api_url: str,
+    monitor_timeout_s: float = DEFAULT_MONITOR_TIMEOUT_S,
+) -> dict[str, Any]:
+    base_url = api_url.rstrip("/")
+    return {
+        "joints": _fetch_json_capture(f"{base_url}/info/joints"),
+        "joints_detailed": _fetch_json_capture(f"{base_url}/info/joints-detailed"),
+        "motion_status": _fetch_json_capture(f"{base_url}/control/motion-status"),
+        "monitor_event": _fetch_monitor_event_capture(
+            f"{base_url}/monitor",
+            timeout_s=monitor_timeout_s,
+        ),
+    }
 
 
 def _safe_ratio(numerator: int | None, denominator: int | None) -> float | None:
@@ -439,9 +706,73 @@ def _select_api_axis_details(api_payload: dict[str, Any] | None, axis_names: lis
     }
 
 
-def _capture_snapshot(*, label: str, experiment_id: str, axis_names: list[str], api_url: str) -> dict[str, Any]:
+def _select_joint_payload(payload: dict[str, Any] | None, axis_names: list[str]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    selected: dict[str, Any] = {}
+    for axis_name in axis_names:
+        axis_index = AXIS_NAME_TO_INDEX[axis_name]
+        axis_entry: dict[str, Any] = {}
+        for key in ("arm_deg", "arm_display_deg", "arm_rad", "arm_display_rad", "axis_counts"):
+            values = payload.get(key)
+            if isinstance(values, list) and 0 <= axis_index < len(values):
+                axis_entry[key] = values[axis_index]
+        if axis_entry:
+            selected[axis_name] = axis_entry
+    return {
+        "read_source": payload.get("read_source"),
+        "canonical_joint_truth_available": payload.get("canonical_joint_truth_available"),
+        "raw_canonical_joint_truth_available": payload.get("raw_canonical_joint_truth_available"),
+        "display_joint_truth_available": payload.get("display_joint_truth_available"),
+        "selected_axes": selected,
+    }
+
+
+def _select_monitor_payload(payload: dict[str, Any] | None, axis_names: list[str]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    selected: dict[str, Any] = {}
+    for axis_name in axis_names:
+        axis_index = AXIS_NAME_TO_INDEX[axis_name]
+        axis_entry: dict[str, Any] = {}
+        joints = payload.get("joints")
+        display_joints = payload.get("display_joints")
+        if isinstance(joints, list) and 0 <= axis_index < len(joints):
+            axis_entry["joints_rad"] = joints[axis_index]
+        if isinstance(display_joints, list) and 0 <= axis_index < len(display_joints):
+            axis_entry["display_joints_rad"] = display_joints[axis_index]
+        if axis_entry:
+            selected[axis_name] = axis_entry
+    return {
+        "joint_feedback_available": payload.get("joint_feedback_available"),
+        "motion_status": payload.get("motion_status"),
+        "selected_axes": selected,
+    }
+
+
+def _capture_snapshot(
+    *,
+    label: str,
+    experiment_id: str,
+    axis_names: list[str],
+    api_url: str,
+    controller_host: str | None = None,
+    controller_port: int | None = None,
+    monitor_timeout_s: float = DEFAULT_MONITOR_TIMEOUT_S,
+) -> dict[str, Any]:
     axis_snapshots = {axis_name: _collect_axis_snapshot(axis_name, AXIS_NAME_TO_INDEX[axis_name]) for axis_name in axis_names}
-    api_payload = _fetch_json(f"{api_url.rstrip('/')}/info/joints-detailed")
+    controller_views = _capture_controller_views(
+        controller_host=controller_host,
+        controller_port=controller_port,
+    )
+    api_views = _capture_api_views(
+        api_url=api_url,
+        monitor_timeout_s=monitor_timeout_s,
+    )
+    controller_joint_state = _extract_json_capture(controller_views.get("joint_state"))
+    api_joints = _extract_json_capture(api_views.get("joints"))
+    api_joints_detailed = _extract_json_capture(api_views.get("joints_detailed"))
+    api_monitor = _extract_json_capture(api_views.get("monitor_event"))
     return {
         "experiment_id": experiment_id,
         "label": label,
@@ -450,9 +781,25 @@ def _capture_snapshot(*, label: str, experiment_id: str, axis_names: list[str], 
             "counts_per_motor_rev": COUNTS_PER_MOTOR_REV,
             "chapter5_absolute_encoder": "17-bit single turn + 16-bit multi-turn revolutions",
             "section11_motion_units": "6062/6064/607A are reference-unit objects; 6063/60FC are encoder-unit bridge objects",
+            "captured_views": [
+                "ethercat_uploads",
+                "controller.GET_JOINT_STATE",
+                "controller.GET_MOTION_STATUS",
+                "api./info/joints",
+                "api./info/joints-detailed",
+                "api./control/motion-status",
+                "api./monitor (single event)",
+                "rtcore_metrics",
+            ],
         },
         "axes": axis_snapshots,
-        "api_joints_detailed": _select_api_axis_details(api_payload, axis_names),
+        "controller": controller_views,
+        "api": api_views,
+        "rtcore_metrics": _load_rtcore_metrics_capture(),
+        "controller_joint_state_selected": _select_joint_payload(controller_joint_state, axis_names),
+        "api_joints_selected": _select_joint_payload(api_joints, axis_names),
+        "api_joints_detailed": _select_api_axis_details(api_joints_detailed, axis_names),
+        "monitor_selected": _select_monitor_payload(api_monitor, axis_names),
     }
 
 
@@ -460,6 +807,11 @@ def _build_watch_axis_sample(
     axis_name: str,
     axis_snapshot: dict[str, Any],
     api_payload: dict[str, Any] | None,
+    *,
+    controller_joint_state: dict[str, Any] | None = None,
+    frontend_payload: dict[str, Any] | None = None,
+    monitor_payload: dict[str, Any] | None = None,
+    metrics_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reads = axis_snapshot.get("reads", {})
     derived = axis_snapshot.get("derived", {})
@@ -487,52 +839,140 @@ def _build_watch_axis_sample(
         "combined_u402a_2c_signed_counts": derived.get("combined_u402a_2c_signed_counts"),
     }
 
-    if not isinstance(api_payload, dict):
-        return result
+    if isinstance(api_payload, dict):
+        result["api_read_source"] = api_payload.get("read_source")
+        result["api_canonical_joint_truth_available"] = api_payload.get("canonical_joint_truth_available")
+        result["api_raw_canonical_joint_truth_available"] = api_payload.get("raw_canonical_joint_truth_available")
+        result["api_display_joint_truth_available"] = api_payload.get("display_joint_truth_available")
 
-    result["api_read_source"] = api_payload.get("read_source")
-    result["api_canonical_joint_truth_available"] = api_payload.get("canonical_joint_truth_available")
-    result["api_raw_canonical_joint_truth_available"] = api_payload.get("raw_canonical_joint_truth_available")
-    result["api_display_joint_truth_available"] = api_payload.get("display_joint_truth_available")
+        for key in ("arm_deg", "arm_display_deg", "arm_rad", "arm_display_rad"):
+            values = api_payload.get(key)
+            if isinstance(values, list) and 0 <= axis_index < len(values):
+                result[f"api_{key}"] = values[axis_index]
 
-    for key in ("arm_deg", "arm_display_deg", "arm_rad", "arm_display_rad"):
-        values = api_payload.get(key)
-        if isinstance(values, list) and 0 <= axis_index < len(values):
-            result[f"api_{key}"] = values[axis_index]
+        axis_absolute_feedback = api_payload.get("axis_absolute_feedback")
+        if isinstance(axis_absolute_feedback, list) and 0 <= axis_index < len(axis_absolute_feedback):
+            entry = axis_absolute_feedback[axis_index]
+            if isinstance(entry, dict):
+                for key in (
+                    "truth_available",
+                    "truth_status",
+                    "truth_reason",
+                    "display_source",
+                    "absolute_source",
+                    "canonical_rad",
+                    "display_rad",
+                    "absolute_counts",
+                    "raw_counts",
+                    "reference_mode",
+                ):
+                    if key in entry:
+                        result[f"api_{key}"] = entry.get(key)
 
-    axis_absolute_feedback = api_payload.get("axis_absolute_feedback")
-    if isinstance(axis_absolute_feedback, list) and 0 <= axis_index < len(axis_absolute_feedback):
-        entry = axis_absolute_feedback[axis_index]
-        if isinstance(entry, dict):
-            for key in (
-                "truth_available",
-                "truth_status",
-                "truth_reason",
-                "display_source",
-                "absolute_source",
-                "canonical_rad",
-                "display_rad",
-                "absolute_counts",
-                "raw_counts",
-                "reference_mode",
-            ):
-                if key in entry:
-                    result[f"api_{key}"] = entry.get(key)
+    if isinstance(controller_joint_state, dict):
+        result["controller_read_source"] = controller_joint_state.get("read_source")
+        result["controller_canonical_joint_truth_available"] = controller_joint_state.get(
+            "canonical_joint_truth_available"
+        )
+        for key in ("arm_deg", "arm_display_deg", "arm_rad", "arm_display_rad", "axis_counts"):
+            values = controller_joint_state.get(key)
+            if isinstance(values, list) and 0 <= axis_index < len(values):
+                result[f"controller_{key}"] = values[axis_index]
+
+    if isinstance(frontend_payload, dict):
+        result["frontend_read_source"] = frontend_payload.get("read_source")
+        result["frontend_canonical_joint_truth_available"] = frontend_payload.get(
+            "canonical_joint_truth_available"
+        )
+        for key in ("arm_deg", "arm_display_deg", "arm_rad", "arm_display_rad", "axis_counts"):
+            values = frontend_payload.get(key)
+            if isinstance(values, list) and 0 <= axis_index < len(values):
+                result[f"frontend_{key}"] = values[axis_index]
+
+    if isinstance(monitor_payload, dict):
+        result["monitor_joint_feedback_available"] = monitor_payload.get("joint_feedback_available")
+        motion_status = monitor_payload.get("motion_status")
+        if isinstance(motion_status, dict):
+            result["monitor_motion_state"] = motion_status.get("state")
+        joints = monitor_payload.get("joints")
+        display_joints = monitor_payload.get("display_joints")
+        if isinstance(joints, list) and 0 <= axis_index < len(joints):
+            result["monitor_joints_rad"] = joints[axis_index]
+        if isinstance(display_joints, list) and 0 <= axis_index < len(display_joints):
+            result["monitor_display_joints_rad"] = display_joints[axis_index]
+
+    if isinstance(metrics_payload, dict):
+        axes = metrics_payload.get("axes")
+        if isinstance(axes, list) and 0 <= axis_index < len(axes):
+            entry = axes[axis_index]
+            if isinstance(entry, dict):
+                if "statusword" in entry:
+                    metrics_statusword = entry.get("statusword")
+                    result["metrics_statusword"] = metrics_statusword
+                    if isinstance(metrics_statusword, int):
+                        result["metrics_statusword_hex"] = f"0x{metrics_statusword & 0xFFFF:04X}"
+                for key in (
+                    "error_code",
+                    "manufacturer_error_code",
+                    "native_home_position_offset",
+                    "absolute_feedback",
+                ):
+                    if key in entry:
+                        result[f"metrics_{key}"] = entry.get(key)
     return result
 
 
-def _capture_watch_sample(*, axis_names: list[str], api_url: str) -> dict[str, Any]:
-    api_payload = _fetch_json(f"{api_url.rstrip('/')}/info/joints-detailed")
+def _capture_watch_sample(
+    *,
+    axis_names: list[str],
+    api_url: str,
+    controller_host: str | None = None,
+    controller_port: int | None = None,
+    monitor_timeout_s: float = DEFAULT_MONITOR_TIMEOUT_S,
+) -> dict[str, Any]:
+    controller_views = _capture_controller_views(
+        controller_host=controller_host,
+        controller_port=controller_port,
+    )
+    api_views = _capture_api_views(
+        api_url=api_url,
+        monitor_timeout_s=monitor_timeout_s,
+    )
+    metrics_capture = _load_rtcore_metrics_capture()
+    controller_joint_state = _extract_json_capture(controller_views.get("joint_state"))
+    api_payload = _extract_json_capture(api_views.get("joints_detailed"))
+    frontend_payload = _extract_json_capture(api_views.get("joints"))
+    monitor_payload = _extract_json_capture(api_views.get("monitor_event"))
+    metrics_payload = _extract_json_capture(metrics_capture)
     axes: dict[str, Any] = {}
     for axis_name in axis_names:
         axis_snapshot = _collect_axis_snapshot(axis_name, AXIS_NAME_TO_INDEX[axis_name])
-        axes[axis_name] = _build_watch_axis_sample(axis_name, axis_snapshot, api_payload)
+        axes[axis_name] = _build_watch_axis_sample(
+            axis_name,
+            axis_snapshot,
+            api_payload,
+            controller_joint_state=controller_joint_state,
+            frontend_payload=frontend_payload,
+            monitor_payload=monitor_payload,
+            metrics_payload=metrics_payload,
+        )
     return {
         "captured_at": _utc_now().isoformat(timespec="milliseconds"),
         "api_read_source": api_payload.get("read_source") if isinstance(api_payload, dict) else None,
         "api_canonical_joint_truth_available": (
             api_payload.get("canonical_joint_truth_available") if isinstance(api_payload, dict) else None
         ),
+        "controller_read_source": (
+            controller_joint_state.get("read_source") if isinstance(controller_joint_state, dict) else None
+        ),
+        "controller_canonical_joint_truth_available": (
+            controller_joint_state.get("canonical_joint_truth_available")
+            if isinstance(controller_joint_state, dict)
+            else None
+        ),
+        "controller": controller_views,
+        "api": api_views,
+        "rtcore_metrics": metrics_capture,
         "axes": axes,
     }
 
@@ -554,8 +994,11 @@ def _format_watch_line(sample: dict[str, Any]) -> str:
                         f"U40.16={axis.get('U40.16')}",
                         f"abs={axis.get('combined_u4020_22_signed_counts')}",
                         f"rot={axis.get('combined_u402a_2c_signed_counts')}",
+                        f"ctrl_deg={axis.get('controller_arm_deg')}",
+                        f"ui_deg={axis.get('frontend_arm_deg')}",
                         f"api_deg={axis.get('api_arm_deg')}",
                         f"api_display_deg={axis.get('api_arm_display_deg')}",
+                        f"mon_disp_rad={axis.get('monitor_display_joints_rad')}",
                         f"hm_ok={axis.get('vendor_hm_success_signature')}",
                     ]
                 )
@@ -593,6 +1036,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     snapshot_parser.add_argument("--experiment-id", default=None, help="reuse an existing experiment directory")
     snapshot_parser.add_argument("--api-url", default=DEFAULT_API_URL, help="API base URL for optional joint snapshot")
+    snapshot_parser.add_argument(
+        "--controller-host",
+        default=os.environ.get("GRADIENT_CONTROLLER_HOST", DEFAULT_CONTROLLER_HOST),
+        help="controller UDP host (default: env GRADIENT_CONTROLLER_HOST or 127.0.0.1)",
+    )
+    snapshot_parser.add_argument(
+        "--controller-port",
+        type=int,
+        default=int(os.environ.get("GRADIENT_CONTROLLER_PORT", str(DEFAULT_CONTROLLER_PORT))),
+        help="controller UDP port (default: env GRADIENT_CONTROLLER_PORT or 3000)",
+    )
+    snapshot_parser.add_argument(
+        "--monitor-timeout-s",
+        type=float,
+        default=DEFAULT_MONITOR_TIMEOUT_S,
+        help="timeout when sampling one /monitor SSE event (default: 1.0)",
+    )
 
     watch_parser = subparsers.add_parser("watch", help="stream live Chapter 5 probe samples to JSONL")
     watch_parser.add_argument("--label", required=True, help="stream label, for example j6-hand-rotate")
@@ -604,6 +1064,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     watch_parser.add_argument("--experiment-id", default=None, help="reuse an existing experiment directory")
     watch_parser.add_argument("--api-url", default=DEFAULT_API_URL, help="API base URL for optional joint snapshot")
+    watch_parser.add_argument(
+        "--controller-host",
+        default=os.environ.get("GRADIENT_CONTROLLER_HOST", DEFAULT_CONTROLLER_HOST),
+        help="controller UDP host (default: env GRADIENT_CONTROLLER_HOST or 127.0.0.1)",
+    )
+    watch_parser.add_argument(
+        "--controller-port",
+        type=int,
+        default=int(os.environ.get("GRADIENT_CONTROLLER_PORT", str(DEFAULT_CONTROLLER_PORT))),
+        help="controller UDP port (default: env GRADIENT_CONTROLLER_PORT or 3000)",
+    )
+    watch_parser.add_argument(
+        "--monitor-timeout-s",
+        type=float,
+        default=DEFAULT_MONITOR_TIMEOUT_S,
+        help="timeout when sampling one /monitor SSE event per sample (default: 1.0)",
+    )
     watch_parser.add_argument(
         "--interval-s",
         type=float,
@@ -641,6 +1118,9 @@ def main(argv: list[str] | None = None) -> int:
             experiment_id=experiment_id,
             axis_names=axis_names,
             api_url=str(args.api_url),
+            controller_host=str(args.controller_host),
+            controller_port=int(args.controller_port),
+            monitor_timeout_s=float(args.monitor_timeout_s),
         )
 
         json_path = experiment_dir / f"{label}.json"
@@ -693,6 +1173,9 @@ def main(argv: list[str] | None = None) -> int:
         "duration_s": duration_s,
         "samples": max_samples,
         "api_url": str(args.api_url),
+        "controller_host": str(args.controller_host),
+        "controller_port": int(args.controller_port),
+        "monitor_timeout_s": float(args.monitor_timeout_s),
         "jsonl_path": str(jsonl_path),
         "started_at": _utc_now().isoformat(timespec="seconds"),
     }
@@ -705,7 +1188,13 @@ def main(argv: list[str] | None = None) -> int:
         with jsonl_path.open("a", encoding="utf-8") as handle:
             while True:
                 loop_started = time.monotonic()
-                sample = _capture_watch_sample(axis_names=axis_names, api_url=str(args.api_url))
+                sample = _capture_watch_sample(
+                    axis_names=axis_names,
+                    api_url=str(args.api_url),
+                    controller_host=str(args.controller_host),
+                    controller_port=int(args.controller_port),
+                    monitor_timeout_s=float(args.monitor_timeout_s),
+                )
                 handle.write(json.dumps(sample) + "\n")
                 handle.flush()
                 captured += 1

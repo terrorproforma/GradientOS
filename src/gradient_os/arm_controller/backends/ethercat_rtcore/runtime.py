@@ -121,16 +121,27 @@ def rtcore_jog_stop_reason_id_to_name(reason_code: object | None) -> str | None:
     return RTCORE_JOG_STOP_REASON_ID_TO_NAME.get(code)
 
 
-def build_rtcore_axis_scaling(robot_config: dict[str, Any]) -> dict[str, Any]:
+def _drive_native_ratio_enabled_for_profile(profile_id: str | None) -> bool:
+    payload = backend_registry.get_drive_position_semantics_config_for_backend(
+        "ethercat_rtcore",
+        drive_profile_id=profile_id,
+    )
+    return bool(payload.get("drive_native_ratio_enabled", False)) if isinstance(payload, dict) else False
+
+
+def build_rtcore_axis_scaling(
+    robot_config: dict[str, Any],
+    *,
+    drive_profile: str | None = None,
+) -> dict[str, Any]:
+    normalized_profile = normalize_drive_profile_id(drive_profile)
+    drive_native_ratio_enabled = _drive_native_ratio_enabled_for_profile(normalized_profile)
     counts_per_rev = [int(value) for value in list(robot_config.get("actuator_encoder_counts_per_rev", []))]
     gear_ratios = [float(value) for value in list(robot_config.get("actuator_gear_ratios", []))]
     signs_raw = list(robot_config.get("actuator_position_signs", []))
 
-    num_axes = min(
-        int(robot_config.get("num_physical_actuators", min(len(counts_per_rev), len(gear_ratios)))),
-        len(counts_per_rev),
-        len(gear_ratios),
-    )
+    max_axes = int(robot_config.get("num_physical_actuators", min(len(counts_per_rev), len(gear_ratios))))
+    num_axes = min(max_axes, len(counts_per_rev), len(gear_ratios))
     if num_axes <= 0:
         raise ValueError("Robot config does not expose valid RTCore axis scaling.")
 
@@ -144,6 +155,7 @@ def build_rtcore_axis_scaling(robot_config: dict[str, Any]) -> dict[str, Any]:
         "counts_per_rev": counts_per_rev[:num_axes],
         "gear_ratio": gear_ratios[:num_axes],
         "sign": signs,
+        "drive_native_ratio_enabled": drive_native_ratio_enabled,
     }
 
 
@@ -152,7 +164,10 @@ def build_rtcore_drive_startup_config(
     *,
     drive_profile: str | None,
 ) -> dict[str, Any]:
-    axis_scaling = build_rtcore_axis_scaling(robot_config)
+    axis_scaling = build_rtcore_axis_scaling(
+        robot_config,
+        drive_profile=drive_profile,
+    )
     num_axes = int(axis_scaling["num_axes"])
     raw_entries = robot_config.get("ethercat_drive_startup_config", [])
     if isinstance(raw_entries, list) and all(
@@ -167,6 +182,7 @@ def build_rtcore_drive_startup_config(
         raw_entries,
         num_axes=num_axes,
         drive_profile_id=normalized_profile,
+        robot_config=robot_config,
     )
     if isinstance(startup, dict):
         return startup
@@ -269,10 +285,13 @@ def build_rtcore_startup_env(
     drive_profile: str | None,
     max_rpm: float | int | None = None,
 ) -> dict[str, str]:
-    axis_scaling = build_rtcore_axis_scaling(robot_config)
     normalized_profile = normalize_drive_profile_id(drive_profile)
     if normalized_profile and rtcore_drive_profile_name_to_id(normalized_profile) == RTCORE_DRIVE_PROFILE_UNKNOWN:
         raise ValueError(f"Unsupported RTCore drive profile '{drive_profile}'.")
+    axis_scaling = build_rtcore_axis_scaling(
+        robot_config,
+        drive_profile=normalized_profile,
+    )
     startup_config = build_rtcore_drive_startup_config(
         robot_config,
         drive_profile=normalized_profile,

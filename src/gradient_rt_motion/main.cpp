@@ -95,11 +95,11 @@ double controller_target_to_csp_wire_counts(double controller_target_counts,
   return controller_target_counts - static_cast<double>(native_home_offset_counts);
 }
 
-int64_t shortest_periodic_error_counts(int64_t error_counts, uint32_t counts_per_rev) {
-  if (counts_per_rev == 0) {
+int64_t shortest_periodic_error_counts(int64_t error_counts, uint32_t period_counts) {
+  if (period_counts == 0) {
     return error_counts;
   }
-  const int64_t period = static_cast<int64_t>(counts_per_rev);
+  const int64_t period = static_cast<int64_t>(period_counts);
   const int64_t half_turn = period / 2;
   if (half_turn <= 0) {
     return error_counts;
@@ -163,7 +163,7 @@ struct AxisConfig {
   uint32_t counts_per_rev = 131072; // common 17-bit encoder counts per rev
   double gear_ratio = 1.0;
   int sign = +1; // +1 or -1 (mechanical orientation)
-  bool feedback_counts_wrap = false; // compare feedback modulo counts_per_rev when true
+  bool feedback_counts_wrap = false; // compare feedback modulo the configured wrap period when true
   uint8_t axis_type = gradient::ipc::v1::AXIS_TYPE_ROTARY; // q is radians by default
   double lead_m_per_rev = 0.0; // only used when axis_type==AXIS_TYPE_LINEAR
 
@@ -174,6 +174,24 @@ struct AxisConfig {
   int32_t max_step_counts_per_cycle = 0;
   uint32_t max_profile_vel_counts_per_s = 0;
 };
+
+uint32_t completion_wrap_period_counts(const AxisConfig& axis) {
+  const uint32_t fallback_period_counts = axis.counts_per_rev;
+  if (axis.axis_type != gradient::ipc::v1::AXIS_TYPE_ROTARY || !(axis.counts_per_unit > 0.0)) {
+    return fallback_period_counts;
+  }
+
+  // Wrapped rotary completion needs the geared/output-shaft period so seam-crossing
+  // moves settle against the same frame used to derive counts_per_unit.
+  constexpr double kCompletionWrapTwoPi = 6.28318530717958647692;
+  const long long derived_period_counts =
+      std::llround(axis.counts_per_unit * kCompletionWrapTwoPi);
+  if (derived_period_counts > 0 &&
+      derived_period_counts <= static_cast<long long>(std::numeric_limits<uint32_t>::max())) {
+    return static_cast<uint32_t>(derived_period_counts);
+  }
+  return fallback_period_counts;
+}
 
 struct PdoLayoutEntry {
   std::string semantic;
@@ -195,6 +213,16 @@ struct StartupSdoConfig {
   uint8_t subindex = 0;
   std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> values{};
 };
+
+struct StartupSdoFeedback {
+  std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> configured{};
+  std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> commanded{};
+  std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> readback_valid{};
+  std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> readback{};
+  std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> verified{};
+};
+
+constexpr uint32_t kMaxStartupSdoDescriptors = 8;
 
 enum class SdoScalarType : uint8_t {
   kNone = 0,
@@ -599,59 +627,68 @@ bool parse_pdo_layout_spec(const std::string& spec, std::vector<PdoLayoutEntry>*
 
 bool parse_startup_sdo_config_spec(const std::string& spec,
                                    uint32_t num_axes,
-                                   StartupSdoConfig* out) {
+                                   std::vector<StartupSdoConfig>* out) {
   if (!out) {
     return false;
   }
-  *out = StartupSdoConfig{};
+  out->clear();
   const std::string trimmed = trim_ascii_ws(spec);
   if (trimmed.empty()) {
     return true;
   }
   const auto descriptors = split_delim_strict(trimmed, ';');
-  if (descriptors.size() != 1) {
+  if (descriptors.empty() ||
+      descriptors.size() > static_cast<size_t>(kMaxStartupSdoDescriptors)) {
     return false;
   }
-  const auto fields = split_delim_strict(descriptors[0], '|');
-  if (fields.size() != 5) {
-    return false;
-  }
-  StartupSdoConfig cfg{};
-  cfg.key = trim_ascii_ws(fields[0]);
-  std::string type = trim_ascii_ws(fields[1]);
-  for (char& c : type) {
-    if (c >= 'A' && c <= 'Z') {
-      c = static_cast<char>(c - 'A' + 'a');
+
+  for (const auto& descriptor_spec : descriptors) {
+    const auto fields = split_delim_strict(descriptor_spec, '|');
+    if (fields.size() != 5) {
+      return false;
     }
-  }
-  if (cfg.key.empty() || type != "u16") {
-    return false;
-  }
-  uint16_t index = 0;
-  uint16_t subindex = 0;
-  std::vector<uint32_t> values{};
-  if (!parse_u16_auto(fields[2].c_str(), &index) ||
-      !parse_u16_auto(fields[3].c_str(), &subindex) ||
-      !parse_u32_csv_allow_zero(fields[4], &values)) {
-    return false;
-  }
-  if (values.size() == 1) {
-    for (uint32_t i = 0; i < num_axes; ++i) {
-      cfg.values[i] = values[0];
+    StartupSdoConfig cfg{};
+    cfg.key = trim_ascii_ws(fields[0]);
+    std::string type = trim_ascii_ws(fields[1]);
+    for (char& c : type) {
+      if (c >= 'A' && c <= 'Z') {
+        c = static_cast<char>(c - 'A' + 'a');
+      }
     }
-  } else if (values.size() == static_cast<size_t>(num_axes)) {
-    for (uint32_t i = 0; i < num_axes; ++i) {
-      cfg.values[i] = values[i];
+    if (cfg.key.empty() || type != "u16") {
+      return false;
     }
-  } else {
-    return false;
+    for (const auto& existing : *out) {
+      if (existing.key == cfg.key) {
+        return false;
+      }
+    }
+    uint16_t index = 0;
+    uint16_t subindex = 0;
+    std::vector<uint32_t> values{};
+    if (!parse_u16_auto(fields[2].c_str(), &index) ||
+        !parse_u16_auto(fields[3].c_str(), &subindex) ||
+        !parse_u32_csv_allow_zero(fields[4], &values)) {
+      return false;
+    }
+    if (values.size() == 1) {
+      for (uint32_t i = 0; i < num_axes; ++i) {
+        cfg.values[i] = values[0];
+      }
+    } else if (values.size() == static_cast<size_t>(num_axes)) {
+      for (uint32_t i = 0; i < num_axes; ++i) {
+        cfg.values[i] = values[i];
+      }
+    } else {
+      return false;
+    }
+    cfg.valid = true;
+    cfg.type = StartupSdoValueType::kU16;
+    cfg.index = index;
+    cfg.subindex = static_cast<uint8_t>(subindex & 0xFFu);
+    out->push_back(std::move(cfg));
   }
-  cfg.valid = true;
-  cfg.type = StartupSdoValueType::kU16;
-  cfg.index = index;
-  cfg.subindex = static_cast<uint8_t>(subindex & 0xFFu);
-  *out = cfg;
-  return true;
+  return !out->empty();
 }
 
 bool parse_sdo_scalar_type_token(const std::string& token, SdoScalarType* out) {
@@ -1270,7 +1307,7 @@ void print_usage(const char* argv0) {
       "  --axis-type    rotary\n"
       "  --drive-profile <profile-or-id>\n"
       "  --max-rpm      100\n"
-      "  --startup-sdo-config key|u16|0xINDEX|0xSUB|V[,V..]\n"
+      "  --startup-sdo-config key|u16|0xINDEX|0xSUB|V[,V..][;key|u16|0xINDEX|0xSUB|V[,V..]...]\n"
       "  --absolute-feedback-config key|0xINDEX|0xSUB|TYPE;...\n"
       "  --native-home-config descriptor string for commissioning-only native-home transactions\n"
       "  --slave-vendor-id  0x....\n"
@@ -1732,8 +1769,8 @@ int main(int argc, char** argv) {
          "(need non-zero --rx-pdo/--tx-pdo and valid --rx-pdo-layout/--tx-pdo-layout)");
     return 2;
   }
-  StartupSdoConfig startup_sdo{};
-  if (!parse_startup_sdo_config_spec(startup_sdo_config_spec, opt.num_axes, &startup_sdo)) {
+  std::vector<StartupSdoConfig> startup_sdos{};
+  if (!parse_startup_sdo_config_spec(startup_sdo_config_spec, opt.num_axes, &startup_sdos)) {
     logf("ERROR: invalid --startup-sdo-config");
     return 2;
   }
@@ -1932,11 +1969,7 @@ int main(int argc, char** argv) {
     uint8_t startup_skip_domain_queue_active = 0;
     uint32_t startup_elapsed_ms = 0;
     uint32_t startup_reset_count = 0;
-    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_configured{};
-    std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_commanded{};
-    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_readback_valid{};
-    std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_readback{};
-    std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_verified{};
+    std::array<StartupSdoFeedback, kMaxStartupSdoDescriptors> startup_drive_config_feedback{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_state{};
     std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_position_offset{};
     std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_last_abort_code{};
@@ -2687,47 +2720,50 @@ int main(int argc, char** argv) {
     };
 
     auto schedule_axis_startup_sdos = [&](uint32_t axis, uint16_t slave_pos) {
-      latest_feedback.startup_drive_config_configured[axis] = startup_sdo.valid ? 1u : 0u;
-      latest_feedback.startup_drive_config_commanded[axis] =
-          startup_sdo.valid ? startup_sdo.values[axis] : 0u;
-      if (!startup_sdo.valid) {
+      if (startup_sdos.empty()) {
         return true;
       }
-      if (startup_sdo.type != StartupSdoValueType::kU16) {
-        logf("ERROR: unsupported startup SDO type for axis=%u slave_pos=%u key=%s",
+      for (size_t descriptor_i = 0; descriptor_i < startup_sdos.size(); ++descriptor_i) {
+        const auto& descriptor = startup_sdos[descriptor_i];
+        auto& feedback = latest_feedback.startup_drive_config_feedback[descriptor_i];
+        feedback.configured[axis] = descriptor.valid ? 1u : 0u;
+        feedback.commanded[axis] = descriptor.valid ? descriptor.values[axis] : 0u;
+        if (descriptor.type != StartupSdoValueType::kU16) {
+          logf("ERROR: unsupported startup SDO type for axis=%u slave_pos=%u key=%s",
+               axis,
+               slave_pos,
+               descriptor.key.c_str());
+          return false;
+        }
+        if (descriptor.values[axis] > static_cast<uint32_t>(std::numeric_limits<uint16_t>::max())) {
+          logf("ERROR: startup SDO value out of range for axis=%u slave_pos=%u key=%s value=%u",
+               axis,
+               slave_pos,
+               descriptor.key.c_str(),
+               static_cast<unsigned int>(descriptor.values[axis]));
+          return false;
+        }
+        const uint16_t value = static_cast<uint16_t>(descriptor.values[axis]);
+        const int rc = ecrt_slave_config_sdo16(sc[axis], descriptor.index, descriptor.subindex, value);
+        if (rc != 0) {
+          logf("ERROR: ecrt_slave_config_sdo16 failed for axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x value=%u rc=%d",
+               axis,
+               slave_pos,
+               descriptor.key.c_str(),
+               static_cast<unsigned int>(descriptor.index),
+               static_cast<unsigned int>(descriptor.subindex),
+               static_cast<unsigned int>(value),
+               rc);
+          return false;
+        }
+        logf("EtherCAT config phase=slave_config_sdo axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x value=%u ok",
              axis,
              slave_pos,
-             startup_sdo.key.c_str());
-        return false;
+             descriptor.key.c_str(),
+             static_cast<unsigned int>(descriptor.index),
+             static_cast<unsigned int>(descriptor.subindex),
+             static_cast<unsigned int>(value));
       }
-      if (startup_sdo.values[axis] > static_cast<uint32_t>(std::numeric_limits<uint16_t>::max())) {
-        logf("ERROR: startup SDO value out of range for axis=%u slave_pos=%u key=%s value=%u",
-             axis,
-             slave_pos,
-             startup_sdo.key.c_str(),
-             static_cast<unsigned int>(startup_sdo.values[axis]));
-        return false;
-      }
-      const uint16_t value = static_cast<uint16_t>(startup_sdo.values[axis]);
-      const int rc = ecrt_slave_config_sdo16(sc[axis], startup_sdo.index, startup_sdo.subindex, value);
-      if (rc != 0) {
-        logf("ERROR: ecrt_slave_config_sdo16 failed for axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x value=%u rc=%d",
-             axis,
-             slave_pos,
-             startup_sdo.key.c_str(),
-             static_cast<unsigned int>(startup_sdo.index),
-             static_cast<unsigned int>(startup_sdo.subindex),
-             static_cast<unsigned int>(value),
-             rc);
-        return false;
-      }
-      logf("EtherCAT config phase=slave_config_sdo axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x value=%u ok",
-           axis,
-           slave_pos,
-           startup_sdo.key.c_str(),
-           static_cast<unsigned int>(startup_sdo.index),
-           static_cast<unsigned int>(startup_sdo.subindex),
-           static_cast<unsigned int>(value));
       return true;
     };
 
@@ -2994,14 +3030,17 @@ int main(int argc, char** argv) {
               }
               if (!have_domain_pd) {
               } else {
-                if (startup_sdo.valid) {
-                  for (uint32_t i = 0; i < opt.num_axes; ++i) {
-                    latest_feedback.startup_drive_config_readback_valid[i] = 0u;
-                    latest_feedback.startup_drive_config_readback[i] = 0u;
-                    latest_feedback.startup_drive_config_verified[i] = 0u;
+                if (!startup_sdos.empty()) {
+                  for (size_t descriptor_i = 0; descriptor_i < startup_sdos.size(); ++descriptor_i) {
+                    auto& feedback = latest_feedback.startup_drive_config_feedback[descriptor_i];
+                    for (uint32_t i = 0; i < opt.num_axes; ++i) {
+                      feedback.readback_valid[i] = 0u;
+                      feedback.readback[i] = 0u;
+                      feedback.verified[i] = 0u;
+                    }
                   }
-                  logf("EtherCAT startup readback deferred for key=%s; metrics thread will verify after startup_ready to avoid blocking rt-cycle during bring-up",
-                       startup_sdo.key.c_str());
+                  logf("EtherCAT startup readback deferred for %zu descriptor(s); metrics thread will verify after startup_ready to avoid blocking rt-cycle during bring-up",
+                       startup_sdos.size());
                 }
                 ecrt_ok = true;
                 startup_begin_ns = now_monotonic_ns();
@@ -3678,9 +3717,11 @@ int main(int argc, char** argv) {
             const int64_t error_counts =
                 static_cast<int64_t>(final_feedback_counts) -
                 static_cast<int64_t>(final_target_counts);
+            const uint32_t wrap_period_counts =
+                opt.axis[i].feedback_counts_wrap ? completion_wrap_period_counts(opt.axis[i]) : 0;
             const int64_t comparable_error_counts =
                 opt.axis[i].feedback_counts_wrap
-                    ? shortest_periodic_error_counts(error_counts, opt.axis[i].counts_per_rev)
+                    ? shortest_periodic_error_counts(error_counts, wrap_period_counts)
                     : error_counts;
             if (comparable_error_counts <
                     -static_cast<int64_t>(kTrajectoryCompletionToleranceCounts) ||
@@ -4022,7 +4063,7 @@ int main(int argc, char** argv) {
     uint64_t last_time_ns = now_monotonic_ns();
     uint64_t last_warn_ns = 0;
     bool startup_readback_complete =
-        !startup_sdo.valid || !metrics_startup_readback_enabled;
+        startup_sdos.empty() || !metrics_startup_readback_enabled;
     bool native_home_offset_refresh_complete =
         !native_home_cfg.valid || !metrics_native_home_refresh_enabled;
     uint64_t startup_readback_ready_since_ns = 0;
@@ -4041,11 +4082,7 @@ int main(int argc, char** argv) {
         startup_readback_complete = true;
         return;
       }
-      if (startup_readback_complete || !startup_sdo.valid) {
-        return;
-      }
-      if (startup_sdo.type != StartupSdoValueType::kU16) {
-        startup_readback_complete = true;
+      if (startup_readback_complete || startup_sdos.empty()) {
         return;
       }
       if (!startup_ready_flag) {
@@ -4061,75 +4098,87 @@ int main(int argc, char** argv) {
       }
 
       startup_readback_complete = true;
-      logf("EtherCAT startup readback begin key=%s delay_ms=%llu",
-           startup_sdo.key.c_str(),
-           static_cast<unsigned long long>(kStartupReadbackDelayNs / 1000000ULL));
-
       constexpr int kStartupReadbackAttempts = 5;
-      for (uint32_t i = 0; i < opt.num_axes; ++i) {
-        bool verified = false;
-        for (int attempt = 1; attempt <= kStartupReadbackAttempts; ++attempt) {
-          uint8_t readback_raw[sizeof(uint16_t)] = {};
-          size_t readback_size = 0;
-          uint32_t abort_code = 0;
-          int rc = -1;
-          {
-            std::lock_guard<std::mutex> lock(shared_master_sdo_mutex);
-            if (g_stop.load(std::memory_order_relaxed) || !shared_master) {
-              return;
-            }
-            rc = ecrt_master_sdo_upload(
-                shared_master,
-                opt.slave_position[i],
-                startup_sdo.index,
-                startup_sdo.subindex,
-                readback_raw,
-                sizeof(readback_raw),
-                &readback_size,
-                &abort_code);
+      for (size_t descriptor_i = 0; descriptor_i < startup_sdos.size(); ++descriptor_i) {
+        const auto& descriptor = startup_sdos[descriptor_i];
+        auto& feedback = latest_feedback.startup_drive_config_feedback[descriptor_i];
+        if (descriptor.type != StartupSdoValueType::kU16) {
+          logf("WARNING: EtherCAT startup readback skipped for unsupported type key=%s",
+               descriptor.key.c_str());
+          for (uint32_t i = 0; i < opt.num_axes; ++i) {
+            feedback.readback_valid[i] = 0u;
+            feedback.readback[i] = 0u;
+            feedback.verified[i] = 0u;
           }
-          if (rc == 0 && readback_size >= sizeof(uint16_t)) {
-            const uint16_t readback_value = EC_READ_U16(readback_raw);
-            const bool readback_matches =
-                readback_value == static_cast<uint16_t>(startup_sdo.values[i]);
-            latest_feedback.startup_drive_config_readback_valid[i] = 1u;
-            latest_feedback.startup_drive_config_readback[i] = readback_value;
-            latest_feedback.startup_drive_config_verified[i] =
-                readback_matches ? 1u : 0u;
-            logf("EtherCAT startup readback axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x commanded=%u readback=%u verified=%u",
-                 i,
-                 static_cast<unsigned int>(opt.slave_position[i]),
-                 startup_sdo.key.c_str(),
-                 static_cast<unsigned int>(startup_sdo.index),
-                 static_cast<unsigned int>(startup_sdo.subindex),
-                 static_cast<unsigned int>(startup_sdo.values[i]),
-                 static_cast<unsigned int>(readback_value),
-                 readback_matches ? 1u : 0u);
-            verified = true;
-            break;
-          }
-          if (attempt < kStartupReadbackAttempts) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-          }
-          if (attempt == kStartupReadbackAttempts) {
-            latest_feedback.startup_drive_config_readback_valid[i] = 0u;
-            latest_feedback.startup_drive_config_readback[i] = 0u;
-            latest_feedback.startup_drive_config_verified[i] = 0u;
-            logf("WARNING: EtherCAT startup readback failed for axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x rc=%d abort=0x%08x size=%zu",
-                 i,
-                 static_cast<unsigned int>(opt.slave_position[i]),
-                 startup_sdo.key.c_str(),
-                 static_cast<unsigned int>(startup_sdo.index),
-                 static_cast<unsigned int>(startup_sdo.subindex),
-                 rc,
-                 static_cast<unsigned int>(abort_code),
-                 readback_size);
-          }
+          continue;
         }
-        if (!verified) {
-          latest_feedback.startup_drive_config_readback_valid[i] = 0u;
-          latest_feedback.startup_drive_config_readback[i] = 0u;
-          latest_feedback.startup_drive_config_verified[i] = 0u;
+        logf("EtherCAT startup readback begin key=%s delay_ms=%llu",
+             descriptor.key.c_str(),
+             static_cast<unsigned long long>(kStartupReadbackDelayNs / 1000000ULL));
+        for (uint32_t i = 0; i < opt.num_axes; ++i) {
+          bool verified = false;
+          for (int attempt = 1; attempt <= kStartupReadbackAttempts; ++attempt) {
+            uint8_t readback_raw[sizeof(uint16_t)] = {};
+            size_t readback_size = 0;
+            uint32_t abort_code = 0;
+            int rc = -1;
+            {
+              std::lock_guard<std::mutex> lock(shared_master_sdo_mutex);
+              if (g_stop.load(std::memory_order_relaxed) || !shared_master) {
+                return;
+              }
+              rc = ecrt_master_sdo_upload(
+                  shared_master,
+                  opt.slave_position[i],
+                  descriptor.index,
+                  descriptor.subindex,
+                  readback_raw,
+                  sizeof(readback_raw),
+                  &readback_size,
+                  &abort_code);
+            }
+            if (rc == 0 && readback_size >= sizeof(uint16_t)) {
+              const uint16_t readback_value = EC_READ_U16(readback_raw);
+              const bool readback_matches =
+                  readback_value == static_cast<uint16_t>(descriptor.values[i]);
+              feedback.readback_valid[i] = 1u;
+              feedback.readback[i] = readback_value;
+              feedback.verified[i] = readback_matches ? 1u : 0u;
+              logf("EtherCAT startup readback axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x commanded=%u readback=%u verified=%u",
+                   i,
+                   static_cast<unsigned int>(opt.slave_position[i]),
+                   descriptor.key.c_str(),
+                   static_cast<unsigned int>(descriptor.index),
+                   static_cast<unsigned int>(descriptor.subindex),
+                   static_cast<unsigned int>(descriptor.values[i]),
+                   static_cast<unsigned int>(readback_value),
+                   readback_matches ? 1u : 0u);
+              verified = true;
+              break;
+            }
+            if (attempt < kStartupReadbackAttempts) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (attempt == kStartupReadbackAttempts) {
+              feedback.readback_valid[i] = 0u;
+              feedback.readback[i] = 0u;
+              feedback.verified[i] = 0u;
+              logf("WARNING: EtherCAT startup readback failed for axis=%u slave_pos=%u key=%s index=0x%04x sub=0x%02x rc=%d abort=0x%08x size=%zu",
+                   i,
+                   static_cast<unsigned int>(opt.slave_position[i]),
+                   descriptor.key.c_str(),
+                   static_cast<unsigned int>(descriptor.index),
+                   static_cast<unsigned int>(descriptor.subindex),
+                   rc,
+                   static_cast<unsigned int>(abort_code),
+                   readback_size);
+            }
+          }
+          if (!verified) {
+            feedback.readback_valid[i] = 0u;
+            feedback.readback[i] = 0u;
+            feedback.verified[i] = 0u;
+          }
         }
       }
 #else
@@ -4288,11 +4337,7 @@ int main(int argc, char** argv) {
       uint8_t startup_ready = 0;
       uint8_t startup_passive_active = 0;
       uint8_t startup_skip_domain_queue_active = 0;
-      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_configured{};
-      std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_commanded{};
-      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_readback_valid{};
-      std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_readback{};
-      std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> startup_drive_config_verified{};
+      std::array<StartupSdoFeedback, kMaxStartupSdoDescriptors> startup_drive_config_feedback{};
       std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_state{};
       std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_position_offset{};
       std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> native_home_last_abort_code{};
@@ -4322,11 +4367,7 @@ int main(int argc, char** argv) {
         startup_ready = latest_feedback.startup_ready;
         startup_passive_active = latest_feedback.startup_passive_active;
         startup_skip_domain_queue_active = latest_feedback.startup_skip_domain_queue_active;
-        startup_drive_config_configured = latest_feedback.startup_drive_config_configured;
-        startup_drive_config_commanded = latest_feedback.startup_drive_config_commanded;
-        startup_drive_config_readback_valid = latest_feedback.startup_drive_config_readback_valid;
-        startup_drive_config_readback = latest_feedback.startup_drive_config_readback;
-        startup_drive_config_verified = latest_feedback.startup_drive_config_verified;
+        startup_drive_config_feedback = latest_feedback.startup_drive_config_feedback;
         native_home_state = latest_feedback.native_home_state;
         native_home_position_offset = latest_feedback.native_home_position_offset;
         native_home_last_abort_code = latest_feedback.native_home_last_abort_code;
@@ -4350,17 +4391,19 @@ int main(int argc, char** argv) {
       } else if (startup_reset_count != last_startup_reset_count ||
                  (last_startup_ready_flag && !startup_ready_flag)) {
         startup_readback_complete =
-            !startup_sdo.valid || !metrics_startup_readback_enabled;
+            startup_sdos.empty() || !metrics_startup_readback_enabled;
         native_home_offset_refresh_complete =
             !native_home_cfg.valid || !metrics_native_home_refresh_enabled;
         startup_readback_ready_since_ns = 0;
         native_home_offset_ready_since_ns = 0;
         absolute_feedback_ready_since_ns = 0;
         absolute_feedback_last_poll_ns = 0;
+        latest_feedback.startup_drive_config_feedback.fill(StartupSdoFeedback{});
         latest_feedback.native_home_state.fill(
             static_cast<uint8_t>(gradient::ipc::v1::NATIVE_HOME_STATE_IDLE));
         latest_feedback.native_home_last_abort_code.fill(0u);
         latest_feedback.absolute_feedback.fill(AbsoluteFeedbackAxis{});
+        startup_drive_config_feedback.fill(StartupSdoFeedback{});
         native_home_state.fill(
             static_cast<uint8_t>(gradient::ipc::v1::NATIVE_HOME_STATE_IDLE));
         native_home_last_abort_code.fill(0u);
@@ -4379,9 +4422,7 @@ int main(int argc, char** argv) {
       perform_startup_drive_config_readback(now_ns, startup_ready_flag);
       perform_startup_native_home_offset_refresh(now_ns, startup_ready_flag);
       perform_absolute_feedback_refresh(now_ns, startup_ready_flag);
-      startup_drive_config_readback_valid = latest_feedback.startup_drive_config_readback_valid;
-      startup_drive_config_readback = latest_feedback.startup_drive_config_readback;
-      startup_drive_config_verified = latest_feedback.startup_drive_config_verified;
+      startup_drive_config_feedback = latest_feedback.startup_drive_config_feedback;
       native_home_position_offset = latest_feedback.native_home_position_offset;
       absolute_feedback = latest_feedback.absolute_feedback;
 
@@ -4469,6 +4510,25 @@ int main(int argc, char** argv) {
         }
         oss << "},";
       };
+      auto append_startup_drive_config_json = [&](const StartupSdoConfig& descriptor,
+                                                  const StartupSdoFeedback& feedback,
+                                                  uint32_t axis_index) {
+        if (!descriptor.valid) {
+          oss << "null";
+          return;
+        }
+        oss << "{";
+        oss << "\"setting_key\":\"" << descriptor.key << "\",";
+        oss << "\"type\":\"u16\",";
+        oss << "\"index\":" << static_cast<unsigned int>(descriptor.index) << ",";
+        oss << "\"subindex\":" << static_cast<unsigned int>(descriptor.subindex) << ",";
+        oss << "\"configured\":" << static_cast<unsigned int>(feedback.configured[axis_index]) << ",";
+        oss << "\"commanded\":" << feedback.commanded[axis_index] << ",";
+        oss << "\"readback_valid\":" << static_cast<unsigned int>(feedback.readback_valid[axis_index]) << ",";
+        oss << "\"readback\":" << feedback.readback[axis_index] << ",";
+        oss << "\"verified\":" << static_cast<unsigned int>(feedback.verified[axis_index]);
+        oss << "}";
+      };
       for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
         if (i != 0) {
           oss << ",";
@@ -4479,21 +4539,21 @@ int main(int argc, char** argv) {
         oss << "\"error_code\":" << error_code[i] << ",";
         oss << "\"manufacturer_error_code\":" << manufacturer_error_code[i] << ",";
         oss << "\"startup_drive_config\":";
-        if (startup_sdo.valid) {
-          oss << "{";
-          oss << "\"setting_key\":\"" << startup_sdo.key << "\",";
-          oss << "\"type\":\"u16\",";
-          oss << "\"index\":" << static_cast<unsigned int>(startup_sdo.index) << ",";
-          oss << "\"subindex\":" << static_cast<unsigned int>(startup_sdo.subindex) << ",";
-          oss << "\"configured\":" << static_cast<unsigned int>(startup_drive_config_configured[i]) << ",";
-          oss << "\"commanded\":" << startup_drive_config_commanded[i] << ",";
-          oss << "\"readback_valid\":" << static_cast<unsigned int>(startup_drive_config_readback_valid[i]) << ",";
-          oss << "\"readback\":" << startup_drive_config_readback[i] << ",";
-          oss << "\"verified\":" << static_cast<unsigned int>(startup_drive_config_verified[i]);
-          oss << "},";
+        if (!startup_sdos.empty()) {
+          append_startup_drive_config_json(startup_sdos.front(), startup_drive_config_feedback[0], i);
         } else {
-          oss << "null,";
+          oss << "null";
         }
+        oss << ",";
+        oss << "\"startup_drive_configs\":[";
+        for (size_t descriptor_i = 0; descriptor_i < startup_sdos.size(); ++descriptor_i) {
+          if (descriptor_i != 0) {
+            oss << ",";
+          }
+          append_startup_drive_config_json(
+              startup_sdos[descriptor_i], startup_drive_config_feedback[descriptor_i], i);
+        }
+        oss << "],";
         oss << "\"native_home_state\":" << static_cast<unsigned int>(native_home_state[i]) << ",";
         oss << "\"native_home_position_offset\":" << native_home_position_offset[i] << ",";
         oss << "\"native_home_last_abort_code\":" << native_home_last_abort_code[i] << ",";

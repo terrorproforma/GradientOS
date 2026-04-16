@@ -1802,6 +1802,7 @@ def create_app() -> FastAPI:
                     {
                         "arm_angles_rad": target_arm_rad,
                         "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
+                        "target_joint_indices": [joint - 1],
                     }
                 ),
                 timeout=2.0,

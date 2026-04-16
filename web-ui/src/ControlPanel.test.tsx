@@ -323,6 +323,134 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(onJointFeedback).not.toHaveBeenCalledWith([10, 20, 30, 40, 50, 60], 7);
 	});
 
+	it("keeps a fixed commissioning message rail while native-home messages change", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axis_enable_mask: 0x0,
+					native_home_active_axis_mask: 0x2,
+					axes: [
+						{
+							axis: 1,
+							logical_joint: 2,
+							ds402_state: "SwitchOnDisabled",
+							statusword: 0x1650,
+							error_code: 0,
+							native_home_state: 0,
+							native_home_state_name: "idle",
+							native_home_active: true,
+							native_home_last_abort_code: 0,
+							native_home_last_abort_code_hex: "0x00000000",
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		await waitFor(() => {
+			expect(screen.getByText(/Drive-native home still running for J2/i)).toBeTruthy();
+			const slots = screen.getAllByTestId("commissioning-message-slot");
+			expect(slots).toHaveLength(3);
+			expect(slots[0].className).toContain("h-9");
+			expect(slots[0].getAttribute("aria-hidden")).toBeNull();
+			expect(slots[1].getAttribute("aria-hidden")).toBe("true");
+			expect(slots[2].getAttribute("aria-hidden")).toBe("true");
+		});
+	});
+
+	it("keeps drive-home enabled when canonical angles are unavailable but drive telemetry is live", async () => {
+		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+			const parsed = new URL(url, "http://localhost");
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
+				return mockJsonResponse({
+					arm_deg: [10, 20, 30, 40, 50, 60],
+					arm_display_deg: [null, null, null, null, null, null],
+					gripper_deg: 7,
+					read_source: "unavailable",
+				});
+			}
+			if (parsed.pathname === "/control/motion-status") {
+				return mockJsonResponse({
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: false,
+					power_transition_blockers: ["coordinate_system_invalid"],
+					power_transition_blocker_details: [
+						{
+							code: "coordinate_system_invalid",
+							message: "Drive-native coordinate system is invalid; run Drive Home before power-up.",
+							truth_unavailable_joints: [1, 2, 3, 4, 5, 6],
+							statuswords: ["0x1650"],
+						},
+					],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						controller_thread_running: false,
+						rtcore_status_present: true,
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: false,
+						power_transition_blockers: ["coordinate_system_invalid"],
+						power_transition_blocker_details: [
+							{
+								code: "coordinate_system_invalid",
+								message: "Drive-native coordinate system is invalid; run Drive Home before power-up.",
+								truth_unavailable_joints: [1, 2, 3, 4, 5, 6],
+								statuswords: ["0x1650"],
+							},
+						],
+					},
+				});
+			}
+			return mockJsonResponse({});
+		}));
+
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					native_home_active_axis_mask: 0x0,
+					axes: Array.from({ length: 6 }, (_, axis) => ({
+						axis,
+						logical_joint: axis + 1,
+						ds402_state: "SwitchOnDisabled",
+						statusword: 0x1650,
+						error_code: 0,
+						native_home_state: 0,
+						native_home_state_name: "idle",
+						native_home_last_abort_code: 0,
+						native_home_last_abort_code_hex: "0x00000000",
+					})),
+				}}
+			/>,
+		);
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		await waitFor(() => {
+			const driveHomeButtons = screen.getAllByRole("button", { name: "Drive Home" }) as HTMLButtonElement[];
+			expect(driveHomeButtons).toHaveLength(6);
+			for (const button of driveHomeButtons) {
+				expect(button.disabled).toBe(false);
+			}
+			expect(driveHomeButtons[0].title).toContain("live drive telemetry");
+		});
+	});
+
 	it("clears joint feedback when the detailed endpoint drops out", async () => {
 		const onJointFeedback = vi.fn();
 		let jointFetchCount = 0;
@@ -592,6 +720,57 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(screen.queryByText("BLOCKED")).toBeNull();
 	});
 
+	it("shows BLOCKED with a native-home message when the drive coordinate system is invalid", async () => {
+		render(
+			<ControlPanelRuntimeHeader
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [],
+				}}
+				motionStatus={{
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: false,
+					power_transition_blockers: ["coordinate_system_invalid"],
+					power_transition_blocker_details: [
+						{
+							code: "coordinate_system_invalid",
+							message: "Drive-native coordinate system is invalid; run Drive Home before power-up.",
+							truth_unavailable_joints: [1, 2, 3, 4, 5, 6],
+							statuswords: ["0x1650"],
+						},
+					],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: false,
+						power_transition_blockers: ["coordinate_system_invalid"],
+						power_transition_blocker_details: [
+							{
+								code: "coordinate_system_invalid",
+								message: "Drive-native coordinate system is invalid; run Drive Home before power-up.",
+								truth_unavailable_joints: [1, 2, 3, 4, 5, 6],
+								statuswords: ["0x1650"],
+							},
+						],
+					},
+				}}
+			/>,
+		);
+
+		expect(screen.getByText("BLOCKED")).toBeTruthy();
+		expect(screen.queryByText("CHECK")).toBeNull();
+		const badge = screen.getByText("BLOCKED").closest("span");
+		expect(badge?.getAttribute("title")).toMatch(/Drive coordinate system is invalid/i);
+		expect(badge?.getAttribute("title")).toMatch(/Drive Home/i);
+	});
+
 	it("waits for a stable safe signal before showing SAFE in the runtime header while drives are disarmed", async () => {
 		render(
 			<ControlPanelRuntimeHeader
@@ -694,7 +873,7 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(screen.getByText(/axis currently disarmed/i)).toBeTruthy();
 	});
 
-	it("does not show success when statusword fallback masks a reported native-home failure", async () => {
+	it("shows success when the live drive status is clean even if the reported abort is stale", async () => {
 		render(
 			<ControlPanel
 				apiHost=""
@@ -726,9 +905,8 @@ describe("ControlPanel jog session lifecycle", () => {
 		);
 
 		fireEvent.click(screen.getByRole("button", { name: "Show" }));
-		expect(screen.getByText(/Drive Home verification conflicted/i)).toBeTruthy();
-		expect(screen.getByText(/reported failed 0x06010002/i)).toBeTruthy();
-		expect(screen.queryByText(/Drive Home succeeded/i)).toBeNull();
+		expect(screen.getByText(/Drive Home succeeded/i)).toBeTruthy();
+		expect(screen.queryByText(/verification conflicted/i)).toBeNull();
 	});
 
 	it("blocks drive-home buttons while a native-home transaction is still active", async () => {

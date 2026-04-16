@@ -1897,6 +1897,7 @@ def _open_loop_executor_thread(
     diagnostics: bool = True,
     return_telemetry: bool = False,
     owns_trajectory_state: bool = True,
+    target_joint_indices: list[int] | None = None,
 ):
     """High-speed *open-loop* executor.
 
@@ -1931,7 +1932,20 @@ def _open_loop_executor_thread(
         telemetry_result = None
         offload_t0 = time.perf_counter()
         try:
-            status = backend.execute_joint_trajectory(joint_path, frequency)  # type: ignore[attr-defined]
+            axis_mask = None
+            if target_joint_indices:
+                axis_mask_getter = getattr(backend, "logical_joint_indices_to_axis_mask", None)
+                if callable(axis_mask_getter):
+                    axis_mask = int(axis_mask_getter([int(value) for value in target_joint_indices]))
+                    if axis_mask == 0:
+                        raise RuntimeError(
+                            "Cannot start targeted RTCore trajectory; selected logical joints are unmapped."
+                        )
+            status = backend.execute_joint_trajectory(  # type: ignore[attr-defined]
+                joint_path,
+                frequency,
+                axis_mask=axis_mask,
+            )
             state_name = str(getattr(status, "state_name", "unknown"))
             if state_name not in ("completed", "idle"):
                 raise RuntimeError(f"RTCore trajectory execution ended in state '{state_name}'")

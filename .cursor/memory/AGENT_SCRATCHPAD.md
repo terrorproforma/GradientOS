@@ -1205,3 +1205,457 @@ Use this file as persistent, repo-local execution memory.
   - `POST /control/reset-faults` cleared the drive fault, but the controller still remained in `not_synchronized` with `/info/joints-detailed` returning `read_source = unavailable` and no `arm_deg`
 - [self] Strong new conclusion: a software reset is not just "harmless and worth trying" on this setup. It can actively knock `J2` out of the currently coherent home/reference-valid state into an obviously bad frame/truth state without solving the underlying problem.
 - [self] Practical rule update: after a `J2` software reset probe, expect recovery to require more than fault reset alone; likely next recovery candidates are stack/controller restart or a fresh native-home workflow, not simply repeating soft resets.
+
+### 2026-04-15 - New manufacturer reply sharpens the intended A6-EC end-state
+- [user] The user provided a fresh manufacturer reply with explicit answers about rotary-mode gear ratio, `607C`, `6091`, HM35, `0x9650`, `C13.10`, and `F31.10`.
+- [self] Biggest architecture update: the vendor now explicitly recommends configuring the real output-shaft mechanical ratio in `C10.18 / C10.19`. Leaving them at `1:1` is now best understood as a fallback/debug posture where `6064` and `U40.28` stay motor-side and the host must own output-shaft conversion.
+- [self] Important distinction to preserve: vendor says `C10.18 / C10.19` govern rotary-mode absolute reconstruction and `RM`, while `6091` is only the electronic gear ratio for command/reference-unit conversion. So our `6064 * 6091 ~= 6063` checks remain useful, but they do not settle the rotary-mode reconstruction question by themselves.
+- [self] This strongly re-opens the earlier startup-config direction we backed out: drive-side mechanical ratio programming now has explicit vendor support and should likely return as a deliberate one-time migration plus re-home, not as a speculative fix.
+- [self] Bench result confirmed by vendor: direct manual `607C` writes alone do not establish homing-valid status; HM Method 35 is still required for `6064` rebasing plus bits 12/15.
+- [self] New rotary-mode guardrail: treat negative `607C` as semantically invalid even if the drive accepts it. For seam-adjacent homes, prefer a positive value near `RM-1`.
+- [self] Trust-model clarification from vendor: `0x9650` is the intended successful HM35 terminal state, and `C13.10 = 1` should be left enabled so homing-related persistence saves automatically.
+- [self] `F31.10` is now better scoped: use it for encoder battery/multi-turn failure recovery, not routine commissioning. After `F31.10 = 4`, physical homing is mandatory.
+
+### 2026-04-15 - Drive-native A6-EC truth must be gated by startup verification, not only by profile intent
+- [self] When adding `drive_native_ratio_enabled`, do **not** switch the backend truth/display math unconditionally for every `a6ec_ds402` instance. Treat the profile flag as declared intent and keep the active truth source on the legacy anchor path until live startup telemetry confirms the drive posture is actually in place.
+- [self] Concrete rule to preserve: active drive-native canonical truth needs both:
+  - startup-drive-config verification from live metrics
+  - vendor HM-valid signature in the live statusword (`bit12 = 1`, `bit15 = 1`, `bit13 = 0`) with no active alarms
+- [self] If either of those checks fails, fall back to anchored absolute reconstruction instead of trusting drive-native truth optimistically.
+- [self] Neutralize double-scaling in the RTCore runtime env by sending `GRADIENT_RT_GEAR_RATIO = 1` for drive-native A6-EC, but keep the cold-start Python robot-config fallback conservative until RTCore reports its live axis config.
+- [tool] Environment guardrail: this machine currently lacks project test deps (`pytest`, `numpy`) in the default interpreter, and `uv run --extra dev ...` failed offline with DNS resolution errors. Non-fabricated validation here is limited to `python3 -m py_compile` and `ReadLints` unless the environment is prepared first.
+- [self] Process correction: I resumed implementation before rereading the required scratchpad/devlog/SOP skills. Re-open those files near the start of the task and capture the guardrails before making architectural edits.
+
+### 2026-04-15 - A6-EC should fail closed, not fall back, once the drive-native ratio path is adopted
+- [user] The user explicitly clarified that A6-EC should use the drive's native gear-ratio path only and should not keep the host-owned alternative, while other drive families may still need software-defined gears.
+- [self] Important contract correction: the earlier "conservative fallback to anchored reconstruction" was a useful migration step, but it is not the intended steady-state A6-EC behavior. For `a6ec_ds402`, if startup verification or HM-valid status is missing, canonical truth should be unavailable rather than silently reconstructed from absolute anchors.
+- [self] Preserve this profile split:
+  - A6-EC: drive-native ratio enabled, no host truth fallback, no anchor bootstrap requirement for active truth
+  - other/non-drive-native profiles: legacy anchored reconstruction can still exist and still needs focused regression coverage
+- [self] Backend init lesson: if cold-start scaling depends on the selected drive profile, stash `configured_drive_profile_id` before building `_robot_axis_config`; otherwise the backend can accidentally apply the default profile semantics during init and mask non-default drive-profile tests.
+- [tool] Live validation result to remember:
+  - the activated env now has `pytest` and `numpy`, so use `source ./start.sh` before assuming the machine cannot run focused tests
+  - focused pytest slice passed after the refactor (`106 passed`)
+  - live stack startup showed `/etc/default/gradient-rt-motion` carrying `GRADIENT_RT_GEAR_RATIO=\"1,1,1,1,1,1\"` and the three-entry `GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG` for `C00.07`, `C10.18`, and `C10.19`
+  - live metrics proved `drive_native_startup_valid = true` on all six axes but `drive_native_truth_valid = false` everywhere because every axis was still at `0x1650`, not the vendor-valid `0x9650` HM state
+- [self] Practical commissioning rule: after this migration, if the controller truth monitor says unavailable and per-axis reason is `drive_native_coordinate_system_invalid`, treat that as evidence that the code path is working and the hardware simply still needs a fresh HM35 re-home.
+
+### 2026-04-15 - Do not leave mixed fallback wording in the active A6-EC note after the code contract changes
+- [user] The user explicitly called out that the working notes should not keep fallback language for A6-EC because fallback itself introduces error in this workstream.
+- [self] Correction rule: once the implementation is truly no-fallback for `a6ec_ds402`, clean the active work note and nearby summaries the same pass. Do not leave phrases like "fallback/debug posture," "older anchored reconstruction still exists," or similar wording in the active A6-EC truth section.
+- [self] Code guardrail to preserve: for A6-EC, do not even carry anchor semantics through active truth and software-zero flows when `absolute_home_anchor_required` is false. Anchors may still exist in the repo for historical/non-A6EC paths, but they should not participate in the active A6-EC path or its wording.
+
+### 2026-04-15 - Multi-SDO startup verification must be aggregated end-to-end for A6-EC
+- [self] Review caught a real migration gap: RTCore already wrote `C00.07`, `C10.18`, and `C10.19`, but startup validity still rode on the single primary `startup_drive_config` object. That could mark drive-native truth as valid without proving the ratio SDOs actually matched.
+- [self] Corrective rule: whenever A6-EC startup validity matters, go through the drive-profile startup extractor/aggregator first. Do **not** read the raw single `startup_drive_config` field directly in backend or telemetry code when multi-descriptor semantics matter.
+- [tool] Fixed the RTCore metrics path to publish `startup_drive_configs` alongside the backward-compatible primary `startup_drive_config`, and to clear startup-verification feedback immediately when the startup epoch changes so restarts fail closed instead of carrying stale verification forward.
+- [tool] Fixed `a6ec_ds402.extract_startup_config_axis(...)` to aggregate `C00.07`, `C10.18`, and `C10.19`, and to surface `missing_setting_keys` / `startup_drive_config_missing_required_settings` when the ratio descriptors are absent.
+- [tool] Fixed the backend startup-validity gate to use the aggregated profile extractor instead of the raw metrics field, matching the telemetry path.
+- [tool] Validation that actually ran:
+  - `make -C src/gradient_rt_motion`
+  - `source ./start.sh && python -m pytest tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q`
+  - `source ./start.sh && python -m pytest tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py tests/test_drive_faults.py tests/test_run_controller_helpers.py tests/test_terminal_dashboard.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q`
+  - `ReadLints` on the touched files returned clean
+- [self] Guardrail to preserve: keep at least one regression on a non-`1:1` axis that proves the A6-EC drive-native trajectory upload stays in logical radians while host scaling is neutralized to `gear_ratio = 1`.
+
+### 2026-04-15 - Live validation confirms the A6-EC migration, but public power-up still needs whole-arm HM validity
+- [tool] Executed the live validation plan end-to-end:
+  - `make -C src/gradient_rt_motion`
+  - `source ./start.sh && python -m pytest tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py tests/test_drive_faults.py tests/test_run_controller_helpers.py tests/test_terminal_dashboard.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q`
+  - `source ./start.sh && GRADIENT_STACK_INTERACTIVE_CONSOLE=0 ./start-stack.sh`
+  - `POST /control/home-joint-native` on `J6`, then on `J1`-`J5`
+  - `POST /control/power-up`, `POST /control/joint-jog` on `J6` with `delta_deg = 0.2`, then `POST /control/power-down`
+- [tool] Observed live results to preserve:
+  - before HM35, startup verification was already `true` on all six axes while truth stayed fail-closed everywhere with `statusword_hex = 0x1650` and `drive_native_truth_reason = coordinate_system_invalid`
+  - a single `J6` HM35 was enough to make that axis individually coherent (`0x9650`, `drive_native_truth_valid = true`, `truth_available = true`)
+  - but `/control/motion-status` still blocked `SAFE_POWER_UP` with `not_synchronized` until every axis had been HM35-homed and the controller could rebuild a full live joint vector
+  - after HM35 on the remaining axes, `/info/joints-detailed` switched to `read_source = live_feedback` and `canonical_joint_truth_available = true`
+  - the public API tiny jog on `J6` succeeded after that full-arm sync; requested `+0.2` deg and observed about `+0.205994` deg from `canonical_rad`
+  - post-jog `POST /control/power-down` returned the stack to `BUS_UP_DISARMED`, and `./start-stack.sh probe` showed all six axes still at `0x9650` with no faults
+- [self] Operational rule update: with the current controller safety gate, per-axis truth validity is not enough for public `SAFE_POWER_UP` / `joint-jog`. Those paths still require a complete live-feedback joint vector, so a bench smoke test through the public API needs the whole arm HM-valid first.
+- [self] Important distinction to preserve: `axis_absolute_feedback` can show a single axis as truth-valid before `GET_JOINT_STATE` becomes `live_feedback`. That is a synchronization-policy limitation in the controller/power-up path, not evidence that the drive-native truth path itself failed.
+
+### 2026-04-15 - Frontend cleanup must verify the live monitor contract, not just `/info/joints-detailed`
+- [user] The user flagged that the frontend still looked wrong after the drive-native truth migration and asked for a cleanup based on what is actually being sent to the UI.
+- [tool] Live diagnosis that mattered:
+  - `/info/joints-detailed` already carried the correct small operator-facing values in `arm_display_deg`
+  - but `/monitor` was still publishing `display_joints` by copying raw `q`, so the frontend was faithfully rendering mislabeled data
+  - the live monitor sample proved the bug because `joints` and `display_joints` were identical large wrapped values on `J3/J4/J6`
+- [self] Corrective rule: when the UI looks semantically wrong after a telemetry migration, inspect the live SSE `/monitor` payload directly before assuming the bug is only in React rendering.
+- [tool] Fixes that worked:
+  - `run_controller.py` monitor telemetry now emits `display_joints` from the backend display snapshot instead of copying raw canonical joints
+  - `App.tsx` and `TelemetryCharts.tsx` now prefer `display_joints` over raw `joints` for operator-facing pose display
+  - the app fallback path now stores `/info/joints` display feedback into `display_joints` instead of relabeling it as raw `joints`
+- [tool] Validation that actually ran:
+  - `source ./start.sh && python -m pytest tests/test_run_controller_helpers.py -q`
+  - `npm --prefix web-ui test -- src/poseTelemetry.test.ts src/ControlPanel.test.tsx`
+  - controlled disarmed stack restart, then live `/monitor` and `/info/joints-detailed` sampling
+- [self] Guardrail to preserve: keep raw `joints` and operator `display_joints` as separate frontend streams. If fallback data only knows the display pose, do not write it back into the raw slot just to satisfy older UI helpers.
+
+### 2026-04-15 - Native gear-ratio proof should use both direct SDO probe and RTCore startup verification
+- [user] The user asked to show, through a probe, that the drives now have the mechanical gear ratios programmed natively.
+- [tool] Best proof pattern that worked:
+  - use `scripts/a6ec_chapter5_probe.py snapshot` to read `C10.18` / `C10.19` directly from every axis
+  - then cross-check `/run/gradient-rt-motion/metrics.json` `startup_drive_configs` to show RTCore commanded the same values and read them back as verified
+- [tool] Live evidence captured:
+  - probe artifact: `logs/encoder-retention/native-ratio-proof/native-ratio-proof.json`
+  - markdown summary: `logs/encoder-retention/native-ratio-proof/native-ratio-proof.md`
+  - direct drive readback showed:
+    - `J1/J2/J3`: `C10.18=100`, `C10.19=1`
+    - `J4`: `C10.18=18`, `C10.19=1`
+    - `J5`: `C10.18=125`, `C10.19=4`
+    - `J6`: `C10.18=10`, `C10.19=1`
+  - RTCore metrics readback showed the same numerator/denominator settings with `verified = 1` on every axis
+- [self] Guardrail to preserve: do not rely on `ratio_6091_motor_over_shaft` as proof of native mechanical gearing. The manufacturer explicitly separated `6091` from rotary-mode reconstruction, so the decisive proof is `C10.18/C10.19` direct readback plus verified startup SDO metrics.
+
+### 2026-04-15 - Double-count sanity check should verify both runtime env and host counts-per-radian math
+- [user] The user asked to double-check that software gears are now `1` and that we are not accidentally double counting.
+- [tool] Live/runtime proof that mattered:
+  - `/etc/default/gradient-rt-motion` currently contains `GRADIENT_RT_GEAR_RATIO="1,1,1,1,1,1"`
+  - the same file carries the native startup SDO config for `C10.18/C10.19`, so the host and drive postures are aligned rather than mixed
+- [tool] Host-math proof that mattered:
+  - instantiating `EthercatRTCoreBackend` for `gradient05` showed `drive_native_ratio_enabled = True`
+  - for `J5`, robot config still correctly knows the physical ratio is `31.25`, but backend `counts_per_unit_j5` equaled the neutral `131072 / (2*pi)` value exactly instead of `neutral * 31.25`
+  - reran the focused regression `tests/test_gradient05_limits_and_backends.py -k nonunit_a6ec_axis_in_logical_radians`, which passed and would fail if host gear scaling were still being applied on top of the drive-native path
+- [self] Guardrail to preserve: the right “no double counting” proof is not just `GRADIENT_RT_GEAR_RATIO=1`; it is `GRADIENT_RT_GEAR_RATIO=1` plus a non-`1:1` axis command-path check showing host `counts_per_unit` stayed neutral.
+
+### 2026-04-15 - RTCore commissioning jog completion should be scoped to the selected joint, not every held axis
+- [user] The user halted probe work and asked to investigate a fresh J6 jog failure from controller logs.
+- [tool] Live evidence that mattered:
+  - `logs/startups/latest/controller.log` showed `SAFE_POWER_UP`, then a bounded `APPLY_JOINT_SETPOINT` for J6, then `TimeoutError: Timed out waiting for RTCore trajectory 1 to complete`
+  - the same live stack later reported healthy idle state through `/control/motion-status`: `state_name=idle`, `active_traj_id=0`, `queue_depth=0`, `motion_done=true`, `last_submitted_traj_id=1`
+  - `/run/gradient-rt-motion/metrics.json` stayed healthy after the failure: all axes `0x9650`, no faults, startup verification intact, stack disarmed after stop/power-down
+  - an older successful J6 jog in another terminal used the same `25`-point `100 Hz` bounded path but finished as `RTCore trajectory execution finished: state=completed traj_id=1 elapsed=0.263s`
+- [self] Corrective rule: for `/control/joint-jog` bounded RTCore moves, carry the selected logical joint indices through `APPLY_JOINT_SETPOINT` and mask the RTCore trajectory to those axes. A tiny single-joint commissioning jog should not stay pending because some unrelated held axis misses final tolerance.
+- [self] Guardrail: this fix intentionally does **not** reinterpret A6-EC raw command semantics or switch jogs to display/output-shaft units. It only narrows the completion-critical axes for targeted commissioning jogs.
+- [tool] Focused validation that actually ran:
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py::test_control_joint_jog tests/test_api_endpoints.py::test_control_joint_jog_ignores_wait_for_idle_flag tests/test_command_api_direct_setpoint.py::test_handle_apply_joint_setpoint_can_start_bounded_joint_trajectory tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing tests/test_trajectory_execution_backends.py::test_open_loop_executor_offloads_rtcore_trajectory_backend tests/test_trajectory_execution_backends.py::test_open_loop_executor_passes_targeted_rtcore_axis_mask -q`
+    - result: `6 passed`
+  - `source ./start.sh && python -m py_compile src/gradient_os/api/main.py src/gradient_os/run_controller.py src/gradient_os/arm_controller/command_api.py src/gradient_os/arm_controller/trajectory_execution.py src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_gradient05_limits_and_backends.py tests/test_trajectory_execution_backends.py`
+  - `ReadLints` on the touched files returned clean
+- [self] Follow-up risk: I did not re-run a live powered J6 jog after the patch because that would move hardware. If the timeout reproduces, the improved `TimeoutError` now includes the last RTCore `state_name`, `active_traj_id`, `queue_depth`, `motion_done`, and `active_command_seq` so the next log read can distinguish completion-bookkeeping failure from a deeper command-path/seam issue.
+
+### 2026-04-15 - Disarmed commissioning flicker is amplified by UI precision, not current post-power-cycle raw jitter
+- [user] The user asked why the commissioning joint-angle flicker looked so prominent and explicitly wanted a live restarted-stack check with monitoring before any new motion.
+- [tool] Fresh live bring-up after the user's hard stop and drive power cycle reached `STACK BOOT COMPLETE` with one launcher-managed RTCore/EtherCAT recycle; the stack landed healthy but fail-closed:
+  - `/control/motion-status`: `state=idle`, `motion_done=true`, `safe_for_power_transition=false`, blocker `not_synchronized`
+  - `/info/joints-detailed`: `read_source=unavailable`, `arm_deg=[]`, `arm_display_deg=[]`
+  - `/run/gradient-rt-motion/metrics.json`: all six axes `0x1650`, startup descriptors still verified, no faults
+- [tool] Read-only jitter measurement from `120` repeated `/info/joints-detailed` polls at `50 ms` cadence showed only small live wander after the power cycle:
+  - raw/reference counts moved by about `1..4` counts per axis
+  - display/reference-angle range was about `0.0082..0.0110 deg` on the noisiest fields
+  - current read-only J6 did **not** reproduce the earlier `~0.1 deg` wobble; its measured rest jitter was still about `0.011 deg`
+- [self] Important UI diagnosis: `web-ui/src/ControlPanel.tsx` was updating commissioning angles on any change above `0.001 deg` but rendering them at only `0.01 deg` precision. That makes normal count-level rest jitter visibly chatter in the last displayed digit even when controller/RTCore semantics are fine.
+- [self] Safe corrective rule: for EtherCAT commissioning views, prefer a display-only deadband while the arm is idle and disarmed instead of changing controller truth, RTCore execution, or drive semantics. Keep jog baselines, telemetry contracts, and safety-critical motion logic untouched.
+- [tool] Implemented fix:
+  - `web-ui/src/ControlPanel.tsx` now applies a small `0.02 deg` display deadband only for idle/disarmed EtherCAT commissioning angles
+  - the underlying controller/API telemetry remains unchanged
+- [tool] Validation that actually ran:
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py::test_control_joint_jog tests/test_api_endpoints.py::test_control_joint_jog_ignores_wait_for_idle_flag tests/test_command_api_direct_setpoint.py::test_handle_apply_joint_setpoint_can_start_bounded_joint_trajectory tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing tests/test_run_controller_helpers.py tests/test_trajectory_execution_backends.py::test_open_loop_executor_offloads_rtcore_trajectory_backend tests/test_trajectory_execution_backends.py::test_open_loop_executor_passes_targeted_rtcore_axis_mask -q`
+  - `npm --prefix web-ui test -- src/ControlPanel.test.tsx src/poseTelemetry.test.ts`
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx` and `web-ui/src/ControlPanel.test.tsx`
+- [self] Remaining risk to preserve: because the power cycle dropped the arm back to `0x1650`, this pass did not reproduce the earlier post-home `~0.1 deg` J6 flicker. If that larger wobble returns after a fresh HM35/home-valid state, treat it as a separate selected-axis investigation rather than assuming the new UI deadband fully explains it.
+
+### 2026-04-16 - Correction: A6-EC used the wrong repo-wide count-domain assumption
+- [user] The user correctly called out that the configured internal gear ratio means a few J6 counts should correspond to a much smaller angle change than the frontend was showing, and that my display-only deadband did not address the underlying issue.
+- [self] Important correction: the user was right. My earlier "mostly cosmetic" conclusion missed a deeper factor-of-ratio scaling error.
+- [tool] Read-only proof that mattered:
+  - a fresh J6 Chapter 5 probe after the power cycle showed `6064 = U40.16 = U40.28 = 1310650` with `C10.18/C10.19 = 10/1`
+  - that means the live A6-EC reference/output-shaft frame is already in RM-scale counts on J6
+  - before the fix, the repo still forced:
+    - `GRADIENT_RT_GEAR_RATIO="1,1,1,1,1,1"` in `/etc/default/gradient-rt-motion`
+    - neutral backend `counts_per_unit = 131072 / (2*pi)` for A6-EC
+  - a direct script proved the bad decode:
+    - J6 count sample `1310650` decoded to `0.1922607421875 deg`
+  - after restoring physical ratio scaling, the exact same J6 count sample decoded to:
+    - `0.01922607421875 deg`
+    - and the post-fix live read-only J6 jitter band over `80` samples was about `0.0010986328125 deg`
+- [self] New guardrail: do not treat "drive-native ratio enabled" as proof that the host should force neutral `counts_per_radian`. Always prove the live count domain first from `6064/U40.16/U40.28` and the configured `C10.18/C10.19`.
+- [self] More concrete correction rule: if the live A6-EC reference objects are already RM-scaled, then neutralizing host gear ratio to `1` creates a factor-of-ratio error in both feedback decoding and command interpretation rather than preventing double counting.
+- [tool] Corrective implementation that worked:
+  - removed the temporary commissioning-panel deadband from `web-ui/src/ControlPanel.tsx`
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py` now renders physical robot-config gear ratios into RTCore env for A6-EC again
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` now rebuilds backend axis scaling from physical `actuator_counts_per_radian` again instead of forcing neutral A6-EC counts-per-radian
+  - updated tests to lock in the corrected A6-EC scaling and added a direct J6 regression on the `1310650` sample
+- [tool] Validation that actually ran:
+  - focused scaling regressions: `4 passed`
+  - broader controller/runtime/trajectory slice: `90 passed`
+  - frontend slice after removing the deadband: `21 passed`
+  - `ReadLints` on the touched runtime/backend/test/frontend files: clean
+  - read-only live restart:
+    - `/etc/default/gradient-rt-motion` now shows `GRADIENT_RT_GEAR_RATIO="100,100,100,18,31.25,10"`
+    - `/info/joints-detailed` J6 `reference_pre_zero_deg` is now `~0.01895`, not `~0.192`
+- [self] Remaining risk: the stack is still correctly blocked from power-up because all axes remain at `0x1650` / `not_synchronized` after the user's power cycle. I did not re-home or re-run a powered jog in this pass.
+
+### 2026-04-16 - Per-axis wrap-period invariant verified for all A6-EC joints
+- [user] The user explicitly restated the expected invariant: each axis must use its own gear ratio, so one output-shaft rotation should equal `2^17 * gear_ratio[j]` counts, not a shared/common ratio.
+- [tool] Verified this directly against the current repo/runtime state with a Python sanity script using:
+  - `Gradient05Config().get_config_dict()`
+  - `build_rtcore_axis_scaling(..., drive_profile="a6ec_ds402")`
+  - `EthercatRTCoreBackend(...)._reference_wrap_period_counts_for_axis(axis)`
+  - `/etc/default/gradient-rt-motion`
+- [tool] Result: all six axes now match the expected per-axis period exactly:
+  - J1: `131072 * 100 = 13107200`
+  - J2: `131072 * 100 = 13107200`
+  - J3: `131072 * 100 = 13107200`
+  - J4: `131072 * 18 = 2359296`
+  - J5: `131072 * 31.25 = 4096000`
+  - J6: `131072 * 10 = 1310720`
+- [tool] Added a focused regression in `tests/test_gradient05_limits_and_backends.py` so this exact per-axis invariant is now locked in by pytest, not just by a one-off shell script.
+- [self] Important guardrail to preserve: the invariant must be checked in both places, not just one:
+  - RTCore/runtime env must carry per-axis `GRADIENT_RT_GEAR_RATIO`
+  - backend `counts_per_unit` and wrap-period math must reconstruct the same per-axis count totals
+- [self] Useful nuance: non-integer mechanical ratios like J5 `31.25` still produce an exact integer wrap period because `131072 * 31.25 = 4096000`.
+
+### 2026-04-16 - Preserve the real power-up blocker instead of flattening it to generic sync noise
+- [user] The user explicitly asked why they were still blocked and wanted the issue fixed properly rather than hidden behind vague messaging.
+- [tool] Live proof after restarting the stack on the patched code:
+  - `GET /control/motion-status` now reports `power_transition_blockers=["coordinate_system_invalid"]`
+  - blocker details include `truth_unavailable_joints=[1,2,3,4,5,6]`, `statuswords=["0x1650"]`, and `requires_native_home=true`
+  - `GET /info/joints-detailed` now exposes `canonical_joint_truth_error="Canonical joint truth unavailable (... reasons=['drive_native_coordinate_system_invalid'], statuswords=['0x1650'])"`
+  - controller log now records the same reason instead of only the generic canonical-truth failure line
+- [self] Important correction: after the scaling fix, the remaining block was not a hidden motion-timeout issue. The actual live state after the power cycle is that all six drives came back with invalid drive-native coordinate-system signature (`0x1650`), so fail-closed power-up is currently correct.
+- [self] Guardrail to preserve: when feedback cannot synchronize because canonical truth is unavailable, do not collapse that to plain `not_synchronized` if the backend knows the real cause. Surface the real blocker (`coordinate_system_invalid`, affected joints, statuswords, native-home requirement) through backend snapshot, motion status, and UI.
+- [self] Operational next step remains hardware-side: a clean native-home/HM35 cycle is still required on all affected axes before power-up can legitimately succeed again. Do not bypass that in software just to remove the block.
+
+### 2026-04-16 - Native-home UI must not depend on canonical/display pose availability
+- [user] The user correctly pointed out a second blocker: even after surfacing `coordinate_system_invalid`, the commissioning panel still disabled every `Drive Home` button, so they could not run the recovery action the software was recommending.
+- [self] Important diagnosis: the `Drive Home` button was incorrectly piggybacking on `zeroDisabled`, which depends on `jointAnglesDeg` being finite. In the `0x1650` / canonical-truth-unavailable state that means all buttons grey out, even though the native-home API/backend do not require canonical pose.
+- [tool] Verified the controller/API path:
+  - `/control/home-joint-native` simply forwards `NATIVE_HOME_JOINT,<joint>`
+  - `EthercatRTCoreBackend.native_home_joint()` neutralizes motion first but does not require canonical truth to be available before issuing the native-home command
+- [tool] Fix that worked:
+  - `web-ui/src/ControlPanel.tsx` now enables `Drive Home` when per-axis drive telemetry is present, even if canonical/display joint angles are unavailable
+  - the tooltip now explains that live drive telemetry is sufficient and canonical angles may be unavailable
+  - the confirmation dialog now falls back to `current live drive feedback` instead of implying canonical pose is known
+- [tool] Validation that actually ran:
+  - `npm --prefix web-ui test -- src/ControlPanel.test.tsx`
+  - result: `20 passed`
+  - the live Vite dev server hot-reloaded `src/ControlPanel.tsx` on the running stack
+- [self] Guardrail to preserve: native-home recovery is exactly the action operators need when the drive-native coordinate system is invalid. Do not disable `Drive Home` just because canonical/display truth is unavailable; that deadlocks the recovery workflow.
+
+### 2026-04-16 - Reserve fixed-height commissioning message slots so live telemetry cannot shove the controls around
+- [user] The user explicitly asked for the live commissioning message labels to stop flickering in and out because the whole panel was jumping around and becoming hard to click.
+- [self] Important diagnosis: the jitter came from three conditionally rendered banners above the per-joint controls. As telemetry changed, those banners mounted/unmounted and changed the total panel height.
+- [tool] Fix that worked:
+  - `web-ui/src/ControlPanel.tsx` now builds a `commissioningMessages` array and renders it into a fixed three-slot message rail
+  - each slot keeps a constant `h-9` height and empty slots stay `invisible` so they still reserve layout space
+  - long messages are line-clamped inside the reserved slot instead of growing the container and moving the buttons
+- [self] Mistake caught and corrected: this file has two nearly identical `nativeHomeInProgressMessage` blocks (`ControlPanelRuntimeHeader` and `ControlPanel`). I initially inserted the new memo into the wrong component, and the vitest failure (`commissioningStatus is not defined`) caught it immediately. When editing this area, anchor patches to `export function ControlPanel(` so the commissioning-only state does not leak into the runtime header.
+- [tool] Validation that actually ran:
+  - `npm --prefix web-ui test -- src/ControlPanel.test.tsx`
+  - result: `21 passed`
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx` and `web-ui/src/ControlPanel.test.tsx`
+  - result: no diagnostics
+- [self] Guardrail to preserve: any live status rail above clickable controls needs reserved layout space; otherwise high-frequency telemetry becomes click-target jitter even when the underlying controls are correct.
+
+### 2026-04-16 - Do not collapse J5/J1 native-home errors into one diagnosis
+- [user] The user asked why `J5` and `J1` showed native-home errors even though they appeared to work after a fault reset.
+- [tool] Verified from the current run logs and live state:
+  - `J5` logged `native drive-home failed verification ... abort=0x06010002`
+  - `J1` logged `native drive-home reached a verified terminal state, but post-home anchor refresh failed ... (drive_native_fault_present)`
+  - a global `RESET_FAULTS` was issued immediately after the `J1` warning, and canonical truth became available again right after
+  - live `/info/joints-detailed` now shows all six joints clean at `0x9650`, with motion status safe for power transition
+- [tool] Crucial split confirmed by current raw vs live telemetry:
+  - raw `/run/gradient-rt-motion/metrics.json` still shows `J5 native_home_state=3` and `native_home_last_abort_code=0x06010002` even though the same axis also reports clean `statusword=0x9650`, `error_code=0`
+  - live `/info/joints-detailed` therefore marks `J5` as succeeded via `native_home_verification_source=statusword_bits12_15_clear13`
+  - raw metrics for `J1` are already clean (`native_home_state=2`, abort `0`), so `J1` was not the stale-`0x06010002` bug
+- [self] Important diagnosis:
+  - `J5` is the existing false-failure family: the command-result/raw-metrics path still reports failure from stale native-home state/abort fields even though the drive wire-state is already homed and fault-free
+  - `J1` is a different class: the home itself verified, but the immediate post-home anchor/truth refresh saw a transient `drive_native_fault_present` condition in live feedback; the subsequent fault reset cleared that transient state
+- [self] Guardrail to preserve: when operators report "it errored but looked fine after reset," always compare three layers before deciding on a fix:
+  - controller warning text
+  - raw `/run/gradient-rt-motion/metrics.json`
+  - live `/info/joints-detailed` effective status and verification source
+- [self] Remaining risk: the current controller warning for the `J1` class does not include the underlying transient `statusword`/`error_code`, only the derived reason. If exact drive-fault identity matters, capture the full API response payload or add richer controller-side logging before reproducing again.
+
+### 2026-04-16 - Native-home false-signal fix needs three coordinated changes, not one
+- [user] The user explicitly pushed back that repeated native-home false signals were still not fixed and needed to stop recurring.
+- [self] Important diagnosis:
+  - `J5`-class failures were being latched too early in `_wait_for_native_home_result()`: once the active mask cleared, a single failed snapshot could immediately return a hard failure before the clean `0x9650` success snapshot arrived a fraction later
+  - `J1`-class failures were being judged too early in `native_home_joint()`: the code validated post-home truth immediately and only then waited for the settle window, so a transient `drive_native_fault_present` bit could fail the command before the settle tolerance had any chance to absorb it
+  - even after backend reconciliation, the frontend row text still printed `Drive Home verification conflicted` whenever stale reported abort fields survived in telemetry, which reintroduced a false operator signal on a clean live axis
+- [tool] Fix that worked:
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`
+    - added a two-snapshot stabilization rule before surfacing a failed native-home result after the active mask clears
+    - added a targeted retry path for retryable post-home truth reasons such as `drive_native_fault_present`, using the existing post-home settle window before declaring anchor-refresh failure
+  - `web-ui/src/ControlPanel.tsx`
+    - when the effective live native-home state is `succeeded`, the row now shows `Drive Home succeeded` instead of escalating stale reported abort metadata into `verification conflicted`
+- [tool] Validation that actually ran:
+  - `pytest tests/test_gradient05_limits_and_backends.py -k "native_home or wait_for_native_home_result"`
+  - result: `22 passed`
+  - `npm --prefix web-ui test -- src/ControlPanel.test.tsx`
+  - result: `21 passed`
+  - `ReadLints` on touched backend/test/frontend files
+  - result: no diagnostics
+- [self] Guardrail to preserve: keep the raw reported failure metadata available for debugging, but do not let it outrank a clean, current live drive state in operator-facing commissioning status.
+- [self] Operational note: Python/backend code changes are not live in the already-running controller process until the stack is restarted.
+
+### 2026-04-16 - J5 seam-crossing jog timeout persisted after the targeted-axis fix
+- [user] The user asked why the current jogging attempt hit `TimeoutError: Timed out waiting for RTCore trajectory 4 to complete`.
+- [tool] Verified from `logs/startups/20260416-012149/controller.log` that the failing request already carried `target_joint_indices=[4]`, so the older "all held axes must satisfy completion" bug is not the direct cause of this specific timeout.
+- [tool] The timeout snapshot was `saw_target=True state=executing active_traj_id=4 queue_depth=0 motion_done=False active_command_seq=133 submitted_command_seq=133`; that means RTCore accepted the selected-axis trajectory and reached the final queued point, but did not declare it complete within the backend wait window.
+- [tool] The same controller log shows no automatic recovery before the operator sent `SAFE_POWER_DOWN,wait`; `WAIT_FOR_IDLE` only finished as `completed` after that explicit stop/power-down path.
+- [tool] Current raw `/run/gradient-rt-motion/metrics.json` after the run shows J5 `rotation_mode_position_reference=4085206` on the `31.25` ratio axis, whose physical wrap period is `131072 * 31.25 = 4096000` counts. That post-run position is still near the negative side of the seam, not the requested `+0.95 deg` side.
+- [self] Strongest code-level suspicion to preserve: RTCore completion in `src/gradient_rt_motion/main.cpp` still reduces wrapped final error with `shortest_periodic_error_counts(..., opt.axis[i].counts_per_rev)`, while the Python/backend A6-EC logic already treats the real wrapped reference period as `counts_per_unit * 2*pi`. For seam-crossing J5 jogs, that mismatch can keep `motion_done` false even after `queue_depth` reaches `0`.
+- [self] Guardrail: when a targeted A6-EC jog times out with `queue_depth=0` and `motion_done=false`, first compare the requested seam-crossing target against the post-run raw reference counts before blaming the API ACK path; the failure is deeper in RTCore command/completion interpretation.
+
+### 2026-04-16 - RTCore wrapped completion must use the geared rotary period, not raw encoder CPR
+- [tool] Fix that worked:
+  - `src/gradient_rt_motion/main.cpp`
+    - changed the trajectory-completion wrap comparison to derive a wrapped rotary period from `counts_per_unit * 2*pi`, with `counts_per_rev` fallback when the derived period is unavailable
+    - kept the rest of the completion gate unchanged (`motion_done`, `EXEC_STATE_COMPLETED`, tolerance, and fault handling)
+  - `tests/test_gradient05_limits_and_backends.py`
+    - locked the J5 A6-EC wrap period at `4096000` counts
+    - added a focused `execute_joint_trajectory(..., axis_mask=0x10)` regression for J5
+    - added a wait-for-completion regression that preserves the observed `queue_depth=0` / `motion_done=false` executing snapshot until a real completed status arrives
+- [tool] Validation that actually ran:
+  - `make -C src/gradient_rt_motion`
+  - `source /home/pi/GradientOS/.venv/bin/activate && PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_a6ec_reference_wrap_period_uses_per_axis_gear_ratios tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing_for_j5_axis_mask tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_wait_for_trajectory_complete_ignores_stale_previous_completion tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_wait_for_short_trajectory_completion_without_observed_active_id tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_wait_for_trajectory_complete_waits_past_queue_empty_executing_snapshot -q`
+  - result: `6 passed`
+  - `ReadLints` on `src/gradient_rt_motion/main.cpp` and `tests/test_gradient05_limits_and_backends.py`
+  - result: no diagnostics
+- [self] Guardrail: this repo currently has no dedicated C++ unit harness for `gradient_rt_motion`, so RTCore-only math changes need both a successful binary build and nearby Python contract tests; do not pretend the Python tests alone prove the C++ behavior end-to-end.
+- [tool] Live repro that mattered:
+  - restarted the stack onto the patched RTCore binary (`logs/startups/20260416-030940`)
+  - preflight API state was healthy and disarmed: `/control/motion-status` reported `safe_for_power_transition=true` and `/info/joints-detailed` showed J5 `arm_display_deg ~= +0.9484`
+  - issued `POST /control/power-up`
+  - issued `POST /control/joint-jog {"joint":5,"delta_deg":-1.0}` so J5 crossed the seam from about `+0.9316 deg` display to about `-0.0683 deg`
+  - controller log showed `RTCore trajectory execution finished: state=completed traj_id=1 elapsed=0.349s`
+  - post-jog `/control/motion-status` reported `state=completed`, `queue_depth=0`, `motion_done=true`, `last_event_code=291`
+  - issued `POST /control/power-down` and the response returned RTCore `idle` with `safe_for_power_transition=true`
+- [self] Updated conclusion: the patched RTCore seam-crossing completion path is now proven live for the targeted J5 jog case that previously timed out.
+
+### 2026-04-16 - A6-EC restart trust gating is stricter than the vendor restart note, but the latest lockout also had bit15 low
+- [user] The user challenged whether post-power-cycle lockout was our own over-strict `0x9650` expectation, citing vendor guidance that restart recovery should trust `6064` and only require `6041 bit 15 = 1`.
+- [tool] Verified the current code path:
+  - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py` still sets `startup_truth_requires_hm_success_signature = True`
+  - `src/gradient_os/telemetry/native_home_status.py::statusword_indicates_valid_native_home_reference()` currently treats the live coordinate system as valid only when bits 12 and 15 are set and bit 13 is clear
+  - `derive_drive_native_truth_validity()` also rejects any live `error_code` / `manufacturer_error_code` fault state
+- [self] Important nuance: the code is **not** hard-coded to exact `0x9650`; it accepts any clean statusword carrying that HM-success signature. Earlier powered-on good states such as `0x9637` are consistent with the current gate.
+- [tool] But the latest post-power-cycle lockout was not only a software-policy artifact: the live probe/API state showed all axes at `0x1650`, which means `bit 15 = 0`. So even a relaxed "bit15-only" restart rule would still have blocked that specific state.
+- [self] Working conclusion to preserve:
+  - there may still be a legitimate follow-up to split "fresh HM completion verification" from "restart persistence verification" so startup can align better with the manufacturer note
+  - however, the immediate field problem after that power cycle was that the drives themselves were not advertising a valid retained coordinate system
+- [tool] Verified the new J5 fault meaning from `docs/resources/a6ec_manual_codes.md`: `Er87.1` is "One-time excessive position reference increment" (target-position increment > 5x maximum speed).
+- [tool] Latest controller evidence in `logs/startups/20260416-034141/controller.log` shows `NATIVE_HOME_JOINT,5` reached a verified terminal state and **then** faulted during the post-home settle window.
+- [self] Strongest current hypothesis: that `Er87.1` is a transient post-home reference jump on J5 during settle / restore-to-CSP / target re-alignment, not the original seam-completion timeout and not purely the startup persistence gate. Capture live manufacturer fault/statusword payload at the moment of failure before changing logic again.
+
+### 2026-04-16 - Separate startup coordinate trust from HM-success verification for A6-EC
+- [user] The user explicitly asked to do the startup-truth change first after agreeing that the current gate looked stricter than the vendor restart guidance.
+- [self] What worked:
+  - keep `derive_effective_native_home_status()` strict on the vendor HM-success signature so fresh home verification still requires bits 12 and 15 with bit 13 clear
+  - make `derive_drive_native_truth_validity()` accept a profile-controlled `require_hm_success_signature` flag so startup/restart trust can be looser without rewriting home-result semantics
+  - thread that flag through both `EthercatRTCoreBackend` truth calculation and `telemetry/drive_faults.py`, otherwise `/info/joints-detailed` and `start-stack.sh probe` will disagree
+- [tool] A6-EC-specific choice implemented in `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`: `startup_truth_requires_hm_success_signature = False`, meaning startup truth now trusts clean `6041 bit 15 = 1` for retained coordinate validity.
+- [self] Important invariant preserved: `drive_native_truth_signature_valid` still means strict HM-success signature; after restart it can be `False` while `coordinate_system_valid` is `True` under the relaxed A6-EC rule.
+- [tool] Focused validation that actually ran:
+  - `python -m py_compile src/gradient_os/telemetry/native_home_status.py src/gradient_os/telemetry/drive_faults.py src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`
+  - `PYTHONPATH=src python -m pytest tests/test_drive_faults.py::test_statusword_indicates_valid_native_home_reference_requires_vendor_success_bits tests/test_gradient05_limits_and_backends.py::test_native_home_metrics_result_requires_bit12_alongside_bit15_for_fallback tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_power_transition_snapshot_reports_coordinate_system_invalid tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_power_transition_snapshot_accepts_bit15_restart_truth tests/test_rtcore_runtime.py::test_drive_fault_snapshot_marks_drive_native_truth_valid_when_startup_and_status_are_valid tests/test_rtcore_runtime.py::test_drive_fault_snapshot_accepts_a6ec_bit15_only_restart_truth -q`
+  - result: `6 passed`
+- [self] Guardrail: a future repro still showing `0x1650` after power cycle is a real drive-side invalid-coordinate state and should not be blamed on this relaxed software gate; only `0x8x50`-class retained states are intended to benefit.
+
+### 2026-04-16 - New J3 Er47.0 jog fault matches the old wrap-frame bug family, not a zero-offset file issue
+- [user] The user reported that J3 made an erratic move in the opposite direction during jogging and then faulted with `Er47.0`, while asking why many current positions show up near `-359 deg`.
+- [tool] Current live evidence:
+  - `/control/motion-status` now blocks power-up with `fault_present` and `canonical_truth_unavailable` on axis 2 / joint 3
+  - `/info/joints-detailed` shows J3 `statusword=0xB638`, `error_code=34321 (0x8611 / Er47.0)`, and truth unavailable because of the live fault
+  - the same payload shows other joints' operator display values near zero while the raw command frame differs by whole turns (for example J2 display `~-4.935 deg` while earlier bounded-move logs printed `355.063 deg`)
+- [tool] The zero-offset store at `.gradient_joint_zero_offsets.json` is still all zeros, so the `-359` readouts are not caused by stale software zero offsets.
+- [self] Important code path to remember:
+  - `/control/joint-jog` baselines the next jog target from `arm_deg` in `src/gradient_os/api/main.py`, not from `arm_display_deg`
+  - the bounded-move log in `src/gradient_os/arm_controller/command_api.py` prints `servo_driver.get_current_arm_state_rad()`, which comes from backend `get_joint_positions()` and therefore the raw RTCore command/reference frame rather than the operator display frame
+  - that makes values like `-359.999`, `355.063`, and `-0.980` seam-equivalent internal representations, not evidence that the physical zero shifted by 359 degrees
+- [tool] In the failing sequence, the first J3 seam-adjacent jog completed, then the second J3 jog targeted `-1.98 deg` but the post-fault live reference on axis 2 landed around `+12.3 deg`, meaning the axis finished on the wrong side of the target by roughly `14 deg` before the drive raised following fault `Er47.0`.
+- [self] Strongest current diagnosis: this is another seam / wrap-turn command-mapping bug in the persistent J3/J4 commissioning family. The raw jog baseline and/or raw-write turn selection is still unstable across successive seam-adjacent jogs, so a nominal `1 deg` jog can become a wrong-turn reference jump. The drive then reports `Er47.0` because `6062` and `6064` diverge beyond the following-error window.
+- [self] Guardrail: when operators report `-359 deg` during commissioning, first separate `arm_deg` / raw command frame from `arm_display_deg` / operator frame; do not treat the raw seam-equivalent numbers as proof that software zero drifted.
+
+### 2026-04-16 - Public/controller joint truth now stays continuous while raw turn selection remains internal
+- [user] The user explicitly rejected seam-wrapped public truth and reiterated that the A6-EC stack must behave like a continuous multi-turn system rather than exposing `-359` adjacent to `0`.
+- [self] Root cause confirmed in code: `EthercatRTCoreBackend.raw_to_joint_positions()` still defaulted to `reference_mode="raw"`, so controller truth, jog baselines, and bounded-move logs were consuming the wrapped RTCore/reference frame even though the backend already had a continuous display/unwrapped path.
+- [tool] Implemented the narrow backend fix in `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+  - `raw_to_joint_positions()` now returns the continuous `reference_mode="display"` truth
+  - `_canonical_joint_positions_from_raw_feedback()` still computes a second raw-frame roundtrip against the live wrapped reference and stores `raw_reference_wrap_lift_counts`, so `_axis_q_from_joint_positions()` can keep commanding the correct equivalent turn in `6064/607A`
+  - unavailable truth or raw/display roundtrip mismatch now clears the cached raw wrap-lift state instead of leaving stale turn memory behind
+- [tool] Focused validation that ran:
+  - `python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_gradient05_limits_and_backends.py`
+  - `PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_uses_drive_native_truth_when_startup_and_status_are_valid tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_drive_native_truth_unwraps_public_joint_positions_but_preserves_raw_write_frame tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_translates_canonical_truth_back_into_raw_wire_counts tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_startup_bootstrap_uses_display_reference_mode -q`
+  - result: `4 passed`
+- [self] Important scope note: this removes wrapped seam-equivalent values from public/controller joint truth and jog baselining, but it does not yet change the deeper semantic source decision between drive-native reference truth and direct anchored `U40.20/.22` absolute truth.
+
+### 2026-04-16 - J6 manual-rotation probe now records controller, frontend, and RTCore views together
+- [user] The user asked to redo the J6 experiment and determine whether the encoder counts actually wrap, while recording raw encoder objects plus whatever the controller and frontend see during the experiment.
+- [self] The existing `scripts/a6ec_chapter5_probe.py` already captured EtherCAT SDO objects and `/info/joints-detailed`, but it was missing the raw controller `GET_JOINT_STATE` reply, raw `GET_MOTION_STATUS`, the frontend-facing `/info/joints` and `/control/motion-status` payloads, a live `/monitor` event, and the current RTCore metrics snapshot in the same artifact.
+- [tool] Implemented the probe expansion in `scripts/a6ec_chapter5_probe.py`:
+  - added direct UDP controller capture for `GET_JOINT_STATE` and `GET_MOTION_STATUS`
+  - added API capture for `/info/joints`, `/info/joints-detailed`, `/control/motion-status`, and a one-event `/monitor` sample
+  - added RTCore metrics capture from `/run/gradient-rt-motion/metrics.json`
+  - threaded those captures into both `snapshot` and `watch` artifacts so a single experiment records raw SDO reads, controller truth, frontend payloads, and RTCore state together
+  - added optional CLI flags for controller host/port and monitor timeout
+- [tool] Added focused regressions in `tests/test_a6ec_chapter5_probe.py` covering:
+  - motion-status base64 decoding
+  - SSE monitor-event parsing
+  - merged watch samples including controller/frontend/monitor/metrics views
+  - snapshot assembly including the new captured views
+- [tool] Validation that ran:
+  - `python -m py_compile scripts/a6ec_chapter5_probe.py tests/test_a6ec_chapter5_probe.py`
+  - `PYTHONPATH=src python -m pytest tests/test_a6ec_chapter5_probe.py -q`
+  - `python scripts/a6ec_chapter5_probe.py --help`
+  - `python scripts/a6ec_chapter5_probe.py snapshot --help`
+  - `python scripts/a6ec_chapter5_probe.py watch --help`
+  - `ReadLints` on the touched probe/test files
+  - result: `9 passed`, CLI help succeeded, no diagnostics
+- [self] Guardrail for the live experiment: when the drives are powered down, some controller/API/monitor reads may legitimately fail or time out. The new capture format preserves those failures as explicit `ok/error` fields instead of dropping them silently, which is important for interpreting the powered-down part of the J6 experiment.
+
+### 2026-04-16 - Live J6 rotation experiment proves the absolute source is multi-turn continuous while raw reference still carries a wrapped turn lift
+- [user] The user physically rotated J6 `> +360 deg`, back to zero, then `> -360 deg` and asked us to capture everything while the controller and stack were up.
+- [tool] Live capture artifact set:
+  - watch stream: `logs/encoder-retention/j6-manual-rotate-20260416-053435/j6-manual-rotate-live.watch.jsonl`
+  - stable end snapshot: `logs/encoder-retention/j6-manual-rotate-20260416-053435/j6-manual-rotate-final.json`
+- [tool] Key observations from the live run:
+  - near the initial zero, J6 sat around `6064 ~= 3`, `U40.16 ~= 3`, `encoder_multi_turn_counts ~= 113075`, and controller/frontend truth near `0 deg`
+  - after the positive `>360` sweep and return near zero, `encoder_multi_turn_counts` returned near the same neighborhood (`~113040`) and controller/frontend truth stayed near zero, but the reference family sat around `6064 ~= 1310690`, `U40.16 ~= -30`, and `rotation_mode_encoder_counts ~= 1310690`
+  - during the later long sweep, `encoder_multi_turn_counts` traversed through large multi-turn values such as `-1216460`, `-1839631`, and `2190820`, while controller/frontend truth also moved continuously to about `-570.9 deg` before coming back near zero
+- [self] Strong conclusion: the direct A6-EC multi-turn source (`U40.20/.22`, normalized as `encoder_multi_turn_counts`) is **not** behaving like a single-turn wrapped signal. The wrap/seam behavior we are still fighting lives in the drive reference / raw command family, not in the existence of a multi-turn counter itself.
+- [tool] Final stable J6 endpoint in `j6-manual-rotate-final.json`:
+  - controller truth: `arm_deg = 2.0687255859375`, `axis_counts = 1303188`
+  - selected axis detail: `raw_counts = 1303188`, `reference_pre_zero_rad = 0.03610607279485828`, `raw_reference_pre_zero_rad = -6.247079234384728`
+  - wrap bookkeeping: `raw_command_roundtrip_reference_wrap_lift_counts = 1310720` and `raw_command_roundtrip_reference_wrap_lift_turns = 1.0`
+  - absolute source: `absolute_counts = 105539`, `absolute_source = encoder_multi_turn_counts`
+- [self] Important interpretation: the backend is still reconciling a seam-equivalent raw reference (`-6.247 rad`, about `-357.93 deg`) with a near-zero lifted public/controller pose (`+2.07 deg`) by applying an explicit one-turn lift. That proves the internal raw reference contract is still wrapped even though the drive exposes a continuous absolute-family count path.
+- [tool] Secondary finding from the same final snapshot:
+  - `U40.28 = 1303190`
+  - `rotation_mode_encoder_counts = 1303190`
+  - the older probe bridge assumption `U40.2A/.2C ~= U40.28 * C10_ratio` is false in this current posture because both values already matched directly while `C10.18/C10.19 = 10.0`
+
+### 2026-04-16 - Freeze and trim watch datasets before charting them
+- [user] When asked to chart the "whole dataset", the user wanted the active J6 probe stopped and the long stale/flat tail removed once the joint was no longer moving.
+- [tool] Important guardrail: check for still-running `a6ec_chapter5_probe.py watch` processes before treating a JSONL capture as final. This J6 file was still appending while the first chart pass was being built.
+- [tool] For `logs/encoder-retention/j6-manual-rotate-20260416-053435/j6-manual-rotate-live.watch.jsonl`, freezing the active `053435` writer and then trimming the contiguous flat tail reduced the plotted dataset from `1189` samples to `144`.
+- [self] A practical stale-tail cutoff for this capture was: trailing `combined_u4020_22_signed_counts` range `<= 8`, trailing `api_absolute_counts` range `<= 8`, and trailing `api_arm_deg` range `<= 0.02 deg`. That cleanly removed the ~27 minute stationary plateau without clipping the actual motion segment.
+- [tool] The resulting chart artifact lives at `/home/pi/.cursor/projects/home-pi-GradientOS/canvases/j6-manual-rotate-dataset.canvas.tsx` and uses a dual-axis view: counts-like series on the left, all other numeric series on the right, with presets/toggles for readability.
+
+### 2026-04-16 - Existing canvas files usually open from a clickable chat path; no sidecar often means not rendered yet
+- [user] The user asked how to open a manually created canvas file rather than how to edit its contents.
+- [tool] Verified `/home/pi/.cursor/projects/home-pi-GradientOS/canvases/j6-manual-rotate-dataset.canvas.tsx` exists, and no matching `j6-manual-rotate-dataset.canvas.status.json` sidecar exists yet.
+- [self] Guardrail: for Cursor canvases already saved in the managed `canvases/` directory, first instruct the user to click the exact `.canvas.tsx` path in chat or open that file via quick-open. If no rendered canvas appears and no sidecar exists, treat it as "not built/opened yet" before assuming the file path is wrong.
+
+### 2026-04-16 - Do not add spaces inside backticked file paths
+- [self] I gave the user a canvas path with leading/trailing spaces inside the backticks. That likely made Cursor try to open a non-existent filename and produced "failed to open file."
+- [self] Guardrail: when sending clickable file paths, never include padding spaces inside the code span. Use exact literals like ``/home/pi/.cursor/projects/home-pi-GradientOS/canvases/j6-manual-rotate-dataset.canvas.tsx``.
+
+### 2026-04-16 - For SSH/browser delivery, prefer repo-served pages over Cursor-managed canvases
+- [user] The user confirmed they were SSH'd into the machine where the canvas file lived, so Cursor's managed canvas opener was the wrong delivery surface.
+- [self] What worked: rebuild the artifact as a normal web-ui page with a stable browser URL instead of trying to make the hidden `.cursor/projects/.../canvases` path user-openable over SSH.
+- [self] Durable rule: for analysis artifacts the user needs to open in a remote browser session, prefer a Vite-served page or repo HTML entry like `web-ui/j6-manual-rotate-dataset.html` plus a typed React entrypoint, not a Cursor-only canvas path.
+
+### 2026-04-16 - A6-EC planner truth should use anchored `encoder_multi_turn_counts`, not live 6064 continuity
+- [user] The user explicitly asked to patch the A6-EC truth path so planner/control continuity is rooted in `encoder_multi_turn_counts`, while any wrapped raw-reference handling stays write-path only.
+- [tool] The live J6 final snapshot confirmed why a bare swap is unsafe: on J6 the same sample showed `reference_pre_zero_rad ~= +0.0361` but `absolute_axis_q_rad ~= -0.5059`, so the continuous absolute counts still need the persisted absolute-home anchor to land in the zeroed logical joint frame.
+- [self] Durable rule: for A6-EC read truth, use `encoder_multi_turn_counts + absolute_home_anchor_rad - master_offset` as canonical planner/controller truth. Do **not** use the 6064-family as the continuity witness.
+- [self] Keep the separation sharp:
+  - `raw_to_joint_positions()` is planner/controller truth and should validate against the raw/write-frame roundtrip, not the stricter display unwrap path.
+  - `get_display_feedback_snapshot()` / `raw_to_display_joint_positions()` remain the stricter operator-display path and may fail closed when display/reference continuity is suspect.
+  - raw 6064-family lift bookkeeping still belongs only to command upload / write-frame reconciliation.
+- [self] Important implementation consequence: if A6-EC canonical truth is rooted in absolute counts, then `absolute_home_anchor_required` must stay true and missing anchors should fail closed (`drive_native_absolute_home_anchor_missing`) rather than silently falling back to 6064 continuity.
+- [self] Answer to the user's RTCore question: the current RTCore/drive write contract still uploads CSP targets in the 607A/6064 reference family. `encoder_multi_turn_counts` is the best read-truth witness here, but commanding directly in that object family would require a deliberate write-path/drive-contract redesign, not just a backend truth-path patch.

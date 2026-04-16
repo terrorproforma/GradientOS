@@ -36,6 +36,7 @@ import {
   X,
 } from "lucide-react";
 import { resolveDefaultApiHost, resolveDefaultVisionHost } from "./useEndpoint";
+import { preferredDisplayPoseJoints } from "./poseTelemetry";
 import {
   type ArmVisualizerHandle,
   type StepLoadStatus,
@@ -231,16 +232,6 @@ type TelemetryEvent = {
   comms?: Record<string, unknown>;
   motion_status?: MotionStatusResponse | null;
 };
-
-function preferredDisplayPoseJoints(latest: TelemetryEvent | null | undefined): number[] | null {
-  if (Array.isArray(latest?.joints) && latest.joints.length > 0) {
-    return latest.joints;
-  }
-  if (Array.isArray(latest?.display_joints) && latest.display_joints.length > 0) {
-    return latest.display_joints;
-  }
-  return null;
-}
 
 type MotionExecutionPayload = {
   controller_motion_state?: string;
@@ -6534,12 +6525,14 @@ export default function App() {
       // Drop out-of-order telemetry packets to prevent visual snap-backs.
       return;
     }
-    if (Array.isArray(joints) && joints.length > 0 && lastAcceptedJointsRef.current) {
+    const poseJoints =
+      Array.isArray(displayJoints) && displayJoints.length > 0 ? displayJoints : joints;
+    if (Array.isArray(poseJoints) && poseJoints.length > 0 && lastAcceptedJointsRef.current) {
       const previous = lastAcceptedJointsRef.current;
-      if (previous.length === joints.length) {
+      if (previous.length === poseJoints.length) {
         let maxJump = 0;
-        for (let i = 0; i < joints.length; i += 1) {
-          const jump = Math.abs(joints[i] - previous[i]);
+        for (let i = 0; i < poseJoints.length; i += 1) {
+          const jump = Math.abs(poseJoints[i] - previous[i]);
           if (jump > maxJump) {
             maxJump = jump;
           }
@@ -6555,8 +6548,8 @@ export default function App() {
     }
 
     lastTelemetrySourceTimeRef.current = candidateTimeSec;
-    if (Array.isArray(joints) && joints.length > 0) {
-      lastAcceptedJointsRef.current = joints.slice();
+    if (Array.isArray(poseJoints) && poseJoints.length > 0) {
+      lastAcceptedJointsRef.current = poseJoints.slice();
     }
 
     setLatest((prev) => ({
@@ -6621,6 +6614,7 @@ export default function App() {
               timestamp: Date.now(),
               raw: "fallback:joint-feedback-unavailable",
               joints: [],
+              display_joints: [],
             };
           }
           return {
@@ -6628,6 +6622,7 @@ export default function App() {
             timestamp: Date.now(),
             raw: prev.raw ?? "fallback:joint-feedback-unavailable",
             joints: [],
+            display_joints: [],
           };
         });
         return;
@@ -6656,7 +6651,7 @@ export default function App() {
       lastAcceptedJointsRef.current = nextJoints.slice();
       setLatest((prev) => {
         if (
-          areJointArraysClose(prev?.joints, nextJoints) &&
+          areJointArraysClose(prev?.display_joints, nextJoints) &&
           (nextGripper === undefined || Math.abs((prev?.gripper ?? 0) - nextGripper) <= 1e-5)
         ) {
           return prev;
@@ -6664,7 +6659,8 @@ export default function App() {
         return {
           timestamp: Date.now(),
           raw: prev?.raw ?? "fallback:/info/joints",
-          joints: nextJoints,
+          joints: Array.isArray(prev?.joints) ? prev.joints : undefined,
+          display_joints: nextJoints,
           gripper: nextGripper ?? prev?.gripper,
           servos: prev?.servos,
           alerts: prev?.alerts,

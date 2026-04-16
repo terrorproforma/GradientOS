@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 from pathlib import Path
 
@@ -60,6 +61,28 @@ def test_statusword_bits_report_vendor_hm_success_signature():
     assert incomplete_bits["vendor_hm_success_signature"] is False
 
 
+def test_parse_motion_status_response_decodes_base64_payload():
+    token = base64.urlsafe_b64encode(b'{"state":"idle","queue_depth":0}').decode("ascii")
+
+    payload = probe._parse_motion_status_response(f"MOTION_STATUS,{token}")
+
+    assert payload == {"state": "idle", "queue_depth": 0}
+
+
+def test_parse_monitor_event_lines_extracts_json_payload():
+    parsed = probe._parse_monitor_event_lines(
+        [
+            "event: telemetry",
+            'data: {"display_joints":[0.1],"joints":[0.2]}',
+            "",
+        ]
+    )
+
+    assert parsed["event"] == "telemetry"
+    assert parsed["data"] == '{"display_joints":[0.1],"joints":[0.2]}'
+    assert parsed["json"] == {"display_joints": [0.1], "joints": [0.2]}
+
+
 def test_build_watch_axis_sample_merges_sdo_and_api_views():
     axis_snapshot = {
         "axis_index": 5,
@@ -112,8 +135,56 @@ def test_build_watch_axis_sample_merges_sdo_and_api_views():
             },
         ],
     }
+    controller_joint_state = {
+        "read_source": "live_feedback",
+        "canonical_joint_truth_available": True,
+        "arm_deg": [0, 0, 0, 0, 0, 0.0047],
+        "arm_display_deg": [0, 0, 0, 0, 0, 0.0047],
+        "arm_rad": [0, 0, 0, 0, 0, 0.00008],
+        "arm_display_rad": [0, 0, 0, 0, 0, 0.00008],
+        "axis_counts": [0, 0, 0, 0, 0, 131059],
+    }
+    frontend_payload = {
+        "read_source": "live_feedback",
+        "canonical_joint_truth_available": True,
+        "arm_deg": [0, 0, 0, 0, 0, 0.0047],
+        "arm_display_deg": [0, 0, 0, 0, 0, 0.0047],
+        "arm_rad": [0, 0, 0, 0, 0, 0.00008],
+        "arm_display_rad": [0, 0, 0, 0, 0, 0.00008],
+        "axis_counts": [0, 0, 0, 0, 0, 131059],
+    }
+    monitor_payload = {
+        "joint_feedback_available": True,
+        "motion_status": {"state": "idle"},
+        "joints": [0, 0, 0, 0, 0, 0.00008],
+        "display_joints": [0, 0, 0, 0, 0, 0.00008],
+    }
+    metrics_payload = {
+        "axes": [
+            {},
+            {},
+            {},
+            {},
+            {},
+            {
+                "statusword": 0x9650,
+                "error_code": 0,
+                "manufacturer_error_code": 0,
+                "native_home_position_offset": 0,
+                "absolute_feedback": {"encoder_multi_turn_low": {"valid": 1, "value": 56113}},
+            },
+        ]
+    }
 
-    sample = probe._build_watch_axis_sample("J6", axis_snapshot, api_payload)
+    sample = probe._build_watch_axis_sample(
+        "J6",
+        axis_snapshot,
+        api_payload,
+        controller_joint_state=controller_joint_state,
+        frontend_payload=frontend_payload,
+        monitor_payload=monitor_payload,
+        metrics_payload=metrics_payload,
+    )
 
     assert sample["statusword_hex"] == "0x9650"
     assert sample["vendor_hm_success_signature"] is True
@@ -125,6 +196,13 @@ def test_build_watch_axis_sample_merges_sdo_and_api_views():
     assert sample["api_arm_deg"] == 0.0047
     assert sample["api_display_source"] == "absolute_encoder_anchor"
     assert sample["api_truth_available"] is True
+    assert sample["controller_arm_deg"] == 0.0047
+    assert sample["controller_axis_counts"] == 131059
+    assert sample["frontend_arm_display_deg"] == 0.0047
+    assert sample["monitor_display_joints_rad"] == 0.00008
+    assert sample["monitor_motion_state"] == "idle"
+    assert sample["metrics_statusword"] == 0x9650
+    assert sample["metrics_absolute_feedback"] == {"encoder_multi_turn_low": {"valid": 1, "value": 56113}}
 
 
 def test_format_watch_line_includes_core_live_fields():
@@ -191,3 +269,90 @@ def test_render_markdown_includes_delta_categories():
     assert "category=`standard`" in markdown
     assert "category=`large`" in markdown
     assert "category=`extreme`" in markdown
+
+
+def test_capture_snapshot_records_controller_api_and_metrics_views(monkeypatch):
+    monkeypatch.setattr(
+        probe,
+        "_collect_axis_snapshot",
+        lambda axis_name, axis_index: {
+            "axis_name": axis_name,
+            "axis_index": axis_index,
+            "reads": {},
+            "derived": {},
+        },
+    )
+    monkeypatch.setattr(
+        probe,
+        "_capture_controller_views",
+        lambda **_kwargs: {
+            "endpoint": {"host": "127.0.0.1", "port": 3000},
+            "joint_state": {
+                "ok": True,
+                "json": {
+                    "read_source": "live_feedback",
+                    "canonical_joint_truth_available": True,
+                    "arm_deg": [0, 0, 0, 0, 0, 6.0],
+                    "arm_display_deg": [0, 0, 0, 0, 0, 6.5],
+                    "arm_rad": [0, 0, 0, 0, 0, 0.1],
+                    "arm_display_rad": [0, 0, 0, 0, 0, 0.11],
+                    "axis_counts": [0, 0, 0, 0, 0, 12345],
+                },
+            },
+            "motion_status": {"ok": True, "json": {"state": "idle"}},
+        },
+    )
+    monkeypatch.setattr(
+        probe,
+        "_capture_api_views",
+        lambda **_kwargs: {
+            "joints": {
+                "ok": True,
+                "json": {
+                    "read_source": "live_feedback",
+                    "canonical_joint_truth_available": True,
+                    "arm_deg": [0, 0, 0, 0, 0, 6.0],
+                    "arm_display_deg": [0, 0, 0, 0, 0, 6.5],
+                    "arm_rad": [0, 0, 0, 0, 0, 0.1],
+                    "arm_display_rad": [0, 0, 0, 0, 0, 0.11],
+                },
+            },
+            "joints_detailed": {
+                "ok": True,
+                "json": {
+                    "canonical_joint_truth_available": True,
+                    "canonical_joint_truth_unavailable_joints": [],
+                    "axis_absolute_feedback": [{}, {}, {}, {}, {}, {"truth_available": True}],
+                },
+            },
+            "motion_status": {"ok": True, "json": {"state": "idle"}},
+            "monitor_event": {
+                "ok": True,
+                "json": {
+                    "joint_feedback_available": True,
+                    "display_joints": [0, 0, 0, 0, 0, 0.11],
+                    "joints": [0, 0, 0, 0, 0, 0.1],
+                    "motion_status": {"state": "idle"},
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(
+        probe,
+        "_load_rtcore_metrics_capture",
+        lambda: {"ok": True, "json": {"axes": [{}, {}, {}, {}, {}, {"statusword": 0x9650}]}},
+    )
+
+    snapshot = probe._capture_snapshot(
+        label="manual-j6-rotate",
+        experiment_id="exp",
+        axis_names=["J6"],
+        api_url="http://127.0.0.1:4000",
+    )
+
+    assert snapshot["controller"]["joint_state"]["json"]["axis_counts"][5] == 12345
+    assert snapshot["api"]["joints"]["json"]["arm_display_deg"][5] == 6.5
+    assert snapshot["rtcore_metrics"]["json"]["axes"][5]["statusword"] == 0x9650
+    assert snapshot["controller_joint_state_selected"]["selected_axes"]["J6"]["axis_counts"] == 12345
+    assert snapshot["api_joints_selected"]["selected_axes"]["J6"]["arm_display_deg"] == 6.5
+    assert snapshot["monitor_selected"]["selected_axes"]["J6"]["display_joints_rad"] == 0.11

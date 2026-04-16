@@ -4,7 +4,10 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ..arm_controller.backends import registry as backend_registry
-from .native_home_status import derive_effective_native_home_status
+from .native_home_status import (
+    derive_drive_native_truth_validity,
+    derive_effective_native_home_status,
+)
 
 
 def coerce_int(value: object, default: int = 0) -> int:
@@ -159,10 +162,29 @@ def build_drive_fault_snapshot(
         servo_backend,
         drive_profile_id=resolved_drive_profile,
     )
+    position_semantics = backend_registry.get_drive_position_semantics_config_for_backend(
+        servo_backend,
+        drive_profile_id=resolved_drive_profile,
+    )
     master_al_detail = backend_registry.decode_fieldbus_state_for_backend(
         servo_backend,
         master_al,
         fieldbus_profile_id=resolved_fieldbus_profile,
+    )
+    drive_native_ratio_enabled = (
+        bool(position_semantics.get("drive_native_ratio_enabled", False))
+        if isinstance(position_semantics, Mapping)
+        else False
+    )
+    startup_truth_requires_hm_success_signature = (
+        bool(position_semantics.get("startup_truth_requires_hm_success_signature", True))
+        if isinstance(position_semantics, Mapping)
+        else True
+    )
+    position_semantics_source = (
+        str(position_semantics.get("position_semantics_source", "absolute_encoder_anchor"))
+        if isinstance(position_semantics, Mapping)
+        else "absolute_encoder_anchor"
     )
 
     axes_raw = metrics.get("axes") if isinstance(metrics.get("axes"), list) else []
@@ -176,6 +198,11 @@ def build_drive_fault_snapshot(
     startup_drive_config_configured_axes = 0
     startup_drive_config_verified_axes = 0
     startup_drive_config_mismatch_axes = 0
+    drive_native_startup_valid_axes = 0
+    drive_native_startup_invalid_axes = 0
+    drive_native_truth_valid_axes = 0
+    drive_native_truth_invalid_axes = 0
+    coordinate_system_valid_axes = 0
 
     for axis_index, axis in enumerate(axes_raw[:num_axes]):
         if not isinstance(axis, Mapping):
@@ -201,6 +228,20 @@ def build_drive_fault_snapshot(
             error_code=error_code,
             manufacturer_error_code=manufacturer_error_code,
         )
+        drive_native_truth = derive_drive_native_truth_validity(
+            axis,
+            statusword=statusword,
+            error_code=error_code,
+            manufacturer_error_code=manufacturer_error_code,
+            require_hm_success_signature=startup_truth_requires_hm_success_signature,
+        )
+        if bool(drive_native_truth.get("coordinate_system_valid", False)):
+            coordinate_system_valid_axes += 1
+        if drive_native_ratio_enabled:
+            if bool(drive_native_truth.get("drive_native_truth_valid", False)):
+                drive_native_truth_valid_axes += 1
+            else:
+                drive_native_truth_invalid_axes += 1
 
         logical_joint = None
         if axis_index < len(axis_to_joint_list):
@@ -235,6 +276,37 @@ def build_drive_fault_snapshot(
                     startup_drive_config_verified_axes += 1
                 else:
                     startup_drive_config_mismatch_axes += 1
+        if drive_native_ratio_enabled:
+            if not isinstance(startup_drive_config, Mapping):
+                drive_native_startup_valid = False
+                drive_native_startup_reason = "startup_drive_config_missing"
+            else:
+                missing_setting_keys = startup_drive_config.get("missing_setting_keys", [])
+                configured = bool(startup_drive_config.get("configured", False))
+                readback_valid = bool(startup_drive_config.get("readback_valid", False))
+                verified = bool(startup_drive_config.get("verified", False))
+                if isinstance(missing_setting_keys, list) and missing_setting_keys:
+                    drive_native_startup_valid = False
+                    drive_native_startup_reason = "startup_drive_config_missing_required_settings"
+                elif not configured:
+                    drive_native_startup_valid = False
+                    drive_native_startup_reason = "startup_drive_config_unconfigured"
+                elif not readback_valid:
+                    drive_native_startup_valid = False
+                    drive_native_startup_reason = "startup_drive_config_unverified"
+                elif not verified:
+                    drive_native_startup_valid = False
+                    drive_native_startup_reason = "startup_drive_config_mismatch"
+                else:
+                    drive_native_startup_valid = True
+                    drive_native_startup_reason = "verified"
+            if drive_native_startup_valid:
+                drive_native_startup_valid_axes += 1
+            else:
+                drive_native_startup_invalid_axes += 1
+        else:
+            drive_native_startup_valid = False
+            drive_native_startup_reason = "profile_disabled"
         slave_al_detail = backend_registry.decode_fieldbus_state_for_backend(
             servo_backend,
             slave_al_state,
@@ -263,6 +335,19 @@ def build_drive_fault_snapshot(
                 ),
                 "pos_counts": coerce_int(axis.get("pos_counts"), 0),
                 "absolute_feedback": absolute_feedback,
+                "position_semantics_source": position_semantics_source,
+                "drive_native_ratio_enabled": drive_native_ratio_enabled,
+                "drive_native_startup_valid": drive_native_startup_valid,
+                "drive_native_startup_reason": drive_native_startup_reason,
+                "drive_native_truth_valid": bool(drive_native_truth["drive_native_truth_valid"]),
+                "drive_native_truth_reason": str(drive_native_truth["drive_native_truth_reason"]),
+                "drive_native_truth_signature_valid": bool(
+                    drive_native_truth["drive_native_truth_signature_valid"]
+                ),
+                "drive_native_truth_verification_source": str(
+                    drive_native_truth["drive_native_truth_verification_source"]
+                ),
+                "coordinate_system_valid": bool(drive_native_truth["coordinate_system_valid"]),
                 "native_home_state": int(native_home_status["native_home_state"]),
                 "native_home_state_name": str(native_home_status["native_home_state_name"]),
                 "native_home_active": bool((native_home_active_axis_mask & (1 << axis_index)) != 0),
@@ -363,6 +448,26 @@ def build_drive_fault_snapshot(
         "statusword_feedback_axes": statusword_feedback_axes,
         "slave_online_axes": slave_online_axes,
         "slave_operational_axes": slave_operational_axes,
+        "drive_native_ratio_enabled": drive_native_ratio_enabled,
+        "position_semantics_source": position_semantics_source,
+        "drive_native_startup_valid": (
+            drive_native_ratio_enabled
+            and num_axes > 0
+            and drive_native_startup_invalid_axes == 0
+            and drive_native_startup_valid_axes == num_axes
+        ),
+        "drive_native_startup_valid_axes": drive_native_startup_valid_axes,
+        "drive_native_startup_invalid_axes": drive_native_startup_invalid_axes,
+        "drive_native_truth_valid": (
+            drive_native_ratio_enabled
+            and num_axes > 0
+            and drive_native_startup_invalid_axes == 0
+            and drive_native_truth_invalid_axes == 0
+            and drive_native_truth_valid_axes == num_axes
+        ),
+        "drive_native_truth_valid_axes": drive_native_truth_valid_axes,
+        "drive_native_truth_invalid_axes": drive_native_truth_invalid_axes,
+        "coordinate_system_valid_axes": coordinate_system_valid_axes,
         "link_up": link_up,
         "responding": responding,
         "online": online,

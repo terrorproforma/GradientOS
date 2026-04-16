@@ -91,31 +91,39 @@ That matters because the live backend is not fundamentally constrained by the st
 
 ### Counts To Joint Angle
 
-The backend converts counts into axis-space radians with the configured scaling:
+There are now two relevant host-side scaling postures:
 
-- `counts_per_radian = (encoder_counts_per_rev * gear_ratio) / (2 * pi)`
-- `axis_q_rad = raw_counts / (sign * counts_per_radian)`
+- Legacy host-owned posture:
+  - `counts_per_radian = (encoder_counts_per_rev * gear_ratio) / (2 * pi)`
+  - `axis_q_rad = raw_counts / (sign * counts_per_radian)`
+- Drive-native ratio posture:
+  - the real mechanical ratio is programmed into `C10.18 / C10.19`
+  - the host command/reference path should therefore use `counts_per_radian = encoder_counts_per_rev / (2 * pi)` for the `6064` / `607A` frame, so the gearbox ratio is not applied twice
 
-Equivalently:
+Equivalently in the legacy posture:
 
 - `axis_q_rad = sign * raw_counts * 2 * pi / (encoder_counts_per_rev * gear_ratio)`
 
-This is why large-ratio joints still need a continuous multi-turn motor source for truth reconstruction, but not necessarily for direct command generation.
+This is why large-ratio joints originally needed a continuous multi-turn motor source for truth reconstruction, but the long-term drive-native posture can instead let the drive expose output-shaft coordinates directly.
 
 ### Canonical Truth Math
 
-The current canonical-truth model is:
+The active A6-EC controller truth contract is now single-path:
 
-- `absolute_axis_q = absolute_counts / (sign * counts_per_radian)`
-- `reference_q = q_from_6064_frame + native_home_offset`
-- `home_anchor_rad = absolute_axis_q - reference_q` at anchor-capture time
-- `canonical_q = absolute_axis_q - home_anchor_rad - software_zero`
+- Drive-native production mode:
+  - `canonical_q = q_from_6064_frame - software_zero`
+  - no host-side absolute-home anchor participates in active truth
+- Fail-closed mode:
+  - keep the configured truth source as the drive output-shaft frame
+  - verify the startup posture through the existing `startup_drive_config` readback channel
+  - trust canonical truth only when the live statusword also shows the vendor-confirmed HM-valid signature (`bit12 = 1`, `bit15 = 1`, `bit13 = 0`) with no active alarms
+  - if startup verification is missing or the live statusword is not HM-valid, report truth unavailable instead of reconstructing any host-owned alternative
 
-So the write path should round-trip as:
+In the active A6-EC path, the write path should round-trip as:
 
 - `reference_q = canonical_q + software_zero`
 
-No extra anchor term belongs on the command path. The anchor already bridges absolute encoder space to the reference or home space.
+No extra anchor term belongs on the command path. Once A6-EC is in the drive-native posture, the host should not bridge back through a stored absolute-home anchor to recover canonical truth.
 
 ## Findings That Look Stable So Far
 
@@ -130,6 +138,52 @@ No extra anchor term belongs on the command path. The anchor already bridges abs
 - `60B0` behaved like a runtime motion-frame object, not the durable semantic-home store we needed.
 - The integrated `F31.10` read/write tail matters for persistence. It was a major breakthrough in making the corrected frame restore across power cycles.
 
+## Manufacturer Clarifications 2026-04-15
+
+The vendor reply added several clarifications that materially sharpen this note.
+
+- "Load" and `RM` in rotary mode mean the output or load shaft after the gearbox, not the motor shaft.
+- The vendor's recommended final configuration is to set the real mechanical ratio in `C10.18 / C10.19`.
+- When `C10.1A / C10.1C` are zero, rotary-mode `RM` is calculated from encoder resolution times the mechanical ratio in `C10.18 / C10.19`.
+- The vendor now explicitly says that if `C10.18 / C10.19` are left at `1:1`, then `6064` and `U40.28` remain motor-side rather than output-shaft coordinates, and the host must continue doing the higher-level conversion work itself.
+- That means a `1:1` ratio setup is best understood as a host-conversion/debug posture, not the intended long-term production configuration.
+- The vendor also explicitly distinguishes `C10.18 / C10.19` from `6091`:
+  - `C10.18 / C10.19` govern rotary-mode absolute-position reconstruction and `RM`
+  - `6091` is the electronic gear ratio used for command-unit conversion
+- This does not make the Chapter 11 `6064 * 6091 ~= 6063` bridge checks useless; it means those checks validate the command/reference-unit mapping, not the rotary-mode absolute reconstruction policy by themselves.
+- Changing `C10.18 / C10.19` requires a fresh homing cycle afterward, even though no power cycle is required.
+- The vendor states that manually writing `607C` alone is not sufficient to establish a valid homing/reference state:
+  - `6064` does not jump immediately
+  - bits 12 and 15 do not become valid merely from the write
+  - HM Method 35 is still required
+- That exactly matches our bench result that direct nonzero `607C` writes did not selectively rebase `6064` or API truth on their own.
+- The vendor now says negative `607C` values in rotary mode are semantically invalid even if the implementation permits them to be written and read back.
+- Their recommendation is to keep `607C` in `0 .. RM-1` and, for seam-adjacent homes, use a positive value near `RM-1` rather than a negative offset.
+- The vendor confirms `0x9650` as the expected good post-HM state:
+  - bit 12 = 1
+  - bit 15 = 1
+  - bit 13 = 0
+  - no active alarms
+- The vendor also frames `F31.10` as a recovery tool for encoder battery/multi-turn failure cases, not as a routine commissioning step. After `F31.10 = 4`, physical homing is required again.
+
+## Integration Implications From That Reply
+
+- The strongest newly-supported implementation direction is to reintroduce actual `C10.18 / C10.19` startup configuration in the drive profile/runtime path and then re-home once to seed the corrected coordinate system.
+- That should be treated as a deliberate migration, not a casual config tweak, because the vendor explicitly warns that changing the ratio changes the coordinate system immediately.
+- The code now programs `C00.07` plus `C10.18 / C10.19` at startup from robot-config mechanics, and the startup-validity gate now requires all three startup descriptors to read back coherently before the drive posture is treated as verified.
+- The host canonical truth path now treats the drive reference/output-shaft frame as the only A6-EC truth source, but it only becomes available when both conditions hold:
+  - startup posture is verified
+  - live statusword still carries the vendor-confirmed HM-valid signature with no active alarms
+- If either condition is missing, the controller deliberately leaves truth unavailable rather than pretending a host-side reconstruction is trustworthy.
+- The write-path guardrail still stands: once the drive owns the mechanical ratio, the host command/reference conversion must not multiply by the gearbox ratio again.
+- A live `start-stack.sh` validation on 2026-04-15 confirmed the active runtime env now carries:
+  - `GRADIENT_RT_GEAR_RATIO="1,1,1,1,1,1"`
+  - `GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG` with `C00.07`, `C10.18`, and `C10.19`
+- That same live run also confirmed the current hardware state is still pre-trust rather than code-broken:
+  - all six axes reported `drive_native_startup_valid = true`
+  - all six axes reported `drive_native_truth_valid = false`
+  - every axis statusword was `0x1650`, so the coordinate system was still invalid until a fresh HM35 re-home re-establishes the vendor-confirmed `0x9650` state
+
 ## Motion And Safety Lessons
 
 - The multi-axis jog regression was a command-frame math bug, not just a display bug.
@@ -138,11 +192,11 @@ No extra anchor term belongs on the command path. The anchor already bridges abs
 - Command upload must stay in the RTCore and `6064` and `607A` reference frame.
 - The command path must not "helpfully" add the absolute anchor back in.
 - Raw absolute multi-turn counts are essential for diagnostics and truth reconstruction, but they are not automatically the right frame to command motion from.
-- The current live stack is not using drive-side gear-ratio mapping on the tested axes. `6091` and `C10.18/C10.19` were `1:1`, so software still owns the higher-level joint semantics.
+- Historically the live stack ran with `C10.18/C10.19 = 1:1`, which forced the host to own the higher-level joint semantics. The current migration removes that posture by programming the real mechanical ratio into the drive at startup and refusing to invent a second host-owned truth path.
 
 ## Truth, Anchors, And Fail-Closed Behavior
 
-- Removing fallback behavior was the right call. Fallbacks made it too easy to hide frame problems behind something merely plausible.
+- Removing alternate host truth reconstruction was the right call. Those alternate paths made it too easy to hide frame problems behind something merely plausible.
 - The system should fail closed when canonical truth cannot be reconstructed safely.
 - A stale software anchor can make a good drive-side frame look bad.
 - The specific `command_frame_roundtrip_mismatch` diagnosis is our host-side diagnosis, not a manufacturer object or drive-side fault.
@@ -176,7 +230,7 @@ No extra anchor term belongs on the command path. The anchor already bridges abs
 ## UI And Operator Trust Lessons
 
 - The frontend must never flatten contradictory native-home telemetry into a cheerful success message.
-- We found a real UI bug where fallback telemetry made a row look effectively successful while the command result still said failure.
+- We found a real UI bug where a secondary telemetry interpretation made a row look effectively successful while the command result still said failure.
 - Commissioning messaging must stay conservative. If telemetry conflicts, show conflict or failure, not optimism.
 - The user's auditory observation about `J2` de-energizing faster was useful evidence. It fit the theory that the transaction was aborting early rather than following the normal tail.
 

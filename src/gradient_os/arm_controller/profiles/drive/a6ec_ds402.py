@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
+from fractions import Fraction
 from typing import Any
 
 from ...ethercat_drive_catalog import build_default_startup_entries, get_ethercat_drive_profile
@@ -15,12 +16,28 @@ FAULT_REFERENCE_RELATIVE_PATH = os.path.join("docs", "resources", "a6ec_manual_c
 STARTUP_SETTING_KEY = "a6ec_encoder_position_tracking_mode"
 STARTUP_SETTING_LABEL = "A6-EC encoder position tracking mode"
 STARTUP_SETTING_OBJECT = "C00.07 / 0x2000:08"
+STARTUP_RATIO_NUMERATOR_KEY = "a6ec_rotation_mode_gear_ratio_numerator"
+STARTUP_RATIO_NUMERATOR_LABEL = "A6-EC rotation-mode gear ratio numerator"
+STARTUP_RATIO_NUMERATOR_OBJECT = "C10.18 / 0x2010:19"
+STARTUP_RATIO_DENOMINATOR_KEY = "a6ec_rotation_mode_gear_ratio_denominator"
+STARTUP_RATIO_DENOMINATOR_LABEL = "A6-EC rotation-mode gear ratio denominator"
+STARTUP_RATIO_DENOMINATOR_OBJECT = "C10.19 / 0x2010:1A"
 STARTUP_SETTING_ENV_VAR = "GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG"
 NATIVE_HOME_CONFIG_ENV_VAR = "GRADIENT_RT_NATIVE_HOME_CONFIG"
 ABSOLUTE_FEEDBACK_CONFIG_ENV_VAR = "GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG"
 MOTION_FEEDBACK_CONFIG = {
     "profile_id": PROFILE_ID,
     "feedback_counts_wrap": True,
+}
+POSITION_SEMANTICS_CONFIG = {
+    "profile_id": PROFILE_ID,
+    "drive_native_ratio_enabled": True,
+    "position_semantics_source": "drive_output_shaft",
+    "canonical_truth_source": "encoder_multi_turn_counts",
+    # On restart, the vendor says a retained coordinate system should be
+    # trusted from 6041 bit 15 even if the HM-complete bit is not reasserted.
+    "startup_truth_requires_hm_success_signature": False,
+    "absolute_home_anchor_required": True,
 }
 STARTUP_SETTING_VALUE_LABELS = {
     0: "Incremental encoder mode",
@@ -161,7 +178,30 @@ ABSOLUTE_FEEDBACK_DISPLAY_SOURCE_KEYS = [
     "rotation_mode_encoder_counts",
 ]
 
+ABSOLUTE_FEEDBACK_TRUTH_SOURCE_KEYS = [
+    "encoder_multi_turn_counts",
+]
+
 _DRIVE_FAULT_CODEBOOK_CACHE: dict[str, Any] | None = None
+_STARTUP_SETTING_ORDER = (
+    STARTUP_SETTING_KEY,
+    STARTUP_RATIO_NUMERATOR_KEY,
+    STARTUP_RATIO_DENOMINATOR_KEY,
+)
+_STARTUP_SETTING_METADATA = {
+    STARTUP_SETTING_KEY: {
+        "label": STARTUP_SETTING_LABEL,
+        "object": STARTUP_SETTING_OBJECT,
+    },
+    STARTUP_RATIO_NUMERATOR_KEY: {
+        "label": STARTUP_RATIO_NUMERATOR_LABEL,
+        "object": STARTUP_RATIO_NUMERATOR_OBJECT,
+    },
+    STARTUP_RATIO_DENOMINATOR_KEY: {
+        "label": STARTUP_RATIO_DENOMINATOR_LABEL,
+        "object": STARTUP_RATIO_DENOMINATOR_OBJECT,
+    },
+}
 
 
 def _repo_root() -> str:
@@ -187,6 +227,108 @@ def _load_drive_fault_codebook() -> dict[str, Any]:
         pass
     _DRIVE_FAULT_CODEBOOK_CACHE = {}
     return _DRIVE_FAULT_CODEBOOK_CACHE
+
+
+def _startup_schema_by_key() -> dict[str, dict[str, Any]]:
+    profile = get_ethercat_drive_profile(PROFILE_ID) or {}
+    startup_schema = profile.get("startup_schema") if isinstance(profile, dict) else {}
+    if not isinstance(startup_schema, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in startup_schema.items()
+        if isinstance(key, str) and isinstance(value, dict)
+    }
+
+
+def _startup_setting_schema(setting_key: str) -> dict[str, Any]:
+    schema = _startup_schema_by_key().get(str(setting_key))
+    if not isinstance(schema, dict):
+        raise ValueError(f"EtherCAT drive startup schema is missing {setting_key}.")
+    return schema
+
+
+def _ratio_u16_pair_for_axis(axis_index: int, *, robot_config: Mapping[str, Any] | None) -> tuple[int, int]:
+    if not isinstance(robot_config, Mapping):
+        raise ValueError(
+            "Robot config is required to derive A6-EC drive-native gear-ratio startup settings."
+        )
+    raw_ratios = robot_config.get("actuator_gear_ratios")
+    if not isinstance(raw_ratios, list) or axis_index >= len(raw_ratios):
+        raise ValueError(
+            f"Robot config is missing actuator_gear_ratios[{axis_index}] for A6-EC startup ratio rendering."
+        )
+    ratio_token = str(raw_ratios[axis_index]).strip()
+    if not ratio_token:
+        raise ValueError(f"Robot actuator gear ratio[{axis_index}] is empty.")
+    try:
+        ratio = Fraction(ratio_token)
+    except Exception as exc:
+        raise ValueError(
+            f"Robot actuator gear ratio[{axis_index}]='{ratio_token}' could not be converted into an exact fraction."
+        ) from exc
+    if ratio <= 0:
+        raise ValueError(f"Robot actuator gear ratio[{axis_index}] must be > 0.")
+    numerator = int(ratio.numerator)
+    denominator = int(ratio.denominator)
+    if numerator <= 0 or denominator <= 0 or numerator > 0xFFFF or denominator > 0xFFFF:
+        raise ValueError(
+            "A6-EC startup gear-ratio pair must fit in u16 registers; "
+            f"axis[{axis_index}] ratio {ratio_token} resolved to {numerator}/{denominator}."
+        )
+    return numerator, denominator
+
+
+def _resolve_startup_entry_defaults(
+    entry: Mapping[str, Any],
+    *,
+    axis_index: int,
+    robot_config: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    resolved = dict(entry)
+    ratio_numerator = resolved.get(STARTUP_RATIO_NUMERATOR_KEY)
+    ratio_denominator = resolved.get(STARTUP_RATIO_DENOMINATOR_KEY)
+    if ratio_numerator in (None, "") or ratio_denominator in (None, ""):
+        default_numerator, default_denominator = _ratio_u16_pair_for_axis(
+            axis_index,
+            robot_config=robot_config,
+        )
+        if ratio_numerator in (None, ""):
+            resolved[STARTUP_RATIO_NUMERATOR_KEY] = default_numerator
+        if ratio_denominator in (None, ""):
+            resolved[STARTUP_RATIO_DENOMINATOR_KEY] = default_denominator
+    return resolved
+
+
+def _coerce_startup_setting_value(
+    *,
+    entry: Mapping[str, Any],
+    axis_index: int,
+    setting_key: str,
+) -> int:
+    schema = _startup_setting_schema(setting_key)
+    label = str(
+        schema.get("label")
+        or _STARTUP_SETTING_METADATA.get(setting_key, {}).get("label")
+        or setting_key
+    )
+    try:
+        value = int(entry[setting_key])
+    except KeyError as exc:
+        raise ValueError(
+            f"EtherCAT drive startup config entry[{axis_index}] is missing {setting_key}."
+        ) from exc
+    except Exception as exc:
+        raise ValueError(
+            f"EtherCAT drive startup config entry[{axis_index}] has an invalid {setting_key}."
+        ) from exc
+    min_value = int(schema.get("min", 0))
+    max_value = int(schema.get("max", 0xFFFF))
+    if value < min_value or value > max_value:
+        raise ValueError(
+            f"EtherCAT drive startup config entry[{axis_index}] must use {label} {min_value}-{max_value}."
+        )
+    return int(value)
 
 
 def _coerce_code_to_u32(raw: Any) -> int | None:
@@ -425,18 +567,14 @@ def _combine_signed_i64_pair(low_field: Mapping[str, Any], high_field: Mapping[s
     return int(combined)
 
 
-def build_startup_config(raw_entries: object, *, num_axes: int) -> dict[str, Any]:
-    profile = get_ethercat_drive_profile(PROFILE_ID) or {}
-    startup_schema = profile.get("startup_schema") if isinstance(profile, dict) else {}
-    setting_schema = startup_schema.get(STARTUP_SETTING_KEY) if isinstance(startup_schema, dict) else {}
-    min_value = int(setting_schema.get("min", 0)) if isinstance(setting_schema, dict) else 0
-    max_value = int(setting_schema.get("max", 5)) if isinstance(setting_schema, dict) else 5
-    object_spec = setting_schema.get("object") if isinstance(setting_schema, dict) else {}
-    object_index = int(object_spec.get("index", 0x2000)) if isinstance(object_spec, dict) else 0x2000
-    object_subindex = int(object_spec.get("subindex", 0x08)) if isinstance(object_spec, dict) else 0x08
-
+def build_startup_config(
+    raw_entries: object,
+    *,
+    num_axes: int,
+    robot_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     if raw_entries in (None, "", []):
-        raw_entries = build_default_startup_entries(PROFILE_ID, num_axes=int(num_axes))
+        raw_entries = []
     if not isinstance(raw_entries, list):
         raise ValueError("EtherCAT drive startup config entries must be a list.")
     if len(raw_entries) not in (0, int(num_axes)):
@@ -444,61 +582,163 @@ def build_startup_config(raw_entries: object, *, num_axes: int) -> dict[str, Any
             "EtherCAT drive startup config entries must be empty or match num_physical_actuators."
         )
 
-    encoder_position_tracking_modes: list[int] = []
-    for axis_index, entry in enumerate(raw_entries):
-        if not isinstance(entry, dict):
+    default_entries = build_default_startup_entries(PROFILE_ID, num_axes=int(num_axes))
+    settings = {setting_key: [] for setting_key in _STARTUP_SETTING_ORDER}
+
+    for axis_index in range(int(num_axes)):
+        default_entry = (
+            default_entries[axis_index]
+            if axis_index < len(default_entries) and isinstance(default_entries[axis_index], Mapping)
+            else {}
+        )
+        user_entry = raw_entries[axis_index] if raw_entries else {}
+        if not isinstance(user_entry, Mapping):
             raise ValueError(
                 f"EtherCAT drive startup config entry[{axis_index}] must be a dict."
             )
-        if STARTUP_SETTING_KEY not in entry:
-            raise ValueError(
-                f"EtherCAT drive startup config entry[{axis_index}] is missing {STARTUP_SETTING_KEY}."
+        merged_entry = dict(default_entry)
+        merged_entry.update(dict(user_entry))
+        resolved_entry = _resolve_startup_entry_defaults(
+            merged_entry,
+            axis_index=axis_index,
+            robot_config=robot_config,
+        )
+        for setting_key in _STARTUP_SETTING_ORDER:
+            settings[setting_key].append(
+                _coerce_startup_setting_value(
+                    entry=resolved_entry,
+                    axis_index=axis_index,
+                    setting_key=setting_key,
+                )
             )
-        try:
-            tracking_mode = int(entry[STARTUP_SETTING_KEY])
-        except Exception as exc:
-            raise ValueError(
-                f"EtherCAT drive startup config entry[{axis_index}] has an invalid {STARTUP_SETTING_KEY}."
-            ) from exc
-        if tracking_mode < min_value or tracking_mode > max_value:
-            raise ValueError(
-                f"EtherCAT drive startup config entry[{axis_index}] must use {STARTUP_SETTING_LABEL} {min_value}-{max_value}."
-            )
-        encoder_position_tracking_modes.append(tracking_mode)
+
+    rendered_descriptors: list[str] = []
+    for setting_key in _STARTUP_SETTING_ORDER:
+        schema = _startup_setting_schema(setting_key)
+        field_type = str(schema.get("type", "u16")).strip().lower()
+        if field_type != "u16":
+            raise ValueError(f"A6-EC startup setting {setting_key} must use u16 values.")
+        object_spec = schema.get("object") if isinstance(schema.get("object"), Mapping) else {}
+        object_index = int(object_spec.get("index", 0))
+        object_subindex = int(object_spec.get("subindex", 0))
+        rendered_descriptors.append(
+            f"{setting_key}|{field_type}|0x{object_index & 0xFFFF:04X}|0x{object_subindex & 0xFF:02X}|"
+            + ",".join(str(int(value)) for value in settings[setting_key])
+        )
 
     return {
         "profile_id": PROFILE_ID,
-        "settings": {
-            STARTUP_SETTING_KEY: encoder_position_tracking_modes,
-        },
+        "settings": settings,
         "env": {
-            STARTUP_SETTING_ENV_VAR: (
-                f"{STARTUP_SETTING_KEY}|u16|0x{object_index & 0xFFFF:04X}|0x{object_subindex & 0xFF:02X}|"
-                + ",".join(str(int(value)) for value in encoder_position_tracking_modes)
-            ),
+            STARTUP_SETTING_ENV_VAR: ";".join(rendered_descriptors),
         },
     }
 
 
+def _startup_setting_value_label(setting_key: str, raw_value: object) -> str | None:
+    if str(setting_key).strip() == STARTUP_SETTING_KEY:
+        return _startup_mode_value_label(raw_value)
+    return None
+
+
+def _normalize_startup_config_entry(raw_entry: Mapping[str, Any]) -> dict[str, Any] | None:
+    setting_key = str(raw_entry.get("setting_key", "")).strip()
+    metadata = _STARTUP_SETTING_METADATA.get(setting_key)
+    if not isinstance(metadata, Mapping):
+        return None
+    try:
+        commanded = int(raw_entry.get("commanded", 0))
+    except Exception:
+        commanded = 0
+    try:
+        readback = int(raw_entry.get("readback", 0))
+    except Exception:
+        readback = 0
+    return {
+        "setting_key": setting_key,
+        "setting_label": str(metadata.get("label", setting_key)),
+        "object": str(metadata.get("object", "")).strip(),
+        "configured": bool(raw_entry.get("configured")),
+        "commanded": commanded,
+        "commanded_value_label": _startup_setting_value_label(setting_key, commanded),
+        "readback_valid": bool(raw_entry.get("readback_valid")),
+        "readback": readback,
+        "readback_value_label": _startup_setting_value_label(setting_key, readback),
+        "verified": bool(raw_entry.get("verified")),
+    }
+
+
 def extract_startup_config_axis(axis: Mapping[str, Any]) -> dict[str, Any] | None:
-    startup_drive_config = axis.get("startup_drive_config")
-    if not isinstance(startup_drive_config, Mapping):
+    normalized_entries: list[dict[str, Any]] = []
+    startup_drive_configs = axis.get("startup_drive_configs")
+    if isinstance(startup_drive_configs, list):
+        for raw_entry in startup_drive_configs:
+            if not isinstance(raw_entry, Mapping):
+                continue
+            normalized_entry = _normalize_startup_config_entry(raw_entry)
+            if normalized_entry is not None:
+                normalized_entries.append(normalized_entry)
+    if not normalized_entries:
+        startup_drive_config = axis.get("startup_drive_config")
+        if isinstance(startup_drive_config, Mapping):
+            normalized_entry = _normalize_startup_config_entry(startup_drive_config)
+            if normalized_entry is not None:
+                normalized_entries.append(normalized_entry)
+    if not normalized_entries:
         return None
-    setting_key = str(startup_drive_config.get("setting_key", "")).strip()
-    if setting_key != STARTUP_SETTING_KEY:
-        return None
+
+    settings_by_key: dict[str, dict[str, Any]] = {}
+    for entry in normalized_entries:
+        setting_key = str(entry.get("setting_key", "")).strip()
+        if setting_key and setting_key not in settings_by_key:
+            settings_by_key[setting_key] = dict(entry)
+
+    required_setting_keys = list(_STARTUP_SETTING_ORDER)
+    present_setting_keys = [setting_key for setting_key in required_setting_keys if setting_key in settings_by_key]
+    missing_setting_keys = [setting_key for setting_key in required_setting_keys if setting_key not in settings_by_key]
+    unconfigured_setting_keys = [
+        setting_key
+        for setting_key in present_setting_keys
+        if not bool(settings_by_key[setting_key].get("configured", False))
+    ]
+    unverified_setting_keys = [
+        setting_key
+        for setting_key in present_setting_keys
+        if not bool(settings_by_key[setting_key].get("readback_valid", False))
+    ]
+    mismatched_setting_keys = [
+        setting_key
+        for setting_key in present_setting_keys
+        if not bool(settings_by_key[setting_key].get("verified", False))
+    ]
+    configured = len(missing_setting_keys) == 0 and len(unconfigured_setting_keys) == 0
+    readback_valid = configured and len(unverified_setting_keys) == 0
+    verified = readback_valid and len(mismatched_setting_keys) == 0
+    primary_entry = settings_by_key.get(STARTUP_SETTING_KEY, {})
+
     return {
         "profile_id": PROFILE_ID,
         "setting_key": STARTUP_SETTING_KEY,
         "setting_label": STARTUP_SETTING_LABEL,
         "object": STARTUP_SETTING_OBJECT,
-        "configured": bool(startup_drive_config.get("configured")),
-        "commanded": int(startup_drive_config.get("commanded", 0)),
-        "commanded_value_label": _startup_mode_value_label(startup_drive_config.get("commanded", 0)),
-        "readback_valid": bool(startup_drive_config.get("readback_valid")),
-        "readback": int(startup_drive_config.get("readback", 0)),
-        "readback_value_label": _startup_mode_value_label(startup_drive_config.get("readback", 0)),
-        "verified": bool(startup_drive_config.get("verified")),
+        "configured": bool(configured),
+        "commanded": int(primary_entry.get("commanded", 0)),
+        "commanded_value_label": primary_entry.get("commanded_value_label"),
+        "readback_valid": bool(readback_valid),
+        "readback": int(primary_entry.get("readback", 0)),
+        "readback_value_label": primary_entry.get("readback_value_label"),
+        "verified": bool(verified),
+        "required_setting_keys": list(required_setting_keys),
+        "present_setting_keys": list(present_setting_keys),
+        "missing_setting_keys": list(missing_setting_keys),
+        "unconfigured_setting_keys": list(unconfigured_setting_keys),
+        "unverified_setting_keys": list(unverified_setting_keys),
+        "mismatched_setting_keys": list(mismatched_setting_keys),
+        "settings": {
+            setting_key: dict(settings_by_key[setting_key])
+            for setting_key in required_setting_keys
+            if setting_key in settings_by_key
+        },
     }
 
 
@@ -521,6 +761,10 @@ def get_absolute_feedback_config() -> dict[str, Any]:
 
 def get_motion_feedback_config() -> dict[str, Any]:
     return dict(MOTION_FEEDBACK_CONFIG)
+
+
+def get_position_semantics_config() -> dict[str, Any]:
+    return dict(POSITION_SEMANTICS_CONFIG)
 
 
 def normalize_absolute_feedback(raw_feedback: object) -> dict[str, Any] | None:
@@ -564,7 +808,7 @@ def resolve_absolute_feedback_counts(raw_feedback: object) -> dict[str, Any] | N
     normalized = normalize_absolute_feedback(raw_feedback)
     if not isinstance(normalized, Mapping):
         return None
-    for source_key in ABSOLUTE_FEEDBACK_DISPLAY_SOURCE_KEYS:
+    for source_key in ABSOLUTE_FEEDBACK_TRUTH_SOURCE_KEYS:
         source_field = normalized.get(source_key)
         if not isinstance(source_field, Mapping) or not bool(source_field.get("valid")):
             continue

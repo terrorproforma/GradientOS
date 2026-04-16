@@ -462,6 +462,101 @@ style_probe_ratio() {
   style_text "${BANNER_VALUE}" "${rendered}"
 }
 
+style_probe_bool() {
+  local raw="${1:-}"
+  local normalized="${raw,,}"
+  case "${normalized}" in
+    1|true|yes)
+      style_ok "yes"
+      ;;
+    0|false|no)
+      style_danger "no"
+      ;;
+    *)
+      style_warn "${raw:-unknown}"
+      ;;
+  esac
+}
+
+style_launcher_state() {
+  local raw="${1:-unknown}"
+  case "${raw}" in
+    running*)
+      style_ok "${raw}"
+      ;;
+    absent)
+      style_warn "${raw}"
+      ;;
+    stale*)
+      style_danger "${raw}"
+      ;;
+    *)
+      style_text "${BANNER_VALUE}" "${raw}"
+      ;;
+  esac
+}
+
+style_ds402_state() {
+  local raw="${1:-unknown}"
+  local normalized="${raw^^}"
+  normalized="${normalized//[^A-Z0-9]/}"
+  case "${normalized}" in
+    OPERATIONENABLED)
+      style_ok "${raw}"
+      ;;
+    SWITCHONDISABLED|READYTOSWITCHON|SWITCHEDON)
+      style_info "${raw}"
+      ;;
+    QUICKSTOPACTIVE|NOTREADYTOSWITCHON|UNKNOWN)
+      style_warn "${raw}"
+      ;;
+    FAULT|FAULTREACTIONACTIVE)
+      style_danger "${raw}"
+      ;;
+    *)
+      style_text "${BANNER_VALUE}" "${raw}"
+      ;;
+  esac
+}
+
+style_probe_hex_code() {
+  local raw="${1:-0x0000}"
+  local normalized="${raw#0x}"
+  normalized="${normalized#0X}"
+  if [[ "${normalized}" =~ ^[0-9A-Fa-f]+$ ]]; then
+    if (( 16#${normalized} == 0 )); then
+      style_ok "${raw}"
+    else
+      style_danger "${raw}"
+    fi
+    return 0
+  fi
+  style_text "${BANNER_VALUE}" "${raw}"
+}
+
+probe_callout_accent() {
+  init_banner_palette
+  local raw="${1:-unknown}"
+  local state="${raw^^}"
+  case "${state}" in
+    ACTIVE|OP|UP|READY|ONLINE)
+      printf '%s' "${UI_OK}"
+      ;;
+    BUS_UP_DISARMED|DISARMED)
+      printf '%s' "${UI_INFO}"
+      ;;
+    INACTIVE|STARTING|PREOP|SAFEOP|UNKNOWN)
+      printf '%s' "${UI_WARN}"
+      ;;
+    DOWN|FAULTED|FAILED|ERROR)
+      printf '%s' "${UI_DANGER}"
+      ;;
+    *)
+      printf '%s' "${UI_INFO}"
+      ;;
+  esac
+}
+
 print_callout_block() {
   init_banner_palette
   ui_status_clear
@@ -476,6 +571,12 @@ print_callout_block() {
     shift
   done
   printf '%b%s%b\n' "${UI_PANEL}" "  ----------------------------------------------------------------------" "${BANNER_RESET}"
+}
+
+probe_kv_line() {
+  local label="$1"
+  local value="$2"
+  printf '  %-24s %s' "${label}" "${value}"
 }
 
 print_boot_success_block() {
@@ -1220,99 +1321,19 @@ print(json.dumps(payload))
 PY
 }
 
-probe_hardware_state() {
-  local payload
-  if ! payload="$(probe_hardware_state_json 2>/dev/null)"; then
-    error "hardware probe failed"
-    return 1
-  fi
-
+probe_hardware_axis_rows() {
+  local payload="$1"
   "${SYSTEM_PYTHON}" - "${payload}" <<'PY'
 import json
 import sys
 
 data = json.loads(sys.argv[1])
-print("hardware_probe:")
-print(
-    f"  controller_udp: {'up' if data.get('controller_udp_up') else 'down'} "
-    f"({data.get('controller_detail')})"
-)
-print(f"  api_http: {'up' if data.get('api_http_up') else 'down'}")
-if data.get("api_error"):
-    print(f"    api_error={data['api_error']}")
-if data.get("runtime_config_available"):
-    print(
-        "  runtime_config:"
-        f" ik={data.get('runtime_ik', 'unknown')}"
-        f" source={data.get('runtime_ik_source', 'unknown')}"
-        f" servo={data.get('runtime_servo', 'unknown')}"
-        f" drive_profile={data.get('runtime_drive_profile', 'unknown')}"
-        f" drive_source={data.get('runtime_drive_profile_source', 'unknown')}"
-        f" configured={data.get('runtime_drive_profile_configured', 'unknown')}"
-        f" live={data.get('runtime_drive_profile_live') or 'unavailable'}"
-        f" restart_required={data.get('runtime_restart_required')}"
-    )
-elif data.get("runtime_config_error"):
-    print(f"  runtime_config: unavailable ({data['runtime_config_error']})")
-if data.get("probe_context_source") and data.get("probe_context_source") != "api_active_runtime":
-    print(
-        "  probe_decode:"
-        f" backend={data.get('probe_servo_backend') or 'unknown'}"
-        f" drive_profile={data.get('probe_drive_profile') or 'unknown'}"
-        f" source={data.get('probe_context_source')}"
-    )
-    if data.get("probe_context_error"):
-        print(f"    probe_context_error={data['probe_context_error']}")
-
-drive_fault_reference = data.get("drive_fault_reference") or data.get("reference")
-if isinstance(drive_fault_reference, dict) and drive_fault_reference.get("available"):
-    print(
-        "  drive_fault_reference:"
-        f" {drive_fault_reference.get('label') or drive_fault_reference.get('profile_id') or 'configured'}"
-        " (only valid for the current servo backend)"
-    )
-elif data.get("probe_servo_backend") or data.get("runtime_servo"):
-    print(
-        "  drive_fault_reference:"
-        f" raw_only (no vendor-specific decode applied for backend={data.get('probe_servo_backend') or data.get('runtime_servo')})"
-    )
-else:
-    print("  drive_fault_reference: raw_only (active servo backend unavailable)")
-
-print(
-    f"  driver_state: {data.get('driver_state')}"
-    f" (armed={data.get('armed')} enable_mask=0x{int(data.get('axis_enable_mask', 0)):x} "
-    f"op_enabled_axes={data.get('op_enabled_axes')}/{data.get('num_axes')})"
-)
-print(
-    "  ethercat_master_state:"
-    f" {data.get('ethercat_master_state')}"
-    f" link_up={data.get('link_up')}"
-    f" responding={data.get('responding')}/{data.get('num_axes')}"
-    f" online={data.get('online')}/{data.get('num_axes')}"
-    f" operational={data.get('operational')}/{data.get('num_axes')}"
-    f" wkc={data.get('wkc_actual')}/{data.get('wkc_expected')}"
-    f" startup_ready={data.get('startup_ready')}"
-    f" master_al=0x{int(data.get('master_al', 0)):x}"
-)
-print(
-    f"  rtcore_state: {data.get('rtcore_state')} "
-    f"(socket_present={1 if data.get('rtcore_socket_present') else 0})"
-)
-print(f"  physical_state: {data.get('physical_state')}")
-print(f"  metrics_path: {data.get('metrics_path')}")
-if any(key in data for key in (
-    "metrics_startup_readback_enabled",
-    "metrics_native_home_refresh_enabled",
-    "metrics_absolute_feedback_poll_enabled",
-)):
-    print(
-        "  rtcore_metrics_sdo:"
-        f" startup_readback={data.get('metrics_startup_readback_enabled')}"
-        f" native_home_refresh={data.get('metrics_native_home_refresh_enabled')}"
-        f" absolute_feedback_poll={data.get('metrics_absolute_feedback_poll_enabled')}"
-    )
 for axis in data.get("axes", []):
+    label = (
+        f"J{axis.get('logical_joint')}/axis{axis.get('axis', axis.get('index'))}"
+        if axis.get("logical_joint") is not None
+        else f"axis{axis.get('axis', axis.get('index'))}"
+    )
     fault = axis.get("fault") if isinstance(axis, dict) else None
     fault_suffix = ""
     if isinstance(fault, dict):
@@ -1326,18 +1347,263 @@ for axis in data.get("axes", []):
         if fault.get("resettable") is True:
             details.append("resettable")
         if details:
-            fault_suffix = f" [{' | '.join(details)}]"
+            fault_suffix = "[" + " | ".join(details) + "]"
     print(
-        "  "
-        f"{('J' + str(axis.get('logical_joint')) + '/axis' + str(axis.get('axis', axis.get('index')))) if axis.get('logical_joint') is not None else ('axis' + str(axis.get('axis', axis.get('index'))))}: ds402={axis.get('ds402_state')} "
-        f"sw=0x{int(axis.get('statusword', 0)):04x} "
-        f"err=0x{int(axis.get('error_code', 0)):04x}{fault_suffix} "
-        f"slave_online={axis.get('slave_online')} "
-        f"slave_operational={axis.get('slave_operational')} "
-        f"slave_al={axis.get('slave_al_state_name')} "
-        f"pos_counts={axis.get('pos_counts')}"
+        "\x1f".join(
+            [
+                label,
+                str(axis.get("ds402_state") or "unknown"),
+                f"0x{int(axis.get('statusword', 0) or 0):04x}",
+                f"0x{int(axis.get('error_code', 0) or 0):04x}",
+                fault_suffix,
+                str(axis.get("slave_online")),
+                str(axis.get("slave_operational")),
+                str(axis.get("slave_al_state_name") or "UNKNOWN"),
+                str(axis.get("pos_counts") if axis.get("pos_counts") is not None else "unknown"),
+            ]
+        )
     )
 PY
+}
+
+probe_hardware_state() {
+  local launcher_status="${1:-absent}"
+  local state_log_dir="${2:-}"
+  local payload
+  if ! payload="$(probe_hardware_state_json 2>/dev/null)"; then
+    error "hardware probe failed"
+    return 1
+  fi
+
+  local latest_log_dir=""
+  if [[ -L "${LOG_ROOT}/latest" || -d "${LOG_ROOT}/latest" ]]; then
+    latest_log_dir="${LOG_ROOT}/latest"
+  fi
+
+  local controller_udp_up=""
+  local controller_detail=""
+  local api_http_up=""
+  local api_error=""
+  local runtime_config_available=""
+  local runtime_config_error=""
+  local runtime_ik=""
+  local runtime_ik_source=""
+  local runtime_servo=""
+  local runtime_drive_profile=""
+  local runtime_drive_profile_source=""
+  local runtime_drive_profile_configured=""
+  local runtime_drive_profile_live=""
+  local runtime_restart_required=""
+  local probe_context_source=""
+  local probe_servo_backend=""
+  local probe_drive_profile=""
+  local probe_context_error=""
+  local drive_fault_available=""
+  local drive_fault_label=""
+  local drive_fault_profile=""
+  local reference_available=""
+  local reference_label=""
+  local reference_profile=""
+  local driver_state=""
+  local armed=""
+  local axis_enable_mask=""
+  local op_enabled_axes=""
+  local num_axes=""
+  local ethercat_master_state=""
+  local link_up=""
+  local responding=""
+  local online=""
+  local operational=""
+  local wkc_actual=""
+  local wkc_expected=""
+  local startup_ready=""
+  local master_al=""
+  local rtcore_state=""
+  local rtcore_socket_present=""
+  local physical_state=""
+  local metrics_path=""
+  local metrics_startup_readback_enabled=""
+  local metrics_native_home_refresh_enabled=""
+  local metrics_absolute_feedback_poll_enabled=""
+  local controller_state="down"
+  local api_state="down"
+
+  controller_udp_up="$(probe_json_field "${payload}" "controller_udp_up")"
+  controller_detail="$(probe_json_field "${payload}" "controller_detail")"
+  api_http_up="$(probe_json_field "${payload}" "api_http_up")"
+  api_error="$(probe_json_field "${payload}" "api_error")"
+  runtime_config_available="$(probe_json_field "${payload}" "runtime_config_available")"
+  runtime_config_error="$(probe_json_field "${payload}" "runtime_config_error")"
+  runtime_ik="$(probe_json_field "${payload}" "runtime_ik")"
+  runtime_ik_source="$(probe_json_field "${payload}" "runtime_ik_source")"
+  runtime_servo="$(probe_json_field "${payload}" "runtime_servo")"
+  runtime_drive_profile="$(probe_json_field "${payload}" "runtime_drive_profile")"
+  runtime_drive_profile_source="$(probe_json_field "${payload}" "runtime_drive_profile_source")"
+  runtime_drive_profile_configured="$(probe_json_field "${payload}" "runtime_drive_profile_configured")"
+  runtime_drive_profile_live="$(probe_json_field "${payload}" "runtime_drive_profile_live")"
+  runtime_restart_required="$(probe_json_field "${payload}" "runtime_restart_required")"
+  probe_context_source="$(probe_json_field "${payload}" "probe_context_source")"
+  probe_servo_backend="$(probe_json_field "${payload}" "probe_servo_backend")"
+  probe_drive_profile="$(probe_json_field "${payload}" "probe_drive_profile")"
+  probe_context_error="$(probe_json_field "${payload}" "probe_context_error")"
+  drive_fault_available="$(probe_json_field "${payload}" "drive_fault_reference.available")"
+  drive_fault_label="$(probe_json_field "${payload}" "drive_fault_reference.label")"
+  drive_fault_profile="$(probe_json_field "${payload}" "drive_fault_reference.profile_id")"
+  reference_available="$(probe_json_field "${payload}" "reference.available")"
+  reference_label="$(probe_json_field "${payload}" "reference.label")"
+  reference_profile="$(probe_json_field "${payload}" "reference.profile_id")"
+  driver_state="$(probe_json_field "${payload}" "driver_state")"
+  armed="$(probe_json_field "${payload}" "armed")"
+  axis_enable_mask="$(probe_json_field "${payload}" "axis_enable_mask")"
+  op_enabled_axes="$(probe_json_field "${payload}" "op_enabled_axes")"
+  num_axes="$(probe_json_field "${payload}" "num_axes")"
+  ethercat_master_state="$(probe_json_field "${payload}" "ethercat_master_state")"
+  link_up="$(probe_json_field "${payload}" "link_up")"
+  responding="$(probe_json_field "${payload}" "responding")"
+  online="$(probe_json_field "${payload}" "online")"
+  operational="$(probe_json_field "${payload}" "operational")"
+  wkc_actual="$(probe_json_field "${payload}" "wkc_actual")"
+  wkc_expected="$(probe_json_field "${payload}" "wkc_expected")"
+  startup_ready="$(probe_json_field "${payload}" "startup_ready")"
+  master_al="$(probe_json_field "${payload}" "master_al")"
+  rtcore_state="$(probe_json_field "${payload}" "rtcore_state")"
+  rtcore_socket_present="$(probe_json_field "${payload}" "rtcore_socket_present")"
+  physical_state="$(probe_json_field "${payload}" "physical_state")"
+  metrics_path="$(probe_json_field "${payload}" "metrics_path")"
+  metrics_startup_readback_enabled="$(probe_json_field "${payload}" "metrics_startup_readback_enabled")"
+  metrics_native_home_refresh_enabled="$(probe_json_field "${payload}" "metrics_native_home_refresh_enabled")"
+  metrics_absolute_feedback_poll_enabled="$(probe_json_field "${payload}" "metrics_absolute_feedback_poll_enabled")"
+
+  if [[ "${controller_udp_up}" == "1" ]]; then
+    controller_state="up"
+  fi
+  if [[ "${api_http_up}" == "1" ]]; then
+    api_state="up"
+  fi
+
+  local controller_value=""
+  local api_value=""
+  local rtcore_value=""
+  local runtime_primary=""
+  local runtime_secondary=""
+  local probe_decode_value=""
+  local drive_fault_value=""
+  local metrics_toggle_value=""
+  local enable_mask_value=""
+  local master_al_value=""
+  local resolved_fault_reference=""
+
+  controller_value="$(style_probe_state "${controller_state}")"
+  if [[ -n "${controller_detail}" ]]; then
+    controller_value="${controller_value} $(style_text "${BANNER_VALUE}" "(${controller_detail})")"
+  fi
+  api_value="$(style_probe_state "${api_state}")"
+  rtcore_value="$(style_probe_state "${rtcore_state:-unknown}") (socket_present=$(style_probe_bool "${rtcore_socket_present}"))"
+  enable_mask_value="$(style_cmd "0x$(printf '%x' "${axis_enable_mask:-0}")")"
+  master_al_value="$(style_cmd "0x$(printf '%x' "${master_al:-0}")")"
+
+  if [[ "${runtime_config_available}" == "1" ]]; then
+    runtime_primary="ik=$(style_text "${BANNER_VALUE}" "${runtime_ik:-unknown}") source=$(style_text "${BANNER_VALUE}" "${runtime_ik_source:-unknown}") servo=$(style_text "${BANNER_VALUE}" "${runtime_servo:-unknown}")"
+    runtime_secondary="drive_profile=$(style_text "${BANNER_VALUE}" "${runtime_drive_profile:-unknown}") drive_source=$(style_text "${BANNER_VALUE}" "${runtime_drive_profile_source:-unknown}") configured=$(style_text "${BANNER_VALUE}" "${runtime_drive_profile_configured:-unknown}") live=$(style_text "${BANNER_VALUE}" "${runtime_drive_profile_live:-unavailable}") restart_required=$(style_probe_bool "${runtime_restart_required}")"
+  fi
+
+  if [[ -n "${probe_context_source}" && "${probe_context_source}" != "api_active_runtime" ]]; then
+    probe_decode_value="backend=$(style_text "${BANNER_VALUE}" "${probe_servo_backend:-unknown}") drive_profile=$(style_text "${BANNER_VALUE}" "${probe_drive_profile:-unknown}") source=$(style_text "${BANNER_VALUE}" "${probe_context_source}")"
+  fi
+
+  if [[ "${drive_fault_available}" == "1" || "${reference_available}" == "1" ]]; then
+    resolved_fault_reference="${drive_fault_label:-${reference_label:-${drive_fault_profile:-${reference_profile:-configured}}}}"
+    drive_fault_value="$(style_text "${BANNER_VALUE}" "${resolved_fault_reference}") (only valid for the current servo backend)"
+  elif [[ -n "${probe_servo_backend}" || -n "${runtime_servo}" ]]; then
+    drive_fault_value="$(style_warn "raw_only") (no vendor-specific decode applied for backend=$(style_text "${BANNER_VALUE}" "${probe_servo_backend:-${runtime_servo}}"))"
+  else
+    drive_fault_value="$(style_warn "raw_only") (active servo backend unavailable)"
+  fi
+
+  if [[ -n "${metrics_startup_readback_enabled}" || -n "${metrics_native_home_refresh_enabled}" || -n "${metrics_absolute_feedback_poll_enabled}" ]]; then
+    metrics_toggle_value="startup_readback=$(style_probe_bool "${metrics_startup_readback_enabled}") native_home_refresh=$(style_probe_bool "${metrics_native_home_refresh_enabled}") absolute_feedback_poll=$(style_probe_bool "${metrics_absolute_feedback_poll_enabled}")"
+  fi
+
+  local -a overview_lines=()
+  overview_lines+=("$(probe_kv_line "launcher_state:" "$(style_launcher_state "${launcher_status}")")")
+  if [[ -n "${state_log_dir}" ]]; then
+    overview_lines+=("$(probe_kv_line "launcher_logs:" "$(style_text "${BANNER_VALUE}" "${state_log_dir}")")")
+  fi
+  if [[ -n "${latest_log_dir}" ]]; then
+    overview_lines+=("$(probe_kv_line "latest_logs:" "$(style_text "${BANNER_VALUE}" "${latest_log_dir}")")")
+  fi
+  overview_lines+=("$(probe_kv_line "physical_state:" "$(style_probe_state "${physical_state:-unknown}")")")
+  overview_lines+=("$(probe_kv_line "driver_state:" "$(style_probe_state "${driver_state:-unknown}")")")
+  overview_lines+=("$(probe_kv_line "ethercat_master_state:" "$(style_probe_state "${ethercat_master_state:-unknown}")")")
+  overview_lines+=("$(probe_kv_line "rtcore_state:" "${rtcore_value}")")
+  print_callout_block "$(probe_callout_accent "${physical_state}")" "PROBE OVERVIEW" "${overview_lines[@]}"
+
+  local -a runtime_lines=()
+  runtime_lines+=("$(probe_kv_line "controller_udp:" "${controller_value}")")
+  runtime_lines+=("$(probe_kv_line "api_http:" "${api_value}")")
+  if [[ -n "${api_error}" ]]; then
+    runtime_lines+=("$(probe_kv_line "api_error:" "$(style_warn "${api_error}")")")
+  fi
+  if [[ "${runtime_config_available}" == "1" ]]; then
+    runtime_lines+=("$(probe_kv_line "runtime_config:" "${runtime_primary}")")
+    runtime_lines+=("$(probe_kv_line "" "${runtime_secondary}")")
+  elif [[ -n "${runtime_config_error}" ]]; then
+    runtime_lines+=("$(probe_kv_line "runtime_config:" "$(style_warn "unavailable (${runtime_config_error})")")")
+  else
+    runtime_lines+=("$(probe_kv_line "runtime_config:" "$(style_warn "unavailable")")")
+  fi
+  if [[ -n "${probe_decode_value}" ]]; then
+    runtime_lines+=("$(probe_kv_line "probe_decode:" "${probe_decode_value}")")
+    if [[ -n "${probe_context_error}" ]]; then
+      runtime_lines+=("$(probe_kv_line "probe_context_error:" "$(style_warn "${probe_context_error}")")")
+    fi
+  fi
+  runtime_lines+=("$(probe_kv_line "drive_fault_reference:" "${drive_fault_value}")")
+  print_callout_block "${UI_INFO}" "RUNTIME PROBES" "${runtime_lines[@]}"
+
+  local -a hardware_lines=()
+  hardware_lines+=("$(probe_kv_line "armed:" "$(style_text "${BANNER_VALUE}" "${armed:-0}")")")
+  hardware_lines+=("$(probe_kv_line "enable_mask:" "${enable_mask_value}")")
+  hardware_lines+=("$(probe_kv_line "op_enabled_axes:" "$(style_probe_ratio "${op_enabled_axes:-0}" "${num_axes:-0}")")")
+  hardware_lines+=("$(probe_kv_line "link_up:" "$(style_probe_bool "${link_up}")")")
+  hardware_lines+=("$(probe_kv_line "responding:" "$(style_probe_ratio "${responding:-0}" "${num_axes:-0}")")")
+  hardware_lines+=("$(probe_kv_line "online:" "$(style_probe_ratio "${online:-0}" "${num_axes:-0}")")")
+  hardware_lines+=("$(probe_kv_line "operational:" "$(style_probe_ratio "${operational:-0}" "${num_axes:-0}")")")
+  hardware_lines+=("$(probe_kv_line "wkc:" "$(style_probe_ratio "${wkc_actual:-0}" "${wkc_expected:-0}")")")
+  hardware_lines+=("$(probe_kv_line "startup_ready:" "$(style_probe_bool "${startup_ready}")")")
+  hardware_lines+=("$(probe_kv_line "master_al:" "${master_al_value}")")
+  hardware_lines+=("$(probe_kv_line "metrics_path:" "$(style_text "${BANNER_VALUE}" "${metrics_path:-unavailable}")")")
+  if [[ -n "${metrics_toggle_value}" ]]; then
+    hardware_lines+=("$(probe_kv_line "rtcore_metrics_sdo:" "${metrics_toggle_value}")")
+  fi
+  print_callout_block "$(probe_callout_accent "${ethercat_master_state}")" "BUS METRICS" "${hardware_lines[@]}"
+
+  local -a axis_lines=()
+  local axis_count=0
+  local axis_label=""
+  local ds402_state=""
+  local statusword=""
+  local error_code=""
+  local fault_suffix=""
+  local slave_online=""
+  local slave_operational=""
+  local slave_al=""
+  local pos_counts=""
+  local axis_line=""
+  while IFS=$'\x1f' read -r axis_label ds402_state statusword error_code fault_suffix slave_online slave_operational slave_al pos_counts; do
+    [[ -n "${axis_label}" ]] || continue
+    axis_count=$((axis_count + 1))
+    axis_line="  $(style_text "${BANNER_LABEL}" "${axis_label}:") $(style_ds402_state "${ds402_state}")   sw=$(style_cmd "${statusword}")   err=$(style_probe_hex_code "${error_code}")"
+    if [[ -n "${fault_suffix}" ]]; then
+      axis_line="${axis_line} $(style_warn "${fault_suffix}")"
+    fi
+    axis_line="${axis_line}   online=$(style_probe_bool "${slave_online}")   op=$(style_probe_bool "${slave_operational}")   al=$(style_probe_state "${slave_al}")   pos=$(style_text "${BANNER_VALUE}" "${pos_counts}")"
+    axis_lines+=("${axis_line}")
+  done < <(probe_hardware_axis_rows "${payload}")
+  if (( axis_count == 0 )); then
+    axis_lines+=("  $(style_warn 'no axes reported in RTCore metrics')")
+  fi
+  print_callout_block "${UI_INFO}" "AXIS STATES" "${axis_lines[@]}"
 }
 
 runtime_config_summary() {
@@ -2743,14 +3009,7 @@ print_probe() {
     state_log_dir="${LOG_DIR:-}"
   fi
 
-  echo "launcher_state: ${launcher_status}"
-  if [[ -n "${state_log_dir}" ]]; then
-    echo "launcher_logs: ${state_log_dir}"
-  fi
-  if [[ -L "${LOG_ROOT}/latest" || -d "${LOG_ROOT}/latest" ]]; then
-    echo "latest_logs: ${LOG_ROOT}/latest"
-  fi
-  probe_hardware_state
+  probe_hardware_state "${launcher_status}" "${state_log_dir}"
 }
 
 stop_managed_stack() {

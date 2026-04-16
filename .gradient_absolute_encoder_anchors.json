@@ -4,62 +4,62 @@
     "gradient-05": {
       "logical_joint_absolute_home_anchors": [
         {
-          "home_anchor_rad": -0.05516338723935631,
+          "home_anchor_rad": -0.055416973438353646,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             0
           ],
-          "updated_at": "2026-04-14T05:57:44+00:00",
+          "updated_at": "2026-04-16T07:46:15+00:00",
           "updated_by": "ethercat_rtcore:joint1:native_home"
         },
         {
-          "home_anchor_rad": 0.008503047254848595,
+          "home_anchor_rad": 0.0587327687851677,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             1
           ],
-          "updated_at": "2026-04-15T09:25:59+00:00",
+          "updated_at": "2026-04-16T07:45:44+00:00",
           "updated_by": "ethercat_rtcore:joint2:native_home"
         },
         {
-          "home_anchor_rad": -0.037317917617287935,
+          "home_anchor_rad": -0.022996768855386835,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             2
           ],
-          "updated_at": "2026-04-15T06:59:50+00:00",
+          "updated_at": "2026-04-16T07:45:16+00:00",
           "updated_by": "ethercat_rtcore:joint3:native_home"
         },
         {
-          "home_anchor_rad": -0.08791893706678588,
+          "home_anchor_rad": -0.3141784401188279,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             3
           ],
-          "updated_at": "2026-04-15T07:05:07+00:00",
+          "updated_at": "2026-04-16T07:43:45+00:00",
           "updated_by": "ethercat_rtcore:joint4:native_home"
         },
         {
-          "home_anchor_rad": -0.09880523652850202,
+          "home_anchor_rad": -0.1003269454700846,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             4
           ],
-          "updated_at": "2026-04-14T05:57:16+00:00",
+          "updated_at": "2026-04-16T07:33:43+00:00",
           "updated_by": "ethercat_rtcore:joint5:native_home"
         },
         {
-          "home_anchor_rad": -0.2690698175750657,
+          "home_anchor_rad": -0.5061177862030187,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             5
           ],
-          "updated_at": "2026-04-14T05:36:01+00:00",
+          "updated_at": "2026-04-16T07:43:20+00:00",
           "updated_by": "ethercat_rtcore:joint6:native_home"
         }
       ],
-      "updated_at": "2026-04-15T09:25:59+00:00",
-      "updated_by": "ethercat_rtcore:joint2:native_home"
+      "updated_at": "2026-04-16T07:46:15+00:00",
+      "updated_by": "ethercat_rtcore:joint1:native_home"
     }
   }
 }

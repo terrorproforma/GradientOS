@@ -40,6 +40,8 @@ ETHERCAT_DRIVE_CATALOG: dict[str, dict[str, Any]] = {
         },
         "startup_defaults": {
             "a6ec_encoder_position_tracking_mode": 4,
+            "a6ec_rotation_mode_gear_ratio_numerator": None,
+            "a6ec_rotation_mode_gear_ratio_denominator": None,
         },
         "startup_schema": {
             "a6ec_encoder_position_tracking_mode": {
@@ -49,7 +51,23 @@ ETHERCAT_DRIVE_CATALOG: dict[str, dict[str, Any]] = {
                 "label": "A6-EC encoder position tracking mode",
                 "object": {"index": 0x2000, "subindex": 0x08},
                 "env_var": "GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG",
-            }
+            },
+            "a6ec_rotation_mode_gear_ratio_numerator": {
+                "type": "u16",
+                "min": 1,
+                "max": 65535,
+                "label": "A6-EC rotation-mode gear ratio numerator",
+                "object": {"index": 0x2010, "subindex": 0x19},
+                "env_var": "GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG",
+            },
+            "a6ec_rotation_mode_gear_ratio_denominator": {
+                "type": "u16",
+                "min": 1,
+                "max": 65535,
+                "label": "A6-EC rotation-mode gear ratio denominator",
+                "object": {"index": 0x2010, "subindex": 0x1A},
+                "env_var": "GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG",
+            },
         },
     }
 }

@@ -548,6 +548,7 @@ def test_handle_apply_joint_setpoint_uses_fallbacks_when_servo_defaults_missing(
 
 def test_handle_apply_joint_setpoint_can_start_bounded_joint_trajectory(monkeypatch):
     thread_events: list[str] = []
+    thread_kwargs: dict[str, object] = {}
 
     class _FakeRobot:
         actuator_gear_ratios = [100.0, 100.0, 100.0, 18.0, 18.1818, 10.0]
@@ -557,6 +558,7 @@ def test_handle_apply_joint_setpoint_can_start_bounded_joint_trajectory(monkeypa
             self._target = target
             self._kwargs = kwargs
             self.daemon = daemon
+            thread_kwargs.update(kwargs)
 
         def start(self):
             thread_events.append("started")
@@ -576,6 +578,7 @@ def test_handle_apply_joint_setpoint_can_start_bounded_joint_trajectory(monkeypa
     result = command_api.handle_apply_joint_setpoint(
         [0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
         max_motor_rpm=100.0,
+        target_joint_indices=[0],
     )
 
     assert result["accepted"] is True
@@ -584,6 +587,8 @@ def test_handle_apply_joint_setpoint_can_start_bounded_joint_trajectory(monkeypa
     assert result["max_motor_rpm"] == 100.0
     assert result["frequency_hz"] == 100
     assert result["duration_s"] >= 1.9
+    assert result["target_joint_indices"] == [0]
+    assert thread_kwargs["target_joint_indices"] == [0]
     assert "started" in thread_events
     assert "direct-write" not in thread_events
 
@@ -1632,6 +1637,44 @@ def test_handle_safe_power_up_rejects_when_runtime_is_not_safe(monkeypatch):
     assert result["code"] == "POWER_UP_BLOCKED"
     assert result["power_transition_blockers"] == ["active_trajectory", "queued_motion"]
     assert backend_calls == []
+
+
+def test_build_power_transition_guard_surfaces_coordinate_system_invalid_blocker():
+    class _Backend:
+        def get_power_transition_snapshot(self):
+            return {
+                "feedback_synchronized": False,
+                "active_jog": False,
+                "faulted_axis_count": 0,
+                "faulted_axis_indices": [],
+                "feedback_truth_available": False,
+                "feedback_truth_reasons": ["drive_native_coordinate_system_invalid"],
+                "feedback_truth_unavailable_axes": [0, 1, 2, 3, 4, 5],
+                "feedback_truth_unavailable_joints": [1, 2, 3, 4, 5, 6],
+                "feedback_truth_statuswords": ["0x1650"],
+            }
+
+    result = command_api._build_power_transition_guard(
+        controller_motion_state="idle",
+        controller_thread_running=False,
+        backend=_Backend(),
+        execution_status=None,
+    )
+
+    assert result["safe_for_power_transition"] is False
+    assert result["power_transition_feedback_synchronized"] is False
+    assert result["power_transition_blockers"] == ["coordinate_system_invalid"]
+    assert result["power_transition_blocker_details"] == [
+        {
+            "code": "coordinate_system_invalid",
+            "message": "Drive-native coordinate system is invalid; run Drive Home before power-up.",
+            "truth_reasons": ["drive_native_coordinate_system_invalid"],
+            "truth_unavailable_axes": [0, 1, 2, 3, 4, 5],
+            "truth_unavailable_joints": [1, 2, 3, 4, 5, 6],
+            "statuswords": ["0x1650"],
+            "requires_native_home": True,
+        }
+    ]
 
 
 def test_handle_safe_power_down_waits_for_idle_and_calls_backend(monkeypatch):

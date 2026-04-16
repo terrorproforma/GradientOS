@@ -100,6 +100,43 @@ def test_build_monitor_motion_status_payload_fails_closed(monkeypatch):
     assert run_controller._build_monitor_motion_status_payload() is None
 
 
+def test_attach_monitor_joint_feedback_uses_display_snapshot_when_available():
+    msg: dict[str, object] = {}
+
+    run_controller._attach_monitor_joint_feedback(
+        msg,
+        canonical_joint_positions_rad=[-628.0, -113.0, -62.0],
+        display_snapshot={
+            "truth_available": True,
+            "joint_positions_rad": [0.01, 0.02, 0.03],
+            "axis_absolute_feedback": [{"logical_joint": 1, "truth_available": True}],
+        },
+    )
+
+    assert msg["joints"] == [-628.0, -113.0, -62.0]
+    assert msg["display_joints"] == [0.01, 0.02, 0.03]
+    assert msg["axis_absolute_feedback"] == [{"logical_joint": 1, "truth_available": True}]
+
+
+def test_attach_monitor_joint_feedback_omits_display_when_truth_unavailable():
+    msg: dict[str, object] = {}
+
+    run_controller._attach_monitor_joint_feedback(
+        msg,
+        canonical_joint_positions_rad=[-628.0, -113.0, -62.0],
+        display_snapshot={
+            "truth_available": False,
+            "joint_positions_rad": [0.01, 0.02, 0.03],
+            "joint_positions_rad_partial": [0.01, None, 0.03],
+            "axis_absolute_feedback": [{"logical_joint": 1, "truth_available": False}],
+        },
+    )
+
+    assert msg["joints"] == [-628.0, -113.0, -62.0]
+    assert "display_joints" not in msg
+    assert msg["axis_absolute_feedback"] == [{"logical_joint": 1, "truth_available": False}]
+
+
 def test_build_joint_state_snapshot_uses_backend_display_feedback(monkeypatch):
     display_positions = [0.11, 0.21, 0.31, 0.41, 0.51, 0.61]
     canonical_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]

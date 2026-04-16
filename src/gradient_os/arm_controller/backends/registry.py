@@ -26,6 +26,7 @@
 #   from gradient_os.arm_controller.backends import registry
 #   encoder_resolution = registry.get_encoder_resolution()
 
+from collections.abc import Mapping
 from typing import Optional, TYPE_CHECKING, Callable
 import importlib
 
@@ -543,6 +544,7 @@ def build_drive_startup_config_for_backend(
     *,
     num_axes: int,
     drive_profile_id: Optional[str] = None,
+    robot_config: Mapping[str, object] | None = None,
 ) -> Optional[dict]:
     effective_profile = resolve_drive_profile_for_backend(
         backend_name,
@@ -553,6 +555,7 @@ def build_drive_startup_config_for_backend(
             effective_profile,
             raw_entries,
             num_axes=int(num_axes),
+            robot_config=robot_config,
         )
         if isinstance(payload, dict) or payload is None:
             return payload
@@ -622,6 +625,22 @@ def get_drive_motion_feedback_config_for_backend(
     )
     if effective_profile:
         payload = profile_registry.get_drive_motion_feedback_config(effective_profile)
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    return None
+
+
+def get_drive_position_semantics_config_for_backend(
+    backend_name: Optional[str],
+    *,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.get_drive_position_semantics_config(effective_profile)
         if isinstance(payload, dict) or payload is None:
             return payload
     return None

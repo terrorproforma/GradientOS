@@ -11,6 +11,14 @@ export default defineConfig({
   define: {
     __GRADIENT_PUBLIC_DIR_FS__: JSON.stringify(resolve(__dirname, "public")),
   },
+  build: {
+    rollupOptions: {
+      input: {
+        app: resolve(__dirname, "index.html"),
+        j6ManualRotateDataset: resolve(__dirname, "j6-manual-rotate-dataset.html"),
+      },
+    },
+  },
   server: {
     port: 8000,
     host: "0.0.0.0",

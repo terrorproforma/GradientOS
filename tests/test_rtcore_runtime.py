@@ -1,4 +1,5 @@
 import pytest
+from fractions import Fraction
 
 from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import (
     DEFAULT_RT_MAX_RPM,
@@ -16,6 +17,52 @@ from gradient_os.arm_controller.robots import get_robot_config
 from gradient_os.telemetry.drive_faults import build_drive_fault_snapshot
 
 
+def _expected_a6ec_ratio_pairs(robot_cfg: dict[str, object]) -> tuple[list[int], list[int]]:
+    numerators: list[int] = []
+    denominators: list[int] = []
+    for raw_value in list(robot_cfg.get("actuator_gear_ratios", []))[:6]:
+        ratio = Fraction(str(raw_value))
+        numerators.append(int(ratio.numerator))
+        denominators.append(int(ratio.denominator))
+    return numerators, denominators
+
+
+def _a6ec_startup_drive_configs_for_ratio(
+    raw_ratio: object,
+    *,
+    mode_value: int = 4,
+) -> list[dict[str, int | str]]:
+    ratio = Fraction(str(raw_ratio))
+    numerator = int(ratio.numerator)
+    denominator = int(ratio.denominator)
+    return [
+        {
+            "setting_key": "a6ec_encoder_position_tracking_mode",
+            "configured": 1,
+            "commanded": mode_value,
+            "readback_valid": 1,
+            "readback": mode_value,
+            "verified": 1,
+        },
+        {
+            "setting_key": "a6ec_rotation_mode_gear_ratio_numerator",
+            "configured": 1,
+            "commanded": numerator,
+            "readback_valid": 1,
+            "readback": numerator,
+            "verified": 1,
+        },
+        {
+            "setting_key": "a6ec_rotation_mode_gear_ratio_denominator",
+            "configured": 1,
+            "commanded": denominator,
+            "readback_valid": 1,
+            "readback": denominator,
+            "verified": 1,
+        },
+    ]
+
+
 def test_rtcore_drive_profile_ids_round_trip():
     profile_code = rtcore_drive_profile_name_to_id("a6ec_ds402")
     assert profile_code != 0
@@ -30,13 +77,25 @@ def test_rtcore_motion_state_name_maps_round_trip():
     assert rtcore_execution_state_id_to_name(999) is None
 
 
-def test_build_rtcore_axis_scaling_uses_robot_config_values():
+def test_build_rtcore_axis_scaling_uses_drive_native_ratio_for_a6ec():
     robot = get_robot_config("gradient05")
     robot_cfg = robot.get_config_dict()
-    scaling = build_rtcore_axis_scaling(robot_cfg)
+    scaling = build_rtcore_axis_scaling(robot_cfg, drive_profile="a6ec_ds402")
     assert scaling["num_axes"] == 6
     assert scaling["counts_per_rev"] == [131072] * 6
     assert scaling["gear_ratio"] == [float(value) for value in robot_cfg["actuator_gear_ratios"][:6]]
+    assert scaling["drive_native_ratio_enabled"] is True
+    assert len(scaling["sign"]) == 6
+
+
+def test_build_rtcore_axis_scaling_keeps_robot_gear_ratio_for_non_native_profile():
+    robot = get_robot_config("gradient05")
+    robot_cfg = robot.get_config_dict()
+    scaling = build_rtcore_axis_scaling(robot_cfg, drive_profile="cia402")
+    assert scaling["num_axes"] == 6
+    assert scaling["counts_per_rev"] == [131072] * 6
+    assert scaling["gear_ratio"] == [float(value) for value in robot_cfg["actuator_gear_ratios"][:6]]
+    assert scaling["drive_native_ratio_enabled"] is False
     assert len(scaling["sign"]) == 6
 
 
@@ -44,7 +103,14 @@ def test_render_rtcore_systemd_env_contains_scaling_and_profile():
     robot = get_robot_config("gradient05")
     robot_cfg = robot.get_config_dict()
     expected_gear_ratio = ",".join(f"{float(value):g}" for value in robot_cfg["actuator_gear_ratios"][:6])
-    expected_startup_sdo = "a6ec_encoder_position_tracking_mode|u16|0x2000|0x08|4,4,4,4,4,4"
+    expected_ratio_numerators, expected_ratio_denominators = _expected_a6ec_ratio_pairs(robot_cfg)
+    expected_startup_sdo = (
+        "a6ec_encoder_position_tracking_mode|u16|0x2000|0x08|4,4,4,4,4,4;"
+        "a6ec_rotation_mode_gear_ratio_numerator|u16|0x2010|0x19|"
+        + ",".join(str(value) for value in expected_ratio_numerators)
+        + ";a6ec_rotation_mode_gear_ratio_denominator|u16|0x2010|0x1A|"
+        + ",".join(str(value) for value in expected_ratio_denominators)
+    )
     expected_native_home = (
         "steady_state_mode|8;commissioning_mode|6;truth_source|0x607C|0x00|i32;"
         "op|set_mode|6;op|write_sdo|0x60E6|0x00|u8|0;op|write_sdo|0x607C|0x00|i32|0;"
@@ -92,22 +158,42 @@ def test_render_rtcore_systemd_env_contains_scaling_and_profile():
 def test_build_rtcore_drive_startup_config_uses_drive_profile_defaults_when_robot_has_no_override():
     robot = get_robot_config("gradient05")
     assert robot.get_config_dict()["ethercat_drive_startup_config"] == []
+    expected_ratio_numerators, expected_ratio_denominators = _expected_a6ec_ratio_pairs(
+        robot.get_config_dict()
+    )
     startup = build_rtcore_drive_startup_config(
         robot.get_config_dict(),
         drive_profile="a6ec_ds402",
     )
-    assert startup["settings"] == {"a6ec_encoder_position_tracking_mode": [4, 4, 4, 4, 4, 4]}
+    assert startup["settings"] == {
+        "a6ec_encoder_position_tracking_mode": [4, 4, 4, 4, 4, 4],
+        "a6ec_rotation_mode_gear_ratio_numerator": expected_ratio_numerators,
+        "a6ec_rotation_mode_gear_ratio_denominator": expected_ratio_denominators,
+    }
 
 
 def test_build_rtcore_drive_startup_config_uses_drive_profile_module():
     robot = get_robot_config("gradient05")
+    expected_ratio_numerators, expected_ratio_denominators = _expected_a6ec_ratio_pairs(
+        robot.get_config_dict()
+    )
     startup = build_rtcore_drive_startup_config(
         robot.get_config_dict(),
         drive_profile="a6ec_ds402",
     )
     assert startup["profile_id"] == "a6ec_ds402"
-    assert startup["settings"] == {"a6ec_encoder_position_tracking_mode": [4, 4, 4, 4, 4, 4]}
-    assert startup["env"]["GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG"] == "a6ec_encoder_position_tracking_mode|u16|0x2000|0x08|4,4,4,4,4,4"
+    assert startup["settings"] == {
+        "a6ec_encoder_position_tracking_mode": [4, 4, 4, 4, 4, 4],
+        "a6ec_rotation_mode_gear_ratio_numerator": expected_ratio_numerators,
+        "a6ec_rotation_mode_gear_ratio_denominator": expected_ratio_denominators,
+    }
+    assert startup["env"]["GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG"] == (
+        "a6ec_encoder_position_tracking_mode|u16|0x2000|0x08|4,4,4,4,4,4;"
+        "a6ec_rotation_mode_gear_ratio_numerator|u16|0x2010|0x19|"
+        + ",".join(str(value) for value in expected_ratio_numerators)
+        + ";a6ec_rotation_mode_gear_ratio_denominator|u16|0x2010|0x1A|"
+        + ",".join(str(value) for value in expected_ratio_denominators)
+    )
 
 
 def test_render_rtcore_systemd_env_rejects_drive_profile_without_ethercat_catalog_entry():
@@ -176,18 +262,152 @@ def test_drive_fault_snapshot_decodes_axis_fault_and_master_state():
     assert snapshot["axes"][2]["manufacturer_fault"]["error_code_hex"] == "0x00000208"
     assert snapshot["axes"][2]["manufacturer_fault"]["code"] == "Er20.8"
     assert snapshot["axes"][2]["manufacturer_fault"]["name"] == "Encoder battery failure"
+    assert snapshot["drive_native_ratio_enabled"] is True
+    assert snapshot["position_semantics_source"] == "drive_output_shaft"
+    assert snapshot["drive_native_startup_valid"] is False
+    assert snapshot["drive_native_startup_valid_axes"] == 0
+    assert snapshot["drive_native_startup_invalid_axes"] == 6
+    assert snapshot["drive_native_truth_valid"] is False
+    assert snapshot["axes"][0]["drive_native_startup_valid"] is False
+    assert snapshot["axes"][0]["drive_native_startup_reason"] == "startup_drive_config_missing"
+    assert snapshot["axes"][0]["drive_native_truth_reason"] == "coordinate_system_invalid"
+    assert snapshot["axes"][2]["drive_native_startup_valid"] is False
+    assert snapshot["axes"][2]["drive_native_startup_reason"] == "startup_drive_config_missing_required_settings"
+    assert snapshot["axes"][2]["drive_native_truth_reason"] == "fault_present"
     assert snapshot["axes"][2]["startup_drive_config"] == {
         "profile_id": "a6ec_ds402",
         "setting_key": "a6ec_encoder_position_tracking_mode",
         "setting_label": "A6-EC encoder position tracking mode",
         "object": "C00.07 / 0x2000:08",
-        "configured": True,
+        "configured": False,
         "commanded": 1,
         "commanded_value_label": "Absolute position linear mode",
-        "readback_valid": True,
+        "readback_valid": False,
         "readback": 1,
         "readback_value_label": "Absolute position linear mode",
-        "verified": True,
+        "verified": False,
+        "required_setting_keys": [
+            "a6ec_encoder_position_tracking_mode",
+            "a6ec_rotation_mode_gear_ratio_numerator",
+            "a6ec_rotation_mode_gear_ratio_denominator",
+        ],
+        "present_setting_keys": ["a6ec_encoder_position_tracking_mode"],
+        "missing_setting_keys": [
+            "a6ec_rotation_mode_gear_ratio_numerator",
+            "a6ec_rotation_mode_gear_ratio_denominator",
+        ],
+        "unconfigured_setting_keys": [],
+        "unverified_setting_keys": [],
+        "mismatched_setting_keys": [],
+        "settings": {
+            "a6ec_encoder_position_tracking_mode": {
+                "setting_key": "a6ec_encoder_position_tracking_mode",
+                "setting_label": "A6-EC encoder position tracking mode",
+                "object": "C00.07 / 0x2000:08",
+                "configured": True,
+                "commanded": 1,
+                "commanded_value_label": "Absolute position linear mode",
+                "readback_valid": True,
+                "readback": 1,
+                "readback_value_label": "Absolute position linear mode",
+                "verified": True,
+            }
+        },
     }
-    assert snapshot["startup_drive_config_verified_axes"] == 1
+    assert snapshot["startup_drive_config_verified_axes"] == 0
     assert snapshot["startup_drive_config_mismatch_axes"] == 0
+
+
+def test_drive_fault_snapshot_marks_drive_native_truth_valid_when_startup_and_status_are_valid():
+    robot_cfg = get_robot_config("gradient05").get_config_dict()
+    snapshot = build_drive_fault_snapshot(
+        metrics={
+            "num_axes": 1,
+            "armed": 0,
+            "axis_enable_mask": 0,
+            "link_up": 1,
+            "responding_slaves": 1,
+            "online_slaves": 1,
+            "operational_slaves": 1,
+            "startup_ready": 1,
+            "wkc_actual": 3,
+            "wkc_expected": 3,
+            "master_al_states": 8,
+            "axes": [
+                {
+                    "statusword": 0x9650,
+                    "error_code": 0,
+                    "manufacturer_error_code": 0,
+                    "startup_drive_config": _a6ec_startup_drive_configs_for_ratio(
+                        robot_cfg["actuator_gear_ratios"][0]
+                    )[0],
+                    "startup_drive_configs": _a6ec_startup_drive_configs_for_ratio(
+                        robot_cfg["actuator_gear_ratios"][0]
+                    ),
+                    "slave_online": 1,
+                    "slave_operational": 1,
+                    "slave_al_state": 8,
+                    "pos_counts": 0,
+                }
+            ],
+        },
+        servo_backend="ethercat_rtcore",
+        drive_profile="a6ec_ds402",
+        axis_to_joint=[0],
+        socket_present=True,
+    )
+    assert snapshot["drive_native_ratio_enabled"] is True
+    assert snapshot["drive_native_startup_valid"] is True
+    assert snapshot["drive_native_truth_valid"] is True
+    assert snapshot["coordinate_system_valid_axes"] == 1
+    assert snapshot["axes"][0]["drive_native_startup_valid"] is True
+    assert snapshot["axes"][0]["drive_native_truth_valid"] is True
+    assert snapshot["axes"][0]["drive_native_truth_reason"] == "valid"
+
+
+def test_drive_fault_snapshot_accepts_a6ec_bit15_only_restart_truth():
+    robot_cfg = get_robot_config("gradient05").get_config_dict()
+    snapshot = build_drive_fault_snapshot(
+        metrics={
+            "num_axes": 1,
+            "armed": 0,
+            "axis_enable_mask": 0,
+            "link_up": 1,
+            "responding_slaves": 1,
+            "online_slaves": 1,
+            "operational_slaves": 1,
+            "startup_ready": 1,
+            "wkc_actual": 3,
+            "wkc_expected": 3,
+            "master_al_states": 8,
+            "axes": [
+                {
+                    "statusword": 0x8650,
+                    "error_code": 0,
+                    "manufacturer_error_code": 0,
+                    "startup_drive_config": _a6ec_startup_drive_configs_for_ratio(
+                        robot_cfg["actuator_gear_ratios"][0]
+                    )[0],
+                    "startup_drive_configs": _a6ec_startup_drive_configs_for_ratio(
+                        robot_cfg["actuator_gear_ratios"][0]
+                    ),
+                    "slave_online": 1,
+                    "slave_operational": 1,
+                    "slave_al_state": 8,
+                    "pos_counts": 0,
+                }
+            ],
+        },
+        servo_backend="ethercat_rtcore",
+        drive_profile="a6ec_ds402",
+        axis_to_joint=[0],
+        socket_present=True,
+    )
+    assert snapshot["drive_native_ratio_enabled"] is True
+    assert snapshot["drive_native_startup_valid"] is True
+    assert snapshot["drive_native_truth_valid"] is True
+    assert snapshot["coordinate_system_valid_axes"] == 1
+    assert snapshot["axes"][0]["drive_native_truth_valid"] is True
+    assert snapshot["axes"][0]["drive_native_truth_signature_valid"] is False
+    assert snapshot["axes"][0]["coordinate_system_valid"] is True
+    assert snapshot["axes"][0]["drive_native_truth_verification_source"] == "statusword_bit15"

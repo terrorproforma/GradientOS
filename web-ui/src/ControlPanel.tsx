@@ -122,6 +122,11 @@ type PowerTransitionBlocker = {
 	faulted_axis_count?: number;
 	faulted_axis_indices?: number[];
 	reason?: string;
+	truth_reasons?: string[];
+	truth_unavailable_axes?: number[];
+	truth_unavailable_joints?: number[];
+	statuswords?: string[];
+	requires_native_home?: boolean;
 };
 
 type MotionStatusResponse = {
@@ -178,6 +183,14 @@ type JogSessionResponse = {
 
 type CommissioningStatus = {
 	tone: "info" | "success" | "warning" | "error";
+	message: string;
+};
+
+type CommissioningMessageTone = CommissioningStatus["tone"] | "neutral";
+
+type CommissioningMessageEntry = {
+	key: string;
+	tone: CommissioningMessageTone;
 	message: string;
 };
 
@@ -291,6 +304,23 @@ type DriveFaultSnapshot = {
 };
 
 const JOINT_STEP_OPTIONS_DEG = [0.25, 1, 5] as const;
+const COMMISSIONING_MESSAGE_SLOT_COUNT = 3;
+
+function commissioningMessageToneClasses(tone: CommissioningMessageTone): string {
+	if (tone === "success") {
+		return "border-emerald-500/30 bg-emerald-400/10 text-emerald-100";
+	}
+	if (tone === "warning") {
+		return "border-amber-500/30 bg-amber-400/10 text-amber-100";
+	}
+	if (tone === "error") {
+		return "border-rose-500/30 bg-rose-400/10 text-rose-100";
+	}
+	if (tone === "info") {
+		return "border-cyan-500/20 bg-cyan-400/10 text-cyan-100";
+	}
+	return "border-slate-700/60 bg-slate-900/70 text-slate-400";
+}
 const MIN_CUSTOM_JOINT_STEP_DEG = 0.001;
 
 function createJogOwnerId(): string {
@@ -395,25 +425,9 @@ function formatNativeHomeStatus(
 	if (stateName === "requested") {
 		return "Drive Home requested...";
 	}
-	const reportedStateName = (axis.native_home_state_reported_name ?? "").trim().toLowerCase();
-	const reportedAbortCode = (axis.native_home_last_abort_code_reported_hex ?? "").trim() || "0x00000000";
-	const verificationSource = (axis.native_home_verification_source ?? "").trim().toLowerCase();
-	const statuswordVerificationSuccess = verificationSource === "statusword_bit15"
-		|| verificationSource === "statusword_bits12_15_clear13";
 	const axisMask = driveFaults?.axis_enable_mask ?? 0;
 	const axisCurrentlyDisarmed = (axisMask & (1 << axis.axis)) === 0;
 	if (stateName === "succeeded") {
-		if (
-			statuswordVerificationSuccess
-			&& reportedStateName === "failed"
-			&& reportedAbortCode !== "0x00000000"
-		) {
-			const parts = ["Drive Home verification conflicted", `reported failed ${reportedAbortCode}`];
-			if (axisCurrentlyDisarmed) {
-				parts.push("axis currently disarmed");
-			}
-			return parts.join(" | ");
-		}
 		const parts = ["Drive Home succeeded"];
 		if (typeof axis.native_home_position_offset === "number") {
 			parts.push(`offset ${axis.native_home_position_offset} cnt`);
@@ -480,6 +494,24 @@ function formatPowerTransitionBlocker(blocker: PowerTransitionBlocker): string {
 	}
 	if (code === "fault_present") {
 		return `One or more drive faults are still present (${blocker.faulted_axis_count ?? 0}).`;
+	}
+	if (code === "coordinate_system_invalid") {
+		const joints = Array.isArray(blocker.truth_unavailable_joints)
+			? blocker.truth_unavailable_joints.filter((value) => Number.isFinite(value)).map((value) => Number(value))
+			: [];
+		const statuswords = Array.isArray(blocker.statuswords)
+			? blocker.statuswords.map((value) => String(value).trim()).filter((value) => value.length > 0)
+			: [];
+		const jointSuffix = joints.length > 0
+			? ` on joint${joints.length === 1 ? "" : "s"} ${joints.join(", ")}`
+			: "";
+		const statusSuffix = statuswords.length > 0
+			? ` (status ${statuswords.join(", ")})`
+			: "";
+		return `Drive coordinate system is invalid${jointSuffix}${statusSuffix}; run Drive Home before power-up.`;
+	}
+	if (code === "canonical_truth_unavailable") {
+		return "Live joint truth is unavailable; keep the drives disarmed until telemetry is valid.";
 	}
 	if (code === "not_synchronized") {
 		return "Live feedback has not been synchronized to a safe hold target yet.";
@@ -1052,6 +1084,31 @@ export function ControlPanel({
 		const targets = uniqueLabels.join(", ");
 		return `Drive-native home still running for ${targets}. Wait for the persistence step to finish before starting another home.`;
 	}, [nativeHomeActiveAxes, nativeHomeBusy]);
+	const commissioningMessages = useMemo<CommissioningMessageEntry[]>(() => {
+		const entries: CommissioningMessageEntry[] = [];
+		if (jointFeedbackError) {
+			entries.push({
+				key: "joint-feedback",
+				tone: "neutral",
+				message: jointFeedbackError,
+			});
+		}
+		if (commissioningStatus) {
+			entries.push({
+				key: "commissioning-status",
+				tone: commissioningStatus.tone,
+				message: commissioningStatus.message,
+			});
+		}
+		if (nativeHomeInProgressMessage) {
+			entries.push({
+				key: "native-home-progress",
+				tone: "warning",
+				message: nativeHomeInProgressMessage,
+			});
+		}
+		return entries;
+	}, [commissioningStatus, jointFeedbackError, nativeHomeInProgressMessage]);
 	const driveControlBackend = (driveFaults?.servo_backend ?? activeServoBackend ?? "").trim().toLowerCase();
 	const requiresExplicitDrivePower = driveControlBackend === "ethercat_rtcore";
 	const drivePowerRequested = Boolean(
@@ -1851,7 +1908,7 @@ export function ControlPanel({
 		const jointNumber = jointIndex + 1;
 		const angleLabel = Number.isFinite(jointAnglesDeg[jointIndex] ?? Number.NaN)
 			? `${jointAnglesDeg[jointIndex].toFixed(2)} deg`
-			: "current feedback";
+			: "current live drive feedback";
 		const confirmed = window.confirm(
 			`Capture J${jointNumber} at ${angleLabel} as the drive-native home position? This runs the drive's commissioning homing transaction, leaves only that homed axis disabled afterward, and may require an explicit Power Up before you move it again.`,
 		);
@@ -2901,37 +2958,39 @@ export function ControlPanel({
 								</div>
 							</div>
 						</div>
-						{jointFeedbackError ? (
-							<div className="mb-2 rounded border border-slate-700/60 bg-slate-900/70 px-2 py-1.5 text-[11px] text-slate-400">
-								{jointFeedbackError}
-							</div>
-						) : null}
-						{commissioningStatus ? (
-							<div
-								className={`mb-2 rounded border px-2 py-1.5 text-[11px] ${
-									commissioningStatus.tone === "success"
-										? "border-emerald-500/30 bg-emerald-400/10 text-emerald-100"
-										: commissioningStatus.tone === "warning"
-											? "border-amber-500/30 bg-amber-400/10 text-amber-100"
-										: commissioningStatus.tone === "error"
-											? "border-rose-500/30 bg-rose-400/10 text-rose-100"
-											: "border-cyan-500/20 bg-cyan-400/10 text-cyan-100"
-								}`}
-							>
-								{commissioningStatus.message}
-							</div>
-						) : null}
-						{nativeHomeInProgressMessage ? (
-							<div className="mb-2 rounded border border-amber-500/30 bg-amber-400/10 px-2 py-1.5 text-[11px] text-amber-100">
-								{nativeHomeInProgressMessage}
-							</div>
-						) : null}
+						<div className="mb-2 space-y-1" aria-live="polite">
+							{Array.from({ length: COMMISSIONING_MESSAGE_SLOT_COUNT }, (_, index) => {
+								const entry = commissioningMessages[index] ?? null;
+								return (
+									<div
+										key={entry?.key ?? `commissioning-message-slot-${index}`}
+										data-testid="commissioning-message-slot"
+										aria-hidden={entry ? undefined : true}
+										className={`h-9 overflow-hidden rounded border px-2 py-0.5 text-[11px] leading-4 ${
+											commissioningMessageToneClasses(entry?.tone ?? "neutral")
+										} ${entry ? "" : "invisible"}`}
+									>
+										<span
+											style={{
+												display: "-webkit-box",
+												WebkitLineClamp: 2,
+												WebkitBoxOrient: "vertical",
+												overflow: "hidden",
+											}}
+										>
+											{entry?.message ?? "\u00A0"}
+										</span>
+									</div>
+								);
+							})}
+						</div>
 						<div className="space-y-1">
 							{Array.from({ length: jointAnglesDeg.length > 0 ? jointAnglesDeg.length : 6 }, (_, jointIndex) => {
 								const jointNumber = jointIndex + 1;
 								const angleDeg = jointAnglesDeg[jointIndex];
 								const angleLabel = Number.isFinite(angleDeg) ? `${angleDeg.toFixed(2)}°` : "--";
 								const driveAxis = commissioningDriveAxesByJoint.get(jointNumber);
+								const hasDriveAxisFeedback = typeof driveAxis?.statusword === "number" && Number.isFinite(driveAxis.statusword) && driveAxis.statusword !== 0;
 								const nativeHomeStatus = formatNativeHomeStatus(driveAxis, driveFaults);
 								const nativeHomeActiveForJoint = Boolean(driveAxis?.native_home_active)
 									|| (driveAxis ? ((nativeHomeActiveAxisMask & (1 << driveAxis.axis)) !== 0) : false);
@@ -2942,6 +3001,7 @@ export function ControlPanel({
 								const controlsDisabled = pendingJointAction !== null || motionBusy;
 								const jogDisabled = controlsDisabled || !hasLiveFeedback || !drivePowerReady;
 								const zeroDisabled = controlsDisabled || !hasLiveFeedback;
+								const nativeHomeDisabled = controlsDisabled || nativeHomeBusy || (!hasLiveFeedback && !hasDriveAxisFeedback);
 								return (
 									<div
 										key={jointNumber}
@@ -3016,7 +3076,7 @@ export function ControlPanel({
 												onClick={() => {
 													void handleJointNativeHome(jointIndex);
 												}}
-												disabled={zeroDisabled || nativeHomeBusy}
+												disabled={nativeHomeDisabled}
 												title={
 													nativeHomeBusy
 														? (
@@ -3026,7 +3086,9 @@ export function ControlPanel({
 														)
 														: hasLiveFeedback
 															? `Run commissioning drive-native home for J${jointNumber} at the current pose`
-															: `Live joint feedback is required before commissioning drive-native home on J${jointNumber}`
+															: hasDriveAxisFeedback
+																? `Run commissioning drive-native home for J${jointNumber} using live drive telemetry. Canonical joint angles are currently unavailable.`
+																: `Drive telemetry is required before commissioning drive-native home on J${jointNumber}`
 												}
 											>
 												{isPending && pendingJointAction === `native-home-${jointIndex}` ? "..." : "Drive Home"}

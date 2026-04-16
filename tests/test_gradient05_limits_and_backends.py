@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import struct
 import threading
 import time
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,7 @@ from gradient_os.arm_controller.backends.ethercat_rtcore.backend import (
     EthercatRTCoreBackend,
     RTCoreExecutionStatus,
     RTCoreJogDebugStatus,
+    _AbsoluteFeedbackAxisMetrics,
     _MAGIC_RING,
     _MSG_HEADER_STRUCT,
     _RING_HEADER_STRUCT,
@@ -57,6 +60,49 @@ def _write_rtcore_metrics_snapshot(path: Path, axes: list[dict[str, object]]) ->
         ),
         encoding="utf-8",
     )
+
+
+def _force_legacy_truth_fallback(backend: EthercatRTCoreBackend) -> EthercatRTCoreBackend:
+    backend._drive_native_ratio_enabled = lambda profile_id=None: False
+    backend._legacy_truth_fallback_enabled = lambda profile_id=None: True
+    backend._absolute_home_anchor_required = lambda profile_id=None: True
+    return backend
+
+
+def _a6ec_startup_drive_configs_for_ratio(
+    raw_ratio: object,
+    *,
+    mode_value: int = 4,
+) -> list[dict[str, int | str]]:
+    ratio = Fraction(str(raw_ratio))
+    numerator = int(ratio.numerator)
+    denominator = int(ratio.denominator)
+    return [
+        {
+            "setting_key": "a6ec_encoder_position_tracking_mode",
+            "configured": 1,
+            "commanded": mode_value,
+            "readback_valid": 1,
+            "readback": mode_value,
+            "verified": 1,
+        },
+        {
+            "setting_key": "a6ec_rotation_mode_gear_ratio_numerator",
+            "configured": 1,
+            "commanded": numerator,
+            "readback_valid": 1,
+            "readback": numerator,
+            "verified": 1,
+        },
+        {
+            "setting_key": "a6ec_rotation_mode_gear_ratio_denominator",
+            "configured": 1,
+            "commanded": denominator,
+            "readback_valid": 1,
+            "readback": denominator,
+            "verified": 1,
+        },
+    ]
 
 
 def test_gradient05_config_defaults_and_mapping_shape():
@@ -211,21 +257,27 @@ def test_ethercat_axis_mapping_defaults_to_direct_order(monkeypatch):
 
 def test_ethercat_axis_mapping_honors_env_override(monkeypatch):
     monkeypatch.setenv("GRADIENT_RTCORE_CONTROL_JOINTS", "3,4")
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
 
     assert backend._resolve_axis_to_joint_map(num_axes=2, num_joints=6) == [2, 3]
 
 
 def test_ethercat_axis_mapping_invalid_override_falls_back(monkeypatch):
     monkeypatch.setenv("GRADIENT_RTCORE_CONTROL_JOINTS", "9,10")
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
 
     assert backend._resolve_axis_to_joint_map(num_axes=2, num_joints=6) == [0, 1]
 
 
 def test_ethercat_backend_applies_master_offsets_to_setpoints(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 2
     backend._axis_to_joint = [0, 1]
@@ -264,7 +316,9 @@ def test_ethercat_backend_applies_master_offsets_to_setpoints(monkeypatch, tmp_p
 
 def test_ethercat_backend_sync_write_ignores_legacy_speed_and_accel(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
 
     commands = backend.prepare_sync_write_commands([1.0, 0.0, 0.0, 0.0, 0.0, 0.0], speed=321, accel=7)
     captured: dict[str, object] = {}
@@ -291,7 +345,9 @@ def test_ethercat_backend_sync_write_ignores_legacy_speed_and_accel(monkeypatch,
 
 def test_ethercat_backend_single_actuator_setpoint_emits_position_only_trajectory(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 2
     backend._axis_to_joint = [0, 1]
@@ -330,7 +386,9 @@ def test_ethercat_backend_single_actuator_setpoint_emits_position_only_trajector
 
 def test_ethercat_backend_set_joint_positions_does_not_advance_cache_on_commit_failure(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 2
     backend._axis_to_joint = [0, 1]
@@ -367,7 +425,9 @@ def test_ethercat_backend_converts_feedback_using_axis_scaling(monkeypatch, tmp_
             },
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._axis_to_joint = [0, 1]
     backend._axis_config = _AxisConfig(
         num_axes=2,
@@ -400,7 +460,9 @@ def test_ethercat_backend_uses_multi_turn_absolute_feedback_as_canonical_truth(m
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._axis_to_joint = [0]
     backend._axis_config = _AxisConfig(
         num_axes=1,
@@ -422,7 +484,9 @@ def test_ethercat_backend_keeps_raw_truth_across_single_turn_wrap_even_when_disp
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     metrics_path = tmp_path / "metrics.json"
     monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._axis_to_joint = [0]
     backend._axis_config = _AxisConfig(
         num_axes=1,
@@ -472,8 +536,231 @@ def test_ethercat_backend_keeps_raw_truth_across_single_turn_wrap_even_when_disp
     assert round(commanded_axis_q[0] * 100.0) == 20
 
 
-def test_ethercat_backend_normalizes_j3_style_wrapped_feedback_counts_for_display():
+def test_ethercat_backend_uses_drive_native_truth_when_startup_and_status_are_valid(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    robot_cfg = Gradient05Config().get_config_dict()
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "statusword": 0x9650,
+                "error_code": 0,
+                "manufacturer_error_code": 0,
+                "startup_drive_config": _a6ec_startup_drive_configs_for_ratio(
+                    robot_cfg["actuator_gear_ratios"][0]
+                )[0],
+                "startup_drive_configs": _a6ec_startup_drive_configs_for_ratio(
+                    robot_cfg["actuator_gear_ratios"][0]
+                ),
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 250},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = EthercatRTCoreBackend(robot_config=robot_cfg)
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[100.0] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[131072] + [0] * 15,
+    )
+    backend._rt_num_axes = 1
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    backend._absolute_encoder_home_anchors[0] = {
+        "home_anchor_rad": 0.0,
+        "source": "pytest",
+        "axis_indices": [0],
+    }
+
+    logical_positions = backend.raw_to_joint_positions({0: 250})
+    snapshot = backend.get_display_feedback_snapshot({0: 250})
+
+    assert logical_positions[0] == pytest.approx(2.5)
+    assert isinstance(snapshot, dict)
+    assert snapshot["truth_available"] is True
+    assert snapshot["drive_native_ratio_enabled"] is True
+    assert snapshot["drive_native_startup_valid"] is True
+    assert snapshot["drive_native_truth_available"] is True
+    assert snapshot["position_semantics_source"] == "drive_output_shaft"
+    axis_detail = snapshot["axis_absolute_feedback"][0]
+    assert axis_detail["truth_source"] == "drive_output_shaft"
+    assert axis_detail["display_source"] == "drive_output_shaft"
+    assert axis_detail["configured_canonical_truth_source"] == "encoder_multi_turn_counts"
+    assert axis_detail["canonical_truth_source"] == "encoder_multi_turn_counts"
+    assert axis_detail["canonical_truth_counts_source"] == "encoder_multi_turn_counts"
+    assert axis_detail["absolute_counts"] == 250
+    assert axis_detail["drive_native_startup_valid"] is True
+    assert axis_detail["drive_native_truth_valid"] is True
+
+
+def test_ethercat_backend_drive_native_truth_unwraps_public_joint_positions_but_preserves_raw_write_frame(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    robot_cfg = Gradient05Config().get_config_dict()
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "statusword": 0x9650,
+                "error_code": 0,
+                "manufacturer_error_code": 0,
+                "startup_drive_config": _a6ec_startup_drive_configs_for_ratio(
+                    robot_cfg["actuator_gear_ratios"][0]
+                )[0],
+                "startup_drive_configs": _a6ec_startup_drive_configs_for_ratio(
+                    robot_cfg["actuator_gear_ratios"][0]
+                ),
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 0},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = EthercatRTCoreBackend(robot_config=robot_cfg)
+    backend._connected = True
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[100.0] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[628] + [0] * 15,
+    )
+    backend._rt_num_axes = 1
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    backend._axis_counts[0] = 620
+    backend._absolute_encoder_home_anchors[0] = {
+        "home_anchor_rad": 0.08,
+        "source": "pytest",
+        "axis_indices": [0],
+    }
+
+    logical_positions = backend.raw_to_joint_positions({0: 620})
+    live_positions = backend.get_joint_positions()
+    commanded_axis_q = backend._axis_q_from_joint_positions(logical_positions)
+
+    assert logical_positions[0] == pytest.approx(-0.08)
+    assert live_positions[0] == pytest.approx(logical_positions[0])
+    assert backend._raw_reference_wrap_lift_counts_for_axis(0) == 628
+    assert round(commanded_axis_q[0] * 100.0) == 620
+
+
+def test_ethercat_backend_drive_native_truth_requires_absolute_home_anchor(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    robot_cfg = Gradient05Config().get_config_dict()
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "statusword": 0x9650,
+                "error_code": 0,
+                "manufacturer_error_code": 0,
+                "startup_drive_config": _a6ec_startup_drive_configs_for_ratio(
+                    robot_cfg["actuator_gear_ratios"][0]
+                )[0],
+                "startup_drive_configs": _a6ec_startup_drive_configs_for_ratio(
+                    robot_cfg["actuator_gear_ratios"][0]
+                ),
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 250},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = EthercatRTCoreBackend(robot_config=robot_cfg)
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[100.0] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[131072] + [0] * 15,
+    )
+    backend._rt_num_axes = 1
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    snapshot = backend.get_display_feedback_snapshot({0: 250})
+
+    assert isinstance(snapshot, dict)
+    assert snapshot["truth_available"] is False
+    axis_detail = snapshot["axis_absolute_feedback"][0]
+    assert axis_detail["truth_reason"] == "drive_native_absolute_home_anchor_missing"
+
+
+def test_ethercat_backend_fails_closed_when_required_drive_native_startup_settings_are_missing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "statusword": 0x9650,
+                "error_code": 0,
+                "manufacturer_error_code": 0,
+                "startup_drive_config": {
+                    "setting_key": "a6ec_encoder_position_tracking_mode",
+                    "configured": 1,
+                    "commanded": 4,
+                    "readback_valid": 1,
+                    "readback": 4,
+                    "verified": 1,
+                },
+            }
+        ],
+    )
     backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._axis_to_joint = [4]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[131072.0 / (2.0 * 3.141592653589793)] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[131072] + [0] * 15,
+    )
+    backend._rt_num_axes = 1
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    snapshot = backend.get_display_feedback_snapshot({0: -250})
+
+    assert snapshot["truth_available"] is False
+    assert snapshot["drive_native_startup_valid"] is False
+    assert snapshot["drive_native_truth_available"] is False
+    axis_detail = snapshot["axis_absolute_feedback"][0]
+    assert axis_detail["drive_native_startup_valid"] is False
+    assert axis_detail["drive_native_startup_reason"] == "startup_drive_config_missing_required_settings"
+    assert axis_detail["truth_reason"] == "drive_native_startup_drive_config_missing_required_settings"
+
+
+def test_ethercat_backend_normalizes_j3_style_wrapped_feedback_counts_for_display():
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._axis_config = _AxisConfig(
         num_axes=1,
         counts_per_unit=[(131072.0 * 100.0) / (2.0 * 3.141592653589793)] + [0.0] * 15,
@@ -514,7 +801,9 @@ def test_ethercat_backend_j3_style_native_home_capture_should_zero_pose_at_wrap_
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [2]
@@ -579,7 +868,9 @@ def test_ethercat_backend_j3_style_raw_truth_uses_wrap_lift_for_command_targets(
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -623,7 +914,9 @@ def test_ethercat_backend_translates_canonical_truth_back_into_raw_wire_counts(m
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._axis_to_joint = [0]
     backend._axis_config = _AxisConfig(
         num_axes=1,
@@ -678,7 +971,7 @@ def test_ethercat_backend_refuses_display_feedback_when_absolute_anchor_does_not
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=cfg)
+    backend = _force_legacy_truth_fallback(EthercatRTCoreBackend(robot_config=cfg))
     backend._axis_to_joint = [0]
     backend._axis_config = _AxisConfig(
         num_axes=1,
@@ -720,7 +1013,9 @@ def test_ethercat_backend_native_home_captures_absolute_encoder_anchor(monkeypat
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -776,7 +1071,9 @@ def test_ethercat_backend_native_home_reports_anchor_refresh_failure_when_captur
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -846,7 +1143,9 @@ def test_ethercat_backend_native_home_requires_post_home_anchor_validation(monke
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -913,7 +1212,9 @@ def test_ethercat_backend_software_zero_refreshes_absolute_encoder_anchor(monkey
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -951,7 +1252,8 @@ def test_ethercat_backend_prefers_robot_defined_axis_scaling(monkeypatch, tmp_pa
         ],
     )
     cfg = Gradient05Config().get_config_dict()
-    backend = EthercatRTCoreBackend(robot_config=cfg)
+    cfg["configured_drive_profile_id"] = "cia402"
+    backend = _force_legacy_truth_fallback(EthercatRTCoreBackend(robot_config=cfg))
     backend._axis_to_joint = [2]
 
     # Simulate RTCore publishing placeholder runtime scaling; robot config should win.
@@ -973,7 +1275,9 @@ def test_ethercat_backend_prefers_robot_defined_axis_scaling(monkeypatch, tmp_pa
 def test_ethercat_backend_zero_capture_persists_joint_offsets(monkeypatch, tmp_path):
     offsets_path = tmp_path / "joint_zero_offsets.json"
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(offsets_path))
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._axis_to_joint = [2, 3]
     backend._axis_config = _AxisConfig(
@@ -1011,7 +1315,9 @@ def test_ethercat_backend_connected_reads_return_canonical_feedback(monkeypatch,
             },
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 2
     backend._axis_to_joint = [0, 1]
@@ -1048,7 +1354,9 @@ def test_ethercat_backend_marks_truth_unavailable_when_absolute_anchor_does_not_
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -1092,7 +1400,9 @@ def test_ethercat_backend_accepts_stationary_roundtrip_wander_within_configured_
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -1135,7 +1445,9 @@ def test_ethercat_backend_rejects_roundtrip_wander_beyond_configured_tolerance(m
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -1188,7 +1500,9 @@ def test_ethercat_backend_diagnoses_stale_absolute_home_anchor_when_clean_homed_
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -1257,7 +1571,9 @@ def test_ethercat_backend_startup_bootstraps_missing_absolute_home_anchor(monkey
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -1302,7 +1618,9 @@ def test_ethercat_backend_startup_bootstrap_uses_display_reference_mode(monkeypa
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [2]
@@ -1386,7 +1704,9 @@ def test_ethercat_backend_connected_reads_fail_closed_when_anchor_bootstrap_cann
     metrics_path = tmp_path / "metrics.json"
     monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
     _write_rtcore_metrics_snapshot(metrics_path, [{}])
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -1574,7 +1894,9 @@ def test_ethercat_backend_native_home_downgrades_verified_result_when_post_home_
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._connected = True
     backend._rt_num_axes = 3
     backend._axis_to_joint = [0, 1, 2]
@@ -1662,6 +1984,79 @@ def test_ethercat_backend_native_home_downgrades_verified_result_when_post_home_
     assert result["post_home_settle_error_code"] == 0xFF00
     assert result["post_home_settle_statusword_hex"] == "0x9638"
     assert result["metrics_time_ns"] == 456
+
+
+def test_ethercat_backend_native_home_retries_transient_post_home_truth_failure_after_settle(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 3
+    backend._axis_to_joint = [0, 1, 2]
+
+    monkeypatch.setattr(backend, "_absolute_home_anchor_required", lambda: False)
+    monkeypatch.setattr(backend, "prepare_for_power_transition", lambda **_kwargs: None)
+    monkeypatch.setattr(backend, "_send_cmd_native_home", lambda axis_mask: None)
+    monkeypatch.setattr(
+        backend,
+        "_wait_for_native_home_result",
+        lambda *args, **kwargs: {
+            "verified": True,
+            "timed_out": False,
+            "terminal_state": "succeeded",
+            "native_home_state": 2,
+            "native_home_last_abort_code": 0,
+            "metrics_time_ns": 123,
+        },
+    )
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+    monkeypatch.setattr(backend, "sync_read_positions", lambda: {1: 140})
+    validations = iter(
+        [
+            {
+                "ok": False,
+                "truth_available": False,
+                "truth_reason": "drive_native_fault_present",
+                "axis": 1,
+                "logical_joint": 1,
+            },
+            {
+                "ok": True,
+                "truth_available": True,
+                "axis": 1,
+                "logical_joint": 1,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        backend,
+        "_absolute_home_anchor_validation_for_joint",
+        lambda *_args, **_kwargs: next(validations),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_wait_for_native_home_post_settle_result",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "timed_out": False,
+            "hard_failure": False,
+            "failure_reason": None,
+            "metrics_time_ns": 456,
+            "axis_results": [],
+        },
+    )
+
+    result = backend.native_home_joint(1)
+
+    assert result["accepted"] is True
+    assert result["verified"] is True
+    assert result["code"] == "NATIVE_HOME_VERIFIED"
+    assert result["post_home_truth_retry_after_settle"] is True
+    assert result["post_home_settle_ok"] is True
+    assert result["post_home_truth_available"] is True
+    assert "post_home_truth_reason" not in result
+    assert result["metrics_time_ns"] == 123
 
 
 def test_ethercat_backend_native_home_aborts_when_pre_neutralization_fails(monkeypatch, tmp_path):
@@ -2059,6 +2454,21 @@ def test_wait_for_native_home_result_reports_failed_after_active_mask_seen(
                 },
             ],
         },
+        {
+            "time_ns": 3,
+            "_mtime_ns": 3,
+            "native_home_active_axis_mask": 0x0,
+            "axes": [
+                {},
+                {
+                    "native_home_state": 3,
+                    "native_home_last_abort_code": 0x06010002,
+                    "statusword": 0x0250,
+                    "error_code": 0,
+                    "manufacturer_error_code": 0,
+                },
+            ],
+        },
     ]
     snapshot_iter = iter(snapshots)
     last_snapshot = snapshots[-1]
@@ -2067,7 +2477,7 @@ def test_wait_for_native_home_result_reports_failed_after_active_mask_seen(
         "_load_rtcore_metrics_snapshot",
         lambda: next(snapshot_iter, last_snapshot),
     )
-    monotonic_values = iter([0.0, 0.0, 0.1, 0.2])
+    monotonic_values = iter([0.0, 0.0, 0.1, 0.2, 0.3, 0.4])
     monkeypatch.setattr(rtcore_backend_module.time, "monotonic", lambda: next(monotonic_values))
     monkeypatch.setattr(rtcore_backend_module.time, "sleep", lambda _delay: None)
 
@@ -2079,6 +2489,74 @@ def test_wait_for_native_home_result_reports_failed_after_active_mask_seen(
     assert result["native_home_state"] == 3
     assert result["native_home_last_abort_code"] == 0x06010002
     assert result["axis_results"][0]["verification_source"] == "native_home_state"
+
+
+def test_wait_for_native_home_result_recovers_when_clean_success_follows_single_failed_snapshot_post_clear(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._rt_num_axes = 3
+
+    snapshots = [
+        {
+            "time_ns": 1,
+            "_mtime_ns": 1,
+            "native_home_active_axis_mask": 0x2,
+            "axes": [{}, {"native_home_state": 1, "native_home_last_abort_code": 0, "statusword": 0x0233}],
+        },
+        {
+            "time_ns": 2,
+            "_mtime_ns": 2,
+            "native_home_active_axis_mask": 0x0,
+            "axes": [
+                {},
+                {
+                    "native_home_state": 3,
+                    "native_home_last_abort_code": 0x06010002,
+                    "statusword": 0x0250,
+                    "error_code": 0,
+                    "manufacturer_error_code": 0,
+                },
+            ],
+        },
+        {
+            "time_ns": 3,
+            "_mtime_ns": 3,
+            "native_home_active_axis_mask": 0x0,
+            "axes": [
+                {},
+                {
+                    "native_home_state": 3,
+                    "native_home_last_abort_code": 0x06010002,
+                    "statusword": 0x9650,
+                    "error_code": 0,
+                    "manufacturer_error_code": 0,
+                },
+            ],
+        },
+    ]
+    snapshot_iter = iter(snapshots)
+    last_snapshot = snapshots[-1]
+    monkeypatch.setattr(
+        backend,
+        "_load_rtcore_metrics_snapshot",
+        lambda: next(snapshot_iter, last_snapshot),
+    )
+    monotonic_values = iter([0.0, 0.0, 0.1, 0.2, 0.3, 0.4])
+    monkeypatch.setattr(rtcore_backend_module.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(rtcore_backend_module.time, "sleep", lambda _delay: None)
+
+    result = backend._wait_for_native_home_result(0x2, timeout_s=1.0)
+
+    assert result["verified"] is True
+    assert result["timed_out"] is False
+    assert result["terminal_state"] == "succeeded"
+    assert result["native_home_state"] == 2
+    assert result["native_home_last_abort_code"] == 0
+    assert result["axis_results"][0]["native_home_state_reported"] == 3
+    assert result["axis_results"][0]["native_home_last_abort_code_reported"] == 0x06010002
+    assert result["axis_results"][0]["verification_source"] == "statusword_bits12_15_clear13"
 
 
 def test_wait_for_native_home_result_accepts_stale_failed_report_after_active_mask_clears(
@@ -2151,7 +2629,9 @@ def test_ethercat_backend_applies_native_home_offsets_to_feedback_but_not_comman
             }
         ],
     )
-    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
     backend._axis_to_joint = [0]
     backend._rt_num_axes = 1
     backend._axis_config = _AxisConfig(
@@ -2215,6 +2695,222 @@ def test_ethercat_backend_enqueue_trajectory_points_keeps_controller_logical_fra
     assert axis_mask == 0x1
 
 
+def test_ethercat_backend_enqueue_trajectory_points_keeps_nonunit_a6ec_axis_in_logical_radians(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    robot_cfg = Gradient05Config().get_config_dict()
+    backend = EthercatRTCoreBackend(robot_config=robot_cfg)
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [4]
+    neutral_counts_per_unit = 131072.0 / (2.0 * 3.141592653589793)
+    legacy_counts_per_unit = neutral_counts_per_unit * float(robot_cfg["actuator_gear_ratios"][4])
+    assert backend._robot_axis_config is not None
+    assert backend._robot_axis_config.counts_per_unit[4] == pytest.approx(legacy_counts_per_unit)
+    assert legacy_counts_per_unit != pytest.approx(neutral_counts_per_unit)
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[legacy_counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[131072] + [0] * 15,
+    )
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+
+    captured: list[tuple[int, bytes]] = []
+    monkeypatch.setattr(
+        backend,
+        "_cmd_ring_write",
+        lambda msg_type, payload: captured.append((msg_type, payload)) or 1,
+    )
+
+    commanded_joint_q = 0.4
+    backend.enqueue_trajectory_points(
+        11,
+        [
+            {
+                "positions_rad": [0.0, 0.0, 0.0, 0.0, commanded_joint_q, 0.0],
+                "t_from_start_ns": 1_000_000,
+            }
+        ],
+    )
+
+    assert len(captured) == 1
+    _msg_type, payload = captured[0]
+    unpacked = _TRAJECTORY_POINT_STRUCT.unpack(payload)
+    q_values = unpacked[4:20]
+    axis_mask = unpacked[36]
+
+    expected_neutral_counts = round(commanded_joint_q * neutral_counts_per_unit * -1.0)
+    expected_legacy_counts = round(commanded_joint_q * legacy_counts_per_unit * -1.0)
+
+    assert axis_mask == 0x1
+    assert q_values[0] == pytest.approx(commanded_joint_q)
+    assert round(q_values[0] * legacy_counts_per_unit * -1.0) == expected_legacy_counts
+    assert expected_neutral_counts != expected_legacy_counts
+
+
+def test_ethercat_backend_j6_display_feedback_uses_rotation_mode_ratio_scaling(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    assert backend._robot_axis_config is not None
+    backend._axis_config = backend._robot_axis_config
+
+    display_counts = backend._display_feedback_counts_for_axis(5, 1310650)
+    display_axis_q = backend._display_axis_q_from_raw_feedback_counts(5, 1310650)
+
+    j6_counts_per_unit = backend._robot_axis_config.counts_per_unit[5]
+    expected_axis_q = float(display_counts) / (-1.0 * float(j6_counts_per_unit))
+
+    assert display_counts == -70
+    assert display_axis_q == pytest.approx(expected_axis_q, abs=1e-12)
+    assert display_axis_q == pytest.approx(0.000335558297349984, abs=1e-12)
+
+
+def test_ethercat_backend_a6ec_reference_wrap_period_uses_per_axis_gear_ratios(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    robot_cfg = Gradient05Config().get_config_dict()
+    backend = EthercatRTCoreBackend(robot_config=robot_cfg)
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    assert backend._robot_axis_config is not None
+    backend._axis_config = backend._robot_axis_config
+
+    expected_period_counts = [
+        int(round(float(counts_per_rev) * float(gear_ratio)))
+        for counts_per_rev, gear_ratio in zip(
+            robot_cfg["actuator_encoder_counts_per_rev"][:6],
+            robot_cfg["actuator_gear_ratios"][:6],
+        )
+    ]
+    assert expected_period_counts[4] == 4_096_000
+
+    for axis_i, expected_period in enumerate(expected_period_counts):
+        counts_per_unit = float(backend._axis_config.counts_per_unit[axis_i])
+        assert int(round(counts_per_unit * (2.0 * math.pi))) == expected_period
+        assert backend._reference_wrap_period_counts_for_axis(axis_i) == expected_period
+
+
+def test_ethercat_backend_power_transition_snapshot_reports_coordinate_system_invalid(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    robot_cfg = Gradient05Config().get_config_dict()
+    backend = EthercatRTCoreBackend(robot_config=robot_cfg)
+    backend._connected = True
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    backend._rt_num_axes = 6
+    backend._axis_to_joint = [0, 1, 2, 3, 4, 5]
+    assert backend._robot_axis_config is not None
+    backend._axis_config = backend._robot_axis_config
+    backend._status_snapshot_event.set()
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+
+    raw_counts = [5, 4408, 13105469, 2359290, 138, 1310651]
+    metrics_axes: list[dict[str, object]] = []
+    for axis_i, (counts, gear_ratio) in enumerate(
+        zip(raw_counts, robot_cfg["actuator_gear_ratios"][:6], strict=False)
+    ):
+        backend._axis_counts[axis_i] = int(counts)
+        backend._absolute_feedback_by_axis[axis_i] = _AbsoluteFeedbackAxisMetrics.from_mapping(
+            {
+                "absolute_position_reference": {"valid": 1, "value": int(counts)},
+                "rotation_mode_position_reference": {"valid": 1, "value": int(counts)},
+                "rotation_mode_encoder_low": {"valid": 1, "value": int(counts)},
+                "rotation_mode_encoder_high": {"valid": 1, "value": 0},
+            }
+        )
+        metrics_axes.append(
+            {
+                "statusword": 0x1650,
+                "error_code": 0,
+                "manufacturer_error_code": 0,
+                "startup_drive_config": _a6ec_startup_drive_configs_for_ratio(gear_ratio)[0],
+                "startup_drive_configs": _a6ec_startup_drive_configs_for_ratio(gear_ratio),
+                "slave_online": 1,
+                "slave_operational": 1,
+                "slave_al_state": 8,
+            }
+        )
+    monkeypatch.setattr(backend, "_load_rtcore_metrics_snapshot", lambda: {"axes": metrics_axes})
+
+    snapshot = backend.get_power_transition_snapshot()
+
+    assert snapshot["feedback_synchronized"] is False
+    assert snapshot["feedback_truth_available"] is False
+    assert snapshot["live_feedback_joint_positions_rad"] == []
+    assert snapshot["feedback_truth_reasons"] == ["drive_native_coordinate_system_invalid"]
+    assert snapshot["feedback_truth_unavailable_axes"] == [0, 1, 2, 3, 4, 5]
+    assert snapshot["feedback_truth_unavailable_joints"] == [1, 2, 3, 4, 5, 6]
+    assert snapshot["feedback_truth_statuswords"] == ["0x1650"]
+
+
+def test_ethercat_backend_power_transition_snapshot_accepts_bit15_restart_truth(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    robot_cfg = Gradient05Config().get_config_dict()
+    backend = EthercatRTCoreBackend(robot_config=robot_cfg)
+    backend._connected = True
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    backend._rt_num_axes = 6
+    backend._axis_to_joint = [0, 1, 2, 3, 4, 5]
+    assert backend._robot_axis_config is not None
+    backend._axis_config = backend._robot_axis_config
+    backend._status_snapshot_event.set()
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+
+    raw_counts = [5, 4408, 13105469, 2359290, 138, 1310651]
+    metrics_axes: list[dict[str, object]] = []
+    for axis_i, (counts, gear_ratio) in enumerate(
+        zip(raw_counts, robot_cfg["actuator_gear_ratios"][:6], strict=False)
+    ):
+        backend._axis_counts[axis_i] = int(counts)
+        backend._absolute_encoder_home_anchors[axis_i] = {
+            "home_anchor_rad": 0.0,
+            "source": "pytest",
+            "axis_indices": [axis_i],
+        }
+        backend._absolute_feedback_by_axis[axis_i] = _AbsoluteFeedbackAxisMetrics.from_mapping(
+            {
+                "encoder_multi_turn_low": {"valid": 1, "value": int(counts)},
+                "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                "absolute_position_reference": {"valid": 1, "value": int(counts)},
+                "rotation_mode_position_reference": {"valid": 1, "value": int(counts)},
+                "rotation_mode_encoder_low": {"valid": 1, "value": int(counts)},
+                "rotation_mode_encoder_high": {"valid": 1, "value": 0},
+            }
+        )
+        metrics_axes.append(
+            {
+                "statusword": 0x8650,
+                "error_code": 0,
+                "manufacturer_error_code": 0,
+                "startup_drive_config": _a6ec_startup_drive_configs_for_ratio(gear_ratio)[0],
+                "startup_drive_configs": _a6ec_startup_drive_configs_for_ratio(gear_ratio),
+                "slave_online": 1,
+                "slave_operational": 1,
+                "slave_al_state": 8,
+            }
+        )
+    monkeypatch.setattr(backend, "_load_rtcore_metrics_snapshot", lambda: {"axes": metrics_axes})
+
+    snapshot = backend.get_power_transition_snapshot()
+
+    assert snapshot["feedback_synchronized"] is True
+    assert snapshot["feedback_truth_available"] is True
+    assert len(snapshot["live_feedback_joint_positions_rad"]) == 6
+    assert snapshot["feedback_truth_reasons"] == []
+    assert snapshot["feedback_truth_statuswords"] == []
+    assert snapshot["power_up_ready"] is True
+
+
 def test_ethercat_backend_defaults_to_disarmed_connect(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     monkeypatch.delenv("GRADIENT_RTCORE_AUTO_ARM", raising=False)
@@ -2276,8 +2972,8 @@ def test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing(monkeyp
         last_update_ns=456,
     )
 
-    def _begin_trajectory(expected_points):
-        captured["begin"] = expected_points
+    def _begin_trajectory(expected_points, axis_mask=None):
+        captured["begin"] = (expected_points, axis_mask)
         return 55
 
     def _enqueue_trajectory_points(traj_id, points):
@@ -2311,21 +3007,114 @@ def test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing(monkeyp
     result = backend.execute_joint_trajectory(
         joint_path,
         frequency=333,
+        axis_mask=0x20,
     )
 
     assert result is status
-    assert captured["begin"] == 3
+    assert captured["begin"] == (3, 0x20)
     assert captured["commit"] == 55
     points_traj_id, points_payload = captured["points"]
     assert points_traj_id == 55
     assert len(points_payload) == 3
     for idx, point in enumerate(points_payload):
+        assert point["axis_mask"] == 0x20
         assert point["positions_rad"] == joint_path[idx]
         assert point["flags"] == _TRAJ_POINTF_HAS_VELOCITY
         assert point["t_from_start_ns"] == idx * 4_000_000
         assert point["qd"] == pytest.approx([25.0, 25.0, 0.0, 0.0, 0.0, 0.0])
     wait_traj_id, wait_timeout_s, wait_submitted_command_seq = captured["wait"]
     assert wait_traj_id == 55
+    assert wait_timeout_s == pytest.approx(5.012)
+    assert wait_submitted_command_seq is None
+    assert backend.get_last_trajectory_timing() == {
+        "requested_frequency_hz": 333,
+        "effective_frequency_hz": 250,
+        "cycle_ns": 1_000_000,
+        "step_ns": 4_000_000,
+        "cycles_per_point": 4,
+    }
+
+
+def test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing_for_j5_axis_mask(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    monkeypatch.setattr(backend, "get_rtcore_cycle_ns", lambda: 1_000_000)
+    backend._rt_num_axes = 6
+    backend._axis_to_joint = [0, 1, 2, 3, 4, 5]
+
+    captured: dict[str, object] = {}
+    status = RTCoreExecutionStatus(
+        active_mode=2,
+        active_mode_name="trajectory",
+        state=4,
+        state_name="completed",
+        active_traj_id=56,
+        current_point_index=2,
+        queue_depth=0,
+        queue_capacity=4096,
+        last_event_code=0,
+        underrun_count=0,
+        stale_command=False,
+        motion_done=True,
+        capability_flags=0,
+        active_command_seq=124,
+        last_update_ns=456,
+    )
+
+    def _begin_trajectory(expected_points, axis_mask=None):
+        captured["begin"] = (expected_points, axis_mask)
+        return 56
+
+    def _enqueue_trajectory_points(traj_id, points):
+        captured["points"] = (traj_id, points)
+
+    def _commit_trajectory(traj_id):
+        captured["commit"] = traj_id
+
+    def _wait_for_trajectory_complete(traj_id, *, timeout_s, submitted_command_seq=None):
+        captured["wait"] = (traj_id, timeout_s, submitted_command_seq)
+        return status
+
+    monkeypatch.setattr(backend, "begin_trajectory", _begin_trajectory)
+    monkeypatch.setattr(
+        backend,
+        "enqueue_trajectory_points",
+        _enqueue_trajectory_points,
+    )
+    monkeypatch.setattr(backend, "commit_trajectory", _commit_trajectory)
+    monkeypatch.setattr(
+        backend,
+        "wait_for_trajectory_complete",
+        _wait_for_trajectory_complete,
+    )
+    joint_path = [
+        [0.0, 0.0, 0.0, 0.0, -0.004, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.004, 0.0],
+    ]
+
+    result = backend.execute_joint_trajectory(
+        joint_path,
+        frequency=333,
+        axis_mask=0x10,
+    )
+
+    assert result is status
+    assert captured["begin"] == (3, 0x10)
+    assert captured["commit"] == 56
+    points_traj_id, points_payload = captured["points"]
+    assert points_traj_id == 56
+    assert len(points_payload) == 3
+    for idx, point in enumerate(points_payload):
+        assert point["axis_mask"] == 0x10
+        assert point["positions_rad"] == joint_path[idx]
+        assert point["flags"] == _TRAJ_POINTF_HAS_VELOCITY
+        assert point["t_from_start_ns"] == idx * 4_000_000
+        assert point["qd"] == pytest.approx([0.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+    wait_traj_id, wait_timeout_s, wait_submitted_command_seq = captured["wait"]
+    assert wait_traj_id == 56
     assert wait_timeout_s == pytest.approx(5.012)
     assert wait_submitted_command_seq is None
     assert backend.get_last_trajectory_timing() == {
@@ -2596,6 +3385,82 @@ def test_ethercat_backend_wait_for_short_trajectory_completion_without_observed_
     assert result.active_traj_id == 0
     assert result.state_name == "idle"
     assert result.active_command_seq == 205
+
+
+def test_ethercat_backend_wait_for_trajectory_complete_waits_past_queue_empty_executing_snapshot(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+
+    statuses = iter(
+        [
+            RTCoreExecutionStatus(
+                active_mode=2,
+                active_mode_name="trajectory",
+                state=3,
+                state_name="executing",
+                active_traj_id=4,
+                current_point_index=22,
+                queue_depth=1,
+                queue_capacity=4096,
+                last_event_code=290,
+                underrun_count=0,
+                stale_command=False,
+                motion_done=False,
+                capability_flags=0,
+                active_command_seq=133,
+                last_update_ns=1000,
+            ),
+            RTCoreExecutionStatus(
+                active_mode=2,
+                active_mode_name="trajectory",
+                state=3,
+                state_name="executing",
+                active_traj_id=4,
+                current_point_index=24,
+                queue_depth=0,
+                queue_capacity=4096,
+                last_event_code=290,
+                underrun_count=0,
+                stale_command=False,
+                motion_done=False,
+                capability_flags=0,
+                active_command_seq=133,
+                last_update_ns=1100,
+            ),
+            RTCoreExecutionStatus(
+                active_mode=2,
+                active_mode_name="trajectory",
+                state=RTCORE_EXEC_STATE_COMPLETED,
+                state_name="completed",
+                active_traj_id=4,
+                current_point_index=24,
+                queue_depth=0,
+                queue_capacity=4096,
+                last_event_code=291,
+                underrun_count=0,
+                stale_command=False,
+                motion_done=True,
+                capability_flags=0,
+                active_command_seq=133,
+                last_update_ns=1200,
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(backend, "get_execution_status", lambda: next(statuses))
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    result = backend.wait_for_trajectory_complete(
+        4,
+        timeout_s=0.1,
+        submitted_command_seq=133,
+    )
+
+    assert result.active_traj_id == 4
+    assert result.state_name == "completed"
+    assert result.motion_done is True
 
 
 def test_ethercat_backend_sends_realtime_jog_command(monkeypatch, tmp_path):

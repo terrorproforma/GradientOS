@@ -394,6 +394,28 @@ def _backend_display_feedback_snapshot(
     }
 
 
+def _attach_monitor_joint_feedback(
+    msg: dict[str, object],
+    *,
+    canonical_joint_positions_rad: list[float] | None,
+    display_snapshot: dict[str, object] | None,
+) -> None:
+    if isinstance(canonical_joint_positions_rad, list):
+        msg["joints"] = [float(value) for value in canonical_joint_positions_rad]
+
+    if not isinstance(display_snapshot, dict):
+        return
+
+    if bool(display_snapshot.get("truth_available", True)):
+        display_positions = display_snapshot.get("joint_positions_rad")
+        if isinstance(display_positions, list):
+            msg["display_joints"] = [float(value) for value in display_positions]
+
+    axis_absolute_feedback = display_snapshot.get("axis_absolute_feedback")
+    if isinstance(axis_absolute_feedback, list):
+        msg["axis_absolute_feedback"] = axis_absolute_feedback
+
+
 _CANONICAL_TRUTH_DETAILS_RE = re.compile(
     r"\(axes=\[(?P<axes>[^\]]*)\],\s*joints=\[(?P<joints>[^\]]*)\]\)"
 )
@@ -1338,6 +1360,9 @@ Examples:
 
         print(f"[Controller] Creating {servo_backend_local} backend instance...")
         robot_config_dict = selected_robot_local.get_config_dict()
+        robot_config_dict["configured_drive_profile_id"] = (
+            str(drive_profile).strip().lower() if drive_profile else None
+        )
         active_backend_local = None
         backend_ready_local = False
         try:
@@ -1443,9 +1468,6 @@ Examples:
                         "t": time.time(),
                         "joint_feedback_available": joint_feedback_available,
                     }
-                    if q is not None:
-                        msg["joints"] = [float(x) for x in q]
-                        msg["display_joints"] = [float(x) for x in q]
                     if joint_feedback_error:
                         msg["joint_feedback_error"] = joint_feedback_error
                     correlation_id = utils.trajectory_state_get("last_correlation_id")
@@ -1495,10 +1517,11 @@ Examples:
                         backend = None
                     raw_positions = _sync_backend_raw_positions(backend)
                     display_snapshot = _backend_display_feedback_snapshot(backend, raw_positions)
-                    if isinstance(display_snapshot, dict):
-                        axis_absolute_feedback = display_snapshot.get("axis_absolute_feedback")
-                        if isinstance(axis_absolute_feedback, list):
-                            msg["axis_absolute_feedback"] = axis_absolute_feedback
+                    _attach_monitor_joint_feedback(
+                        msg,
+                        canonical_joint_positions_rad=q,
+                        display_snapshot=display_snapshot,
+                    )
                     if cached_motion_status is None or now - last_motion_status_ts >= 0.1:
                         cached_motion_status = _build_monitor_motion_status_payload()
                         last_motion_status_ts = now
@@ -2734,12 +2757,19 @@ Examples:
                         speed_raw = payload.get("speed")
                         accel_raw = payload.get("acceleration")
                         max_motor_rpm_raw = payload.get("max_motor_rpm")
+                        target_joint_indices_raw = payload.get("target_joint_indices")
+                        target_joint_indices = None
+                        if target_joint_indices_raw is not None:
+                            if not isinstance(target_joint_indices_raw, list):
+                                raise ValueError("target_joint_indices must be a list")
+                            target_joint_indices = [int(value) for value in target_joint_indices_raw]
                         payload = command_api.handle_apply_joint_setpoint(
                             [float(value) for value in arm_angles],
                             gripper_rad=gripper_rad,
                             speed=int(speed_raw) if speed_raw is not None else None,
                             acceleration=float(accel_raw) if accel_raw is not None else None,
                             max_motor_rpm=float(max_motor_rpm_raw) if max_motor_rpm_raw is not None else None,
+                            target_joint_indices=target_joint_indices,
                         )
                         _send_controller_ack(sock, addr, "APPLY_JOINT_SETPOINT", payload)
                     except Exception as e:

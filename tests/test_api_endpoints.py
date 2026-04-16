@@ -1196,6 +1196,7 @@ def test_control_joint_jog(client):
     assert last_command.startswith("APPLY_JOINT_SETPOINT,")
     payload = json.loads(base64.urlsafe_b64decode(last_command.split(",", 1)[1]).decode("utf-8"))
     assert payload["max_motor_rpm"] == pytest.approx(100.0)
+    assert payload["target_joint_indices"] == [2]
 
 
 def test_control_joint_jog_ignores_wait_for_idle_flag(client):
@@ -1222,6 +1223,7 @@ def test_control_joint_jog_ignores_wait_for_idle_flag(client):
     assert expect_response is True
     payload = _decode_command_payload(commands[-1][0])
     assert payload["max_motor_rpm"] == pytest.approx(100.0)
+    assert payload["target_joint_indices"] == [1]
 
 
 def test_control_joint_jog_surfaces_backend_rejection(client, monkeypatch):

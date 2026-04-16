@@ -1368,6 +1368,58 @@ def _get_backend_power_transition_snapshot(backend) -> dict[str, object]:
     return dict(snapshot) if isinstance(snapshot, dict) else {}
 
 
+def _feedback_synchronization_blocker_from_snapshot(
+    backend_snapshot: dict[str, object],
+) -> dict[str, object]:
+    truth_reasons = sorted(
+        {
+            str(value).strip()
+            for value in list(backend_snapshot.get("feedback_truth_reasons", []))
+            if str(value).strip()
+        }
+    )
+    unavailable_axes = [
+        int(value)
+        for value in list(backend_snapshot.get("feedback_truth_unavailable_axes", []))
+        if isinstance(value, (int, float))
+    ]
+    unavailable_joints = [
+        int(value)
+        for value in list(backend_snapshot.get("feedback_truth_unavailable_joints", []))
+        if isinstance(value, (int, float))
+    ]
+    statuswords = sorted(
+        {
+            str(value).strip()
+            for value in list(backend_snapshot.get("feedback_truth_statuswords", []))
+            if str(value).strip()
+        }
+    )
+    if truth_reasons == ["drive_native_coordinate_system_invalid"]:
+        return {
+            "code": "coordinate_system_invalid",
+            "message": "Drive-native coordinate system is invalid; run Drive Home before power-up.",
+            "truth_reasons": truth_reasons,
+            "truth_unavailable_axes": unavailable_axes,
+            "truth_unavailable_joints": unavailable_joints,
+            "statuswords": statuswords,
+            "requires_native_home": True,
+        }
+    if truth_reasons:
+        return {
+            "code": "canonical_truth_unavailable",
+            "message": "Live joint truth is unavailable; keep the drives disarmed until telemetry is valid.",
+            "truth_reasons": truth_reasons,
+            "truth_unavailable_axes": unavailable_axes,
+            "truth_unavailable_joints": unavailable_joints,
+            "statuswords": statuswords,
+        }
+    return {
+        "code": "not_synchronized",
+        "message": "Live feedback is not synchronized yet; keep the drives disarmed.",
+    }
+
+
 def _build_power_transition_guard(
     *,
     controller_motion_state: str,
@@ -1450,12 +1502,7 @@ def _build_power_transition_guard(
             }
         )
     if backend is not None and not feedback_synchronized:
-        blockers.append(
-            {
-                "code": "not_synchronized",
-                "message": "Live feedback is not synchronized yet; keep the drives disarmed.",
-            }
-        )
+        blockers.append(_feedback_synchronization_blocker_from_snapshot(backend_snapshot))
 
     blocker_codes = [str(item.get("code", "")).strip() for item in blockers if str(item.get("code", "")).strip()]
     return {
@@ -3268,6 +3315,7 @@ def handle_apply_joint_setpoint(
     speed: int | None = None,
     acceleration: float | None = None,
     max_motor_rpm: float | None = None,
+    target_joint_indices: Sequence[int] | None = None,
 ) -> dict[str, object]:
     """
     Send a direct joint/gripper setpoint and return once the backend accepts it.
@@ -3282,6 +3330,17 @@ def handle_apply_joint_setpoint(
         if acceleration is not None
         else utils.DEFAULT_SERVO_ACCELERATION_DEG_S2
     )
+    normalized_target_joint_indices: list[int] | None = None
+    if target_joint_indices is not None:
+        normalized_target_joint_indices = []
+        for raw_index in target_joint_indices:
+            joint_idx = int(raw_index)
+            if joint_idx < 0 or joint_idx >= len(arm_angles_rad):
+                raise ValueError(f"target_joint_indices contains out-of-range joint index {joint_idx}")
+            if joint_idx not in normalized_target_joint_indices:
+                normalized_target_joint_indices.append(joint_idx)
+        if not normalized_target_joint_indices:
+            normalized_target_joint_indices = None
     _begin_non_program_motion()
     if max_motor_rpm is not None and float(max_motor_rpm) > 0.0:
         if bool(utils.trajectory_state_get("is_running", False)):
@@ -3314,6 +3373,7 @@ def handle_apply_joint_setpoint(
                 "joint_path": joint_path,
                 "frequency": _SAFE_JOINT_MOVE_FREQUENCY_HZ,
                 "diagnostics": False,
+                "target_joint_indices": normalized_target_joint_indices,
             },
             daemon=True,
         )
@@ -3340,6 +3400,9 @@ def handle_apply_joint_setpoint(
                 "max_motor_rpm": float(max_motor_rpm),
                 "duration_s": float(duration_s),
                 "frequency_hz": _SAFE_JOINT_MOVE_FREQUENCY_HZ,
+                "target_joint_indices": list(normalized_target_joint_indices)
+                if normalized_target_joint_indices is not None
+                else None,
             },
         )
 
