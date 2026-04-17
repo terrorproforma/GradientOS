@@ -1184,11 +1184,7 @@ One of the most important drive-safety rules is:
 
 This avoids large target steps during DS402 transitions, which were explicitly associated with avoiding `Er87.*` behavior.
 
-Final native-home-specific clarification:
-
-- for A6-EC with persisted native home in `0x607C`, drive-facing hold/output/enable targets must stay in raw PDO wire counts (`0x6064` / `0x607A`),
-- subtract `native_home_position_offset` only when converting queued controller/logical targets into raw CSP wire counts,
-- do not subtract it again when mirroring live feedback into hold targets or seeding realtime jog accumulators.
+Drive-facing CSP hold/output/enable targets stay in the raw PDO wire frame (`0x6064` / `0x607A` counts). Target count selection uses a stateless per-write nearest-turn fold against live `0x6064` (see §9.4). There is no cached wrap-lift term between writes.
 
 From RTCore comments:
 
@@ -1200,6 +1196,66 @@ From RTCore comments:
 And from controller power-up logic:
 
 - power-up is blocked unless the stack is neutral and synchronized.
+
+### 9.4 Command-frame turn selection is stateless per write
+
+Seam-adjacent small jogs on multi-turn-capable A6-EC axes repeatedly produced drive `Er87.1` (excessive position reference increment > 5 x max speed) and `Er47.0` (following error). The root cause was host-side stale wrap-lift state: a cached per-axis `±RM` offset that could lose track of which shaft turn the axis was on between writes and produce a single-cycle `RM`-count jump on the next `607A` upload.
+
+Finalized contract:
+
+- `607A` turn selection is stateless per write. For every upload, compute `target_counts = round((canonical_q + master_offset) * sign * counts_per_unit)` then fold to the nearest shaft turn of live `0x6064`:
+
+```
+delta = target_counts - live_6064_counts
+delta -= round(delta / RM) * RM
+target_607A = live_6064_counts + delta
+```
+
+- `abs(target_607A - live_6064_counts) <= RM / 2` is an invariant by construction. The host raises `command_frame_oversized_delta` if the fold ever produces a delta larger than that, as a regression guard.
+- Do NOT persist a wrap-lift quantity between writes. Cached wrap-lift state is what produced the `Er87.1` family and is permanently removed from the Python backend.
+- Trajectory upload has a pre-commit sanity gate: each consecutive point's `607A` step must be `<= 0.5 * RM` or the upload is rejected with `command_frame_oversized_step`. This is a host-side frame-sanity fence. Per-cycle motion clamping remains RTCore's `max_step_counts_per_cycle`.
+
+### 9.5 Multi-turn truth requires the absolute encoder source, not bare `0x6064`
+
+Vendor guidance (Q4/Q10) says the host only needs `0x6064`. Practical constraint: `0x6064` wraps at `RM` in absolute rotation mode (`0 .. RM - 1`) and cannot carry multi-turn continuity. Gradient-05 software joint limits exceed one shaft revolution on J1/J4/J5/J6, so those joints genuinely need multi-turn truth.
+
+Finalized contract:
+
+- Canonical planner/controller truth for A6-EC is `canonical_q = absolute_axis_q − absolute_home_anchor − master_offset` where `absolute_axis_q` is the i64 combine of `U40.20 / U40.22` and the anchor is persisted in `.gradient_absolute_encoder_anchors.json`.
+- `U40.20 / U40.22` are NOT demoted to diagnostics. They are the authoritative multi-turn source.
+- Vendor "6064 is authoritative" should be interpreted as "authoritative within shaft space". Before publishing canonical truth the controller verifies that `(canonical_q + master_offset) * sign * counts_per_unit` agrees with live `0x6064` modulo `RM` within `16` counts. Whole-shaft-turn offsets are legitimate multi-turn state; sub-shaft-turn drift is a frame bug and fails truth closed with `multi_turn_anchor_inconsistent_with_live_6064`.
+
+### 9.6 HM35 must wait for a drive-confirmed disarmed statusword
+
+Vendor Q2 requires the motor to be "stationary AND inactive" before HM35. The host-side `motion_intent_cleared` flag alone is not sufficient because it does not observe the drive's actual DS402 state transition.
+
+Finalized contract:
+
+- RTCore `MSG_CMD_NATIVE_HOME` is two-stage. Stage A clears `axis_enable_mask`, `armed`, and motion intent, then polls each targeted axis's `statusword` until the DS402 state has left `OperationEnabled` / `QuickStopActive` for several consecutive cycles within a `~500 ms` budget. Stage B runs the existing descriptor-driven HM35 transaction unchanged.
+- Stage-A timeout raises a synthesized abort code in the reserved `0xFxxxxxxx` RTCore-side range (currently `NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT = 0xF1000001`). Real CoE SDO aborts live in `0x05xxxxxx`–`0x08xxxxxx`; the ranges must not collide.
+- Controller-side, `prepare_for_power_transition` accepts `require_drive_disarmed=True` with a targeted axis mask. Neutrality becomes `motion_intent_cleared AND per_axis_drive_disarmed[axis]` for every targeted axis. The backend wait also sends an explicit `axis_disable` to the targeted mask so the cyclic loop actively drives the state machine away from `OperationEnabled` instead of passively waiting.
+- Operator-observable expectation: a single brake click per native-home action (one disarm), not a disarm + HM35-enable pair.
+
+### 9.7 Restart trust via persisted home anchor
+
+Vendor Q6/Q9 states that `0x6041 bit 15` remains valid after a drive power cycle. On the current A6-EC firmware this does NOT hold — bit 15 is cleared on every drive power-up — while `0x6064`, `U40.20 / U40.22`, and `0x607C` all restore cleanly across both power loss and manual rotation while the drive is off (per vendor Q1's 32,767-motor-turn budget). Requiring a re-home after every power cycle was untenable, so the controller carries three trust paths and accepts the first that matches.
+
+Finalized trust order (first match wins), all gated by a clean drive (no faults, bus up, slave operational):
+
+1. Fresh-home strict signature: `bit 12 ∧ bit 15 ∧ ¬bit 13`. `drive_native_truth_verification_source = "statusword_bits12_15_clear13"`.
+2. Bit-15-alone (vendor Q9 literal): `bit 15` set alone when the profile sets `startup_truth_requires_hm_success_signature=False`. `"statusword_bit15"`. **Vestigial on the A6-EC firmware we currently run** — see `POSITION_SEMANTICS_CONFIG["firmware_bit15_retention_expected"]` in `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`, which advertises this as `False`. Kept in code for future drives / firmware revisions that honour Q9, but unreachable in practice on production A6-EC hardware today.
+3. Persisted-home-anchor agreement: profile sets `accept_persisted_home_anchor_as_restart_trust=True` AND `.gradient_absolute_encoder_anchors.json` has an entry for the joint AND live `U40.20 / U40.22` reports `valid=1` AND the mod-`RM` shaft-frame check agrees within tolerance AND no encoder-retention-family fault is live. `"persisted_home_anchor_agreement"`.
+
+Otherwise truth fails closed with a specific reason. Reason priority (first match wins): `encoder_retention_fault_present` (live `Er20.1 .. Er20.9` / `ALF9.0` outranks the generic fault branches), `fault_present`, `manufacturer_fault_present`, `slave_offline`, `slave_not_operational`, `native_home_active`, then the anchor-path diagnostics: `persisted_home_anchor_missing`, `multi_turn_feedback_invalid`, `multi_turn_feedback_lost_across_power_cycle` (when the optional last-seen U40.20/.22 sidecar shows the live delta exceeds the physically-possible budget), `persisted_home_anchor_inconsistent_with_live_6064`, and finally the generic `coordinate_system_invalid`. The operator must re-home.
+
+Invariants:
+
+- Initial HM35 per joint is always required to establish the anchor file entry. The restart-trust path reuses state, it does not manufacture trust.
+- After initial HM35, drive power cycles do NOT require re-homing as long as multi-turn remains valid.
+- Manual joint rotation while the drive is off is absorbed by the restart-trust path because `absolute_axis_q − reference_q` is invariant under shaft motion. Encoder data loss (battery, `> 32,767` motor-turn overrun, catastrophic fault) is the well-founded case that breaks the invariant.
+- An optional `last_seen` sidecar on each anchor entry records the `absolute_counts` observed on every trusted-axis cycle (rate-limited to once per 5 s per joint). It is diagnostic only — the shaft-frame gate remains the primary closure — but when a live delta against the stored sidecar exceeds `32,767 × counts_per_rev`, the reason upgrades to `multi_turn_feedback_lost_across_power_cycle` so operators can distinguish encoder-loss from ordinary anchor disagreement.
+- Live encoder-retention-family faults (`Er20.1 .. Er20.9`, `ALF9.0`) surface as `encoder_retention_fault_present` and block trust regardless of anchor agreement, because multi-turn integrity is the exact precondition the anchor path depends on.
+- `F31.10 = 4` always requires a fresh HM35 afterward; restart trust is not a substitute.
 
 ## 10. Safe Power-Transition Contract
 
@@ -2711,6 +2767,9 @@ These are the concrete best practices the repo converged on.
 - Do not inject legacy hold-position writes on RTCore-backed STOP.
 - Keep jog as a timeout-governed RT mode, not a pseudo-trajectory.
 - Fail closed if live feedback synchronization is missing.
+- Choose `607A` turn via a stateless per-write fold against live `0x6064`; never cache a wrap-lift term between writes.
+- Require a drive-confirmed disarmed statusword before HM35, not just a host-side motion-intent flag.
+- Keep canonical truth multi-turn-rooted when joint limits exceed one shaft revolution; verify mod-`RM` agreement with live `0x6064` before publishing.
 
 ### 15.3 Bring-up best practices
 
@@ -2725,6 +2784,8 @@ These are the concrete best practices the repo converged on.
 - Keep env override support for partial bring-up, but make it explicit.
 - Implement zero capture via software offsets using live RTCore scaling, not drive EEPROM edits.
 - Preserve conservative commissioning safety caps like `--max-rpm 100`.
+- Require exactly one initial HM35 per joint to establish the persisted home anchor; trust the restart-trust paths thereafter. Re-home only when multi-turn feedback is invalidated or the shaft-frame check disagrees.
+- Validate drive persistence with a real power-cycle probe (`scripts/a6ec_chapter5_probe.py` pre/post snapshots under `logs/encoder-retention/`), not vendor claims alone.
 
 ### 15.5 Comms / execution best practices
 

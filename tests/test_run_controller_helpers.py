@@ -209,7 +209,9 @@ def test_build_joint_state_snapshot_does_not_fallback_display_feedback(monkeypat
     assert snapshot["arm_rad"] == canonical_positions
     assert snapshot["arm_display_rad"] == []
     assert snapshot["arm_display_deg"] == []
-    assert snapshot["canonical_joint_truth_available"] is False
+    assert snapshot["raw_canonical_joint_truth_available"] is True
+    assert snapshot["display_joint_truth_available"] is False
+    assert snapshot["canonical_joint_truth_available"] is True
 
 
 def test_build_joint_state_snapshot_preserves_partial_display_feedback(monkeypatch):
@@ -288,10 +290,11 @@ def test_build_joint_state_snapshot_preserves_partial_display_feedback(monkeypat
     assert display_deg[3] is None
     assert display_deg[4] == pytest.approx(float((0.51 * 180.0) / 3.141592653589793))
     assert display_deg[5] == pytest.approx(float((0.61 * 180.0) / 3.141592653589793))
+    assert snapshot["raw_canonical_joint_truth_available"] is True
     assert snapshot["display_joint_truth_available"] is False
     assert snapshot["display_joint_truth_unavailable_axes"] == [1, 3]
     assert snapshot["display_joint_truth_unavailable_joints"] == [2, 4]
-    assert snapshot["canonical_joint_truth_available"] is False
+    assert snapshot["canonical_joint_truth_available"] is True
 
 
 def test_build_joint_state_snapshot_keeps_raw_blocker_details_when_display_truth_is_available(monkeypatch):

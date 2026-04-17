@@ -273,7 +273,18 @@ def test_drive_fault_snapshot_decodes_axis_fault_and_master_state():
     assert snapshot["axes"][0]["drive_native_truth_reason"] == "coordinate_system_invalid"
     assert snapshot["axes"][2]["drive_native_startup_valid"] is False
     assert snapshot["axes"][2]["drive_native_startup_reason"] == "startup_drive_config_missing_required_settings"
-    assert snapshot["axes"][2]["drive_native_truth_reason"] == "fault_present"
+    # Er20.8 (encoder battery failure, 0x7305 / 0x208) is part of the
+    # encoder-retention fault family, so the truth-validity helper now
+    # surfaces the more specific `encoder_retention_fault_present`
+    # reason ahead of the generic `fault_present` branch. The profile
+    # also carries the matched vendor code and name on the per-axis
+    # payload.
+    assert snapshot["axes"][2]["drive_native_truth_reason"] == "encoder_retention_fault_present"
+    assert snapshot["axes"][2]["encoder_retention_fault_present"] is True
+    retention_detail = snapshot["axes"][2]["encoder_retention_fault"]
+    assert isinstance(retention_detail, dict)
+    assert "Er20.8" in retention_detail.get("codes", [])
+    assert "Encoder battery failure" in retention_detail.get("names", [])
     assert snapshot["axes"][2]["startup_drive_config"] == {
         "profile_id": "a6ec_ds402",
         "setting_key": "a6ec_encoder_position_tracking_mode",
@@ -363,6 +374,62 @@ def test_drive_fault_snapshot_marks_drive_native_truth_valid_when_startup_and_st
     assert snapshot["axes"][0]["drive_native_startup_valid"] is True
     assert snapshot["axes"][0]["drive_native_truth_valid"] is True
     assert snapshot["axes"][0]["drive_native_truth_reason"] == "valid"
+
+
+def test_drive_fault_snapshot_uses_verified_startup_drive_configs_when_legacy_primary_is_stale():
+    robot_cfg = get_robot_config("gradient05").get_config_dict()
+    verified_startup = _a6ec_startup_drive_configs_for_ratio(robot_cfg["actuator_gear_ratios"][0])
+    snapshot = build_drive_fault_snapshot(
+        metrics={
+            "num_axes": 1,
+            "armed": 0,
+            "axis_enable_mask": 0,
+            "link_up": 1,
+            "responding_slaves": 1,
+            "online_slaves": 1,
+            "operational_slaves": 1,
+            "startup_ready": 1,
+            "wkc_actual": 3,
+            "wkc_expected": 3,
+            "master_al_states": 8,
+            "axes": [
+                {
+                    # Model a stale legacy single-entry view after a startup
+                    # epoch reset. The authoritative per-descriptor list is
+                    # what the backend should aggregate for startup validity.
+                    "startup_drive_config": {
+                        "setting_key": "a6ec_encoder_position_tracking_mode",
+                        "configured": 0,
+                        "commanded": 0,
+                        "readback_valid": 0,
+                        "readback": 0,
+                        "verified": 0,
+                    },
+                    "startup_drive_configs": verified_startup,
+                    "statusword": 0x9650,
+                    "error_code": 0,
+                    "manufacturer_error_code": 0,
+                    "slave_online": 1,
+                    "slave_operational": 1,
+                    "slave_al_state": 8,
+                    "pos_counts": 0,
+                }
+            ],
+        },
+        servo_backend="ethercat_rtcore",
+        drive_profile="a6ec_ds402",
+        axis_to_joint=[0],
+        socket_present=True,
+    )
+    axis = snapshot["axes"][0]
+    assert snapshot["drive_native_startup_valid"] is True
+    assert axis["drive_native_startup_valid"] is True
+    assert axis["drive_native_startup_reason"] == "verified"
+    assert axis["startup_drive_config"]["configured"] is True
+    assert axis["startup_drive_config"]["commanded"] == 4
+    assert axis["startup_drive_config"]["settings"][
+        "a6ec_rotation_mode_gear_ratio_numerator"
+    ]["configured"] is True
 
 
 def test_drive_fault_snapshot_accepts_a6ec_bit15_only_restart_truth():

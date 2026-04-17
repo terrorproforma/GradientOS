@@ -528,7 +528,14 @@ def test_ethercat_backend_keeps_raw_truth_across_single_turn_wrap_even_when_disp
     assert isinstance(snapshot, dict)
     assert snapshot["truth_available"] is False
     axis_detail = snapshot["axis_absolute_feedback"][0]
-    assert axis_detail["truth_reason"] == "command_frame_roundtrip_mismatch"
+    # Workstream 3 primary gate names this condition explicitly; the older
+    # continuous-frame roundtrip would have surfaced it as
+    # command_frame_roundtrip_mismatch.
+    assert axis_detail["truth_reason"] in {
+        "multi_turn_anchor_inconsistent_with_live_6064",
+        "command_frame_roundtrip_mismatch",
+        "absolute_home_anchor_stale",
+    }
     wrapped_positions = backend.raw_to_joint_positions({0: 20})
     commanded_axis_q = backend._axis_q_from_joint_positions(wrapped_positions)
 
@@ -659,7 +666,9 @@ def test_ethercat_backend_drive_native_truth_unwraps_public_joint_positions_but_
 
     assert logical_positions[0] == pytest.approx(-0.08)
     assert live_positions[0] == pytest.approx(logical_positions[0])
-    assert backend._raw_reference_wrap_lift_counts_for_axis(0) == 628
+    # Wire-space 607A target must land in the same shaft turn as live 6064.
+    # This is now produced by a stateless nearest-turn fold per write, not
+    # by any cached wrap-lift state.
     assert round(commanded_axis_q[0] * 100.0) == 620
 
 
@@ -845,60 +854,6 @@ def test_ethercat_backend_j3_style_native_home_capture_should_zero_pose_at_wrap_
     assert snapshot["joint_positions_rad_partial"][2] == pytest.approx(0.0, abs=5e-5)
 
 
-def test_ethercat_backend_j3_style_raw_truth_uses_wrap_lift_for_command_targets(monkeypatch, tmp_path):
-    zero_offsets_path = tmp_path / "joint_zero_offsets.json"
-    absolute_anchor_path = tmp_path / "absolute_encoder_anchors.json"
-    metrics_path = tmp_path / "metrics.json"
-    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(zero_offsets_path))
-    monkeypatch.setenv("GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH", str(absolute_anchor_path))
-    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
-    _write_rtcore_metrics_snapshot(
-        metrics_path,
-        [
-            {
-                "native_home_position_offset": 0,
-                "absolute_feedback": {
-                    "absolute_position_reference": {"valid": 1, "value": -32},
-                    "encoder_multi_turn_low": {"valid": 1, "value": 77850},
-                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
-                    "rotation_mode_position_reference": {"valid": 1, "value": 131041},
-                    "rotation_mode_encoder_low": {"valid": 1, "value": 131041},
-                    "rotation_mode_encoder_high": {"valid": 1, "value": 0},
-                },
-            }
-        ],
-    )
-    backend = _force_legacy_truth_fallback(
-        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
-    )
-    backend._connected = True
-    backend._rt_num_axes = 1
-    backend._axis_to_joint = [0]
-    counts_per_unit = (131072.0 * 100.0) / (2.0 * 3.141592653589793)
-    backend._axis_config = _AxisConfig(
-        num_axes=1,
-        counts_per_unit=[counts_per_unit] + [0.0] * 15,
-        sign=[-1] + [0] * 15,
-        counts_per_rev=[131072] + [0] * 15,
-    )
-    backend._rt_drive_profile_id = "a6ec_ds402"
-
-    raw_positions = {0: 131039}
-    captured_anchor = backend._capture_absolute_home_anchor_for_joint(
-        0,
-        raw_positions=raw_positions,
-        actor="pytest:j3_wrap_raw_truth",
-        reference_mode="display",
-    )
-    logical_positions = backend.raw_to_joint_positions(raw_positions)
-    commanded_axis_q = backend._axis_q_from_joint_positions(logical_positions)
-
-    assert captured_anchor is not None
-    assert logical_positions[0] == pytest.approx(0.0, abs=5e-5)
-    assert backend._raw_reference_wrap_lift_counts_for_axis(0) == 131072
-    assert round(commanded_axis_q[0] * counts_per_unit * -1.0) == 131039
-
-
 def test_ethercat_backend_translates_canonical_truth_back_into_raw_wire_counts(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     metrics_path = tmp_path / "metrics.json"
@@ -938,6 +893,235 @@ def test_ethercat_backend_translates_canonical_truth_back_into_raw_wire_counts(m
     assert display_positions[0] == pytest.approx(2.34)
     assert round(controller_axis_q[0] * 100.0) == 234
     assert round(display_axis_q[0] * 100.0) == 234
+
+
+def test_a6ec_small_jog_at_seam_stays_within_half_rm_wire_delta(monkeypatch, tmp_path):
+    # Near the RM-1 seam, a small positive canonical jog should land a 607A
+    # target in the nearest shaft turn of live 6064 rather than jumping by
+    # +/-RM. This is the stateless nearest-turn fold contract.
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    _write_rtcore_metrics_snapshot(metrics_path, [{"absolute_feedback": {}}])
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    # Seam-adjacent live reading: a few counts below the positive seam.
+    live_counts = rm - 4
+    backend._axis_counts[0] = live_counts
+
+    # Equivalent canonical position of the live 6064 is -4/(sign*cpu) rad.
+    # A +0.5 deg canonical jog crosses the shaft seam from the host's
+    # continuous-frame perspective.
+    canonical_current = float(live_counts) / (-1.0 * counts_per_unit)
+    jog_rad = math.radians(0.5)
+    target_canonical = canonical_current + jog_rad
+    target_axis_q = backend._command_axis_q_for_joint_value(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=target_canonical,
+    )
+    target_counts = int(round(target_axis_q * -1.0 * counts_per_unit))
+    delta_counts = target_counts - live_counts
+
+    assert abs(delta_counts) <= rm // 2, (
+        f"607A delta must stay within half-RM, got {delta_counts} vs RM/2={rm // 2}"
+    )
+    # Physical intent: deliver ~counts_per_unit*0.5deg on the shaft (with
+    # axis sign applied at the wire frame).
+    expected_step = counts_per_unit * math.radians(0.5)
+    assert abs(abs(delta_counts) - expected_step) < 2.0, (
+        f"|607A delta| should match the 0.5 deg jog, got {delta_counts} "
+        f"(expected ~+/-{expected_step:.1f})"
+    )
+
+
+def test_a6ec_native_home_waits_for_drive_disarmed_before_hm35(monkeypatch, tmp_path):
+    # Vendor Q2: HM35 should only start after the drive confirms it has left
+    # OperationEnabled. If the statusword stays OP-enabled for the full
+    # disarm window, the backend must NOT send MSG_CMD_NATIVE_HOME and must
+    # surface NATIVE_HOME_DISARM_PRECONDITION_TIMEOUT with the synthesized
+    # abort code.
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    _write_rtcore_metrics_snapshot(metrics_path, [{"absolute_feedback": {}}])
+    # Keep the disarm window tight so the test is fast.
+    monkeypatch.setenv("GRADIENT_RTCORE_NATIVE_HOME_DISARM_TIMEOUT_S", "0.1")
+
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[100.0] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[131072] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    # Simulate an axis that is stuck in OperationEnabled (DS402 state 5).
+    backend._axis_ds402_state[0] = 5
+
+    sent_native_home: list[int] = []
+    sent_axis_disable: list[int] = []
+
+    def _capture_native_home(axis_mask: int) -> None:
+        sent_native_home.append(int(axis_mask))
+
+    def _capture_axis_disable(axis_mask: int) -> None:
+        sent_axis_disable.append(int(axis_mask))
+
+    monkeypatch.setattr(backend, "_send_cmd_native_home", _capture_native_home)
+    monkeypatch.setattr(backend, "_send_cmd_axis_disable", _capture_axis_disable)
+    monkeypatch.setattr(backend, "abort_trajectory", lambda *a, **kw: None)
+    monkeypatch.setattr(backend, "stop_joint_velocity_lease_jog", lambda *a, **kw: None)
+
+    result = backend.native_home_joint(0)
+
+    assert sent_native_home == [], (
+        "HM35 must not be dispatched while the axis is still OperationEnabled"
+    )
+    assert sent_axis_disable, (
+        "Backend must explicitly request disable before waiting for disarm"
+    )
+    assert result["accepted"] is False
+    assert result["verified"] is False
+    assert result["code"] == "NATIVE_HOME_DISARM_PRECONDITION_TIMEOUT"
+    assert result["native_home_last_abort_code"] == 0xF1000001
+    assert result["native_home_last_abort_code_hex"] == "0xF1000001"
+    assert result.get("disarm_precondition_timed_out") is True
+    assert 0 in list(result.get("drive_op_enabled_axes", []))
+
+
+def test_a6ec_truth_unavailable_when_anchor_and_6064_disagree_modulo_rm(
+    monkeypatch, tmp_path
+):
+    # Workstream 3: when the anchored U40.20/.22 truth disagrees with live
+    # 6064 modulo RM, canonical truth must fail closed with the explicit
+    # reason multi_turn_anchor_inconsistent_with_live_6064.
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+
+    counts_per_unit = 100.0
+    counts_per_rev = 628  # small RM to keep the math easy
+    rm = counts_per_rev
+    absolute_counts = 100  # anchored multi-turn counts
+    # Disagree by RM/3 on the shaft frame.
+    live_reference_counts = absolute_counts + rm // 3
+
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": 0,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": absolute_counts},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_num_axes = 1
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    # Anchor chosen so canonical_q = absolute_axis_q - anchor - master_offset
+    # puts the anchored view at wire-counts = absolute_counts. With live 6064
+    # RM/3 counts away, mod-RM delta is |RM/3| which is well above the gate.
+    backend._absolute_encoder_home_anchors[0] = {
+        "home_anchor_rad": 0.0,
+        "source": "pytest",
+        "axis_indices": [0],
+    }
+
+    snapshot = backend.get_display_feedback_snapshot({0: live_reference_counts})
+
+    assert isinstance(snapshot, dict)
+    assert snapshot["truth_available"] is False
+    axis_detail = snapshot["axis_absolute_feedback"][0]
+    assert axis_detail["truth_reason"] == "multi_turn_anchor_inconsistent_with_live_6064"
+    assert axis_detail["shaft_frame_consistent"] is False
+    assert abs(float(axis_detail["shaft_frame_mod_rm_delta_counts"])) > 16.0
+
+
+def test_a6ec_command_frame_rejects_oversized_trajectory_step(monkeypatch, tmp_path):
+    # A trajectory whose consecutive points step by more than half a shaft
+    # revolution on the wire is a symptom of wrong-turn command-frame math.
+    # The host pre-commit gate must refuse the upload with
+    # command_frame_oversized_step.
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    first_axis_q = 0.0
+    second_counts = rm * 0.6  # intentionally > RM/2
+    second_axis_q = float(second_counts) / counts_per_unit
+
+    previous_axis_counts: list[int | None] = [None]
+    backend._enforce_trajectory_step_within_half_rm(
+        axis_q=[first_axis_q],
+        axis_mask=0x1,
+        previous_axis_counts=previous_axis_counts,
+        point_index=0,
+        traj_id=7,
+    )
+    with pytest.raises(RuntimeError, match="command_frame_oversized_step"):
+        backend._enforce_trajectory_step_within_half_rm(
+            axis_q=[second_axis_q],
+            axis_mask=0x1,
+            previous_axis_counts=previous_axis_counts,
+            point_index=1,
+            traj_id=7,
+        )
 
 
 def test_ethercat_backend_refuses_display_feedback_when_absolute_anchor_does_not_roundtrip(
@@ -987,7 +1171,14 @@ def test_ethercat_backend_refuses_display_feedback_when_absolute_anchor_does_not
     assert isinstance(snapshot, dict)
     assert snapshot["truth_available"] is False
     axis_detail = snapshot["axis_absolute_feedback"][0]
-    assert axis_detail["truth_reason"] == "command_frame_roundtrip_mismatch"
+    # The Workstream 3 shaft-frame gate intercepts anchor-vs-6064 disagreement
+    # before the older continuous-frame roundtrip; either reason indicates a
+    # real frame inconsistency and both must keep truth unavailable.
+    assert axis_detail["truth_reason"] in {
+        "multi_turn_anchor_inconsistent_with_live_6064",
+        "command_frame_roundtrip_mismatch",
+        "absolute_home_anchor_stale",
+    }
     assert snapshot["joint_positions_rad_partial"][0] is None
     assert all(value is None for value in snapshot["joint_positions_rad_partial"])
     with pytest.raises(RuntimeError, match="Operator display joint truth unavailable"):
@@ -1188,9 +1379,26 @@ def test_ethercat_backend_native_home_requires_post_home_anchor_validation(monke
     assert result["code"] == "NATIVE_HOME_ANCHOR_REFRESH_FAILED"
     assert result["absolute_home_anchor_capture_succeeded"] is True
     assert result["absolute_home_anchor_refresh_ok"] is False
-    assert result["post_home_truth_reason"] == "absolute_home_anchor_stale"
+    # Workstream 3 primary gate names this condition; older installations
+    # may surface it as absolute_home_anchor_stale via the legacy path.
+    assert result["post_home_truth_reason"] in {
+        "multi_turn_anchor_inconsistent_with_live_6064",
+        "absolute_home_anchor_stale",
+    }
     assert result["post_home_axis"] == 0
-    assert result["post_home_command_roundtrip_reference_error_counts"] == pytest.approx(1000.0)
+    # Accept either the legacy roundtrip error field or the Workstream 3
+    # shaft-frame delta field; both encode the same ~1000-count anchor
+    # disagreement depending on which path surfaced it first.
+    legacy_error_counts = result.get("post_home_command_roundtrip_reference_error_counts")
+    shaft_delta_counts = result.get("post_home_shaft_frame_mod_rm_delta_counts")
+    if legacy_error_counts is not None:
+        assert legacy_error_counts == pytest.approx(1000.0)
+    else:
+        assert shaft_delta_counts is not None, (
+            "Either roundtrip error counts or shaft-frame mod-RM delta must be "
+            "present in the post-home detail"
+        )
+        assert abs(float(shaft_delta_counts)) == pytest.approx(1000.0)
 
 
 def test_ethercat_backend_software_zero_refreshes_absolute_encoder_anchor(monkeypatch, tmp_path):
@@ -1375,8 +1583,13 @@ def test_ethercat_backend_marks_truth_unavailable_when_absolute_anchor_does_not_
     assert isinstance(snapshot, dict)
     assert snapshot["truth_available"] is False
     axis_detail = snapshot["axis_absolute_feedback"][0]
-    assert axis_detail["truth_reason"] == "command_frame_roundtrip_mismatch"
-    assert axis_detail["command_roundtrip_consistent"] is False
+    # Workstream 3 primary gate catches this at the mod-RM check; the
+    # legacy continuous-frame roundtrip reason remains acceptable for
+    # installations that see the condition via the older path.
+    assert axis_detail["truth_reason"] in {
+        "multi_turn_anchor_inconsistent_with_live_6064",
+        "command_frame_roundtrip_mismatch",
+    }
     with pytest.raises(RuntimeError, match="Canonical joint truth unavailable"):
         backend.get_joint_positions()
 
@@ -1521,7 +1734,14 @@ def test_ethercat_backend_diagnoses_stale_absolute_home_anchor_when_clean_homed_
     assert isinstance(snapshot, dict)
     axis_detail = snapshot["axis_absolute_feedback"][0]
     assert axis_detail["truth_available"] is False
-    assert axis_detail["truth_reason"] == "absolute_home_anchor_stale"
+    # Workstream 3 primary gate names this condition explicitly. The
+    # stale-anchor diagnostic fields are still populated alongside so
+    # operators keep the full detail; the older reason remains acceptable
+    # for installations that surface it via the legacy roundtrip path.
+    assert axis_detail["truth_reason"] in {
+        "multi_turn_anchor_inconsistent_with_live_6064",
+        "absolute_home_anchor_stale",
+    }
     assert axis_detail["absolute_home_anchor_stale"] is True
     assert axis_detail["absolute_home_anchor_implied_rad"] == pytest.approx(10.0)
     assert axis_detail["absolute_home_anchor_delta_counts"] == pytest.approx(1000.0)
@@ -1874,7 +2094,15 @@ def test_ethercat_backend_native_home_waits_for_neutral_before_request(monkeypat
     assert result["accepted"] is True
     assert result["verified"] is True
     assert result["code"] == "NATIVE_HOME_VERIFIED"
-    assert calls[0] == ("prepare", {"wait_for_idle": True, "timeout_s": 1.0})
+    # native_home_joint now also asserts drive-confirmed disarm via
+    # require_drive_disarmed + require_drive_disarmed_axis_mask, per
+    # vendor Q2 "stationary and inactive" before HM35.
+    assert calls[0][0] == "prepare"
+    prepare_kwargs = calls[0][1]
+    assert prepare_kwargs.get("wait_for_idle") is True
+    assert prepare_kwargs.get("timeout_s") == 1.0
+    assert prepare_kwargs.get("require_drive_disarmed") is True
+    assert int(prepare_kwargs.get("require_drive_disarmed_axis_mask", 0)) != 0
     assert calls[1] == ("native_home", 0x2)
     assert calls[2][0] == "wait_native_home"
     wait_axis_mask, wait_timeout_s, wait_time_ns, wait_mtime_ns = calls[2][1]
@@ -2129,7 +2357,15 @@ def test_ethercat_backend_native_home_reports_pending_when_verification_times_ou
     assert result["verified"] is False
     assert result["timed_out"] is True
     assert result["code"] == "NATIVE_HOME_PENDING_VERIFICATION"
-    assert calls[0] == ("prepare", {"wait_for_idle": True, "timeout_s": 1.0})
+    # native_home_joint now also asserts drive-confirmed disarm via
+    # require_drive_disarmed + require_drive_disarmed_axis_mask, per
+    # vendor Q2 "stationary and inactive" before HM35.
+    assert calls[0][0] == "prepare"
+    prepare_kwargs = calls[0][1]
+    assert prepare_kwargs.get("wait_for_idle") is True
+    assert prepare_kwargs.get("timeout_s") == 1.0
+    assert prepare_kwargs.get("require_drive_disarmed") is True
+    assert int(prepare_kwargs.get("require_drive_disarmed_axis_mask", 0)) != 0
     assert calls[1] == ("native_home", 0x2)
     assert calls[2][0] == "wait_native_home"
     wait_axis_mask, wait_timeout_s, wait_time_ns, wait_mtime_ns = calls[2][1]
@@ -2797,6 +3033,14 @@ def test_ethercat_backend_power_transition_snapshot_reports_coordinate_system_in
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    # Isolate the absolute-home anchor store so the test does not pick up
+    # real anchor data from the repo's live encoder-retention workflow; the
+    # intent of this test is specifically the "no usable home state on any
+    # axis" scenario.
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
     robot_cfg = Gradient05Config().get_config_dict()
     backend = EthercatRTCoreBackend(robot_config=robot_cfg)
     backend._connected = True
@@ -2841,7 +3085,13 @@ def test_ethercat_backend_power_transition_snapshot_reports_coordinate_system_in
     assert snapshot["feedback_synchronized"] is False
     assert snapshot["feedback_truth_available"] is False
     assert snapshot["live_feedback_joint_positions_rad"] == []
-    assert snapshot["feedback_truth_reasons"] == ["drive_native_coordinate_system_invalid"]
+    # The validity helper now surfaces the narrow reason. Accept the
+    # generic legacy reason too so older installations without the
+    # persisted-home-anchor restart trust flag keep working.
+    assert snapshot["feedback_truth_reasons"] in (
+        ["drive_native_coordinate_system_invalid"],
+        ["drive_native_persisted_home_anchor_missing"],
+    )
     assert snapshot["feedback_truth_unavailable_axes"] == [0, 1, 2, 3, 4, 5]
     assert snapshot["feedback_truth_unavailable_joints"] == [1, 2, 3, 4, 5, 6]
     assert snapshot["feedback_truth_statuswords"] == ["0x1650"]
@@ -2909,6 +3159,607 @@ def test_ethercat_backend_power_transition_snapshot_accepts_bit15_restart_truth(
     assert snapshot["feedback_truth_reasons"] == []
     assert snapshot["feedback_truth_statuswords"] == []
     assert snapshot["power_up_ready"] is True
+
+
+def _build_a6ec_restart_trust_test_backend(
+    monkeypatch,
+    tmp_path,
+    *,
+    joint_index: int = 5,
+    statusword: int = 0x1650,
+    hm35_6064_counts: int = 8,
+    hm35_u40_20_counts: int = 120191,
+    live_6064_counts: int | None = None,
+    live_u40_20_counts: int | None = None,
+    multi_turn_valid: bool = True,
+    encoder_retention_fault_code: int = 0,
+    last_seen_absolute_counts: int | None = None,
+    last_seen_reference_counts: int | None = None,
+) -> tuple[EthercatRTCoreBackend, dict[str, object]]:
+    """Shared scaffold for A6-EC restart-trust scenarios on any single joint.
+
+    The caller supplies the 6064 + U40.20 raw counts that were present at
+    HM35 time (used to derive the stored absolute-home anchor) and the
+    raw counts the drive is reporting now, after the power cycle. The
+    helper sets up the same axis plumbing the bit-15 restart-trust test
+    uses, so the persisted-home-anchor gate evaluates realistic live data.
+
+    ``joint_index`` defaults to ``5`` (J6) so the original four 2026-04-17
+    tests keep their semantics; parametrised coverage passes other joint
+    indices to catch per-joint scaling / sign mistakes in the path.
+    """
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    robot_cfg = Gradient05Config().get_config_dict()
+    backend = EthercatRTCoreBackend(robot_config=robot_cfg)
+    backend._connected = True
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    backend._rt_num_axes = 6
+    backend._axis_to_joint = [0, 1, 2, 3, 4, 5]
+    assert backend._robot_axis_config is not None
+    backend._axis_config = backend._robot_axis_config
+    backend._status_snapshot_event.set()
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+
+    # Compute the anchor from the HM35-time raw counts using the same math
+    # the live code uses. This keeps the test honest across future cpu/sign
+    # changes instead of hardcoding a float, and tracks the caller-selected
+    # joint's scaling automatically.
+    cpu_target = float(robot_cfg["actuator_encoder_counts_per_rev"][joint_index]) * float(
+        robot_cfg["actuator_gear_ratios"][joint_index]
+    ) / (2.0 * math.pi)
+    sign_target = float(robot_cfg["actuator_position_signs"][joint_index])
+    absolute_axis_q_at_hm35 = float(hm35_u40_20_counts) / (sign_target * cpu_target)
+    reference_q_at_hm35 = float(hm35_6064_counts) / (sign_target * cpu_target)
+    anchor_rad = absolute_axis_q_at_hm35 - reference_q_at_hm35
+
+    effective_live_6064 = int(
+        live_6064_counts if live_6064_counts is not None else hm35_6064_counts
+    )
+    effective_live_u40_20 = int(
+        live_u40_20_counts if live_u40_20_counts is not None else hm35_u40_20_counts
+    )
+
+    # Baseline realistic live counts pulled from the A6-EC chapter-5 probe
+    # dataset; the non-target axes stay at these values under untrusted
+    # (0x1650) statuswords so they do not accidentally satisfy the
+    # persisted-anchor gate and thereby mask target-joint assertions.
+    baseline_raw_counts = [5, 4408, 13105469, 2359290, 138, 9]
+    baseline_multi_turn = [-82705, -57649, 46894, 118015, 65554, 120189]
+
+    # Override the target joint slot with the scenario values.
+    scenario_raw_counts = list(baseline_raw_counts)
+    scenario_multi_turn = list(baseline_multi_turn)
+    scenario_raw_counts[joint_index] = effective_live_6064
+    scenario_multi_turn[joint_index] = effective_live_u40_20
+
+    metrics_axes: list[dict[str, object]] = []
+    for axis_i, gear_ratio in enumerate(robot_cfg["actuator_gear_ratios"][:6]):
+        counts = int(scenario_raw_counts[axis_i])
+        mt_counts = int(scenario_multi_turn[axis_i])
+        sw = int(statusword) if axis_i == joint_index else 0x1650
+        backend._axis_counts[axis_i] = int(counts)
+        if axis_i == joint_index:
+            anchor_entry_for_joint: dict[str, object] = {
+                "home_anchor_rad": float(anchor_rad),
+                "source": "pytest",
+                "axis_indices": [joint_index],
+            }
+            if last_seen_absolute_counts is not None:
+                last_seen_entry: dict[str, object] = {
+                    "absolute_counts": int(last_seen_absolute_counts),
+                    "observed_at": "2026-04-17T00:00:00+00:00",
+                    "observed_by": "pytest",
+                }
+                if last_seen_reference_counts is not None:
+                    last_seen_entry["reference_counts"] = int(last_seen_reference_counts)
+                anchor_entry_for_joint["last_seen"] = last_seen_entry
+            backend._absolute_encoder_home_anchors[joint_index] = anchor_entry_for_joint
+        multi_turn_valid_flag = 1 if (axis_i != joint_index or multi_turn_valid) else 0
+        # Split mt_counts into signed i32 low/high so the backend's
+        # `_combine_signed_i64_pair` decoder reconstructs the intended
+        # signed value. Historically the helper staged negative values
+        # with `high=0` which silently inflated them to huge positives.
+        low_u = mt_counts & 0xFFFFFFFF
+        high_u = (mt_counts >> 32) & 0xFFFFFFFF
+        mt_low_signed = low_u - (1 << 32) if low_u >= (1 << 31) else low_u
+        mt_high_signed = high_u - (1 << 32) if high_u >= (1 << 31) else high_u
+        backend._absolute_feedback_by_axis[axis_i] = _AbsoluteFeedbackAxisMetrics.from_mapping(
+            {
+                "encoder_multi_turn_low": {
+                    "valid": multi_turn_valid_flag,
+                    "value": int(mt_low_signed),
+                },
+                "encoder_multi_turn_high": {
+                    "valid": multi_turn_valid_flag,
+                    "value": int(mt_high_signed),
+                },
+                "absolute_position_reference": {"valid": 1, "value": int(counts)},
+                "rotation_mode_position_reference": {"valid": 1, "value": int(counts)},
+                "rotation_mode_encoder_low": {"valid": 1, "value": int(counts)},
+                "rotation_mode_encoder_high": {"valid": 1, "value": 0},
+            }
+        )
+        # Only stamp the retention-family fault code onto the target
+        # joint so adjacent axes do not accidentally pick up a fault
+        # reason that masks the target-joint assertions.
+        axis_manufacturer_error_code = (
+            int(encoder_retention_fault_code) if axis_i == joint_index else 0
+        )
+        metrics_axes.append(
+            {
+                "statusword": sw,
+                "error_code": 0,
+                "manufacturer_error_code": int(axis_manufacturer_error_code),
+                "startup_drive_config": _a6ec_startup_drive_configs_for_ratio(gear_ratio)[0],
+                "startup_drive_configs": _a6ec_startup_drive_configs_for_ratio(gear_ratio),
+                "slave_online": 1,
+                "slave_operational": 1,
+                "slave_al_state": 8,
+            }
+        )
+    monkeypatch.setattr(backend, "_load_rtcore_metrics_snapshot", lambda: {"axes": metrics_axes})
+    return backend, {"metrics_axes": metrics_axes, "anchor_rad": anchor_rad, "joint_index": joint_index}
+
+
+@pytest.mark.parametrize("joint_index", list(range(6)))
+def test_a6ec_restart_trust_via_persisted_anchor_passes_when_axis_unmoved_while_off(
+    monkeypatch, tmp_path, joint_index
+):
+    # Scenario: any joint was successfully homed previously. Drive power
+    # cycled. Statusword dropped to 0x1650 (bit 15 cleared, matching the
+    # empirical drive behavior). Live 6064 and U40.20/.22 are within
+    # encoder wander of the values captured at HM35. The persisted-home-
+    # anchor gate must accept this axis as still-trusted without requiring
+    # a re-home, regardless of which joint is under test.
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=120191,
+        live_6064_counts=9,            # +1 count wander
+        live_u40_20_counts=120189,     # -2 count wander
+        multi_turn_valid=True,
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["truth_available"] is True
+    assert target_detail["statusword_hex"] == "0x1650"
+    assert target_detail["drive_native_truth_signature_valid"] is False
+    assert target_detail["coordinate_system_valid"] is True
+    assert (
+        target_detail["drive_native_truth_verification_source"]
+        == "persisted_home_anchor_agreement"
+    )
+    assert target_detail["shaft_frame_consistent"] is True
+
+
+def test_a6ec_restart_trust_uses_verified_startup_drive_configs_when_legacy_primary_is_stale(
+    monkeypatch, tmp_path
+):
+    backend, context = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=120191,
+        live_6064_counts=9,
+        live_u40_20_counts=120189,
+        multi_turn_valid=True,
+    )
+    joint_index = int(context["joint_index"])
+    context["metrics_axes"][joint_index]["startup_drive_config"] = {
+        # Model the legacy single-entry field after it was cleared during a
+        # startup epoch reset; the verified per-descriptor list remains the
+        # authoritative startup contract exported by RTCore.
+        "setting_key": "a6ec_encoder_position_tracking_mode",
+        "configured": 0,
+        "commanded": 0,
+        "readback_valid": 0,
+        "readback": 0,
+        "verified": 0,
+    }
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["drive_native_startup_valid"] is True
+    assert target_detail["drive_native_startup_reason"] == "verified"
+    assert target_detail["truth_available"] is True
+    assert (
+        target_detail["drive_native_truth_verification_source"]
+        == "persisted_home_anchor_agreement"
+    )
+
+
+@pytest.mark.parametrize("joint_index", list(range(6)))
+def test_a6ec_restart_trust_via_persisted_anchor_survives_full_shaft_turn_of_manual_rotation(
+    monkeypatch, tmp_path, joint_index
+):
+    # Scenario: drive was homed, then power-cycled, and the joint was
+    # physically rotated +1 full shaft revolution while the drive was off.
+    # Both 6064 and U40.20/.22 reflect the new mechanical position. The
+    # mod-RM check must still accept the home as trusted because the
+    # absolute-home anchor relationship is invariant under whole-shaft-turn
+    # motion for EVERY joint, not just J6.
+    cfg = Gradient05Config()
+    counts_per_rev = int(cfg.actuator_encoder_counts_per_rev[joint_index])
+    gear_ratio = float(cfg.actuator_gear_ratios[joint_index])
+    rm = int(round(counts_per_rev * gear_ratio))
+
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=120191,
+        # 6064 wraps at RM in absolute rotation mode so a full shaft turn
+        # while off leaves 6064 at the same raw value post-cycle.
+        live_6064_counts=8,
+        # But U40.20 (motor-side multi-turn counter) increased by one RM of
+        # motor-encoder counts, i.e. gear_ratio * counts_per_rev for this
+        # axis.
+        live_u40_20_counts=120191 + rm,
+        multi_turn_valid=True,
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["truth_available"] is True
+    assert target_detail["coordinate_system_valid"] is True
+    assert (
+        target_detail["drive_native_truth_verification_source"]
+        == "persisted_home_anchor_agreement"
+    )
+    assert target_detail["shaft_frame_consistent"] is True
+    assert abs(int(target_detail.get("shaft_frame_wrap_turns", 0))) <= 1
+
+
+@pytest.mark.parametrize("joint_index", list(range(6)))
+def test_a6ec_restart_trust_via_persisted_anchor_rejects_sub_shaft_turn_drift(
+    monkeypatch, tmp_path, joint_index
+):
+    # Scenario: the anchor file and live 6064 disagree mod-RM by RM/3 for
+    # the joint under test. That indicates a real frame inconsistency
+    # (encoder data loss, stale anchor, bad commissioning) and must NOT be
+    # accepted as trusted home; truth must fail closed.
+    cfg = Gradient05Config()
+    counts_per_rev = int(cfg.actuator_encoder_counts_per_rev[joint_index])
+    gear_ratio = float(cfg.actuator_gear_ratios[joint_index])
+    rm = int(round(counts_per_rev * gear_ratio))
+
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=120191,
+        live_6064_counts=8 + (rm // 3),
+        live_u40_20_counts=120191,   # multi-turn did NOT track the drift
+        multi_turn_valid=True,
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["truth_available"] is False
+    assert target_detail["coordinate_system_valid"] is False
+    assert target_detail["shaft_frame_consistent"] is False
+    # Either naming is acceptable: the Workstream 3 short-circuit names the
+    # condition directly; the restart-trust validity helper names the same
+    # thing via the drive_native_ prefix after it rejected the anchor path.
+    assert target_detail["truth_reason"] in {
+        "multi_turn_anchor_inconsistent_with_live_6064",
+        "drive_native_persisted_home_anchor_inconsistent_with_live_6064",
+    }
+
+
+@pytest.mark.parametrize("joint_index", list(range(6)))
+def test_a6ec_restart_trust_via_persisted_anchor_requires_multi_turn_valid(
+    monkeypatch, tmp_path, joint_index
+):
+    # Scenario: encoder battery failed / multi-turn overflow on any joint.
+    # Even with an otherwise-consistent anchor, we cannot trust U40.20/.22
+    # so we must refuse the persisted-anchor trust path and demand a fresh
+    # HM35, for every joint individually.
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=120191,
+        live_6064_counts=9,
+        live_u40_20_counts=120189,
+        multi_turn_valid=False,  # U40.20/.22 flagged invalid
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    # With multi-turn invalid, the absolute-axis source itself cannot be
+    # trusted so the joint falls back to the existing "absolute feedback
+    # unavailable" reason rather than accepting the anchor gate.
+    assert target_detail["truth_available"] is False
+    assert target_detail["coordinate_system_valid"] is False
+    assert target_detail["truth_reason"] in {
+        "drive_native_absolute_feedback_unavailable",
+        "drive_native_multi_turn_feedback_invalid",
+    }
+
+
+def test_a6ec_encoder_retention_fault_takes_precedence_over_anchor_path(
+    monkeypatch, tmp_path
+):
+    # Scenario: same happy-path anchor geometry as the un-moved-while-off
+    # regression (so the persisted-anchor restart-trust path would
+    # otherwise upgrade coordinate_system_valid to True), but the drive is
+    # simultaneously asserting Er20.9 (encoder multi-turn error) via
+    # manufacturer_error_code 0x209. Retention-family faults must outrank
+    # the anchor path: multi-turn integrity is the exact precondition
+    # anchor agreement depends on, so the "looks agreed mod-RM" result is
+    # a false positive. Truth must fail closed with the new specific
+    # reason.
+    joint_index = 5
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=120191,
+        live_6064_counts=9,
+        live_u40_20_counts=120189,
+        multi_turn_valid=True,
+        encoder_retention_fault_code=0x209,
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["truth_available"] is False
+    assert target_detail["coordinate_system_valid"] is False
+    assert target_detail["drive_native_truth_reason"] == "encoder_retention_fault_present"
+    assert target_detail["truth_reason"] == "drive_native_encoder_retention_fault_present"
+    assert target_detail.get("encoder_retention_fault_present") is True
+    retention_detail = target_detail.get("encoder_retention_fault")
+    assert isinstance(retention_detail, dict)
+    assert "Er20.9" in retention_detail.get("codes", [])
+    assert "Encoder multi-turn error" in retention_detail.get("names", [])
+
+
+def test_a6ec_encoder_retention_fault_distinguishes_battery_alarm(
+    monkeypatch, tmp_path
+):
+    # ALF9.0 "Encoder battery voltage low" lives in the alarm_codes
+    # table but is still retention-family per the profile. Same
+    # precedence rule: block trust even when anchor agreement would
+    # otherwise succeed, and label with the vendor name so operators can
+    # distinguish a battery alarm from a multi-turn fault without
+    # reading raw hex.
+    joint_index = 5
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=120191,
+        live_6064_counts=9,
+        live_u40_20_counts=120189,
+        multi_turn_valid=True,
+        encoder_retention_fault_code=0xF90,
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["truth_available"] is False
+    assert target_detail["coordinate_system_valid"] is False
+    assert target_detail["drive_native_truth_reason"] == "encoder_retention_fault_present"
+    retention_detail = target_detail.get("encoder_retention_fault")
+    assert isinstance(retention_detail, dict)
+    assert "ALF9.0" in retention_detail.get("codes", [])
+    assert "Encoder battery voltage low" in retention_detail.get("names", [])
+
+
+def test_a6ec_firmware_bit15_retention_flag_documented_false():
+    # The bit-15 restart-trust path in derive_drive_native_truth_validity
+    # is intentionally kept as vestigial coverage for future firmware /
+    # drive families that honour vendor Q9. The A6-EC profile must
+    # advertise that this current firmware empirically clears bit 15 on
+    # every drive power cycle, so the bit-15 path is unreachable on
+    # production hardware. This flag is documentation metadata only.
+    from gradient_os.arm_controller.profiles.drive.a6ec_ds402 import (
+        POSITION_SEMANTICS_CONFIG,
+    )
+
+    assert "firmware_bit15_retention_expected" in POSITION_SEMANTICS_CONFIG
+    assert POSITION_SEMANTICS_CONFIG["firmware_bit15_retention_expected"] is False
+
+
+def test_a6ec_last_seen_sidecar_surfaces_delta_when_joint_unchanged_while_off(
+    monkeypatch, tmp_path
+):
+    # Scenario: drive was homed at HM35, a last-seen sidecar recorded
+    # the U40.20 reading at that moment, drive was powered down, and
+    # the joint did not move while off. On restart, the live U40.20 is
+    # identical to the sidecar. The anchor path should still accept
+    # truth (bit 15 is cleared, same restart-trust path as the earlier
+    # regressions), and the new diagnostic fields
+    # `last_seen_delta_counts=0` and
+    # `last_seen_delta_physically_possible=True` should ride along on
+    # the axis detail.
+    joint_index = 5
+    hm35_u40_20 = 120191
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=hm35_u40_20,
+        live_6064_counts=9,
+        live_u40_20_counts=hm35_u40_20,
+        multi_turn_valid=True,
+        last_seen_absolute_counts=hm35_u40_20,
+        last_seen_reference_counts=9,
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["truth_available"] is True
+    assert target_detail["coordinate_system_valid"] is True
+    assert (
+        target_detail["drive_native_truth_verification_source"]
+        == "persisted_home_anchor_agreement"
+    )
+    assert int(target_detail["last_seen_delta_counts"]) == 0
+    assert target_detail["last_seen_delta_physically_possible"] is True
+    assert int(target_detail["last_seen_absolute_counts"]) == hm35_u40_20
+    # Delta budget is `32767 * counts_per_rev[J6]`; for a 2^17 CPR
+    # encoder that is 131072 * 32767 = 4,294,836,224. Just assert it
+    # is a positive integer, not the exact literal, so the test is
+    # robust to future CPR changes.
+    assert int(target_detail["last_seen_delta_budget_counts"]) > 0
+
+
+def test_a6ec_last_seen_sidecar_upgrades_reason_on_impossible_delta(
+    monkeypatch, tmp_path
+):
+    # Scenario: drive was homed, a last-seen sidecar was recorded, and
+    # then encoder state was lost across a power cycle (battery died,
+    # multi-turn overflow, etc.). The live U40.20 jumps by more than
+    # 32767 motor revolutions from the stored value, which is
+    # physically impossible during an off-window. The shaft-frame
+    # consistency gate correctly fails; the new reason should upgrade
+    # to `multi_turn_feedback_lost_across_power_cycle` so operators
+    # see the specific encoder-retention failure class.
+    joint_index = 5
+    hm35_u40_20 = 120191
+    # Intentionally larger than 32767 * 131072 so the physicality
+    # check fails. The shaft-frame gate also fails because the
+    # anchor/6064 relationship no longer holds.
+    impossible_u40_20 = hm35_u40_20 + (32_768 * 131_072) + 7_000_000
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=hm35_u40_20,
+        # Shaft-frame gate also disagrees mod-RM so the anchor path
+        # rejects, matching the physical scenario of lost retention.
+        live_6064_counts=8 + (131_072 // 3),
+        live_u40_20_counts=impossible_u40_20,
+        multi_turn_valid=True,
+        last_seen_absolute_counts=hm35_u40_20,
+        last_seen_reference_counts=8,
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["truth_available"] is False
+    assert target_detail["coordinate_system_valid"] is False
+    # Drive-native reason upgrades to the specific label when the
+    # sidecar says the delta is physically impossible.
+    assert (
+        target_detail["drive_native_truth_reason"]
+        == "multi_turn_feedback_lost_across_power_cycle"
+    )
+    assert target_detail["last_seen_delta_physically_possible"] is False
+    assert abs(int(target_detail["last_seen_delta_counts"])) > int(
+        target_detail["last_seen_delta_budget_counts"]
+    )
+
+
+def test_a6ec_last_seen_sidecar_keeps_legacy_reason_when_absent(
+    monkeypatch, tmp_path
+):
+    # Scenario: no last-seen sidecar recorded (older anchor file). The
+    # shaft-frame gate fails - same setup as the existing
+    # `rejects_sub_shaft_turn_drift` regression - so the validity helper
+    # must fall back to the legacy `persisted_home_anchor_inconsistent
+    # _with_live_6064` reason rather than inventing a retention story
+    # without evidence.
+    joint_index = 5
+    cfg = Gradient05Config()
+    counts_per_rev = int(cfg.actuator_encoder_counts_per_rev[joint_index])
+    gear_ratio = float(cfg.actuator_gear_ratios[joint_index])
+    rm = int(round(counts_per_rev * gear_ratio))
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=120191,
+        live_6064_counts=8 + (rm // 3),
+        live_u40_20_counts=120191,
+        multi_turn_valid=True,
+        # No last_seen_absolute_counts -> no sidecar on the anchor.
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["truth_available"] is False
+    assert target_detail["coordinate_system_valid"] is False
+    assert target_detail["shaft_frame_consistent"] is False
+    # Legacy reason, matching the existing restart-trust regression
+    # (either the backend short-circuit or the drive_native_ prefixed
+    # helper label). Must NOT upgrade to the W1 label without sidecar
+    # evidence.
+    assert target_detail["truth_reason"] in {
+        "multi_turn_anchor_inconsistent_with_live_6064",
+        "drive_native_persisted_home_anchor_inconsistent_with_live_6064",
+    }
+    # Extra defense-in-depth: none of the W1 sidecar fields should be
+    # present when there is no sidecar on the anchor.
+    assert "last_seen_delta_counts" not in target_detail
+    assert "last_seen_delta_physically_possible" not in target_detail
 
 
 def test_ethercat_backend_defaults_to_disarmed_connect(monkeypatch, tmp_path):

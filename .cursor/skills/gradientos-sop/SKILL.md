@@ -53,8 +53,8 @@ Read the file that matches the task:
 ## Active Workstream Notes
 
 - [../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md](../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md)
-  Use for the active A6-EC frame-semantics and native-home workstream: probe rationale, raw vs reference vs rotation frame separation, anchor math, persistence lessons, UI trust implications, and open verification risks.
-  Treat this as a durable WIP note referenced by the skill, not as fully-settled canonical SOP.
+  Use for the A6-EC frame-semantics and native-home workstream note: probe rationale, raw vs reference vs rotation frame separation, anchor math, persistence lessons, UI trust implications, and remaining open questions.
+  Durable project doc; the settled rules from this workstream are promoted into the master principles doc under `§9.4`-`§9.7` and into [commissioning-safety.md](./commissioning-safety.md).
 
 ## Non-Negotiable Rules
 

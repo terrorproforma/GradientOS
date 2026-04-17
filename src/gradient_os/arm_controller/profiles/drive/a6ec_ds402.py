@@ -36,8 +36,32 @@ POSITION_SEMANTICS_CONFIG = {
     "canonical_truth_source": "encoder_multi_turn_counts",
     # On restart, the vendor says a retained coordinate system should be
     # trusted from 6041 bit 15 even if the HM-complete bit is not reasserted.
+    # In practice this A6-EC firmware clears bit 15 on every drive power
+    # cycle (vendor Q9 notwithstanding), so we also accept a second restart
+    # trust path driven by persisted U40.20/.22 + 6064 agreement with the
+    # stored host-side absolute-home anchor.
     "startup_truth_requires_hm_success_signature": False,
     "absolute_home_anchor_required": True,
+    # When True, a missing bit 15 is tolerable on restart as long as:
+    #   * the absolute-home anchor file still has a recorded anchor for the
+    #     axis (initial HM35 is always required to establish it),
+    #   * live U40.20/.22 multi-turn data is valid,
+    #   * the derived `(absolute_axis_q - anchor) * sign * cpu` agrees with
+    #     live 6064 modulo RM within the shaft-frame tolerance.
+    # Failure of any of those three drops truth closed and the operator must
+    # re-home. This honours the vendor's real persistence story (multi-turn
+    # counter + EEPROM-saved 607C) rather than the missing bit-15 promise.
+    "accept_persisted_home_anchor_as_restart_trust": True,
+    # W2: Documentation-only flag. On the A6-EC firmware we currently run,
+    # 0x6041 bit 15 is empirically cleared on every drive power cycle
+    # (vendor Q9 says it should persist; on this drive it does not), so
+    # the `statusword_bit15` restart-trust path in
+    # `derive_drive_native_truth_validity` is unreachable in practice on
+    # this hardware. The bit-15 code path is kept in the helper for
+    # future firmware releases / drive families that honour Q9, not as a
+    # live gate today. Tests assert this flag is False so the state of
+    # the world stays visible in the profile.
+    "firmware_bit15_retention_expected": False,
 }
 STARTUP_SETTING_VALUE_LABELS = {
     0: "Incremental encoder mode",
@@ -448,6 +472,101 @@ def describe_manufacturer_fault_code(error_code: int) -> dict[str, Any] | None:
         "bus_fault_code_hex": bus_fault_code.lower() if isinstance(bus_fault_code, str) else None,
         "bus_fault_name": bus_fault_name,
         "source": "manufacturer_error_code",
+    }
+
+
+# Vendor codes whose presence means U40.20/.22 multi-turn retention or the
+# home-anchor relationship is no longer trustworthy. An active member of
+# this set must outrank a clean shaft-frame gate: the anchor-agreement
+# path depends on multi-turn integrity, so a live encoder-retention fault
+# means the successful agreement is a false positive.
+ENCODER_RETENTION_FAULT_CODES: frozenset[str] = frozenset(
+    {
+        # Encoder family (0x203F -> 0X201..0X209)
+        "Er20.1",  # Encoder internal fault
+        "Er20.2",  # Encoder reading/writing error
+        "Er20.3",  # Encoder data frame loss
+        "Er20.4",  # Excessive encoder incremental position
+        "Er20.5",  # Abnormal encoder data
+        "Er20.6",  # Mismatch of encoder type
+        "Er20.7",  # Encoder model not supported
+        "Er20.8",  # Encoder battery failure
+        "Er20.9",  # Encoder multi-turn error
+        # Battery family (0x203F -> 0XF90, alarm)
+        "ALF9.0",  # Encoder battery voltage low
+    }
+)
+
+
+def _lookup_retention_match_by_numeric_code(code_u32: int) -> dict[str, Any] | None:
+    fault_entry = _match_entry_by_numeric_code("fault_codes", "fault_code_203f", code_u32)
+    if isinstance(fault_entry, dict):
+        vendor_code = str(fault_entry.get("code", "")).strip()
+        if vendor_code in ENCODER_RETENTION_FAULT_CODES:
+            return fault_entry
+    alarm_entry = _match_entry_by_numeric_code("alarm_codes", "alarm_code_203f", code_u32)
+    if isinstance(alarm_entry, dict):
+        vendor_code = str(alarm_entry.get("code", "")).strip()
+        if vendor_code in ENCODER_RETENTION_FAULT_CODES:
+            return alarm_entry
+    return None
+
+
+def is_encoder_retention_fault(code: int) -> bool:
+    """True when the numeric 0x203F-family value maps to an encoder-retention code."""
+    code_u32 = int(code) & 0xFFFFFFFF
+    if code_u32 == 0:
+        return False
+    return _lookup_retention_match_by_numeric_code(code_u32) is not None
+
+
+def describe_encoder_retention_fault(
+    manufacturer_error_code: int,
+    error_code: int = 0,
+) -> dict[str, Any]:
+    """Decode the 0x203F manufacturer_error_code (and optional 0x603F bus code)
+    and return whether the live fault/alarm belongs to the encoder-retention
+    family, along with the matched vendor labels. The returned dict always
+    carries ``present`` so callers can branch without defensive key checks.
+    """
+    codes: list[str] = []
+    names: list[str] = []
+    matched_sources: list[str] = []
+    manufacturer_u32 = int(manufacturer_error_code) & 0xFFFFFFFF
+    if manufacturer_u32 != 0:
+        match = _lookup_retention_match_by_numeric_code(manufacturer_u32)
+        if isinstance(match, dict):
+            vendor_code = str(match.get("code", "")).strip()
+            vendor_name = str(match.get("name", "")).strip()
+            if vendor_code:
+                codes.append(vendor_code)
+            if vendor_name:
+                names.append(vendor_name)
+            matched_sources.append("manufacturer_error_code")
+    # Bus fault code (0x603F) does not itself carry a retention-family
+    # identity; the retention decision is driven by 0x203F alone. We still
+    # surface the bus-code label when the manufacturer-side hit it for
+    # operator diagnostics.
+    bus_code_u16 = int(error_code) & 0xFFFF
+    bus_name: str | None = None
+    if bus_code_u16 != 0:
+        bus_entry = _load_drive_fault_codebook().get("tables", {}).get(
+            "bus_fault_codes", {}
+        ).get(f"0X{bus_code_u16:04X}")
+        if isinstance(bus_entry, dict):
+            bus_name = (
+                str(bus_entry.get("name", "")).strip() or None
+            )
+    present = bool(codes)
+    return {
+        "present": bool(present),
+        "profile_id": PROFILE_ID,
+        "codes": list(codes),
+        "names": list(names),
+        "matched_sources": list(matched_sources),
+        "manufacturer_error_code_hex": f"0x{manufacturer_u32:08x}",
+        "error_code_hex": f"0x{bus_code_u16:04x}",
+        "bus_fault_name": bus_name,
     }
 
 

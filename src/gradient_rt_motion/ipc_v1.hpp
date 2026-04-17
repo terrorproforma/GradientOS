@@ -496,6 +496,13 @@ enum : uint32_t {
   NATIVE_HOME_STATE_FAILED = 3,
 };
 
+// Synthesized RTCore-side native-home abort codes. These occupy the
+// 0xFxxxxxxx range so they never collide with a real CoE SDO abort
+// (CoE aborts live in 0x05xxxxxx - 0x08xxxxxx).
+enum : uint32_t {
+  NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT = 0xF1000001u,
+};
+
 // Axis "unit" typing (v1).
 enum : uint8_t {
   AXIS_TYPE_UNKNOWN = 0,

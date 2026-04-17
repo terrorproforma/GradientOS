@@ -4076,6 +4076,18 @@ int main(int argc, char** argv) {
     constexpr uint64_t kStartupReadbackDelayNs = 500000000ULL; // 500ms after startup_ready
     constexpr uint64_t kAbsoluteFeedbackPollIntervalNs = 200000000ULL; // 200ms
 
+    auto reset_startup_drive_config_feedback = [&](auto& feedback_store) {
+      feedback_store.fill(StartupSdoFeedback{});
+      for (size_t descriptor_i = 0; descriptor_i < startup_sdos.size(); ++descriptor_i) {
+        const auto& descriptor = startup_sdos[descriptor_i];
+        auto& feedback = feedback_store[descriptor_i];
+        for (uint32_t i = 0; i < opt.num_axes; ++i) {
+          feedback.configured[i] = descriptor.valid ? 1u : 0u;
+          feedback.commanded[i] = descriptor.valid ? descriptor.values[i] : 0u;
+        }
+      }
+    };
+
     auto perform_startup_drive_config_readback = [&](uint64_t now_ns, bool startup_ready_flag) {
 #if GRADIENT_HAVE_ECRT
       if (!metrics_startup_readback_enabled) {
@@ -4102,6 +4114,10 @@ int main(int argc, char** argv) {
       for (size_t descriptor_i = 0; descriptor_i < startup_sdos.size(); ++descriptor_i) {
         const auto& descriptor = startup_sdos[descriptor_i];
         auto& feedback = latest_feedback.startup_drive_config_feedback[descriptor_i];
+        for (uint32_t i = 0; i < opt.num_axes; ++i) {
+          feedback.configured[i] = descriptor.valid ? 1u : 0u;
+          feedback.commanded[i] = descriptor.valid ? descriptor.values[i] : 0u;
+        }
         if (descriptor.type != StartupSdoValueType::kU16) {
           logf("WARNING: EtherCAT startup readback skipped for unsupported type key=%s",
                descriptor.key.c_str());
@@ -4398,12 +4414,12 @@ int main(int argc, char** argv) {
         native_home_offset_ready_since_ns = 0;
         absolute_feedback_ready_since_ns = 0;
         absolute_feedback_last_poll_ns = 0;
-        latest_feedback.startup_drive_config_feedback.fill(StartupSdoFeedback{});
+        reset_startup_drive_config_feedback(latest_feedback.startup_drive_config_feedback);
         latest_feedback.native_home_state.fill(
             static_cast<uint8_t>(gradient::ipc::v1::NATIVE_HOME_STATE_IDLE));
         latest_feedback.native_home_last_abort_code.fill(0u);
         latest_feedback.absolute_feedback.fill(AbsoluteFeedbackAxis{});
-        startup_drive_config_feedback.fill(StartupSdoFeedback{});
+        reset_startup_drive_config_feedback(startup_drive_config_feedback);
         native_home_state.fill(
             static_cast<uint8_t>(gradient::ipc::v1::NATIVE_HOME_STATE_IDLE));
         native_home_last_abort_code.fill(0u);
@@ -5388,14 +5404,72 @@ int main(int argc, char** argv) {
                           mh->seq,
                           gradient::ipc::v1::EVT_DISARMED,
                           gradient::ipc::v1::EXEC_STATE_ABORTED);
-                      bool all_succeeded = true;
+                      // Vendor Q2: "Ensure the motor is stationary and inactive" before HM35.
+                      // Wait for each targeted axis to leave OperationEnabled for several
+                      // consecutive cycles before starting the HM35 transaction so the
+                      // audible disarm + HM35 re-enable pair is replaced by a single
+                      // disarm followed by the service-mode-owned HM35 sequence.
+                      constexpr uint64_t kDisarmPreconditionTimeoutNs = 500000000ULL; // 500 ms
+                      constexpr uint32_t kDisarmPreconditionStableCycles = 3;
+                      constexpr auto kDisarmPreconditionPoll =
+                          std::chrono::milliseconds(5);
+                      uint32_t disarm_confirmed_mask = 0;
+                      uint32_t disarm_failed_mask = 0;
                       for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
-                        if ((mask & (1u << axis)) != 0u) {
-                          native_home_axis(axis);
-                          if (latest_feedback.native_home_state[axis] !=
-                              gradient::ipc::v1::NATIVE_HOME_STATE_SUCCEEDED) {
-                            all_succeeded = false;
+                        if ((mask & (1u << axis)) == 0u) {
+                          continue;
+                        }
+                        const uint64_t deadline_ns =
+                            now_monotonic_ns() + kDisarmPreconditionTimeoutNs;
+                        uint32_t stable_cycles = 0;
+                        bool confirmed = false;
+                        while (now_monotonic_ns() < deadline_ns) {
+                          const uint16_t sw = latest_feedback.statusword[axis];
+                          const gradient::ds402::State st =
+                              gradient::ds402::decode_statusword(sw);
+                          if (st != gradient::ds402::State::OperationEnabled &&
+                              st != gradient::ds402::State::QuickStopActive) {
+                            if (++stable_cycles >= kDisarmPreconditionStableCycles) {
+                              confirmed = true;
+                              break;
+                            }
+                          } else {
+                            stable_cycles = 0;
                           }
+                          std::this_thread::sleep_for(kDisarmPreconditionPoll);
+                        }
+                        if (confirmed) {
+                          disarm_confirmed_mask |= (1u << axis);
+                        } else {
+                          disarm_failed_mask |= (1u << axis);
+                          latest_feedback.native_home_last_abort_code[axis] =
+                              gradient::ipc::v1::
+                                  NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT;
+                          latest_feedback.native_home_state[axis] =
+                              gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+                          logf("WARNING: native_home disarm precondition timeout axis=%u last_statusword=0x%04x abort=0x%08x",
+                               axis,
+                               static_cast<unsigned int>(
+                                   latest_feedback.statusword[axis]),
+                               static_cast<unsigned int>(
+                                   gradient::ipc::v1::
+                                       NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT));
+                        }
+                      }
+                      if (disarm_confirmed_mask != 0u) {
+                        logf("Native-home disarm precondition satisfied axis_mask=0x%x (timeouts=0x%x)",
+                             static_cast<unsigned int>(disarm_confirmed_mask),
+                             static_cast<unsigned int>(disarm_failed_mask));
+                      }
+                      bool all_succeeded = (disarm_failed_mask == 0u);
+                      for (uint32_t axis = 0; axis < opt.num_axes; ++axis) {
+                        if ((disarm_confirmed_mask & (1u << axis)) == 0u) {
+                          continue;
+                        }
+                        native_home_axis(axis);
+                        if (latest_feedback.native_home_state[axis] !=
+                            gradient::ipc::v1::NATIVE_HOME_STATE_SUCCEEDED) {
+                          all_succeeded = false;
                         }
                       }
                       if (all_succeeded) {
@@ -5405,8 +5479,9 @@ int main(int argc, char** argv) {
                              static_cast<unsigned int>(
                                  armed.load(std::memory_order_relaxed) ? 1u : 0u));
                       } else {
-                        logf("WARNING: native_home left requested axes disarmed after failure axis_mask=0x%x",
-                             static_cast<unsigned int>(mask));
+                        logf("WARNING: native_home left requested axes disarmed after failure axis_mask=0x%x disarm_timeouts=0x%x",
+                             static_cast<unsigned int>(mask),
+                             static_cast<unsigned int>(disarm_failed_mask));
                       }
                       native_home_active_axis_mask.fetch_and(~mask, std::memory_order_relaxed);
                     }

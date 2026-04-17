@@ -9,7 +9,7 @@ import socket
 import struct
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -17,6 +17,7 @@ from typing import Any, Optional
 from ....absolute_encoder_anchors import (
     load_absolute_encoder_anchors,
     save_absolute_encoder_anchor,
+    save_last_seen_absolute_counts,
 )
 from ....telemetry.native_home_status import (
     derive_drive_native_truth_validity,
@@ -63,6 +64,19 @@ _ROLE_CONTROLLER = 1
 
 _GRADIENT_MAX_AXES = 16
 
+# W1: rate-limit interval for persisting the optional last-seen
+# U40.20/.22 sidecar on the anchor file. 5s is short enough that an
+# operator-induced drive power cycle is likely to preserve at least one
+# fresh sample, and long enough that routine feedback cycles do not
+# hammer the disk.
+_LAST_SEEN_PERSIST_INTERVAL_S = 5.0
+
+# A6-EC motor-encoder multi-turn counter is 32767 turns wide; anything
+# past that without commanded motion during the off-window is considered
+# physically impossible and therefore evidence of lost retention rather
+# than legitimate drift (see vendor Q3 and commissioning-safety.md).
+_MAX_OFF_MOTOR_REVOLUTIONS = 32_767
+
 _MSG_STATUS_HELLO = 0x0201
 _MSG_STATUS_SNAPSHOT = 0x0202
 _MSG_STATUS_AXIS_CONFIG = 0x0203
@@ -93,12 +107,30 @@ _SERVICE_SDO_VALUE_U16 = 1
 
 _POWER_TRANSITION_WAIT_POLL_INTERVAL_S = 0.01
 _POWER_TRANSITION_DEFAULT_TIMEOUT_S = 1.0
+_POWER_TRANSITION_DRIVE_DISARMED_TIMEOUT_S = 1.0
 _NATIVE_HOME_WAIT_POLL_INTERVAL_S = 0.05
 _NATIVE_HOME_WAIT_TIMEOUT_S = 20.0
 _NATIVE_HOME_POST_SETTLE_TIMEOUT_S = 3.0
 _NATIVE_HOME_FAILED_STABILIZATION_SNAPSHOTS = 2
 _COMMAND_ROUNDTRIP_TOLERANCE_COUNTS = 15.0
 _ABSOLUTE_HOME_ANCHOR_STALE_TOLERANCE_COUNTS = 8.0
+# Per the plan: a live 6064 disagreement with anchored canonical truth,
+# taken modulo RM, above this tolerance fails closed with the explicit
+# reason `multi_turn_anchor_inconsistent_with_live_6064`. The A6-EC probe
+# work established that stationary reads wander by a few counts, and
+# post-restart live soak runs showed occasional 7-9 count spikes even on
+# a physically stationary joint, so keep this gate comfortably above the
+# observed jitter band while still catching real sub-shaft-turn drift.
+_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS = 16.0
+# Synthesized RTCore abort code for "HM35 precondition never saw a drive-
+# confirmed disarmed statusword". Must match
+# NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT in ipc_v1.hpp.
+_NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT = 0xF1000001
+# DS402 "state name" cells we accept as "drive is not actively driving the
+# motor" for the Vendor-Q2 "stationary and inactive" precondition. Both host
+# and RTCore use the same decode, but we keep the list local so the Python
+# contract is explicit.
+_DS402_OP_ENABLED_STATES = {5, 6}  # OperationEnabled, QuickStopActive
 _TWO_PI = 2.0 * 3.141592653589793
 _RTCORE_METRICS_PATH = Path("/run/gradient-rt-motion/metrics.json")
 
@@ -428,10 +460,14 @@ class EthercatRTCoreBackend(ActuatorBackend):
             self._robot_id,
             num_joints=self._num_joints,
         )
+        # Rate-limit last-seen sidecar persistence so we do not hammer
+        # the anchor file on every feedback cycle. Keyed by logical
+        # joint index; value is the `time.time()` wall-clock timestamp
+        # of the last successful persist.
+        self._last_seen_persist_last_wall_s: dict[int, float] = {}
         self._native_home_metrics_mtime_ns = -1
         self._feedback_unwrapped_counts: list[int] = [0] * _GRADIENT_MAX_AXES
         self._feedback_unwrapped_valid: list[bool] = [False] * _GRADIENT_MAX_AXES
-        self._raw_reference_wrap_lift_counts: list[int] = [0] * _GRADIENT_MAX_AXES
         self._rt_drive_profile_code = 0
         self._rt_drive_profile_id: Optional[str] = None
         self._last_wkc_expected = 0
@@ -559,7 +595,6 @@ class EthercatRTCoreBackend(ActuatorBackend):
             self._rt_drive_profile_id = None
             self._feedback_unwrapped_counts = [0] * _GRADIENT_MAX_AXES
             self._feedback_unwrapped_valid = [False] * _GRADIENT_MAX_AXES
-            self._raw_reference_wrap_lift_counts = [0] * _GRADIENT_MAX_AXES
             self._last_submitted_traj_id = 0
             self._execution_status = RTCoreExecutionStatus(
                 active_mode=RTCORE_MOTION_MODE_IDLE,
@@ -658,6 +693,8 @@ class EthercatRTCoreBackend(ActuatorBackend):
             axis_error_code = list(self._axis_error_code[: self._rt_num_axes])
             axis_fault_flags = list(self._axis_fault_flags[: self._rt_num_axes])
             axis_counts = list(self._axis_counts[: self._rt_num_axes])
+            axis_ds402_state = list(self._axis_ds402_state[: self._rt_num_axes])
+            axis_statusword = list(self._axis_statusword[: self._rt_num_axes])
             axis_config = self._axis_config
             feedback_ready = self._status_snapshot_event.is_set()
 
@@ -686,7 +723,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 axis_i: axis_counts[axis_i]
                 for axis_i in range(min(len(axis_counts), self._rt_num_axes))
             }
-            truth_snapshot = self._canonical_joint_positions_from_raw_feedback(raw_feedback)
+            truth_snapshot = self._canonical_joint_positions_from_raw_feedback(
+                raw_feedback,
+            )
             feedback_truth_available = bool(truth_snapshot.get("truth_available", False))
             if feedback_truth_available:
                 positions = truth_snapshot.get("joint_positions_rad")
@@ -729,6 +768,20 @@ class EthercatRTCoreBackend(ActuatorBackend):
             and len(live_feedback_joint_positions) == self._num_joints
         )
 
+        per_axis_drive_disarmed: list[bool] = [
+            int(state) not in _DS402_OP_ENABLED_STATES for state in axis_ds402_state
+        ]
+        per_axis_statusword_hex: list[str] = [
+            f"0x{int(sw) & 0xFFFF:04x}" for sw in axis_statusword
+        ]
+        drive_disarmed_all = bool(
+            per_axis_drive_disarmed and all(per_axis_drive_disarmed)
+        )
+        drive_op_enabled_axes = [
+            axis_i
+            for axis_i, disarmed in enumerate(per_axis_drive_disarmed)
+            if not disarmed
+        ]
         return {
             "connected": bool(self._connected),
             "feedback_ready": bool(feedback_ready),
@@ -751,17 +804,57 @@ class EthercatRTCoreBackend(ActuatorBackend):
             "faulted_axis_indices": faulted_axis_indices,
             "motion_active": bool(motion_active),
             "motion_intent_cleared": not motion_active,
+            "per_axis_drive_disarmed": per_axis_drive_disarmed,
+            "per_axis_ds402_state": [int(state) for state in axis_ds402_state],
+            "per_axis_statusword_hex": per_axis_statusword_hex,
+            "drive_disarmed_all": drive_disarmed_all,
+            "drive_op_enabled_axes": drive_op_enabled_axes,
             "power_up_ready": bool(not motion_active and not stale_command and not faulted_axis_indices and feedback_synchronized),
         }
 
-    def wait_for_power_transition_neutral(self, *, timeout_s: float | None = None) -> dict[str, Any]:
+    def _power_transition_neutrality_satisfied(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        require_drive_disarmed: bool,
+        require_drive_disarmed_axis_mask: int,
+    ) -> bool:
+        if not bool(snapshot.get("motion_intent_cleared", False)):
+            return False
+        if not require_drive_disarmed:
+            return True
+        per_axis = snapshot.get("per_axis_drive_disarmed")
+        if not isinstance(per_axis, list):
+            return False
+        if require_drive_disarmed_axis_mask > 0:
+            for axis_i in range(len(per_axis)):
+                if (require_drive_disarmed_axis_mask & (1 << axis_i)) == 0:
+                    continue
+                if not bool(per_axis[axis_i]):
+                    return False
+            return True
+        return bool(snapshot.get("drive_disarmed_all", False))
+
+    def wait_for_power_transition_neutral(
+        self,
+        *,
+        timeout_s: float | None = None,
+        require_drive_disarmed: bool = False,
+        require_drive_disarmed_axis_mask: int = 0,
+    ) -> dict[str, Any]:
         latest = self.get_power_transition_snapshot()
         resolved_timeout_s = (
             _POWER_TRANSITION_DEFAULT_TIMEOUT_S
             if timeout_s is None
             else max(0.0, float(timeout_s))
         )
-        if resolved_timeout_s <= 0.0 or bool(latest.get("motion_intent_cleared", False)):
+        latest["drive_disarmed_required"] = bool(require_drive_disarmed)
+        latest["drive_disarmed_required_axis_mask"] = int(require_drive_disarmed_axis_mask)
+        if resolved_timeout_s <= 0.0 or self._power_transition_neutrality_satisfied(
+            latest,
+            require_drive_disarmed=require_drive_disarmed,
+            require_drive_disarmed_axis_mask=int(require_drive_disarmed_axis_mask),
+        ):
             latest["wait_timed_out"] = False
             return latest
 
@@ -769,7 +862,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
         while time.monotonic() <= deadline:
             time.sleep(_POWER_TRANSITION_WAIT_POLL_INTERVAL_S)
             latest = self.get_power_transition_snapshot()
-            if bool(latest.get("motion_intent_cleared", False)):
+            latest["drive_disarmed_required"] = bool(require_drive_disarmed)
+            latest["drive_disarmed_required_axis_mask"] = int(require_drive_disarmed_axis_mask)
+            if self._power_transition_neutrality_satisfied(
+                latest,
+                require_drive_disarmed=require_drive_disarmed,
+                require_drive_disarmed_axis_mask=int(require_drive_disarmed_axis_mask),
+            ):
                 latest["wait_timed_out"] = False
                 return latest
 
@@ -782,11 +881,17 @@ class EthercatRTCoreBackend(ActuatorBackend):
         wait_for_idle: bool = False,
         timeout_s: float | None = None,
         quick_stop: bool = True,
+        require_drive_disarmed: bool = False,
+        require_drive_disarmed_axis_mask: int = 0,
     ) -> dict[str, Any]:
         if not self._connected:
             snapshot = self.get_power_transition_snapshot()
             snapshot["waited_for_idle"] = bool(wait_for_idle)
             snapshot["wait_timed_out"] = False
+            snapshot["drive_disarmed_required"] = bool(require_drive_disarmed)
+            snapshot["drive_disarmed_required_axis_mask"] = int(
+                require_drive_disarmed_axis_mask
+            )
             return snapshot
 
         try:
@@ -798,12 +903,35 @@ class EthercatRTCoreBackend(ActuatorBackend):
         except Exception as exc:
             print(f"[EtherCAT RTCore] WARNING: jog stop before power transition failed: {exc}")
 
+        # If caller requires drive-confirmed disarm, also send explicit RTCore
+        # disable commands for the targeted axes so the cyclic loop starts
+        # driving the DS402 state machine away from OperationEnabled. Without
+        # this step the host would only be "waiting", not "asking".
+        if require_drive_disarmed and require_drive_disarmed_axis_mask > 0:
+            try:
+                self._send_cmd_axis_disable(
+                    axis_mask=int(require_drive_disarmed_axis_mask)
+                )
+            except Exception as exc:
+                print(
+                    "[EtherCAT RTCore] WARNING: axis disable before drive-disarm wait"
+                    f" failed: {exc}"
+                )
+
         if wait_for_idle:
-            snapshot = self.wait_for_power_transition_neutral(timeout_s=timeout_s)
+            snapshot = self.wait_for_power_transition_neutral(
+                timeout_s=timeout_s,
+                require_drive_disarmed=require_drive_disarmed,
+                require_drive_disarmed_axis_mask=int(require_drive_disarmed_axis_mask),
+            )
         else:
             time.sleep(0.02)
             snapshot = self.get_power_transition_snapshot()
             snapshot["wait_timed_out"] = False
+            snapshot["drive_disarmed_required"] = bool(require_drive_disarmed)
+            snapshot["drive_disarmed_required_axis_mask"] = int(
+                require_drive_disarmed_axis_mask
+            )
         snapshot["waited_for_idle"] = bool(wait_for_idle)
         return snapshot
 
@@ -880,6 +1008,12 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if self._rt_num_axes <= 0:
             raise RuntimeError("RTCore did not report a valid num_axes")
         total = len(points)
+        # Pre-commit sanity gate: each point's 607A counts must not step more
+        # than half a shaft revolution against the previous point. This does
+        # not clamp motion (RTCore still enforces max_step per cycle); it just
+        # refuses to ship a trajectory whose upload-space delta proves the
+        # host frame-selection is wrong by a whole shaft turn.
+        previous_axis_counts: list[int | None] = [None] * self._rt_num_axes
         for idx, point in enumerate(points):
             t_from_start_ns = int(point.get("t_from_start_ns", 0))
             axis_mask = int(point.get("axis_mask", (1 << self._rt_num_axes) - 1))
@@ -899,6 +1033,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 raise ValueError(
                     f"Expected {self._rt_num_axes} RT axis values, got {len(axis_q)}"
                 )
+            self._enforce_trajectory_step_within_half_rm(
+                axis_q=axis_q,
+                axis_mask=int(axis_mask),
+                previous_axis_counts=previous_axis_counts,
+                point_index=int(idx),
+                traj_id=int(traj_id),
+            )
 
             qd = point.get("qd")
             qd_values = [0.0] * _GRADIENT_MAX_AXES
@@ -1291,7 +1432,16 @@ class EthercatRTCoreBackend(ActuatorBackend):
             )
 
         try:
-            self.prepare_for_power_transition(wait_for_idle=True, timeout_s=_POWER_TRANSITION_DEFAULT_TIMEOUT_S)
+            disarm_timeout_s = self._env_float(
+                "GRADIENT_RTCORE_NATIVE_HOME_DISARM_TIMEOUT_S",
+                _POWER_TRANSITION_DRIVE_DISARMED_TIMEOUT_S,
+            )
+            precondition_snapshot = self.prepare_for_power_transition(
+                wait_for_idle=True,
+                timeout_s=disarm_timeout_s,
+                require_drive_disarmed=True,
+                require_drive_disarmed_axis_mask=int(axis_mask),
+            )
         except Exception as exc:
             print(f"[EtherCAT RTCore] WARNING: pre-native-home neutralization failed: {exc}")
             return _result(
@@ -1301,6 +1451,48 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 message=f"Could not neutralize motion before drive-native home: {exc}",
                 joint=joint_i + 1,
                 axis_mask=axis_mask,
+            )
+
+        precondition_snapshot_mapping: dict[str, Any] = (
+            precondition_snapshot if isinstance(precondition_snapshot, dict) else {}
+        )
+        if bool(precondition_snapshot_mapping.get("wait_timed_out", False)):
+            # Drive never left OperationEnabled within the disarm window; do not
+            # start HM35 at all, per vendor Q2 "stationary and inactive".
+            op_enabled_axes = [
+                int(axis_i)
+                for axis_i in list(precondition_snapshot_mapping.get("drive_op_enabled_axes", []))
+                if (int(axis_i) & 0xFFFF) < 32 and (axis_mask & (1 << int(axis_i))) != 0
+            ]
+            statuswords = list(precondition_snapshot_mapping.get("per_axis_statusword_hex", []))
+            op_statuswords = [
+                statuswords[axis_i]
+                for axis_i in op_enabled_axes
+                if 0 <= axis_i < len(statuswords)
+            ]
+            print(
+                "[EtherCAT RTCore] WARNING: native-home disarm precondition timeout"
+                f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
+                f" op_enabled_axes={op_enabled_axes}"
+                f" statuswords={op_statuswords}"
+            )
+            return _result(
+                accepted=False,
+                verified=False,
+                code="NATIVE_HOME_DISARM_PRECONDITION_TIMEOUT",
+                message=(
+                    "Drive did not leave OperationEnabled within the disarm"
+                    f" precondition window; refusing to start HM35."
+                    f" op_enabled_axes={op_enabled_axes} statuswords={op_statuswords}"
+                ),
+                joint=joint_i + 1,
+                axis_mask=axis_mask,
+                native_home_last_abort_code=_NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT,
+                extra={
+                    "disarm_precondition_timed_out": True,
+                    "drive_op_enabled_axes": op_enabled_axes,
+                    "drive_op_enabled_statuswords": op_statuswords,
+                },
             )
 
         baseline_snapshot = self._load_rtcore_metrics_snapshot()
@@ -1449,6 +1641,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
                         "post_home_logical_joint",
                         "post_home_command_roundtrip_reference_error_counts",
                         "post_home_command_roundtrip_reference_error_rad",
+                        "post_home_shaft_frame_consistent",
+                        "post_home_shaft_frame_mod_rm_delta_counts",
+                        "post_home_shaft_frame_mod_rm_delta_rad",
+                        "post_home_shaft_frame_tolerance_counts",
+                        "post_home_shaft_frame_tolerance_rad",
+                        "post_home_shaft_frame_period_counts",
+                        "post_home_shaft_frame_wrap_turns",
                     ):
                         post_home_detail.pop(key, None)
                     for key in (
@@ -1456,6 +1655,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
                         "logical_joint",
                         "command_roundtrip_reference_error_counts",
                         "command_roundtrip_reference_error_rad",
+                        "shaft_frame_consistent",
+                        "shaft_frame_mod_rm_delta_counts",
+                        "shaft_frame_mod_rm_delta_rad",
+                        "shaft_frame_tolerance_counts",
+                        "shaft_frame_tolerance_rad",
+                        "shaft_frame_period_counts",
+                        "shaft_frame_wrap_turns",
                     ):
                         value = validation.get(key)
                         if value is not None:
@@ -1630,21 +1836,36 @@ class EthercatRTCoreBackend(ActuatorBackend):
             )
 
         abort_code = int(wait_result.get("native_home_last_abort_code", 0))
+        abort_is_disarm_timeout = (
+            (abort_code & 0xFFFFFFFF) == _NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT
+        )
         print(
             "[EtherCAT RTCore] WARNING: native drive-home failed verification:"
             f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
             f" abort=0x{abort_code & 0xFFFFFFFF:08X}"
+            + (" (RTCore disarm precondition timeout)" if abort_is_disarm_timeout else "")
         )
         return _result(
             accepted=False,
             verified=False,
-            code="NATIVE_HOME_FAILED",
+            code=(
+                "NATIVE_HOME_DISARM_PRECONDITION_TIMEOUT"
+                if abort_is_disarm_timeout
+                else "NATIVE_HOME_FAILED"
+            ),
             message=(
-                "Drive-native commissioning home failed verification."
-                + (
-                    f" Abort code 0x{abort_code & 0xFFFFFFFF:08X}."
-                    if abort_code != 0
-                    else ""
+                (
+                    "RTCore refused to start HM35 because the drive never left"
+                    " OperationEnabled within the disarm precondition window."
+                )
+                if abort_is_disarm_timeout
+                else (
+                    "Drive-native commissioning home failed verification."
+                    + (
+                        f" Abort code 0x{abort_code & 0xFFFFFFFF:08X}."
+                        if abort_code != 0
+                        else ""
+                    )
                 )
             ),
             joint=joint_i + 1,
@@ -1653,6 +1874,11 @@ class EthercatRTCoreBackend(ActuatorBackend):
             native_home_state=int(wait_result.get("native_home_state", 3)),
             native_home_last_abort_code=abort_code,
             metrics_time_ns=int(wait_result.get("metrics_time_ns", 0)),
+            extra=(
+                {"disarm_precondition_timed_out": True}
+                if abort_is_disarm_timeout
+                else None
+            ),
         )
 
     def _best_effort_safe_power_down(
@@ -1837,6 +2063,22 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 manufacturer_error_code = int(axis_payload.get("manufacturer_error_code", 0))
             except Exception:
                 manufacturer_error_code = 0
+            # Ask the active drive profile whether the live fault/alarm
+            # codes belong to the encoder-retention family (e.g. Er20.9,
+            # ALF9.0 on A6-EC). When present this must outrank the generic
+            # fault_present / manufacturer_fault_present branches and
+            # block the persisted-home-anchor restart-trust path, because
+            # multi-turn retention is exactly the precondition that path
+            # depends on.
+            encoder_retention_fault_detail = drive_profile_registry.describe_drive_encoder_retention_fault(
+                self._profile_id_for_axis_semantics(),
+                manufacturer_error_code=manufacturer_error_code,
+                error_code=error_code,
+            )
+            encoder_retention_fault_present = bool(
+                isinstance(encoder_retention_fault_detail, dict)
+                and encoder_retention_fault_detail.get("present", False)
+            )
             native_home_status = derive_effective_native_home_status(
                 axis_payload,
                 statusword=statusword,
@@ -1855,6 +2097,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
             startup_truth_requires_hm_success_signature = (
                 self._startup_truth_requires_hm_success_signature()
             )
+            accept_persisted_home_anchor_as_restart_trust = (
+                self._accept_persisted_home_anchor_as_restart_trust()
+            )
             drive_native_startup = self._drive_native_startup_validity(axis_payload)
             drive_native_startup_valid = bool(drive_native_startup.get("drive_native_startup_valid", False))
             configured_position_semantics_source = (
@@ -1867,13 +2112,12 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 if drive_native_ratio_enabled
                 else "absolute_encoder_anchor"
             )
-            drive_native_truth = derive_drive_native_truth_validity(
-                axis_payload,
-                statusword=statusword,
-                error_code=error_code,
-                manufacturer_error_code=manufacturer_error_code,
-                require_hm_success_signature=startup_truth_requires_hm_success_signature,
-            )
+            # Pre-compute the anchor lookup and the shaft-frame consistency
+            # gate so the validity helper has enough signal to accept a
+            # missing bit 15 as still-trusted after a drive power cycle, per
+            # the per-profile `accept_persisted_home_anchor_as_restart_trust`
+            # flag. The gate itself is re-used later in place of the old
+            # Workstream 3 short-circuit.
             anchor_required_for_truth = bool(
                 absolute_home_anchor_required or canonical_truth_uses_absolute_feedback
             )
@@ -1882,6 +2126,102 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 if anchor_required_for_truth and 0 <= joint_i < self._num_joints
                 else None
             )
+            persisted_home_anchor_present = anchor_entry is not None
+            multi_turn_feedback_valid = False
+            if isinstance(normalized_absolute_feedback, Mapping):
+                mt_source_payload = normalized_absolute_feedback.get("encoder_multi_turn_counts")
+                if isinstance(mt_source_payload, Mapping):
+                    multi_turn_feedback_valid = bool(mt_source_payload.get("valid"))
+            # W1 last-seen U40.20/.22 sidecar: compute a pre-gate
+            # delta between the in-memory absolute counts and the
+            # sidecar value stored on the anchor. The sidecar is
+            # diagnostic only; it is passed into the validity helper
+            # so that when the shaft-frame gate fails AND the delta is
+            # physically impossible (>32767 motor revs for A6-EC), the
+            # rejection reason upgrades to the more specific
+            # "multi_turn_feedback_lost_across_power_cycle" label.
+            last_seen_sidecar: dict[str, Any] | None = None
+            last_seen_delta_counts: int | None = None
+            last_seen_delta_physically_possible: bool | None = None
+            max_off_motor_delta_counts: int | None = None
+            if isinstance(anchor_entry, dict):
+                candidate_sidecar = anchor_entry.get("last_seen")
+                if isinstance(candidate_sidecar, dict):
+                    try:
+                        stored_absolute_counts = int(candidate_sidecar.get("absolute_counts"))
+                    except Exception:
+                        stored_absolute_counts = None
+                    if (
+                        stored_absolute_counts is not None
+                        and absolute_result is not None
+                    ):
+                        last_seen_sidecar = dict(candidate_sidecar)
+                        last_seen_delta_counts = int(
+                            int(absolute_result[2]) - int(stored_absolute_counts)
+                        )
+                        counts_per_rev_axis = self._encoder_counts_per_rev_for_axis(axis_i)
+                        if counts_per_rev_axis > 0:
+                            max_off_motor_delta_counts = int(
+                                _MAX_OFF_MOTOR_REVOLUTIONS * counts_per_rev_axis
+                            )
+                            last_seen_delta_physically_possible = bool(
+                                abs(int(last_seen_delta_counts)) <= int(max_off_motor_delta_counts)
+                            )
+            persisted_home_anchor_consistent: bool | None = None
+            anchor_consistency_detail: dict[str, object] | None = None
+            if (
+                canonical_truth_uses_absolute_feedback
+                and raw is not None
+                and anchor_entry is not None
+                and absolute_result is not None
+            ):
+                # master_offset cancels inside the gate (expected_reference_q
+                # re-adds it before comparing to live 6064). Use the full
+                # canonical_q expression so the diagnostic fields land with
+                # the same meaning they have later in the block.
+                trial_canonical_q = (
+                    float(absolute_result[0])
+                    - float(anchor_entry["home_anchor_rad"])
+                    - self._master_offset_for_joint(joint_i)
+                )
+                anchor_consistency_detail = self._shaft_frame_consistency_detail(
+                    axis_i=axis_i,
+                    canonical_q=float(trial_canonical_q),
+                    logical_joint_idx=joint_i,
+                    live_reference_counts=int(raw),
+                )
+                if isinstance(anchor_consistency_detail, dict):
+                    persisted_home_anchor_consistent = bool(
+                        anchor_consistency_detail.get("shaft_frame_consistent", False)
+                    )
+            drive_native_truth = derive_drive_native_truth_validity(
+                axis_payload,
+                statusword=statusword,
+                error_code=error_code,
+                manufacturer_error_code=manufacturer_error_code,
+                require_hm_success_signature=startup_truth_requires_hm_success_signature,
+                accept_persisted_home_anchor_as_restart_trust=accept_persisted_home_anchor_as_restart_trust,
+                persisted_home_anchor_present=persisted_home_anchor_present,
+                persisted_home_anchor_consistent=persisted_home_anchor_consistent,
+                multi_turn_feedback_valid=multi_turn_feedback_valid,
+                encoder_retention_fault_present=encoder_retention_fault_present,
+                last_seen_present=bool(last_seen_sidecar is not None),
+                last_seen_delta_physically_possible=last_seen_delta_physically_possible,
+            )
+            # Expose the persisted-anchor signals so operator tools and
+            # regressions can inspect exactly why a given axis was (or was
+            # not) upgraded to trust via the persisted-home-anchor path.
+            if accept_persisted_home_anchor_as_restart_trust:
+                axis_payload_restart_trust_context = {
+                    "persisted_home_anchor_present": bool(persisted_home_anchor_present),
+                    "multi_turn_feedback_valid": bool(multi_turn_feedback_valid),
+                }
+                if persisted_home_anchor_consistent is not None:
+                    axis_payload_restart_trust_context[
+                        "persisted_home_anchor_consistent"
+                    ] = bool(persisted_home_anchor_consistent)
+            else:
+                axis_payload_restart_trust_context = None
             detail: dict[str, object] = {
                 "axis": int(axis_i),
                 "logical_joint": logical_joint,
@@ -1916,6 +2256,49 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 "error_code": int(error_code),
                 "manufacturer_error_code": int(manufacturer_error_code),
             }
+            # Populate the shaft-frame / anchor-trust context early so it
+            # rides along with detail even when a later short-circuit sets
+            # truth_available=False.
+            if isinstance(anchor_consistency_detail, dict):
+                detail.update(anchor_consistency_detail)
+            if axis_payload_restart_trust_context is not None:
+                detail.update(axis_payload_restart_trust_context)
+            # Surface the profile-decoded encoder-retention fault detail
+            # when present so operator tools see matched vendor codes/names
+            # alongside the derived truth reason.
+            if encoder_retention_fault_present and isinstance(
+                encoder_retention_fault_detail, dict
+            ):
+                detail["encoder_retention_fault"] = dict(encoder_retention_fault_detail)
+                detail["encoder_retention_fault_present"] = True
+            # W1: surface the optional last-seen U40.20/.22 sidecar so
+            # /info/joints-detailed can expose it. The sidecar is
+            # diagnostic only - consumers that care about trust should
+            # branch on `drive_native_truth_*` fields, not on these.
+            if last_seen_sidecar is not None:
+                detail["last_seen_absolute_counts"] = int(
+                    last_seen_sidecar.get("absolute_counts", 0)
+                )
+                if "reference_counts" in last_seen_sidecar:
+                    detail["last_seen_reference_counts"] = int(
+                        last_seen_sidecar.get("reference_counts", 0)
+                    )
+                if "observed_at" in last_seen_sidecar:
+                    detail["last_seen_observed_at"] = str(
+                        last_seen_sidecar.get("observed_at", "")
+                    )
+                if "observed_by" in last_seen_sidecar:
+                    detail["last_seen_observed_by"] = str(
+                        last_seen_sidecar.get("observed_by", "")
+                    )
+            if last_seen_delta_counts is not None:
+                detail["last_seen_delta_counts"] = int(last_seen_delta_counts)
+            if last_seen_delta_physically_possible is not None:
+                detail["last_seen_delta_physically_possible"] = bool(
+                    last_seen_delta_physically_possible
+                )
+            if max_off_motor_delta_counts is not None:
+                detail["last_seen_delta_budget_counts"] = int(max_off_motor_delta_counts)
             position_semantics_sources.append(position_semantics_source)
             if drive_native_ratio_enabled:
                 drive_native_enabled_axes.append(int(axis_i))
@@ -1987,8 +2370,6 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 )
 
             if truth_reason is not None:
-                if raw is not None:
-                    self._set_raw_reference_wrap_lift_counts_for_axis(axis_i, 0)
                 detail["truth_available"] = False
                 detail["truth_status"] = "unavailable"
                 detail["truth_reason"] = truth_reason
@@ -2018,6 +2399,58 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     - float(anchor_entry["home_anchor_rad"])
                     - self._master_offset_for_joint(joint_i)
                 )
+
+            # Vendor Q4/Q10: 6064 is authoritative within shaft space. When
+            # our multi-turn canonical truth is rooted in anchored
+            # U40.20/.22, we must prove that truth still agrees with live
+            # 6064 modulo RM before publishing it. A whole-shaft-turn offset
+            # in the anchor is legitimate (it only changes which turn we are
+            # on, not where on the shaft); a sub-shaft-turn disagreement is
+            # a frame bug and must fail closed. We also surface the
+            # stale-anchor diagnostic fields when relevant so operators see
+            # how much the stored anchor needs to move.
+            #
+            # We already computed this gate above to feed the truth-validity
+            # helper (it also underpins the persisted-home-anchor restart
+            # trust path) and merged it into `detail`. Re-use the cached
+            # result here to decide whether to short-circuit with the
+            # "multi_turn_anchor_inconsistent_with_live_6064" reason.
+            if (
+                canonical_truth_uses_absolute_feedback
+                and raw is not None
+                and anchor_entry is not None
+            ):
+                shaft_gate = anchor_consistency_detail
+                if isinstance(shaft_gate, dict):
+                    if not bool(shaft_gate.get("shaft_frame_consistent", True)):
+                        if absolute_axis_q is not None:
+                            diagnostic_reference_q = float(
+                                display_reference_q
+                                if display_reference_q is not None
+                                else reference_q
+                            )
+                            stale_anchor_detail = self._absolute_home_anchor_diagnostic_for_axis(
+                                axis_i=axis_i,
+                                axis_snapshot=axis_snapshot,
+                                absolute_axis_q=float(absolute_axis_q),
+                                reference_q=diagnostic_reference_q,
+                                anchor_entry=anchor_entry,
+                            )
+                            detail.update(stale_anchor_detail)
+                        detail["truth_available"] = False
+                        detail["truth_status"] = "unavailable"
+                        detail["truth_reason"] = (
+                            "multi_turn_anchor_inconsistent_with_live_6064"
+                        )
+                        detail["display_source"] = "truth_unavailable"
+                        unavailable_axes.append(int(axis_i))
+                        if logical_joint is not None:
+                            unavailable_joints.append(int(logical_joint))
+                        if drive_native_ratio_enabled:
+                            drive_native_unavailable_axes.append(int(axis_i))
+                        axis_truth_details.append(detail)
+                        continue
+
             roundtrip_detail = self._command_roundtrip_detail_for_axis(
                 axis_i=axis_i,
                 logical_joint_idx=joint_i,
@@ -2046,8 +2479,6 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 raw_roundtrip_detail.get("command_roundtrip_consistent", False)
             ) if raw_roundtrip_detail is not None else True
             if not roundtrip_consistent or not raw_roundtrip_consistent:
-                if raw is not None:
-                    self._set_raw_reference_wrap_lift_counts_for_axis(axis_i, 0)
                 if canonical_truth_uses_absolute_feedback and absolute_axis_q is not None and anchor_entry is not None:
                     diagnostic_reference_q = float(
                         display_reference_q
@@ -2078,16 +2509,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     drive_native_unavailable_axes.append(int(axis_i))
                 axis_truth_details.append(detail)
                 continue
-            lift_detail = (
-                raw_roundtrip_detail
-                if raw_roundtrip_detail is not None
-                else roundtrip_detail if normalized_reference_mode == "raw" else None
-            )
-            if lift_detail is not None:
-                self._set_raw_reference_wrap_lift_counts_for_axis(
-                    axis_i,
-                    int(lift_detail.get("command_roundtrip_reference_wrap_lift_counts", 0)),
-                )
+
             positions[joint_i] = float(canonical_q)
             partial_position_samples[joint_i].append(float(canonical_q))
             detail["truth_available"] = True
@@ -2098,6 +2520,28 @@ class EthercatRTCoreBackend(ActuatorBackend):
             # operator view follows the same canonical frame.
             detail["display_source"] = position_semantics_source
             detail["display_rad"] = float(canonical_q)
+            # W1: persist a rate-limited last-seen U40.20/.22 sidecar on
+            # the runtime canonical-truth path (reference_mode="raw").
+            # Skip in display-only mode (same spirit as the
+            # mutate_command_wrap_bookkeeping=False guard): display
+            # reads must stay observational and must not mutate anchor
+            # state.
+            if (
+                normalized_reference_mode == "raw"
+                and canonical_truth_uses_absolute_feedback
+                and anchor_entry is not None
+                and absolute_result is not None
+                and raw is not None
+                and multi_turn_feedback_valid
+                and not encoder_retention_fault_present
+                and 0 <= joint_i < self._num_joints
+            ):
+                self._persist_last_seen_absolute_counts_for_joint(
+                    logical_joint_idx=int(joint_i),
+                    absolute_counts=int(absolute_result[2]),
+                    reference_counts=int(raw),
+                    now_wall_s=time.time(),
+                )
             axis_truth_details.append(detail)
 
         unavailable_axes = sorted(set(unavailable_axes))
@@ -2178,10 +2622,11 @@ class EthercatRTCoreBackend(ActuatorBackend):
         )
 
     def raw_to_joint_positions(self, raw_positions: dict[int, int]) -> list[float]:
-        # Controller/planner truth must stay continuous in logical joint space
-        # while preserving the raw 0x6064-equivalent turn bookkeeping used for
-        # command upload. Operator display uses the stricter display snapshot
-        # path below.
+        # Controller/planner truth stays continuous in logical joint space.
+        # Operator display uses the stricter display snapshot path below.
+        # The 607A turn selection is now a stateless nearest-turn fold against
+        # live 6064 applied at write time (see _command_axis_q_for_joint_value),
+        # so no per-axis wrap-lift state needs to be mutated here.
         return self._canonical_joint_positions_or_raise(
             raw_positions,
             reference_mode="raw",
@@ -2913,6 +3358,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
         payload = self._drive_position_semantics_config(profile_id)
         return bool(payload.get("startup_truth_requires_hm_success_signature", True))
 
+    def _accept_persisted_home_anchor_as_restart_trust(self, profile_id: Optional[str] = None) -> bool:
+        payload = self._drive_position_semantics_config(profile_id)
+        return bool(payload.get("accept_persisted_home_anchor_as_restart_trust", False))
+
     def _drive_native_startup_validity(
         self,
         axis_snapshot: Optional[dict[str, object]],
@@ -3082,13 +3531,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 axis.get("absolute_feedback")
             )
         with self._status_lock:
-            previous_offsets = list(self._native_home_offset_counts)
             self._native_home_offset_counts = offsets
             self._absolute_feedback_by_axis = absolute_feedback
             self._native_home_metrics_mtime_ns = stat.st_mtime_ns
-            for axis_i in range(min(len(previous_offsets), len(offsets), len(self._raw_reference_wrap_lift_counts))):
-                if int(previous_offsets[axis_i]) != int(offsets[axis_i]):
-                    self._raw_reference_wrap_lift_counts[axis_i] = 0
 
     def _load_rtcore_metrics_snapshot(self) -> dict[str, object] | None:
         try:
@@ -3185,13 +3630,89 @@ class EthercatRTCoreBackend(ActuatorBackend):
         source_raw = raw_entry.get("source")
         updated_at_raw = raw_entry.get("updated_at")
         updated_by_raw = raw_entry.get("updated_by")
-        return {
+        entry: dict[str, Any] = {
             "home_anchor_rad": float(home_anchor_rad),
             "source": str(source_raw).strip() if source_raw is not None else None,
             "axis_indices": axis_indices,
             "updated_at": str(updated_at_raw).strip() if updated_at_raw is not None else None,
             "updated_by": str(updated_by_raw).strip() if updated_by_raw is not None else None,
         }
+        last_seen = raw_entry.get("last_seen")
+        if isinstance(last_seen, dict):
+            entry["last_seen"] = dict(last_seen)
+        return entry
+
+    def _encoder_counts_per_rev_for_axis(self, axis_i: int) -> int:
+        """Encoder counts per single motor revolution for the target
+        axis. Used by the W1 last-seen sidecar to bound
+        ``last_seen_delta_physically_possible`` at
+        ``32_767 * counts_per_rev``.
+        """
+        config = getattr(self, "_axis_config", None)
+        try:
+            counts_per_rev = int(config.counts_per_rev[axis_i]) if config is not None else 0
+        except Exception:
+            counts_per_rev = 0
+        if counts_per_rev > 0:
+            return int(counts_per_rev)
+        robot_config = getattr(self, "_robot_config", None)
+        if isinstance(robot_config, Mapping):
+            raw = robot_config.get("actuator_encoder_counts_per_rev")
+            if isinstance(raw, list) and 0 <= axis_i < len(raw):
+                try:
+                    return int(raw[axis_i])
+                except Exception:
+                    return 0
+        return 0
+
+    def _persist_last_seen_absolute_counts_for_joint(
+        self,
+        *,
+        logical_joint_idx: int,
+        absolute_counts: int,
+        reference_counts: int,
+        now_wall_s: float,
+    ) -> None:
+        """Rate-limited persistence of the last-seen sidecar on the
+        anchor file. No-op when the joint has no recorded anchor
+        (``save_last_seen_absolute_counts`` returns ``None`` in that
+        case) and when the last persist for this joint was within
+        ``_LAST_SEEN_PERSIST_INTERVAL_S``. Failures are swallowed - the
+        sidecar is diagnostic, not safety-critical.
+        """
+        if logical_joint_idx < 0 or logical_joint_idx >= self._num_joints:
+            return
+        last_persist = self._last_seen_persist_last_wall_s.get(int(logical_joint_idx))
+        if (
+            last_persist is not None
+            and (now_wall_s - float(last_persist)) < _LAST_SEEN_PERSIST_INTERVAL_S
+        ):
+            return
+        try:
+            saved_entry = save_last_seen_absolute_counts(
+                self._robot_id,
+                num_joints=self._num_joints,
+                logical_joint_index=int(logical_joint_idx),
+                absolute_counts=int(absolute_counts),
+                reference_counts=int(reference_counts),
+                observed_at_monotonic_ns=int(time.monotonic_ns()),
+                actor="ethercat_rtcore:restart-trust",
+            )
+        except Exception:
+            return
+        if not isinstance(saved_entry, dict):
+            return
+        # Mirror the persisted sidecar back into the in-memory anchor
+        # list so the next feedback cycle sees it without reloading the
+        # file from disk.
+        with self._status_lock:
+            if 0 <= logical_joint_idx < len(self._absolute_encoder_home_anchors):
+                existing = self._absolute_encoder_home_anchors[int(logical_joint_idx)]
+                if isinstance(existing, dict):
+                    merged = dict(existing)
+                    merged["last_seen"] = dict(saved_entry.get("last_seen", {}))
+                    self._absolute_encoder_home_anchors[int(logical_joint_idx)] = merged
+        self._last_seen_persist_last_wall_s[int(logical_joint_idx)] = float(now_wall_s)
 
     def _reference_q_before_master_offset_for_axis(
         self,
@@ -3209,47 +3730,32 @@ class EthercatRTCoreBackend(ActuatorBackend):
             return None
         return float(physical_q) + self._native_home_offset_q_for_axis(axis_i)
 
-    def _raw_reference_wrap_period_counts_for_axis(self, axis_i: int) -> int:
-        return self._reference_wrap_period_counts_for_axis(axis_i)
-
-    def _raw_reference_wrap_lift_counts_for_axis(self, axis_i: int) -> int:
+    def _live_reference_counts_for_axis(self, axis_i: int) -> int | None:
+        # The live 6064 wire-frame reading that the stateless nearest-turn
+        # selector uses as its anchor. Returning None means there is no live
+        # reference to fold against and the caller must treat that as "no
+        # turn selection possible" rather than synthesizing one.
         with self._status_lock:
-            if axis_i < 0 or axis_i >= len(self._raw_reference_wrap_lift_counts):
-                return 0
-            return int(self._raw_reference_wrap_lift_counts[axis_i])
+            if axis_i < 0 or axis_i >= len(self._axis_counts):
+                return None
+            return int(self._axis_counts[axis_i])
 
-    def _set_raw_reference_wrap_lift_counts_for_axis(self, axis_i: int, wrap_lift_counts: int) -> None:
-        period_counts = self._raw_reference_wrap_period_counts_for_axis(axis_i)
-        normalized_lift_counts = int(wrap_lift_counts)
-        if period_counts > 0:
-            normalized_lift_counts = (
-                int(round(float(normalized_lift_counts) / float(period_counts))) * int(period_counts)
-            )
-        with self._status_lock:
-            if axis_i < 0 or axis_i >= len(self._raw_reference_wrap_lift_counts):
-                return
-            self._raw_reference_wrap_lift_counts[axis_i] = int(normalized_lift_counts)
-
-    def _raw_reference_wrap_lift_q_for_axis(self, axis_i: int, wrap_lift_counts: int | None = None) -> float:
-        lift_counts = (
-            self._raw_reference_wrap_lift_counts_for_axis(axis_i)
-            if wrap_lift_counts is None
-            else int(wrap_lift_counts)
-        )
-        if lift_counts == 0:
-            return 0.0
-        lift_q = self._axis_q_from_counts(axis_i, int(lift_counts))
-        return float(lift_q) if lift_q is not None else 0.0
-
-    def _wrap_adjusted_command_axis_q_for_axis(
+    def _nearest_turn_fold_axis_q_for_axis(
         self,
         axis_i: int,
         base_axis_q: float,
         *,
+        observed_reference_counts: int | None = None,
         observed_reference_q: float | None = None,
     ) -> tuple[float, int]:
+        # Stateless per-write nearest-turn fold. Takes the desired axis-space
+        # target and the live 6064 reference, and returns the axis-space value
+        # whose 607A wire counts are the nearest-turn equivalent of the target
+        # against the live reading. No per-axis wrap-lift state is carried
+        # between calls, so consecutive seam-adjacent jogs cannot lose track of
+        # which shaft turn the axis is currently on.
         cfg = self._axis_config
-        period_counts = self._raw_reference_wrap_period_counts_for_axis(axis_i)
+        period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
         if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes) or period_counts <= 0:
             return float(base_axis_q), 0
         counts_per_unit = float(cfg.counts_per_unit[axis_i])
@@ -3257,12 +3763,18 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if counts_per_unit <= 0.0 or sign not in (-1, 1):
             return float(base_axis_q), 0
         base_counts = float(base_axis_q) * float(sign) * float(counts_per_unit)
-        if observed_reference_q is None:
-            wrap_lift_counts = self._raw_reference_wrap_lift_counts_for_axis(axis_i)
-        else:
+        if observed_reference_counts is not None:
+            observed_counts = float(observed_reference_counts)
+        elif observed_reference_q is not None:
             observed_counts = float(observed_reference_q) * float(sign) * float(counts_per_unit)
-            wrap_turns = int(round((float(observed_counts) - float(base_counts)) / float(period_counts)))
-            wrap_lift_counts = int(wrap_turns * int(period_counts))
+        else:
+            live_counts = self._live_reference_counts_for_axis(axis_i)
+            if live_counts is None:
+                return float(base_axis_q), 0
+            observed_counts = float(live_counts)
+        delta = float(observed_counts) - float(base_counts)
+        wrap_turns = int(round(delta / float(period_counts)))
+        wrap_lift_counts = int(wrap_turns * int(period_counts))
         adjusted_counts = float(base_counts) + float(wrap_lift_counts)
         adjusted_axis_q = float(adjusted_counts) / (float(sign) * float(counts_per_unit))
         return float(adjusted_axis_q), int(wrap_lift_counts)
@@ -3270,9 +3782,51 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def _base_command_axis_q_for_joint_value(self, logical_joint_idx: int, canonical_q: float) -> float:
         return float(canonical_q) + self._master_offset_for_joint(logical_joint_idx)
 
-    def _command_axis_q_for_joint_value(self, axis_i: int, logical_joint_idx: int, canonical_q: float) -> float:
+    def _command_axis_q_for_joint_value(
+        self,
+        axis_i: int,
+        logical_joint_idx: int,
+        canonical_q: float,
+        *,
+        live_reference_counts: int | None = None,
+    ) -> float:
         base_axis_q = self._base_command_axis_q_for_joint_value(logical_joint_idx, canonical_q)
-        adjusted_axis_q, _wrap_lift_counts = self._wrap_adjusted_command_axis_q_for_axis(axis_i, base_axis_q)
+        adjusted_axis_q, lift_counts = self._nearest_turn_fold_axis_q_for_axis(
+            axis_i,
+            base_axis_q,
+            observed_reference_counts=live_reference_counts,
+        )
+        period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
+        if period_counts > 0:
+            # After folding, the signed delta against the live reference must
+            # fit inside half a shaft revolution. This is a regression guard:
+            # with the nearest-turn fold in place it should always hold; we
+            # surface the counts/turn details if it ever does not.
+            cfg = self._axis_config
+            if cfg is not None and 0 <= axis_i < int(cfg.num_axes):
+                counts_per_unit = float(cfg.counts_per_unit[axis_i])
+                sign = int(cfg.sign[axis_i])
+                if counts_per_unit > 0.0 and sign in (-1, 1):
+                    adjusted_counts = float(adjusted_axis_q) * float(sign) * float(counts_per_unit)
+                    resolved_live_counts: float
+                    if live_reference_counts is not None:
+                        resolved_live_counts = float(live_reference_counts)
+                    else:
+                        live_counts = self._live_reference_counts_for_axis(axis_i)
+                        resolved_live_counts = (
+                            float(live_counts)
+                            if live_counts is not None
+                            else float(adjusted_counts) - float(lift_counts)
+                        )
+                    fold_delta_counts = adjusted_counts - resolved_live_counts
+                    if abs(fold_delta_counts) > 0.5 * float(period_counts):
+                        raise RuntimeError(
+                            "command_frame_oversized_delta:"
+                            f" axis={axis_i} joint={logical_joint_idx + 1}"
+                            f" delta_counts={fold_delta_counts:.1f}"
+                            f" period_counts={int(period_counts)}"
+                            f" live_counts={resolved_live_counts:.1f}"
+                        )
         return float(adjusted_axis_q)
 
     def _canonical_joint_q_from_command_axis_q(
@@ -3281,7 +3835,24 @@ class EthercatRTCoreBackend(ActuatorBackend):
         logical_joint_idx: int,
         target_axis_q: float,
     ) -> float:
-        base_target_axis_q = float(target_axis_q) - self._raw_reference_wrap_lift_q_for_axis(axis_i)
+        # The forward command path now folds stateless per write, so the
+        # reverse (used only to record what canonical_q a given axis_q target
+        # represented) re-folds against the live reference to recover a
+        # single-turn-equivalent logical q without carrying stale lift state.
+        cfg = self._axis_config
+        period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
+        base_target_axis_q = float(target_axis_q)
+        if cfg is not None and 0 <= axis_i < int(cfg.num_axes) and period_counts > 0:
+            counts_per_unit = float(cfg.counts_per_unit[axis_i])
+            sign = int(cfg.sign[axis_i])
+            if counts_per_unit > 0.0 and sign in (-1, 1):
+                live_counts = self._live_reference_counts_for_axis(axis_i)
+                if live_counts is not None:
+                    target_counts = float(target_axis_q) * float(sign) * float(counts_per_unit)
+                    delta_counts = target_counts - float(live_counts)
+                    wrap_turns = int(round(delta_counts / float(period_counts)))
+                    base_counts = target_counts - float(wrap_turns * int(period_counts))
+                    base_target_axis_q = float(base_counts) / (float(sign) * float(counts_per_unit))
         return float(base_target_axis_q) - self._master_offset_for_joint(logical_joint_idx)
 
     def _counts_tolerance_rad_for_axis(self, axis_i: int, counts: float) -> float:
@@ -3316,7 +3887,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
         base_roundtrip_reference_q = self._base_command_axis_q_for_joint_value(logical_joint_idx, canonical_q)
         wrap_lift_counts = 0
         if normalized_reference_mode == "raw":
-            roundtrip_reference_q, wrap_lift_counts = self._wrap_adjusted_command_axis_q_for_axis(
+            # Diagnostic view: fold the base reference to the same shaft turn
+            # the observed 6064 is currently in. Purely informational here;
+            # does NOT mutate any per-axis state.
+            roundtrip_reference_q, wrap_lift_counts = self._nearest_turn_fold_axis_q_for_axis(
                 axis_i,
                 base_roundtrip_reference_q,
                 observed_reference_q=float(reference_q),
@@ -3332,7 +3906,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             "command_roundtrip_consistent": abs(float(error_rad)) <= float(tolerance_rad),
         }
         if normalized_reference_mode == "raw":
-            period_counts = self._raw_reference_wrap_period_counts_for_axis(axis_i)
+            period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
             detail["command_roundtrip_reference_base_rad"] = float(base_roundtrip_reference_q)
             detail["command_roundtrip_reference_wrap_lift_counts"] = int(wrap_lift_counts)
             if period_counts > 0:
@@ -3351,6 +3925,60 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
     def _absolute_home_anchor_stale_tolerance_rad_for_axis(self, axis_i: int) -> float:
         return self._counts_tolerance_rad_for_axis(axis_i, _ABSOLUTE_HOME_ANCHOR_STALE_TOLERANCE_COUNTS)
+
+    def _shaft_frame_consistency_detail(
+        self,
+        *,
+        axis_i: int,
+        canonical_q: float,
+        logical_joint_idx: int,
+        live_reference_counts: int,
+    ) -> dict[str, object] | None:
+        # Compute the mod-RM distance between the anchored canonical_q view
+        # (expressed in 607A/6064 wire counts) and the live 6064 reading.
+        # Whole-shaft-turn offsets between the two are legitimate (they just
+        # encode which shaft turn the joint is currently on); only a
+        # sub-shaft-turn disagreement is a frame bug.
+        cfg = self._axis_config
+        if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
+            return None
+        period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
+        if period_counts <= 0:
+            return None
+        counts_per_unit = float(cfg.counts_per_unit[axis_i])
+        sign = int(cfg.sign[axis_i])
+        if counts_per_unit <= 0.0 or sign not in (-1, 1):
+            return None
+        # canonical_q is the planner-space value (after anchor and
+        # master_offset subtracted); the expected reference frame is what
+        # 6064 should read if canonical_q and the live multi-turn anchor
+        # were fully consistent. Re-apply the master offset, convert to
+        # counts in the wire frame, and compare modulo RM.
+        expected_reference_q = float(canonical_q) + self._master_offset_for_joint(logical_joint_idx)
+        expected_counts = float(expected_reference_q) * float(sign) * float(counts_per_unit)
+        delta_counts = float(expected_counts) - float(live_reference_counts)
+        # Fold to nearest shaft turn so the mod-RM distance is the
+        # sub-shaft-turn residual.
+        period = float(period_counts)
+        wrap_turns = int(round(delta_counts / period))
+        mod_rm_delta_counts = delta_counts - float(wrap_turns) * period
+        mod_rm_delta_rad = mod_rm_delta_counts / (float(sign) * float(counts_per_unit))
+        tolerance_rad = self._counts_tolerance_rad_for_axis(
+            axis_i,
+            _SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS,
+        )
+        consistent = abs(float(mod_rm_delta_rad)) <= float(tolerance_rad)
+        return {
+            "shaft_frame_consistent": bool(consistent),
+            "shaft_frame_mod_rm_delta_counts": float(mod_rm_delta_counts),
+            "shaft_frame_mod_rm_delta_rad": float(mod_rm_delta_rad),
+            "shaft_frame_tolerance_counts": float(_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS),
+            "shaft_frame_tolerance_rad": float(tolerance_rad),
+            "shaft_frame_period_counts": int(period_counts),
+            "shaft_frame_wrap_turns": int(wrap_turns),
+            "shaft_frame_expected_reference_counts": float(expected_counts),
+            "shaft_frame_live_reference_counts": int(live_reference_counts),
+        }
 
     def _absolute_home_anchor_diagnostic_for_axis(
         self,
@@ -3508,6 +4136,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 "absolute_home_anchor_delta_counts",
                 "absolute_home_anchor_delta_rad",
                 "absolute_home_anchor_implied_rad",
+                "shaft_frame_consistent",
+                "shaft_frame_mod_rm_delta_counts",
+                "shaft_frame_mod_rm_delta_rad",
+                "shaft_frame_tolerance_counts",
+                "shaft_frame_tolerance_rad",
+                "shaft_frame_period_counts",
+                "shaft_frame_wrap_turns",
             ):
                 value = failing_detail.get(key)
                 if value is not None:
@@ -4084,15 +4719,62 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 # so canonical truth becomes:
                 #   absolute_axis_q - absolute_home_anchor - software_zero
                 # = reference_q - software_zero
-                # The command path therefore still inverts back to the same
-                # reference frame by re-applying the software-zero offset and,
-                # when needed, the current raw-reference wrap lift.
+                # The command path inverts back to the reference frame by
+                # re-applying the software-zero offset; turn selection is
+                # handled by a stateless nearest-turn fold against live 6064
+                # inside _command_axis_q_for_joint_value, so there is no cached
+                # per-axis wrap state that can go stale between writes.
                 axis_q[axis_i] = self._command_axis_q_for_joint_value(
                     axis_i,
                     joint_i,
                     float(positions_rad[joint_i]),
                 )
         return axis_q
+
+    def _enforce_trajectory_step_within_half_rm(
+        self,
+        *,
+        axis_q: list[float],
+        axis_mask: int,
+        previous_axis_counts: list[int | None],
+        point_index: int,
+        traj_id: int,
+    ) -> None:
+        # Guardrail: reject trajectories whose delivered wire-space step
+        # between consecutive points would exceed half a shaft revolution on
+        # any axis. Such a step is the pathological case that historically
+        # produced Er87.1 / Er47.0 on seam-adjacent jogs. This is a frame
+        # sanity gate, not a motion clamp.
+        cfg = self._axis_config
+        if cfg is None:
+            return
+        num_axes = min(int(cfg.num_axes), self._rt_num_axes, len(axis_q))
+        for axis_i in range(num_axes):
+            if axis_mask != 0 and (axis_mask & (1 << axis_i)) == 0:
+                continue
+            counts_per_unit = float(cfg.counts_per_unit[axis_i])
+            sign = int(cfg.sign[axis_i])
+            if counts_per_unit <= 0.0 or sign not in (-1, 1):
+                continue
+            period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
+            if period_counts <= 0:
+                previous_axis_counts[axis_i] = int(
+                    round(float(axis_q[axis_i]) * float(sign) * float(counts_per_unit))
+                )
+                continue
+            current_counts = int(
+                round(float(axis_q[axis_i]) * float(sign) * float(counts_per_unit))
+            )
+            prev = previous_axis_counts[axis_i]
+            if prev is not None:
+                step_counts = current_counts - int(prev)
+                if abs(step_counts) > (period_counts // 2):
+                    raise RuntimeError(
+                        "command_frame_oversized_step:"
+                        f" axis={axis_i} point_index={point_index} traj_id={traj_id}"
+                        f" step_counts={step_counts} period_counts={int(period_counts)}"
+                    )
+            previous_axis_counts[axis_i] = current_counts
 
     def _axis_qd_from_joint_velocities(self, joint_velocities_rad_s: list[float]) -> list[float]:
         if len(joint_velocities_rad_s) != self._num_joints:

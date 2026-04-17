@@ -251,6 +251,10 @@ type DriveFaultAxis = {
 	manufacturer_error_code_hex?: string;
 	startup_drive_config?: DriveStartupConfig | null;
 	absolute_feedback?: Record<string, AbsoluteFeedbackField> | null;
+	drive_native_truth_valid?: boolean;
+	drive_native_truth_reason?: string;
+	drive_native_truth_verification_source?: string;
+	coordinate_system_valid?: boolean;
 	native_home_state?: number;
 	native_home_state_name?: string;
 	native_home_active?: boolean;
@@ -442,6 +446,41 @@ function formatNativeHomeStatus(
 		return `Drive Home failed | abort ${abortCode}`;
 	}
 	return `Drive Home ${stateName}`;
+}
+
+type DriveNativeTruthStatusView = {
+	message: string;
+	tone: "valid" | "invalid";
+};
+
+function formatDriveNativeTruthStatus(axis: DriveFaultAxis | undefined): DriveNativeTruthStatusView | null {
+	if (!axis) {
+		return null;
+	}
+	const verificationSource = (axis.drive_native_truth_verification_source ?? "").trim();
+	const truthReason = (axis.drive_native_truth_reason ?? "").trim();
+	if (axis.drive_native_truth_valid === true) {
+		if (verificationSource.length > 0) {
+			return {
+				message: `Canonical truth trust: ${verificationSource}`,
+				tone: "valid",
+			};
+		}
+		if (axis.coordinate_system_valid === true) {
+			return {
+				message: "Canonical truth trust: verified",
+				tone: "valid",
+			};
+		}
+		return null;
+	}
+	if (truthReason.length > 0) {
+		return {
+			message: `Canonical truth unavailable: ${truthReason}`,
+			tone: "invalid",
+		};
+	}
+	return null;
 }
 
 function expSliderToMultiplier(v: number): number {
@@ -2992,6 +3031,7 @@ export function ControlPanel({
 								const driveAxis = commissioningDriveAxesByJoint.get(jointNumber);
 								const hasDriveAxisFeedback = typeof driveAxis?.statusword === "number" && Number.isFinite(driveAxis.statusword) && driveAxis.statusword !== 0;
 								const nativeHomeStatus = formatNativeHomeStatus(driveAxis, driveFaults);
+								const driveNativeTruthStatus = formatDriveNativeTruthStatus(driveAxis);
 								const nativeHomeActiveForJoint = Boolean(driveAxis?.native_home_active)
 									|| (driveAxis ? ((nativeHomeActiveAxisMask & (1 << driveAxis.axis)) !== 0) : false);
 								const isPending = pendingJointAction === `jog-${jointIndex}`
@@ -3015,6 +3055,17 @@ export function ControlPanel({
 											{nativeHomeStatus ? (
 												<div className="mt-0.5 max-w-[12rem] text-[10px] leading-snug text-amber-200/90">
 													{nativeHomeStatus}
+												</div>
+											) : null}
+											{driveNativeTruthStatus ? (
+												<div
+													className={`mt-0.5 max-w-[14rem] text-[10px] leading-snug ${
+														driveNativeTruthStatus.tone === "valid"
+															? "text-cyan-200/90"
+															: "text-rose-200/90"
+													}`}
+												>
+													{driveNativeTruthStatus.message}
 												</div>
 											) : null}
 										</div>

@@ -909,6 +909,44 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(screen.queryByText(/verification conflicted/i)).toBeNull();
 	});
 
+	it("shows canonical truth trust source and unavailable reason in joint commissioning", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [
+						{
+							axis: 0,
+							logical_joint: 1,
+							ds402_state: "SwitchOnDisabled",
+							statusword: 0x1650,
+							error_code: 0,
+							drive_native_truth_valid: true,
+							drive_native_truth_verification_source: "persisted_home_anchor_agreement",
+							coordinate_system_valid: true,
+						},
+						{
+							axis: 1,
+							logical_joint: 2,
+							ds402_state: "SwitchOnDisabled",
+							statusword: 0x1650,
+							error_code: 0,
+							drive_native_truth_valid: false,
+							drive_native_truth_reason: "multi_turn_feedback_invalid",
+							coordinate_system_valid: false,
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+		expect(screen.getByText(/Canonical truth trust: persisted_home_anchor_agreement/i)).toBeTruthy();
+		expect(screen.getByText(/Canonical truth unavailable: multi_turn_feedback_invalid/i)).toBeTruthy();
+	});
+
 	it("blocks drive-home buttons while a native-home transaction is still active", async () => {
 		render(
 			<ControlPanel

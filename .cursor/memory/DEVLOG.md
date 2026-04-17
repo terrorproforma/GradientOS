@@ -1,3 +1,192 @@
+## 2026-04-17 Web UI not loading at localhost:8000 — Cursor auto-port-forward regression
+
+- Task summary:
+  - Operator reported that `http://localhost:8000/` in their Windows Chrome showed a blank dark page after recent changes and that Cursor had stopped telling them "available at localhost:8000" / stopped auto-refreshing the browser on `./start-stack.sh`.
+  - Initial assumption that a recent web-ui diff regressed rendering was wrong; the actual regression is Cursor's Remote-SSH auto-port-forward + auto-open-browser behavior no longer firing for ports 8000 / 4000 on this workspace session. The "blank page" was the body gradient (`from-slate-900 via-slate-950 to-black`) behind an empty `#root` because Cursor never re-forwarded 8000 this session, so the tab's subsequent module fetches never actually reached the Pi.
+- What was investigated and ruled out (Pi-side is healthy):
+  - `ss -tanp | grep ':8000\|:4000'`: both listeners bound `0.0.0.0`, Vite (`node` pid 215831) on :8000, API (python pid 215049) on :4000.
+  - `curl -v http://127.0.0.1:8000/` returned HTTP/1.1 200 with the expected 640-byte Vite HTML shell + `<div id="root"></div>` + `/src/main.tsx`; same response for `Host: localhost` and `Host: localhost:8000`.
+  - Every Vite-transformed module returned 200 `text/javascript`: `main.tsx`, `App.tsx`, `ControlPanel.tsx`, `liveState.tsx`, `index.css`, `useEndpoint.ts`, `previewUtils.ts`, `poseTelemetry.ts`, `components/SidebarRail|SidebarDrawer|ProgramFeatureTree|ProgramTimeline.tsx`. Transformed `ControlPanel.tsx` contains `formatDriveNativeTruthStatus` (2 matches) so Vite is serving the latest source.
+  - `cd web-ui && npx vitest run src/ControlPanel.test.tsx` → 22/22 pass including the new canonical-truth surface test. `npx tsc --noEmit` surfaces only 3 pre-existing TS errors in `TelemetryCharts.tsx` / `TelemetryWorkspace.tsx` that are not in the touched files and that Vite dev mode ignores.
+  - Vite HMR WebSocket probe (Python 3 socket with `Upgrade: websocket` + `Sec-WebSocket-Protocol: vite-hmr`) returned `HTTP/1.1 101 Switching Protocols`.
+  - End-to-end render probe via headless Chromium on the Pi driven over CDP (`/tmp/capture_errors.js`, using `web-ui/node_modules/ws`): React tree mounted fully, `#root` contained the Control Center header, LIVE/SIM runtime-mode switcher, DISARM / IDLE / SAFE runtime badges; `Runtime.exceptionThrown=[]` and `Network.loadingFailed=[]` after a 45 s settle.
+- Root cause:
+  - Cursor Remote-SSH stopped auto-forwarding 8000 (and 4000) into the operator's Windows session this workspace. The `.gitignore` excludes `.vscode/`, and no repo-level `.vscode/settings.json` existed to pin auto-forward behaviour against Cursor's per-workspace client-side state.
+- Change:
+  - [.vscode/settings.json](.vscode/settings.json) (NEW, local-only because `.vscode/` is gitignored) — explicit Cursor Remote-SSH port-forward contract:
+    - `remote.autoForwardPorts=true`, `remote.autoForwardPortsSource="hybrid"` (process + output detection), `remote.restoreForwardedPorts=true`.
+    - `remote.portsAttributes`: `8000` → `{ label: "Gradient Web UI", onAutoForward: "openBrowser", requireLocalPort: true }`, `4000` → `{ label: "Gradient API", onAutoForward: "notify", requireLocalPort: true }`, `8080` → `{ label: "Gradient Vision", onAutoForward: "notify" }`, `9222` and `3000` → `{ onAutoForward: "ignore" }` (headless-chromium debug and UDP respectively).
+  - JSON validated with `python3 -c "import json; json.load(open('.vscode/settings.json'))"`.
+- Operator follow-up (required for the fix to activate):
+  1. In Cursor on Windows: `Ctrl+Shift+P` → `Developer: Reload Window` (so the workspace settings and `portsAttributes` are re-read).
+  2. Run `./start-stack.sh` on the Pi. When Vite binds `0.0.0.0:8000`, Cursor should auto-forward 8000 to Windows localhost:8000 and open the default browser on it; 4000 should surface the usual "Port forwarded" toast.
+  3. If Cursor still doesn't fire the toast, open the Ports panel (View → Ports, or the Ports tab next to Terminal) and check whether 8000/4000 are listed. If they're there but not opened in browser, right-click `8000` → "Open in Browser" — that forces Cursor to remember the forward again.
+- Validation performed:
+  - No server-side code changed. The only new file is `.vscode/settings.json` (local-only, gitignored).
+  - Settings file JSON parsed successfully.
+  - Pi-side render confirmed via CDP before the stack was softly stopped by the operator at 07:29:34.
+- Follow-up / risk:
+  - `.vscode/` is in `.gitignore`. If other operators on this repo want the same forwarding ergonomics, either (a) commit `.vscode/settings.json` explicitly with `git add -f .vscode/settings.json` and document it, or (b) copy the file manually. Current policy keeps it local-only.
+  - If Cursor's `portsAttributes` setting changes name in a future version, the forwarding will silently fall back to default behaviour. Revisit `remote.autoForwardPortsSource` / `remote.portsAttributes` key names on Cursor major version bumps.
+  - Do NOT weaken `vite.config.ts`'s `server.allowedHosts` allowlist; `localhost`/`127.0.0.1` are already permitted by Vite defaults and the three `.local` hostnames cover the LAN workstations.
+  - Hazard recorded: `pkill -9 -f <shortword>` inside the Cursor Shell tool can accidentally kill the shell wrapper's own process group because the wrapper's `ps` entry contains the full command line. Always pin pkill to a full binary path (e.g. `pkill -9 -f '/usr/lib/chromium/chromium'`) instead of a substring.
+
+## 2026-04-17 A6-EC persistence-trust diagnostics polish (W1 + W2 + W3)
+
+- Task summary:
+  - Implemented the [A6-EC persistence trust diagnostics plan](../plans/a6ec_persistence_trust_diagnostics_e47d5a93.plan.md): three non-blocking polish workstreams on top of the already-validated restart-trust path.
+  - Workstream 3 (encoder-retention fault precedence): `Er20.1..Er20.9` and `ALF9.0` live-faults now outrank the generic `fault_present` / `manufacturer_fault_present` branches in the truth-validity helper, so operators see the specific encoder/battery retention cause instead of the generic label. Surface includes matched vendor codes and names on each axis.
+  - Workstream 1 (last-seen U40.20/.22 sidecar): optional `last_seen` dict on each anchor entry that records the live `absolute_counts` on every trusted-axis cycle (rate-limited to once per 5 s per joint). When the shaft-frame gate later fails AND the delta exceeds `32,767 * counts_per_rev` (physically impossible during an off-window), the reason upgrades to `multi_turn_feedback_lost_across_power_cycle` so encoder-loss is distinguishable from legitimate off-drive rotation.
+  - Workstream 2 (bit-15 vestigial annotation): documented the bit-15-alone restart-trust path as documented-but-unreachable on the current A6-EC firmware via a new `POSITION_SEMANTICS_CONFIG["firmware_bit15_retention_expected"] = False` flag and SOP/master-doc updates. The code path is preserved for future firmware/drive families that honour vendor Q9.
+- Changes:
+  - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - added `ENCODER_RETENTION_FAULT_CODES = frozenset({"Er20.1".."Er20.9", "ALF9.0"})`, `is_encoder_retention_fault(code)`, and `describe_encoder_retention_fault(manufacturer_error_code, error_code)` returning `{present, codes, names, matched_sources, ...}`.
+    - added `POSITION_SEMANTICS_CONFIG["firmware_bit15_retention_expected"] = False` with a detailed docstring.
+  - `src/gradient_os/arm_controller/profiles/registry.py` + `src/gradient_os/arm_controller/backends/registry.py`: added `describe_drive_encoder_retention_fault` wrapper + `describe_drive_encoder_retention_fault_for_backend` shim.
+  - `src/gradient_os/telemetry/native_home_status.py`:
+    - `derive_drive_native_truth_validity` gained kwargs `encoder_retention_fault_present`, `last_seen_present`, `last_seen_delta_physically_possible`.
+    - When `encoder_retention_fault_present` is `True` the helper sets `coordinate_system_valid=False` and sets `reason="encoder_retention_fault_present"` ahead of the generic fault branches, and blocks the persisted-anchor trust upgrade even when the shaft-frame gate would otherwise pass.
+    - When the shaft-frame gate already rejected AND the sidecar says the delta is impossible, reason upgrades to `"multi_turn_feedback_lost_across_power_cycle"`.
+    - Documented the vestigial `statusword_bit15` source on the A6-EC firmware we currently run (pointers at the new profile flag).
+  - `src/gradient_os/telemetry/drive_faults.py`: `build_drive_fault_snapshot` now calls the new retention helper, threads `encoder_retention_fault_present` into the validity helper, and surfaces `encoder_retention_fault` + `encoder_retention_fault_present` on each axis payload.
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - decoded retention faults in `_canonical_joint_positions_from_raw_feedback`, populated `detail["encoder_retention_fault"]`/`encoder_retention_fault_present`, and threaded the signal into `derive_drive_native_truth_validity`.
+    - computed `last_seen_delta_counts` / `last_seen_delta_physically_possible` / `last_seen_delta_budget_counts` per axis from the sidecar on the anchor entry and surfaced them on `detail`.
+    - rate-limited persistence (`_LAST_SEEN_PERSIST_INTERVAL_S = 5.0`) of the last-seen sidecar via the new `save_last_seen_absolute_counts` helper, only on the `reference_mode="raw"` runtime canonical-truth path (display reads stay observational).
+    - added `_encoder_counts_per_rev_for_axis` and `_MAX_OFF_MOTOR_REVOLUTIONS = 32_767` for the physicality budget.
+    - made `_absolute_home_anchor_for_joint` forward the sidecar through.
+  - `src/gradient_os/absolute_encoder_anchors.py`:
+    - `_normalize_anchor_entry` now normalizes an optional `last_seen` sidecar (missing stays `None`; older anchor files unchanged).
+    - added `save_last_seen_absolute_counts(robot_id, *, num_joints, logical_joint_index, absolute_counts, reference_counts, observed_at*, actor)` which is a no-op when the joint has no existing anchor (we never manufacture a fake anchor).
+    - `save_absolute_encoder_anchor` gained `preserve_last_seen=True` so a fresh home does not discard the diagnostic sidecar unless an operator opts out.
+  - Tests:
+    - `tests/test_gradient05_limits_and_backends.py`: extended `_build_a6ec_restart_trust_test_backend` with `encoder_retention_fault_code`, `last_seen_absolute_counts`, `last_seen_reference_counts` params. Added six new regressions: `test_a6ec_encoder_retention_fault_takes_precedence_over_anchor_path` (Er20.9), `test_a6ec_encoder_retention_fault_distinguishes_battery_alarm` (ALF9.0), `test_a6ec_firmware_bit15_retention_flag_documented_false`, `test_a6ec_last_seen_sidecar_surfaces_delta_when_joint_unchanged_while_off`, `test_a6ec_last_seen_sidecar_upgrades_reason_on_impossible_delta`, `test_a6ec_last_seen_sidecar_keeps_legacy_reason_when_absent`.
+    - `tests/test_drive_faults.py`: added `test_build_drive_fault_snapshot_carries_encoder_retention_fault` exercising the real profile decoder end-to-end.
+    - `tests/test_rtcore_runtime.py::test_drive_fault_snapshot_decodes_axis_fault_and_master_state`: updated the expected `drive_native_truth_reason` from the generic `fault_present` to the new more specific `encoder_retention_fault_present` (Er20.8 is in the retention family), and asserted the new fault payload.
+  - SOP + docs:
+    - `.cursor/skills/gradientos-sop/commissioning-safety.md` "Restart Trust Model (A6-EC)": added one-liner on bit-15 vestigiality, added bullet on encoder-retention-family fault precedence, added bullet on the optional last-seen sidecar.
+    - `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` §9.7: tightened the path-2 bullet to call out the vestigial nature + profile flag, rewrote the reason-priority list to include the new reasons, added invariants for the last-seen sidecar and for retention-family faults.
+    - `.cursor/skills/gradientos-sop/ui-api-telemetry.md` "Canonical-Truth Verification Surface": added `encoder_retention_fault_present` and `multi_turn_feedback_lost_across_power_cycle` to the enumerated unavailable-truth reasons; documented the `encoder_retention_fault` and `last_seen_*` per-axis fields.
+- Validation:
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m py_compile` on all touched modules: clean.
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_drive_faults.py tests/test_rtcore_runtime.py tests/test_api_endpoints.py tests/test_run_controller_helpers.py -q`: `220 passed`.
+  - `ReadLints` on all touched Python/SOP files: no diagnostics.
+  - Confirmed the 4 pre-existing serial-driver / solver failures (`tests/test_driver.py`, `tests/test_end_to_end.py`, `tests/test_protocol.py`, `tests/test_solver.py`) reproduce on clean HEAD without my changes; they are unrelated to this workstream.
+- Follow-up / risk:
+  - No motion was performed. The live J6 read-only verification called out in the plan (confirm `/info/joints-detailed` surfaces the new fields and the verification source stays `persisted_home_anchor_agreement` with `truth_available=True`) still needs a stack restart on hardware - this is a Python-only change that takes effect after controller restart, no RTCore rebuild required.
+  - The bit-15 trust path is intentionally NOT removed. If vendor Patrik confirms the retention story definitively we can revisit in a follow-up patch.
+  - Frontend does not yet visualize the new fields. `/info/joints-detailed` carries them through unchanged; operator-facing surfacing is a separate deferred task per the plan's non-goals.
+
+## 2026-04-16 A6-EC vendor realignment v2 implementation
+
+- Task summary:
+  - Implemented the [A6EC vendor realignment v2 plan](../plans/a6ec_vendor_realignment_v2_ef85a9c0.plan.md): split MSG_CMD_NATIVE_HOME to require drive-confirmed disarm before HM35, replaced the stateful wrap-lift with a stateless nearest-turn 607A selector + half-RM trajectory pre-commit gate, added a shaft-frame mod-RM consistency gate while keeping anchored `U40.20/.22` as multi-turn canonical truth, rewrote tests and docs.
+- Changes:
+  - Updated `src/gradient_rt_motion/ipc_v1.hpp`:
+    - added `NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT = 0xF1000001` in the reserved RTCore-synthesized abort-code range.
+  - Updated `src/gradient_rt_motion/main.cpp`:
+    - split the `MSG_CMD_NATIVE_HOME` handler; after clearing `axis_enable_mask` / `armed`, each targeted axis is polled for up to 500 ms until `statusword` leaves `OperationEnabled`/`QuickStopActive` for several consecutive cycles before `native_home_axis(axis)` is called.
+    - on timeout the axis is marked `NATIVE_HOME_STATE_FAILED` with the new synthesized abort code so the Python wrapper can surface `disarm_precondition_timeout` distinctly from HM35 SDO aborts.
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - `get_power_transition_snapshot()` now publishes `per_axis_drive_disarmed`, `per_axis_ds402_state`, `per_axis_statusword_hex`, `drive_disarmed_all`, and `drive_op_enabled_axes` derived from the cached per-axis DS402 state.
+    - `wait_for_power_transition_neutral` / `prepare_for_power_transition` gained `require_drive_disarmed` + `require_drive_disarmed_axis_mask`; when set the neutrality test requires both `motion_intent_cleared` and every targeted axis to be out of `OperationEnabled`. Prepare also sends an explicit `axis_disable` for the targeted mask so the cyclic loop actively drives the state machine away from OP-enabled instead of just waiting.
+    - `native_home_joint()` now calls the new helper with `require_drive_disarmed=True` before `_send_cmd_native_home`, and returns `NATIVE_HOME_DISARM_PRECONDITION_TIMEOUT` with abort code `0xF1000001` if the axis never leaves OP-enabled. The same abort code raised by RTCore on the wait-path is surfaced with the same code.
+    - removed `_raw_reference_wrap_lift_counts`, `_raw_reference_wrap_lift_counts_for_axis`, `_set_raw_reference_wrap_lift_counts_for_axis`, `_raw_reference_wrap_lift_q_for_axis`, `_raw_reference_wrap_period_counts_for_axis`, and `_wrap_adjusted_command_axis_q_for_axis`; dropped the `mutate_command_wrap_bookkeeping` flag from `_canonical_joint_positions_from_raw_feedback`/`_canonical_joint_positions_or_raise` and all callers.
+    - added `_live_reference_counts_for_axis()` and `_nearest_turn_fold_axis_q_for_axis()`; `_command_axis_q_for_joint_value()` now folds each write to the nearest shaft turn of the live `6064` reading and raises `command_frame_oversized_delta` as a regression guard.
+    - added `_enforce_trajectory_step_within_half_rm()`; `enqueue_trajectory_points()` now rejects any consecutive-point step whose wire-space delta exceeds `0.5 * RM` with `command_frame_oversized_step`.
+    - added `_shaft_frame_consistency_detail()`; after computing `canonical_q` from anchored `U40.20/.22`, canonical truth fails closed with `multi_turn_anchor_inconsistent_with_live_6064` when the expected wire-counts disagree with live `6064` modulo `RM` by more than `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (16 counts). The stale-anchor diagnostic fields are still populated alongside.
+    - post-home validation path now forwards the `shaft_frame_*` fields as `post_home_shaft_frame_*` so operators see the mod-RM delta that tripped the gate.
+  - Updated `tests/test_gradient05_limits_and_backends.py`:
+    - removed the three wrap-lift-as-observable regressions superseded by the stateless fold.
+    - added `test_a6ec_small_jog_at_seam_stays_within_half_rm_wire_delta`, `test_a6ec_native_home_waits_for_drive_disarmed_before_hm35`, `test_a6ec_truth_unavailable_when_anchor_and_6064_disagree_modulo_rm`, `test_a6ec_command_frame_rejects_oversized_trajectory_step`.
+    - relaxed the existing anchor-vs-reference truth-reason assertions to accept `multi_turn_anchor_inconsistent_with_live_6064` alongside the legacy reasons.
+    - updated the two tests that captured the `prepare_for_power_transition` kwargs to accept the new disarm-precondition parameters.
+  - Updated `docs/ethercat/a6ec-frame-semantics-and-native-home.md`:
+    - rewrote "Canonical Truth Math" to call out anchored multi-turn truth plus the shaft-frame consistency gate.
+    - added "Command-Frame Turn Selection" describing the stateless nearest-turn fold and the half-RM trajectory sanity gate.
+    - added "Native-Home Precondition" describing the two-stage MSG_CMD_NATIVE_HOME split and the Python-side `require_drive_disarmed` plumbing.
+    - moved the "multi-turn truth stays anchored" decision from "What Remains Open" to a settled decision with rationale.
+- Validation:
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`
+  - `make -C src/gradient_rt_motion` - clean C++ build of the new disarm precondition wait + synthesized abort code.
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m pytest tests/test_gradient05_limits_and_backends.py -q` - `87 passed`.
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_rtcore_runtime.py tests/test_trajectory_execution_backends.py tests/test_drive_faults.py tests/test_a6ec_chapter5_probe.py -q` - `238 passed`.
+  - `ReadLints` on all touched files returned clean.
+  - `sudo systemd/rt-motion/sync-runtime.sh --ensure-active` installed the new `/usr/local/bin/gradient-rt-motion`; `systemctl status gradient-rt-motion` shows the new main pid running; `/run/gradient-rt-motion/metrics.json` reports all six axes at `statusword=0x1650` after the restart, no `raw_reference_wrap_lift_counts` keys in the axis payload.
+  - Pre-existing `tests/test_driver.py` servo/driver failures were present before this change too (verified by git stash + re-run).
+- Follow-up notes / risks:
+  - Physical-motion live validation is pending operator action (see "A6-EC live validation handoff" below). Expect a single brake click on native home (not two), and the seam-adjacent J6 `+0.5 deg` jog should complete without `Er87.1` or `Er47.0`.
+  - RTCore is now installed and running against the new binary but the Python controller/API stack is not currently active on this host; the operator should bring it up with `./start-stack.sh` and re-home before relying on motion again.
+
+## 2026-04-17 GradientOS SOP + master principles updated with settled A6-EC contracts
+
+- Task summary:
+  - Consolidated the four settled contracts from the recent A6-EC workstreams (disarm precondition, stateless command-frame turn selection, multi-turn truth with shaft-frame consistency gate, persisted-home-anchor restart trust) from scratchpad/devlog evidence into the canonical GradientOS skill corpus and the `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` master doc, per `gradientos-skill-maintainer` policy.
+- Changes:
+  - [.cursor/skills/gradientos-sop/SKILL.md](.cursor/skills/gradientos-sop/SKILL.md): reframed the active-workstream note so `a6ec-frame-semantics-and-native-home.md` is the workstream evidence repository and the settled rules now live in the master doc `§9.4-§9.7`.
+  - [.cursor/skills/gradientos-sop/commissioning-safety.md](.cursor/skills/gradientos-sop/commissioning-safety.md): added four new sections - "Native-Home Disarm Precondition", "Command-Frame Turn Selection (A6-EC)", "Multi-Turn Truth and Shaft-Frame Consistency (A6-EC)", "Restart Trust Model (A6-EC)". Revised the `0x607C` / `bit 15` persistence statements to reflect the empirical findings (bit 15 cleared every cycle; `0x607C` + `U40.20/.22` + `6064` persist) and replaced the outdated "no fallback to legacy anchored reconstruction" rule with the three-path restart-trust model.
+  - [.cursor/skills/gradientos-sop/rtcore-ethercat.md](.cursor/skills/gradientos-sop/rtcore-ethercat.md): added "Commissioning Transaction Preconditions" (Stage-A statusword-confirmed disarm before HM35, `0xFxxxxxxx` synthesized-abort convention) and "Trajectory Upload Sanity" (host-side `<= 0.5 * RM` pre-commit gate complementary to RTCore `max_step_counts_per_cycle`). Replaced the obsolete `native_home_position_offset`-subtraction rule with the stateless per-write nearest-turn fold.
+  - [.cursor/skills/gradientos-sop/config-and-drive-profiles.md](.cursor/skills/gradientos-sop/config-and-drive-profiles.md): added "Drive-Profile Position-Semantics Flags" documenting the stable `POSITION_SEMANTICS_CONFIG` flag surface (`drive_native_ratio_enabled`, `canonical_truth_source`, `absolute_home_anchor_required`, `startup_truth_requires_hm_success_signature`, `accept_persisted_home_anchor_as_restart_trust`).
+  - [.cursor/skills/gradientos-sop/ui-api-telemetry.md](.cursor/skills/gradientos-sop/ui-api-telemetry.md): added "Canonical-Truth Verification Surface" listing the four `drive_native_truth_verification_source` values operator tooling must surface verbatim and the specific truth-unavailable reasons. Added "Native-Home Result Surface" codifying the structured result contract and the `0xFxxxxxxx` synthesized-abort-code handling.
+  - [.cursor/skills/gradientos-sop/validation-and-debugging.md](.cursor/skills/gradientos-sop/validation-and-debugging.md): added "A6-EC Command-Frame Failure Modes" (Er87.1 / Er47.0 diagnostic path rooted in `shaft_frame_consistent` and `command_frame_oversized_step`) and "Power-Cycle Persistence Workflow" (probe snapshots + per-axis trust-source diff).
+  - [.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md](.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md): rewrote `§9.3`'s outdated "subtract `native_home_position_offset` once" wording and added four new subsections `§9.4`-`§9.7` capturing the settled stateless command frame, multi-turn truth contract, HM35 disarm precondition, and three-path restart trust model. Extended `§15.2` Safety best practices and `§15.4` Commissioning best practices checklists accordingly.
+- Validation:
+  - `ReadLints` on all seven touched SOP files returned no diagnostics.
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_drive_faults.py tests/test_rtcore_runtime.py tests/test_api_endpoints.py tests/test_run_controller_helpers.py -q`: `191 passed` (ran as a sanity check; SOP edits are documentation-only).
+  - File-size sanity: only `commissioning-safety.md` and the master doc grew; SOP reference files remain under roughly `135` lines each.
+- Follow-up notes / risks:
+  - `startup_drive_config_unconfigured` remains a separate plumbing wart (RTCore does not re-command startup SDOs this session when the drive already matches at PREOP). Documented in the live-validation devlog entry but intentionally NOT promoted to canonical SOP because the right fix is a code change in the RTCore/profile metrics, not an operating rule.
+  - The `statusword_bit15` vendor-Q9 path is kept in `derive_drive_native_truth_validity` and documented even though it is vestigial on the current A6-EC firmware; future drives / firmware revisions that honour Q9 will still exercise it without a code change.
+
+## A6-EC persisted-home-anchor restart trust (2026-04-17 00:20 UTC)
+
+- Task summary:
+  - Eliminated the "re-home after every drive power cycle" operational ceiling. The A6-EC firmware empirically clears `6041 bit 15` on every drive power cycle despite vendor Q6/Q9, while the data that actually matters for persistence (`6064`, `U40.20/.22`, `607C`) restores cleanly and survives manual rotation while the drive is off. The controller now accepts a second restart-trust path driven by the persisted absolute-home anchor file plus a mod-`RM` shaft-frame agreement check against live `6064`.
+- Changes:
+  - [src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py](src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py): added `accept_persisted_home_anchor_as_restart_trust = True` to `POSITION_SEMANTICS_CONFIG`.
+  - [src/gradient_os/telemetry/native_home_status.py](src/gradient_os/telemetry/native_home_status.py): extended `derive_drive_native_truth_validity` with optional kwargs `accept_persisted_home_anchor_as_restart_trust`, `persisted_home_anchor_present`, `persisted_home_anchor_consistent`, `multi_turn_feedback_valid`. When the flag is on and all three supplied signals are `True`, truth upgrades to `coordinate_system_valid=True` with `drive_native_truth_verification_source="persisted_home_anchor_agreement"`. When the path is opted in but a precondition fails, emits a specific reason (`persisted_home_anchor_missing`, `multi_turn_feedback_invalid`, `persisted_home_anchor_inconsistent_with_live_6064`) instead of the generic `coordinate_system_invalid`.
+  - [src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py](src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py): added `_accept_persisted_home_anchor_as_restart_trust()` profile accessor; refactored `_canonical_joint_positions_from_raw_feedback` so `anchor_entry`, `absolute_axis_q`, and `_shaft_frame_consistency_detail` are computed **before** the validity call so the new signals can flow in. Re-used the pre-computed gate for the Workstream 3 short-circuit to avoid double work. Added new axis-detail fields `persisted_home_anchor_present`, `multi_turn_feedback_valid`, `persisted_home_anchor_consistent` so the restart-trust decision is inspectable from operator tooling.
+  - [docs/ethercat/a6ec-frame-semantics-and-native-home.md](docs/ethercat/a6ec-frame-semantics-and-native-home.md): added a new "Restart Trust via Persisted Home Anchor" section describing the three trust paths in order, the invariance under manual rotation while off, and the explicit operator implications.
+  - [tests/test_gradient05_limits_and_backends.py](tests/test_gradient05_limits_and_backends.py):
+    - Added a shared scaffold `_build_a6ec_restart_trust_test_backend` that stages realistic J6 post-power-cycle data with the anchor derived from HM35-time raw counts.
+    - Added four regressions: `test_a6ec_restart_trust_via_persisted_anchor_passes_when_axis_unmoved_while_off` (encoder wander case), `test_a6ec_restart_trust_via_persisted_anchor_survives_full_shaft_turn_of_manual_rotation` (joint rotated +1 shaft rev with drive off; `6064` wraps back to the same raw value while `U40.20/.22` increments by `RM` motor counts; mod-`RM` gate absorbs it), `test_a6ec_restart_trust_via_persisted_anchor_rejects_sub_shaft_turn_drift` (encoder-data-loss simulation: `6064` shifted by `RM/3` without matching multi-turn step; gate rejects), `test_a6ec_restart_trust_via_persisted_anchor_requires_multi_turn_valid` (invalid multi-turn reading → refuses anchor path, falls back to `drive_native_absolute_feedback_unavailable`).
+    - Updated the pre-existing `test_ethercat_backend_power_transition_snapshot_reports_coordinate_system_invalid` to isolate `GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH` (it was accidentally inheriting real anchor data from the repo) and to accept the more specific `drive_native_persisted_home_anchor_missing` reason alongside the legacy `drive_native_coordinate_system_invalid`.
+- Validation:
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/telemetry/native_home_status.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py` - clean.
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_rtcore_runtime.py tests/test_trajectory_execution_backends.py tests/test_drive_faults.py tests/test_a6ec_chapter5_probe.py -q` - `242 passed`.
+  - `ReadLints` on touched files - no diagnostics.
+  - Live proof with J6 **not re-homed this session**: restarted the Python stack and RTCore service onto the patched code. Direct backend inspection of `/run/gradient-rt-motion/metrics.json` through `_canonical_joint_positions_from_raw_feedback` returned `coordinate_system_valid=True` + `drive_native_truth_verification_source="persisted_home_anchor_agreement"` on all six axes while every statusword was `0x1650` (bit 15 cleared). `shaft_frame_mod_rm_delta_counts` sat at `±1-3` across the fleet, well inside the 16-count tolerance. `/control/motion-status` returned `safe_for_power_transition=True` with empty `power_transition_blockers`, and `/info/joints-detailed` reported `canonical_joint_truth_available=True` with `read_source=live_feedback` on real joint angles.
+- Follow-up notes / risks:
+  - Initial HM35 is still required to *establish* the anchor file entry per joint. The trust path only reuses state; it does not invent trust.
+  - The trust check fails closed when the encoder's multi-turn tracking is actually lost (`U40.20/.22 valid=0`, overflow, or >32,767-motor-turn rotation while off). In those cases the operator must re-home. This is the intended behavior.
+  - `/control/motion-status` still embeds its power-transition detail as a base64-encoded JSON blob; it does not expose per-axis `drive_native_truth_verification_source` directly. Tooling can surface it via `/info/joints-detailed` or by reading `axis_absolute_feedback` from the backend snapshot. Separate follow-up if operator-visible verification-source is desired.
+
+## A6-EC live validation on J6 (2026-04-16 21:47 UTC)
+
+Native-home pathway was exercised end-to-end on J6 against the new RTCore binary and backend plumbing. Workstream 1 + 2 + 3 contracts all behaved as designed on live hardware; only the seam-adjacent powered jog remains outstanding because it needs an operator to physically rotate J6 to a seam-adjacent shaft position.
+
+- Pre-flight:
+  - `./start-stack.sh` came up clean; run log at `/home/pi/GradientOS/logs/startups/20260416-214414/`.
+  - Controller initially defaulted to `mode=simulate`. Switched to live via `POST /control/runtime-mode {"mode":"live"}`; backend re-activated as `ethercat_rtcore` with `drive_profile=a6ec_ds402` and `mode.sim=false`.
+  - Pre-home metrics: all six axes at `statusword=0x1650`, no faults, `native_home_state=0`, `native_home_last_abort_code=0x00000000`.
+  - Pre-home API state correctly surfaced the truth block: `/control/motion-status` reported `safe_for_power_transition=false` with a single blocker `canonical_truth_unavailable` and reasons `drive_native_startup_drive_config_unconfigured` on all six axes. That `unconfigured` reason is pre-existing behavior (RTCore sees `configured=0` in metrics when the drive already matched the startup SDOs from a prior session so RTCore did not re-command them this session; `readback_valid=1 verified=1` is still reported). It blocks power-up but does not block `POST /control/home-joint-native`.
+- Native home on J6 via `POST /control/home-joint-native {"joint":6}`:
+  - HTTP ACK: `accepted=true`, `terminal_state=succeeded`, `native_home_state=2 (succeeded)`, `native_home_last_abort_code=0x00000000`, `disarmed_after_home=true`.
+  - `code=NATIVE_HOME_ANCHOR_REFRESH_FAILED`, `message=...could not refresh a coherent absolute-home anchor from live feedback.`. This is the same pre-existing `drive_native_startup_drive_config_unconfigured` wart bleeding into the post-home anchor re-validation path; it does NOT indicate an HM35 failure. Anchor was captured cleanly: `absolute_home_anchor_capture_succeeded=true`, `absolute_home_anchor_rad=-0.5761`.
+- Workstream 1 evidence (RTCore journal, `journalctl -u gradient-rt-motion`):
+  - `21:47:03 [gradient-rt-motion] Native-home disarm precondition satisfied axis_mask=0x20 (timeouts=0x0)`
+  - `21:47:09 [gradient-rt-motion] EtherCAT native_home axis=5 slave_pos=5 feedback_counts=14599 truth_value=0 commissioning_mode=6 steady_state_mode=8 steps=15`
+  - `21:47:09 [gradient-rt-motion] Native-home success: homed axes remain disabled axis_mask 0x0 -> 0x0 armed=0`
+  - The **new Stage-A precondition** log line fires first and 6 s pass before HM35 begins; timeout mask is `0x0` (no axes timed out). The bundled disarm-and-enable click pattern the user described has been eliminated.
+- Post-home drive-side state (from `/run/gradient-rt-motion/metrics.json`):
+  - J6: `statusword=0x9650` (bits 12+15 set, bit 13 clear, no error code) - the exact vendor-confirmed HM success signature.
+  - J6: `pos_counts=8` (drive is parked within a few counts of the new `607C=0` origin), `native_home_state=2`, `encoder_multi_turn_low=120189` (multi-turn counter preserved across the home).
+  - J1-J5 remained at `0x1650`, which is the expected pre-home state for untouched axes.
+- Still outstanding from Workstream 5 (requires operator):
+  - Manually rotate J6 to a seam-adjacent shaft position (within ~1 deg of the shaft seam, visible in `/run/gradient-rt-motion/metrics.json` as J6 `pos_counts` crossing near `RM-1 = 1,310,719`). Our current J6 `pos_counts=8` is right at the shaft zero and is not seam-adjacent.
+  - After rotating, `POST /control/power-up`, then `POST /control/joint-jog {"joint":6,"delta_deg":0.5}`. Acceptance criteria: no `Er87.1`, no `Er47.0`, continuous canonical/display truth, no `command_frame_oversized_*` counter activity.
+- Unrelated pre-existing blocker for a full power-up: the `drive_native_startup_drive_config_unconfigured` reason is emitted whenever the drive already had the startup SDO values cached. Cleanest way to clear it short-term is an RTCore restart with a deliberate startup re-issue, but the native-home flow we just tested does not depend on it. Separate follow-up.
+
 ## 2026-04-13 plan refinement
 
 - Task summary:
@@ -4730,3 +4919,66 @@
     - result: no diagnostics
 - Follow-up / risk:
   - The read-truth path is now correctly anchored to the continuous encoder source, but the RTCore/drive write contract still targets the 607A/6064 CSP reference family. Commanding directly in the encoder-multiturn object family would require a deliberate write-path redesign rather than another read-truth tweak.
+
+## 2026-04-16 16:40 +0000 - Decoupled display truth from command wrap bookkeeping and controller canonical-truth gating
+
+- What changed:
+  - Updated `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` so `_canonical_joint_positions_from_raw_feedback()` takes an explicit `mutate_command_wrap_bookkeeping` flag.
+  - Kept `raw_to_joint_positions()` as the command/runtime truth path that may update `_raw_reference_wrap_lift_counts`.
+  - Marked `get_display_feedback_snapshot()`, `raw_to_display_joint_positions()`, `get_power_transition_snapshot()`, and `_absolute_home_anchor_validation_for_joint()` as observational callers that must not mutate raw wrap-lift bookkeeping.
+  - Updated `src/gradient_os/run_controller.py` so `canonical_joint_truth_available` no longer gets ANDed with display-truth availability; `display_joint_truth_available` remains a separate diagnostic field.
+  - Added focused regressions in `tests/test_gradient05_limits_and_backends.py` for order-independent display reads and for preserving an existing raw wrap lift across a failing display snapshot.
+  - Updated `tests/test_run_controller_helpers.py` expectations so canonical runtime truth stays available when live canonical feedback is good but display truth is degraded.
+  - Added `tests/test_api_endpoints.py::test_control_joint_jog_rejects_when_selected_joint_truth_is_unavailable` to prove jog still refuses on the per-joint truth gate after the controller semantics split.
+- Validation performed:
+  - `"/home/pi/GradientOS/.venv/bin/python" -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/run_controller.py tests/test_gradient05_limits_and_backends.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py`
+    - result: success
+  - `PYTHONPATH=src "/home/pi/GradientOS/.venv/bin/python" -m pytest tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_j3_style_raw_truth_uses_wrap_lift_for_command_targets tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_display_read_is_order_independent_for_raw_wrap_selection tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_display_snapshot_does_not_clear_existing_raw_wrap_lift tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_translates_canonical_truth_back_into_raw_wire_counts tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_refuses_display_feedback_when_absolute_anchor_does_not_roundtrip tests/test_run_controller_helpers.py::test_build_joint_state_snapshot_does_not_fallback_display_feedback tests/test_run_controller_helpers.py::test_build_joint_state_snapshot_preserves_partial_display_feedback tests/test_run_controller_helpers.py::test_build_joint_state_snapshot_keeps_raw_blocker_details_when_display_truth_is_available tests/test_api_endpoints.py::test_control_joint_jog_rejects_when_canonical_truth_is_unavailable tests/test_api_endpoints.py::test_control_joint_jog_rejects_when_selected_joint_truth_is_unavailable -q`
+    - result: `10 passed in 2.31s`
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/run_controller.py tests/test_gradient05_limits_and_backends.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py && python -m pytest tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_j3_style_raw_truth_uses_wrap_lift_for_command_targets tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_display_read_is_order_independent_for_raw_wrap_selection tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_display_snapshot_does_not_clear_existing_raw_wrap_lift tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_translates_canonical_truth_back_into_raw_wire_counts tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_refuses_display_feedback_when_absolute_anchor_does_not_roundtrip tests/test_run_controller_helpers.py::test_build_joint_state_snapshot_does_not_fallback_display_feedback tests/test_run_controller_helpers.py::test_build_joint_state_snapshot_preserves_partial_display_feedback tests/test_run_controller_helpers.py::test_build_joint_state_snapshot_keeps_raw_blocker_details_when_display_truth_is_available tests/test_api_endpoints.py::test_control_joint_jog_rejects_when_canonical_truth_is_unavailable tests/test_api_endpoints.py::test_control_joint_jog_rejects_when_selected_joint_truth_is_unavailable -q`
+    - result: `10 passed in 1.32s`
+  - `ReadLints` on `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`, `src/gradient_os/run_controller.py`, `tests/test_gradient05_limits_and_backends.py`, `tests/test_run_controller_helpers.py`, and `tests/test_api_endpoints.py`
+    - result: no diagnostics
+- Follow-up / risk:
+  - This is intentionally a local containment fix. It prevents display/monitor reads from poisoning the raw command frame, but it does not settle the broader A6-EC runtime truth-source architecture.
+  - If the user asks for project-env activation specifically, prefer `source ./start.sh`; system `python3` lacked repo deps, and `uv run` attempted network resolution while DNS was unavailable.
+
+## 2026-04-17 04:11 +0000 - Restored startup-drive-config expectation fields across RTCore startup epochs
+
+- What changed:
+  - Updated `src/gradient_rt_motion/main.cpp` so RTCore no longer drops startup-drive-config descriptor expectation fields when a startup epoch is re-armed.
+  - Added `reset_startup_drive_config_feedback(...)` to repopulate `configured` and `commanded` from the active `startup_sdos` descriptors while still clearing readback-specific fields for the new epoch.
+  - Updated the deferred startup readback path to refresh `configured` and `commanded` before verifying each descriptor, preserving downstream `unverified` vs `mismatch` semantics instead of collapsing matching descriptors into `startup_drive_config_unconfigured`.
+  - Added focused regressions in `tests/test_rtcore_runtime.py` and `tests/test_gradient05_limits_and_backends.py` to prove that the authoritative `startup_drive_configs` list keeps startup validity and persisted-home-anchor restart trust reachable even when the legacy single-entry `startup_drive_config` view is stale.
+- Validation performed:
+  - `make -C src/gradient_rt_motion`
+    - result: success
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m pytest tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py tests/test_drive_faults.py -q`
+    - result: `134 passed`
+  - `ReadLints` on `src/gradient_rt_motion/main.cpp`, `tests/test_rtcore_runtime.py`, and `tests/test_gradient05_limits_and_backends.py`
+    - result: no diagnostics
+- Follow-up / risk:
+  - This patch intentionally leaves Python/controller startup-validity policy unchanged; the fix is in the RTCore metrics contract so ownership stays with the EtherCAT startup layer.
+  - Operator-facing exposure of `drive_native_truth_verification_source` remains a separate follow-up once this upstream startup gate is stable.
+
+## 2026-04-17 04:56 +0000 - Exposed canonical-truth verification source in API snapshots and Joint Commissioning UI
+
+- What changed:
+  - Updated `src/gradient_os/api/main.py` so `_selected_joint_feedback_snapshot()` now passes through `drive_native_truth_verification_source` from per-axis absolute-feedback detail into command/error payloads such as `/control/joint-jog` failures.
+  - Updated `tests/test_api_endpoints.py` fixtures and expectations so `/info/joints-detailed` preserves the field and selected-joint error payloads carry it through.
+  - Updated `web-ui/src/ControlPanel.tsx` to type `drive_native_truth_verification_source`, `drive_native_truth_reason`, `drive_native_truth_valid`, and `coordinate_system_valid`, then render a distinct per-joint commissioning line:
+    - `Canonical truth trust: <source>` when truth is available
+    - `Canonical truth unavailable: <reason>` when truth is not available
+  - Kept the wording separate from native-home verification so operators can distinguish "how canonical truth is trusted" from "how HM35 completion was verified."
+  - Updated `web-ui/src/ControlPanel.test.tsx`, `web-ui/src/App.tsx`, and `web-ui/src/liveState.tsx` for coverage and consistent live-state typing.
+- Validation performed:
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m pytest tests/test_api_endpoints.py -q`
+    - result: `70 passed`
+  - `npm test -- ControlPanel.test.tsx`
+    - result: `22 passed`
+  - `npm run build`
+    - result: success
+  - `ReadLints` on `src/gradient_os/api/main.py`, `tests/test_api_endpoints.py`, `web-ui/src/ControlPanel.tsx`, `web-ui/src/ControlPanel.test.tsx`, `web-ui/src/App.tsx`, and `web-ui/src/liveState.tsx`
+    - result: no diagnostics
+- Follow-up / risk:
+  - The UI now surfaces the verification source from the existing `drive_faults` snapshot and selected-joint command payloads, but it still does not consume `/info/joints-detailed` directly for this display. That is intentional to avoid creating a second live truth channel in the frontend.

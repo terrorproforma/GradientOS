@@ -24,22 +24,63 @@ Use this file for power transitions, safe restarts, commissioning motion flows, 
   - the CSP runtime position-offset term `0x60B0`
 - Current manufacturer guidance says the intended rotary-mode production setup is to configure the real output-shaft mechanical ratio in `C10.18 / C10.19`; leaving them at `1:1` makes `6064`/`U40.28` motor-side and forces the host to own the output-shaft conversion itself.
 - Any change to `C10.18 / C10.19` requires a fresh homing cycle afterward, even if no power cycle is needed.
-- Current evidence says `0x60B0` should be treated as a runtime motion-frame object, not the durable native-home store.
-- Current evidence also says `0x607C` is not a reliable witness for persisted semantic-home state on this A6-EC setup; corrected frame behavior has persisted across power cycles while `0x607C` remained `0`.
-- In the drive-native migration, treat `drive_native_ratio_enabled` and startup verification as separate conditions:
-  - profile/runtime config can declare the intended drive-native posture
-  - controller truth should switch to the drive-owned output-shaft frame only after startup drive-config verification succeeds and the live statusword still shows the vendor-confirmed HM-valid signature with no active alarms
-  - for A6-EC, do not fall back to legacy anchored reconstruction anymore; if either check fails, mark truth unavailable and require a clean HM35/vendor-valid coordinate state before trusting the pose again
+- `0x60B0` is a runtime motion-frame object, not a durable native-home store. Do not treat it as persistent home state.
+- `0x607C` is the manufacturer-documented persistent home offset (auto-saved to EEPROM per vendor Q3/Q7). It DOES survive drive power cycle. But it is the home-capture target, not a standalone runtime trust witness.
+- For A6-EC, do not fall back to legacy anchored reconstruction when `drive_native_ratio_enabled` is on; instead let the canonical truth path run with its three trust sources (see "Restart Trust Model" below). If all three fail, mark truth unavailable and require a clean HM35 before trusting the pose again.
 - For Gradient-05 style rotary joints, Chapter 5 strongly suggests the startup absolute mode should be the rotation-mode setting, not the older linear-mode assumption.
-- Native home should therefore be modeled as a commissioning-only workflow: jog in normal `CSP`, run a one-shot HM capture transaction, refresh truth, return to `CSP`, and then re-sync targets before further motion.
+- Native home should be modeled as a commissioning-only workflow: jog in normal `CSP`, run a one-shot HM capture transaction, refresh truth, return to `CSP`, and then re-sync targets before further motion.
 - After native home, keep the homed axis disabled until an explicit safe power-up; do not silently re-enable it as part of the home transaction.
 - Native-home verification should use a fresh post-command RTCore metrics sample before trusting `requested`, `succeeded`, or `failed`; stale pre-command metrics can create false commissioning outcomes.
 - For the active A6-EC native-home workstream, use [../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md](../../../docs/ethercat/a6ec-frame-semantics-and-native-home.md) when reasoning about `607C`, `6041 bit15`, `60B0`, `60E6`, `60FC`, persisted anchors, and the `F31.10` tail.
-- Current evidence from that note says `607C` and `6041 bit15` are not sufficient persistence witnesses by themselves; verification must include fresh metrics, tail completion, and coherent anchor refresh.
-- Manufacturer guidance now also makes two rotary-mode rules explicit:
+- Manufacturer guidance on rotary-mode homing:
   - manually writing `607C` alone does not establish a valid homed/reference state; HM Method 35 must still run
   - keep `607C` within `0 .. RM-1` in rotary mode; avoid negative seam-crossing offsets and prefer a positive value near `RM-1`
 - If encoder battery health or multi-turn retention is suspect, expect vendor faults such as `ALF9.0` (battery voltage low), `Er20.8` (encoder battery failure), or `Er20.9` (encoder multi-turn error), and re-validate native home before trusting the pose after a power cycle.
+
+## Native-Home Disarm Precondition
+
+Vendor Q2 requires the motor to be "stationary AND inactive" before HM35. The host-side `motion_intent_cleared` flag is not sufficient on its own. Contract:
+
+- RTCore `MSG_CMD_NATIVE_HOME` runs in two stages. Stage A clears `axis_enable_mask` / `armed` / motion intent, then polls each targeted axis's `statusword` until it has left `OperationEnabled` / `QuickStopActive` for several consecutive cycles (`~500 ms` budget). Stage B runs the existing HM35 transaction unchanged. Timeout synthesizes abort code `NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT = 0xF1000001` in the reserved `0xFxxxxxxx` RTCore-side range.
+- On the Python side, `EthercatRTCoreBackend.prepare_for_power_transition` accepts `require_drive_disarmed=True` + `require_drive_disarmed_axis_mask=<mask>`. When set, neutrality is `motion_intent_cleared AND all targeted axes not OperationEnabled` sourced from `get_power_transition_snapshot().per_axis_drive_disarmed`. `native_home_joint` always calls the stronger variant before `_send_cmd_native_home`.
+- Observable expectation: one brake click (disarm) per native-home action, not a disarm + HM35-enable pair. A second click means the precondition contract was bypassed.
+
+## Command-Frame Turn Selection (A6-EC)
+
+`607A` targets must land in the same shaft turn the drive is currently observing. Getting this wrong produces `Er87.1` (excessive position reference increment) or `Er47.0` (following error) on seam-adjacent small jogs. Contract:
+
+- Turn selection is stateless per write. The host computes `target_counts = round((canonical_q + master_offset) * sign * counts_per_unit)` and folds to the nearest shaft turn of live `6064` using `delta -= round(delta / RM) * RM`.
+- `abs(target_607A - live_6064) <= RM / 2` is an invariant by construction. Violating it raises `command_frame_oversized_delta` as a regression guard.
+- Do NOT carry a cached `raw_reference_wrap_lift` quantity between writes; stale-state is what produced the original `Er87.1` family.
+- Trajectory upload path has a pre-commit sanity gate: each consecutive point's `607A` step must be `<= 0.5 * RM` or the upload is rejected with `command_frame_oversized_step`. This is a frame-sanity fence, not a motion clamp; per-cycle motion clamping itself lives in RTCore `max_step_counts_per_cycle`.
+
+## Multi-Turn Truth and Shaft-Frame Consistency (A6-EC)
+
+Vendor Q4/Q10 says "host only needs `6064`". That claim applies to single-turn-bounded axes. It is NOT sufficient for joints whose software limits exceed one shaft revolution (Gradient-05 J1/J4/J5/J6). `6064` wraps at `RM` in absolute rotation mode and cannot carry multi-turn continuity. Contract:
+
+- Canonical planner/controller truth is `canonical_q = absolute_axis_q − absolute_home_anchor − master_offset` where `absolute_axis_q` is derived from the multi-turn `U40.20 / U40.22` pair and the anchor lives in `.gradient_absolute_encoder_anchors.json`.
+- Before publishing canonical truth, verify that `(canonical_q + master_offset) * sign * counts_per_unit` agrees with live `6064` modulo `RM` within `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (16 counts).
+- Whole-shaft-turn offsets between the anchored view and live `6064` are legitimate (that is what the anchor encodes). Sub-shaft-turn drift is a frame bug; truth fails closed with reason `multi_turn_anchor_inconsistent_with_live_6064` (or the drive-native-prefixed equivalent) and the stale-anchor diagnostic fields are attached.
+- Do not demote `U40.20/.22` to diagnostics-only for this drive family; multi-turn-capable joints require it.
+
+## Restart Trust Model (A6-EC)
+
+Vendor Q6/Q9 says `6041 bit 15` persists across drive power cycle. On this A6-EC firmware it empirically does NOT — bit 15 is cleared on every drive power-up while `6064`, `U40.20/.22`, and `607C` restore cleanly (including across manual joint rotation while the drive is off, within the vendor Q1 32,767-motor-turn budget). Canonical truth is established via three trust paths evaluated in order (first match wins):
+
+1. Fresh-home strict: `bit 12 ∧ bit 15 ∧ ¬bit 13` with no active alarms → `drive_native_truth_verification_source = "statusword_bits12_15_clear13"`.
+2. Bit-15-alone (vendor Q9 literal path): `bit 15` set and `startup_truth_requires_hm_success_signature=False` in the profile → `"statusword_bit15"`. **Documented-but-unreachable on the A6-EC firmware we currently run**, because bit 15 is cleared on every drive power cycle (see `POSITION_SEMANTICS_CONFIG["firmware_bit15_retention_expected"] = False` in `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`). Kept in code for future drives / firmware revisions that honour Q9. See `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md §9.7` for the canonical version of this rule.
+3. Persisted-home-anchor agreement: profile sets `accept_persisted_home_anchor_as_restart_trust=True` AND the `.gradient_absolute_encoder_anchors.json` entry for the joint is present AND `U40.20/.22` reports `valid=1` AND the mod-`RM` shaft-frame check is consistent within tolerance AND no encoder-retention-family fault is live → `"persisted_home_anchor_agreement"`.
+
+If none match, truth fails closed with a specific reason (`encoder_retention_fault_present`, `persisted_home_anchor_missing`, `multi_turn_feedback_invalid`, `persisted_home_anchor_inconsistent_with_live_6064`, `multi_turn_feedback_lost_across_power_cycle`, or the generic `coordinate_system_invalid`). The operator must re-home.
+
+Contract:
+
+- Initial HM35 is always required to establish the anchor file entry per joint. The restart-trust path reuses state; it does not invent trust.
+- After that initial home, power cycles do NOT require re-homing as long as the encoder's multi-turn counter stays valid.
+- Manual joint rotation while the drive is off is accepted by the restart-trust path because `absolute_axis_q − reference_q` is invariant under shaft motion. Only encoder data loss (battery death, `> 32,767` motor turns, or catastrophic encoder fault) breaks the invariant and forces a re-home.
+- Live `Er20.1 .. Er20.9` / `ALF9.0` (encoder-retention-family fault codes decoded from `manufacturer_error_code` / `error_code`) surface as `encoder_retention_fault_present` and block trust regardless of anchor agreement. This outranks the generic `fault_present` / `manufacturer_fault_present` branches because retention is a more specific interpretation of the same underlying 0x603F / 0x203F signal.
+- `F31.10 = 4` (encoder data reset) always requires a fresh HM35 afterward; restart trust is not a substitute.
+- Optional last-seen U40.20/.22 sidecar: the backend persists the live `absolute_counts` onto the anchor entry under `last_seen` on every trusted-axis canonical-truth cycle (rate-limited to once per 5 s per joint). When the shaft-frame consistency gate later fails AND the delta from the stored sidecar exceeds `32,767 × counts_per_rev` (physically impossible during an off-window), the rejection reason upgrades to `multi_turn_feedback_lost_across_power_cycle` instead of the generic anchor-disagreement label, so operators can tell "joint moved while off" apart from "encoder data lost while off".
 
 ## Commissioning Motion Rules
 

@@ -228,12 +228,30 @@ def build_drive_fault_snapshot(
             error_code=error_code,
             manufacturer_error_code=manufacturer_error_code,
         )
+        # Ask the active drive profile whether the live fault codes belong
+        # to the encoder-retention family. When so, pass that signal to
+        # the truth-validity helper so operators see the more specific
+        # "encoder_retention_fault_present" reason instead of the generic
+        # "manufacturer_fault_present".
+        encoder_retention_fault_detail = (
+            backend_registry.describe_drive_encoder_retention_fault_for_backend(
+                servo_backend,
+                manufacturer_error_code=manufacturer_error_code,
+                error_code=error_code,
+                drive_profile_id=resolved_drive_profile,
+            )
+        )
+        encoder_retention_fault_present = bool(
+            isinstance(encoder_retention_fault_detail, Mapping)
+            and encoder_retention_fault_detail.get("present", False)
+        )
         drive_native_truth = derive_drive_native_truth_validity(
             axis,
             statusword=statusword,
             error_code=error_code,
             manufacturer_error_code=manufacturer_error_code,
             require_hm_success_signature=startup_truth_requires_hm_success_signature,
+            encoder_retention_fault_present=encoder_retention_fault_present,
         )
         if bool(drive_native_truth.get("coordinate_system_valid", False)):
             coordinate_system_valid_axes += 1
@@ -379,6 +397,13 @@ def build_drive_fault_snapshot(
                     manufacturer_error_code,
                     drive_profile_id=resolved_drive_profile,
                 ),
+                "encoder_retention_fault": (
+                    dict(encoder_retention_fault_detail)
+                    if isinstance(encoder_retention_fault_detail, Mapping)
+                    and encoder_retention_fault_detail.get("present", False)
+                    else None
+                ),
+                "encoder_retention_fault_present": bool(encoder_retention_fault_present),
             }
         )
 

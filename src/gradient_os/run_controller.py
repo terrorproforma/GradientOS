@@ -500,10 +500,6 @@ def _build_joint_state_snapshot() -> dict[str, object]:
             if isinstance(display_snapshot, dict):
                 truth_available = bool(display_snapshot.get("truth_available", True))
                 snapshot["display_joint_truth_available"] = truth_available
-                snapshot["canonical_joint_truth_available"] = (
-                    bool(snapshot.get("canonical_joint_truth_available", False))
-                    and truth_available
-                )
                 display_positions = display_snapshot.get("joint_positions_rad")
                 partial_display_positions = display_snapshot.get("joint_positions_rad_partial")
                 if truth_available and isinstance(display_positions, list):

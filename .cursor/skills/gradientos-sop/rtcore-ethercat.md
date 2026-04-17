@@ -50,8 +50,21 @@ Use this file when changing `gradient-rt-motion`, EtherCAT host setup, drive bri
 - Synchronize targets with feedback before enabling.
 - STOP and power transitions must not re-inject stale motion into RTCore.
 - Preserve the no-sudden-move contract across restart, enable, and recovery flows.
-- For A6-EC with persisted native home in `0x607C`, drive-facing CSP hold/output/enable targets must stay in the raw PDO wire frame (`0x6064` / `0x607A` counts).
-- Subtract `native_home_position_offset` only when converting queued controller/logical targets into raw CSP wire counts; do not subtract it again when mirroring live feedback into hold targets or seeding realtime jog accumulators.
+- Drive-facing CSP hold/output/enable targets stay in the raw PDO wire frame (`0x6064` / `0x607A` counts).
+- Target counts for A6-EC are chosen with a stateless per-write nearest-turn fold against live `0x6064` (`abs(target − live_6064) <= RM / 2`). Do not carry cached wrap-lift state between writes, and do not re-apply any persisted home offset twice.
+
+## Commissioning Transaction Preconditions
+
+- RTCore `MSG_CMD_NATIVE_HOME` is a two-stage transaction:
+  - Stage A: clear `axis_enable_mask` / `armed` / motion intent, then poll each targeted axis's `statusword` until it has left `OperationEnabled` / `QuickStopActive` for several consecutive cycles within a bounded budget (current implementation: `~500 ms`, `3` stable cycles).
+  - Stage B: run the existing descriptor-driven HM35 transaction unchanged.
+- Stage-A timeout uses a synthesized abort code in the reserved `0xFxxxxxxx` RTCore-side range (currently `NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT = 0xF1000001`). Real CoE SDO aborts live in `0x05xxxxxx`–`0x08xxxxxx`; the ranges must not collide. New synthesized codes should follow the same convention.
+- Controller-side, `prepare_for_power_transition` accepts `require_drive_disarmed=True` and `require_drive_disarmed_axis_mask=<mask>`. When set, the neutrality test is `motion_intent_cleared AND per_axis_drive_disarmed[axis]` for every targeted axis, sourced from the DS402 state of the live statusword snapshot. Any commissioning transaction that requires a disarmed drive (currently HM35) must use this stronger wait.
+
+## Trajectory Upload Sanity
+
+- The Python backend rejects trajectory uploads whose consecutive-point `607A` step exceeds `0.5 * RM` on any targeted axis (`command_frame_oversized_step`). This is a host-side frame-sanity fence that catches wrong-turn command math before the fieldbus sees it.
+- RTCore still enforces `max_step_counts_per_cycle` per cycle. These gates are complementary: the host gate prevents an entire trajectory from being a wrong-turn error; RTCore's per-cycle clamp prevents runaway motion within a single legitimate trajectory.
 
 ## Commissioning and Bring-Up
 

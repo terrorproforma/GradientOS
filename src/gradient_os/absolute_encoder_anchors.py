@@ -28,6 +28,43 @@ def _empty_store() -> dict[str, Any]:
     }
 
 
+def _normalize_last_seen(raw: Any) -> dict[str, Any] | None:
+    """Defensively normalize the optional ``last_seen`` sidecar.
+
+    Missing or malformed sidecars return ``None`` so older anchor files
+    keep working untouched. The sidecar is diagnostic only: the store
+    contract for ``home_anchor_rad`` stays identical.
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        absolute_counts = int(raw.get("absolute_counts"))
+    except Exception:
+        return None
+    entry: dict[str, Any] = {"absolute_counts": int(absolute_counts)}
+    if "reference_counts" in raw:
+        try:
+            entry["reference_counts"] = int(raw.get("reference_counts"))
+        except Exception:
+            pass
+    observed_at_raw = raw.get("observed_at")
+    if observed_at_raw is not None:
+        token = str(observed_at_raw).strip()
+        if token:
+            entry["observed_at"] = token
+    if "observed_at_monotonic_ns" in raw:
+        try:
+            entry["observed_at_monotonic_ns"] = int(raw.get("observed_at_monotonic_ns"))
+        except Exception:
+            pass
+    observed_by_raw = raw.get("observed_by")
+    if observed_by_raw is not None:
+        token = str(observed_by_raw).strip()
+        if token:
+            entry["observed_by"] = token
+    return entry
+
+
 def _normalize_anchor_entry(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -46,12 +83,14 @@ def _normalize_anchor_entry(raw: Any) -> dict[str, Any] | None:
     source_raw = raw.get("source")
     updated_at_raw = raw.get("updated_at")
     updated_by_raw = raw.get("updated_by")
+    last_seen = _normalize_last_seen(raw.get("last_seen"))
     return {
         "home_anchor_rad": float(home_anchor_rad),
         "source": str(source_raw).strip() if source_raw is not None else None,
         "axis_indices": axis_indices,
         "updated_at": str(updated_at_raw).strip() if updated_at_raw is not None else None,
         "updated_by": str(updated_by_raw).strip() if updated_by_raw is not None else None,
+        "last_seen": last_seen,
     }
 
 
@@ -111,15 +150,17 @@ def save_absolute_encoder_anchors(
         if entry is None:
             normalized_entries.append(None)
             continue
-        normalized_entries.append(
-            {
-                "home_anchor_rad": float(entry["home_anchor_rad"]),
-                "source": entry.get("source"),
-                "axis_indices": [int(value) for value in entry.get("axis_indices", [])],
-                "updated_at": entry.get("updated_at") or _utc_now_iso(),
-                "updated_by": entry.get("updated_by") or str(actor or "unknown"),
-            }
-        )
+        serialized_entry: dict[str, Any] = {
+            "home_anchor_rad": float(entry["home_anchor_rad"]),
+            "source": entry.get("source"),
+            "axis_indices": [int(value) for value in entry.get("axis_indices", [])],
+            "updated_at": entry.get("updated_at") or _utc_now_iso(),
+            "updated_by": entry.get("updated_by") or str(actor or "unknown"),
+        }
+        last_seen = entry.get("last_seen")
+        if isinstance(last_seen, dict):
+            serialized_entry["last_seen"] = dict(last_seen)
+        normalized_entries.append(serialized_entry)
     robots[robot_key] = {
         "logical_joint_absolute_home_anchors": normalized_entries,
         "updated_at": _utc_now_iso(),
@@ -148,6 +189,7 @@ def save_absolute_encoder_anchor(
     source: str,
     axis_indices: Sequence[int] | None = None,
     actor: str = "unknown",
+    preserve_last_seen: bool = True,
 ) -> dict[str, Any]:
     joint_i = int(logical_joint_index)
     if joint_i < 0 or joint_i >= int(num_joints):
@@ -155,16 +197,78 @@ def save_absolute_encoder_anchor(
             f"Logical joint index {joint_i} is out of range for {int(num_joints)} joints."
         )
     anchors = load_absolute_encoder_anchors(robot_id, num_joints=num_joints)
-    anchors[joint_i] = {
+    existing_last_seen: dict[str, Any] | None = None
+    if preserve_last_seen:
+        existing_entry = anchors[joint_i] if isinstance(anchors[joint_i], dict) else None
+        if isinstance(existing_entry, dict):
+            maybe_last_seen = existing_entry.get("last_seen")
+            if isinstance(maybe_last_seen, dict):
+                existing_last_seen = dict(maybe_last_seen)
+    new_entry: dict[str, Any] = {
         "home_anchor_rad": float(home_anchor_rad),
         "source": str(source).strip() or None,
         "axis_indices": [int(value) for value in list(axis_indices or [])],
         "updated_at": _utc_now_iso(),
         "updated_by": str(actor or "unknown"),
     }
+    if existing_last_seen is not None:
+        new_entry["last_seen"] = existing_last_seen
+    anchors[joint_i] = new_entry
     saved = save_absolute_encoder_anchors(robot_id, anchors, actor=actor)
     return (
         saved.get("logical_joint_absolute_home_anchors", [])[joint_i]
         if isinstance(saved, dict)
         else {}
+    )
+
+
+def save_last_seen_absolute_counts(
+    robot_id: str,
+    *,
+    num_joints: int,
+    logical_joint_index: int,
+    absolute_counts: int,
+    reference_counts: int | None = None,
+    observed_at: str | None = None,
+    observed_at_monotonic_ns: int | None = None,
+    actor: str = "unknown",
+) -> dict[str, Any] | None:
+    """Update only the optional ``last_seen`` sidecar on the anchor entry
+    for the target joint. No-op when the joint has no recorded anchor -
+    we never materialize a fake anchor just to hold a last-seen reading.
+
+    Returns the updated per-joint anchor entry (including the new
+    ``last_seen`` dict) on success, or ``None`` when there is no anchor
+    for the joint yet.
+    """
+    joint_i = int(logical_joint_index)
+    if joint_i < 0 or joint_i >= int(num_joints):
+        raise IndexError(
+            f"Logical joint index {joint_i} is out of range for {int(num_joints)} joints."
+        )
+    anchors = load_absolute_encoder_anchors(robot_id, num_joints=num_joints)
+    existing = anchors[joint_i] if isinstance(anchors[joint_i], dict) else None
+    if not isinstance(existing, dict):
+        return None
+    updated_entry = dict(existing)
+    sidecar: dict[str, Any] = {"absolute_counts": int(absolute_counts)}
+    if reference_counts is not None:
+        try:
+            sidecar["reference_counts"] = int(reference_counts)
+        except Exception:
+            pass
+    sidecar["observed_at"] = str(observed_at).strip() if observed_at else _utc_now_iso()
+    if observed_at_monotonic_ns is not None:
+        try:
+            sidecar["observed_at_monotonic_ns"] = int(observed_at_monotonic_ns)
+        except Exception:
+            pass
+    sidecar["observed_by"] = str(actor or "unknown")
+    updated_entry["last_seen"] = sidecar
+    anchors[joint_i] = updated_entry
+    saved = save_absolute_encoder_anchors(robot_id, anchors, actor=actor)
+    return (
+        saved.get("logical_joint_absolute_home_anchors", [])[joint_i]
+        if isinstance(saved, dict)
+        else None
     )

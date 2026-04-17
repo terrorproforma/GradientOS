@@ -3306,6 +3306,7 @@ def _selected_joint_feedback_snapshot(payload: dict[str, Any], *, joint: int) ->
                 "display_source",
                 "absolute_source",
                 "absolute_home_anchor_source",
+                "drive_native_truth_verification_source",
                 "truth_status",
                 "truth_reason",
                 "truth_source",

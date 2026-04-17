@@ -560,3 +560,103 @@ def test_build_drive_fault_snapshot_carries_native_home_active_mask(monkeypatch)
     assert snapshot["native_home_active_axis_mask_hex"] == "0x2"
     assert snapshot["axes"][0]["native_home_active"] is False
     assert snapshot["axes"][1]["native_home_active"] is True
+
+
+def test_build_drive_fault_snapshot_carries_encoder_retention_fault(monkeypatch):
+    # When the live manufacturer_error_code matches the A6-EC
+    # encoder-retention family (e.g. Er20.9 = 0x209, "Encoder multi-turn
+    # error"), the per-axis payload in build_drive_fault_snapshot must
+    # carry an encoder_retention_fault dict with the matched vendor code
+    # and name, and the truth-validity reason must upgrade to
+    # encoder_retention_fault_present ahead of the generic
+    # manufacturer_fault_present branch.
+    monkeypatch.setattr(
+        drive_faults.backend_registry,
+        "resolve_drive_profile_for_backend",
+        lambda *args, **kwargs: "a6ec_ds402",
+    )
+    monkeypatch.setattr(
+        drive_faults.backend_registry,
+        "resolve_fieldbus_profile_for_backend",
+        lambda *args, **kwargs: "test_fieldbus",
+    )
+    monkeypatch.setattr(
+        drive_faults.backend_registry,
+        "get_drive_fault_reference_metadata_for_backend",
+        lambda *args, **kwargs: {"available": False},
+    )
+    monkeypatch.setattr(
+        drive_faults.backend_registry,
+        "decode_fieldbus_state_for_backend",
+        lambda *args, **kwargs: {"name": "OP"},
+    )
+    monkeypatch.setattr(
+        drive_faults.backend_registry,
+        "decode_drive_statusword_for_backend",
+        lambda *args, **kwargs: {"state": "Fault"},
+    )
+    monkeypatch.setattr(
+        drive_faults.backend_registry,
+        "extract_drive_startup_config_axis_for_backend",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        drive_faults.backend_registry,
+        "describe_drive_fault_code_for_backend",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        drive_faults.backend_registry,
+        "describe_drive_manufacturer_fault_code_for_backend",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        drive_faults.backend_registry,
+        "describe_fieldbus_master_state_for_backend",
+        lambda *args, **kwargs: "OP",
+    )
+    # Leave describe_drive_encoder_retention_fault_for_backend unpatched
+    # so the real a6ec_ds402 decoder runs; that's exactly the production
+    # path we want to cover.
+
+    snapshot = build_drive_fault_snapshot(
+        metrics={
+            "num_axes": 1,
+            "armed": 0,
+            "axis_enable_mask": 0x0,
+            "link_up": 1,
+            "responding_slaves": 1,
+            "online_slaves": 1,
+            "operational_slaves": 1,
+            "startup_ready": 1,
+            "wkc_actual": 2,
+            "wkc_expected": 2,
+            "master_al_states": 0x08,
+            "axes": [
+                {
+                    "statusword": 0x1650,
+                    "error_code": 0,
+                    "manufacturer_error_code": 0x209,
+                    "slave_online": 1,
+                    "slave_operational": 1,
+                    "slave_al_state": 0x08,
+                    "pos_counts": 0,
+                    "native_home_state": 0,
+                    "native_home_last_abort_code": 0,
+                },
+            ],
+        },
+        servo_backend="ethercat_rtcore",
+        axis_to_joint=[5],
+        socket_present=True,
+    )
+
+    axis = snapshot["axes"][0]
+    assert axis["encoder_retention_fault_present"] is True
+    retention_detail = axis["encoder_retention_fault"]
+    assert isinstance(retention_detail, dict)
+    assert "Er20.9" in retention_detail.get("codes", [])
+    assert "Encoder multi-turn error" in retention_detail.get("names", [])
+    assert axis["drive_native_truth_reason"] == "encoder_retention_fault_present"
+    assert axis["coordinate_system_valid"] is False
+    assert axis["drive_native_truth_valid"] is False

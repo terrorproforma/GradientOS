@@ -80,6 +80,28 @@ def describe_drive_manufacturer_fault_code(profile_id: str | None, error_code: i
     return None
 
 
+def describe_drive_encoder_retention_fault(
+    profile_id: str | None,
+    *,
+    manufacturer_error_code: int,
+    error_code: int = 0,
+) -> dict[str, Any] | None:
+    """Return the drive-profile's encoder-retention-family decode of the
+    provided ``manufacturer_error_code`` (and optional bus ``error_code``).
+    When the profile implements the optional
+    ``describe_encoder_retention_fault`` symbol, its payload is passed
+    through. Profiles that do not implement it return ``None``; callers
+    should treat that as "retention family is not modelled here" and skip
+    the precedence branch.
+    """
+    module = get_drive_profile(profile_id)
+    decoder = getattr(module, "describe_encoder_retention_fault", None) if module is not None else None
+    if not callable(decoder):
+        return None
+    payload = decoder(int(manufacturer_error_code), int(error_code))
+    return payload if isinstance(payload, dict) else None
+
+
 def build_drive_startup_config(
     profile_id: str | None,
     raw_entries: object,

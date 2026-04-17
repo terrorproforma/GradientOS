@@ -538,6 +538,36 @@ def describe_drive_manufacturer_fault_code_for_backend(
     return None
 
 
+def describe_drive_encoder_retention_fault_for_backend(
+    backend_name: Optional[str],
+    *,
+    manufacturer_error_code: int,
+    error_code: int = 0,
+    drive_profile_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Backend-level wrapper for the drive-profile's encoder-retention
+    fault decode. Returns the profile payload (with ``present: bool``) or
+    ``None`` when the active profile does not model retention faults. The
+    caller is responsible for branching on ``present`` - this wrapper does
+    not second-guess the profile's decoding rules.
+    """
+    if not backend_name:
+        return None
+    effective_profile = resolve_drive_profile_for_backend(
+        backend_name,
+        drive_profile_id=drive_profile_id,
+    )
+    if effective_profile:
+        payload = profile_registry.describe_drive_encoder_retention_fault(
+            effective_profile,
+            manufacturer_error_code=int(manufacturer_error_code),
+            error_code=int(error_code),
+        )
+        if isinstance(payload, dict) or payload is None:
+            return payload
+    return None
+
+
 def build_drive_startup_config_for_backend(
     backend_name: Optional[str],
     raw_entries: object,

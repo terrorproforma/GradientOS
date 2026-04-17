@@ -270,6 +270,7 @@ def patch_send(monkeypatch):
                             "absolute_home_anchor_source": "encoder_multi_turn_counts",
                             "absolute_counts": 1234,
                             "absolute_source": "encoder_multi_turn_counts",
+                            "drive_native_truth_verification_source": "persisted_home_anchor_agreement",
                             "absolute_axis_q_rad": 12.34,
                             "reference_pre_zero_rad": 2.34,
                             "display_source": "absolute_encoder_anchor",
@@ -1288,6 +1289,67 @@ def test_control_joint_jog_rejects_when_canonical_truth_is_unavailable(client, m
     }
 
 
+def test_control_joint_jog_rejects_when_selected_joint_truth_is_unavailable(client, monkeypatch):
+    def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
+        if command == "GET_JOINT_STATE":
+            return True, (
+                "JOINT_STATE_JSON,"
+                + json.dumps(
+                    {
+                        "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+                        "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                        "arm_display_deg": [None, None, None, None, None, None],
+                        "read_source": "live_feedback",
+                        "canonical_joint_truth_available": True,
+                        "display_joint_truth_available": False,
+                        "axis_to_joint": [0],
+                        "axis_counts": [131060],
+                        "axis_absolute_feedback": [
+                            {
+                                "axis": 0,
+                                "logical_joint": 1,
+                                "truth_available": False,
+                                "truth_reason": "command_frame_roundtrip_mismatch",
+                                "drive_native_truth_verification_source": "persisted_home_anchor_agreement",
+                                "display_source": "truth_unavailable",
+                                "absolute_source": "encoder_multi_turn_counts",
+                                "absolute_counts": 1234,
+                            }
+                        ],
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        return True, "ACK"
+
+    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
+
+    resp = client.post("/control/joint-jog", json={"joint": 1, "delta_deg": 1.0})
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["code"] == "CANONICAL_JOINT_TRUTH_UNAVAILABLE"
+    assert detail["message"] == (
+        "Selected joint is missing anchored absolute truth; refusing to baseline joint jog."
+    )
+    assert detail["joint"] == 1
+    assert detail["selected_joint_feedback"] == {
+        "joint": 1,
+        "canonical_joint_truth_available": True,
+        "current_joint_deg": 1.0,
+        "current_canonical_deg": 1.0,
+        "current_raw_deg": 1.0,
+        "axis_index": 0,
+        "axis_counts": 131060,
+        "display_source": "truth_unavailable",
+        "absolute_source": "encoder_multi_turn_counts",
+        "drive_native_truth_verification_source": "persisted_home_anchor_agreement",
+        "truth_reason": "command_frame_roundtrip_mismatch",
+        "truth_available": False,
+        "absolute_counts": 1234,
+    }
+
+
 def test_info_status(client):
     resp = client.get("/info/status")
     assert resp.status_code == 200
@@ -1379,6 +1441,7 @@ def test_info_joints_detailed(client):
                 "absolute_home_anchor_source": "encoder_multi_turn_counts",
                 "absolute_counts": 1234,
                 "absolute_source": "encoder_multi_turn_counts",
+                "drive_native_truth_verification_source": "persisted_home_anchor_agreement",
                 "absolute_axis_q_rad": 12.34,
                 "reference_pre_zero_rad": 2.34,
                 "display_source": "absolute_encoder_anchor",

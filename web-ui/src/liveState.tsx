@@ -97,6 +97,10 @@ export type DriveFaultAxis = {
   slave_al_state_name?: string;
   pos_counts?: number;
   absolute_feedback?: Record<string, AbsoluteFeedbackField> | null;
+  drive_native_truth_valid?: boolean;
+  drive_native_truth_reason?: string;
+  drive_native_truth_verification_source?: string;
+  coordinate_system_valid?: boolean;
   native_home_state?: number;
   native_home_state_name?: string;
   native_home_active?: boolean;

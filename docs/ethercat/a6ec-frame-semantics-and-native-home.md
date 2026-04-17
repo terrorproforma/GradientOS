@@ -108,22 +108,134 @@ This is why large-ratio joints originally needed a continuous multi-turn motor s
 
 ### Canonical Truth Math
 
-The active A6-EC controller truth contract is now single-path:
+The A6-EC controller truth contract keeps multi-turn correctness while
+respecting the vendor "6064 authoritative within shaft space" claim.
 
-- Drive-native production mode:
-  - `canonical_q = q_from_6064_frame - software_zero`
-  - no host-side absolute-home anchor participates in active truth
+- Canonical truth source (planner, limits, logical joint space):
+  - `canonical_q = absolute_axis_q (from U40.20/.22) - absolute_home_anchor - software_zero`
+  - `6064` alone is not sufficient because it wraps at `RM` while GradientOS joint
+    limits (J1/J4/J5/J6) can straddle more than one shaft revolution. The
+    anchored multi-turn source is the only drive output that stays continuous
+    across shaft seams and across power cycles (vendor Q1 preserves up to
+    32,767 motor turns).
+- Shaft-frame consistency (Workstream 3 gate):
+  - Before publishing canonical truth, verify that
+    `(canonical_q + master_offset) * sign * counts_per_unit mod RM`
+    agrees with live `6064 mod RM` within a small tolerance
+    (`_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS`, default 16 counts).
+  - A whole-shaft-turn offset is legitimate (it is what anchors *mean* for a
+    multi-turn axis). A sub-shaft-turn disagreement is a frame bug; truth
+    reads `unavailable` with reason `multi_turn_anchor_inconsistent_with_live_6064`
+    and the stale-anchor diagnostic fields are attached so operators see how
+    far the anchor drifted.
 - Fail-closed mode:
-  - keep the configured truth source as the drive output-shaft frame
-  - verify the startup posture through the existing `startup_drive_config` readback channel
-  - trust canonical truth only when the live statusword also shows the vendor-confirmed HM-valid signature (`bit12 = 1`, `bit15 = 1`, `bit13 = 0`) with no active alarms
-  - if startup verification is missing or the live statusword is not HM-valid, report truth unavailable instead of reconstructing any host-owned alternative
+  - verify the startup posture through the `startup_drive_config` readback channel
+  - trust canonical truth only when the drive reports a valid coordinate system
+    (vendor Q9: `6041 bit15 = 1` on restart; vendor Q5/Q6 for fresh HM:
+    `bit12 = 1 AND bit15 = 1 AND bit13 = 0` with no active alarms)
+  - if any of startup verification, drive-native truth validity, the anchored
+    multi-turn source, or the shaft-frame consistency gate is missing, leave
+    truth unavailable instead of synthesizing a host-owned fallback
 
-In the active A6-EC path, the write path should round-trip as:
+### Command-Frame Turn Selection
 
-- `reference_q = canonical_q + software_zero`
+`607A` is written in the `6064` reference frame. For multi-turn joints the
+target must land in the same shaft turn the drive is currently observing, or
+the drive will chase a wrong-turn target and raise `Er47.0` (following error)
+or `Er87.1` (excessive per-cycle increment).
 
-No extra anchor term belongs on the command path. Once A6-EC is in the drive-native posture, the host should not bridge back through a stored absolute-home anchor to recover canonical truth.
+- The host computes `target_counts_raw = round((canonical_q + master_offset) * sign * counts_per_unit)`.
+- It then folds to the nearest shaft turn of the live 6064 reading:
+  - `delta = target_counts_raw - live_6064_counts`
+  - `delta -= round(delta / RM) * RM`
+  - `target_607A = live_6064_counts + delta`
+- `abs(delta) <= RM / 2` by construction; violating that raises
+  `command_frame_oversized_delta` as a regression guard.
+- The selector is **stateless**: no per-axis wrap-lift is cached between
+  writes. Seam-adjacent consecutive jogs cannot lose track of the current
+  shaft turn because each write resolves against live `6064`.
+- The trajectory upload path additionally refuses any queued point whose
+  delivered `607A` step exceeds `0.5 * RM` against the previous point
+  (`command_frame_oversized_step`). This is a host-side sanity fence; the
+  motion clamp itself still lives in RTCore `max_step_counts_per_cycle`.
+
+`U40.20/.22` remain the multi-turn truth source; they are NOT demoted to
+diagnostics because pure `6064` truth cannot carry multi-turn continuity for
+our joint set. Single-turn-bounded joints could in principle switch to pure
+`6064`, but the drive-family policy is kept uniform so operators reason about
+one truth model only.
+
+### Restart Trust via Persisted Home Anchor
+
+Vendor Q6/Q9 claims `6041 bit 15` persists through a drive power cycle.
+Empirically this A6-EC firmware clears bit 15 every cycle even though `6064`,
+`U40.20/.22`, and `607C` all restore cleanly. Requiring a re-home after every
+power cycle is operationally untenable, so the controller has a second
+restart trust path built on the objects that **do** persist.
+
+The trust path is file-driven and opt-in per drive profile
+(`accept_persisted_home_anchor_as_restart_trust=True` in
+`POSITION_SEMANTICS_CONFIG`). It does not replace the vendor signature
+path; it runs after it in `derive_drive_native_truth_validity`:
+
+1. If `bit12 ∧ bit15 ∧ ¬bit13` (vendor Q5/Q6 fresh-home signature) → trust
+   via `drive_native_truth_verification_source = "statusword_bits12_15_clear13"`.
+2. Else if `bit15` alone and the profile accepts it → trust via
+   `"statusword_bit15"` (vendor Q9; vestigial on this firmware).
+3. **Else** if the persisted absolute-home anchor exists *and* the live
+   `U40.20/.22` multi-turn reading is valid *and* the shaft-frame
+   consistency check (mod-`RM`) agrees with the anchor within
+   `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (16 counts) → trust via
+   `"persisted_home_anchor_agreement"`.
+4. Else → `coordinate_system_valid = False` with a specific reason:
+   `persisted_home_anchor_missing`, `multi_turn_feedback_invalid`, or
+   `persisted_home_anchor_inconsistent_with_live_6064`.
+
+The third path is invariant under manual rotation while the drive is off,
+because both `absolute_axis_q` (from `U40.20/.22`) and `reference_q` (from
+`6064`) track the motion identically — so the stored anchor
+`home_anchor_rad = absolute_axis_q − reference_q` stays true mod-`2π`. A
+whole-shaft-turn offset is absorbed by the `mod RM`; sub-shaft-turn drift
+(encoder battery death, >32k turn overflow per vendor Q11, or catastrophic
+encoder fault) breaks the mod-`RM` agreement and fails closed.
+
+Operator implications:
+- An **initial HM35 is still required** to establish the anchor file entry
+  (`.gradient_absolute_encoder_anchors.json`). The trust path only reuses
+  that state; it does not manufacture trust out of nothing.
+- After a drive power cycle with the joint unmoved, truth becomes available
+  immediately without any operator action.
+- After a drive power cycle with the joint manually rotated (within the
+  encoder's 32,767-motor-turn budget), truth still becomes available; the
+  canonical joint position reflects the new mechanical pose.
+- If `U40.20/.22` ever reports `valid=0`, or the mod-`RM` gate fails, truth
+  reads `unavailable` and the operator must re-home. That is the
+  well-founded case where persistence has actually been lost.
+
+### Native-Home Precondition
+
+Vendor Q2: "Ensure the motor is stationary and inactive" before HM35.
+
+- [src/gradient_rt_motion/main.cpp](../../src/gradient_rt_motion/main.cpp)
+  splits `MSG_CMD_NATIVE_HOME` into two stages. Stage A clears
+  `axis_enable_mask`, sets `armed=false` if no axes remain enabled, clears
+  motion intent, and then polls `latest_feedback.statusword[axis]` for up to
+  `~500 ms` until the axis has left `OperationEnabled` for several
+  consecutive cycles. Stage B runs the existing HM35 transaction unchanged.
+  On timeout, `native_home_last_abort_code[axis]` is set to
+  `NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT` (`0xF1000001`).
+- [src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py](../../src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py)
+  `native_home_joint` calls `prepare_for_power_transition` with
+  `require_drive_disarmed=True` and the targeted axis mask. The host-side
+  wait uses `get_power_transition_snapshot().per_axis_drive_disarmed`
+  (derived from each axis's DS402 state) so HM35 is not even dispatched
+  until the drive confirms it has left `OperationEnabled`.
+- Operationally this replaces the old bundled "disarm then HM35 enable"
+  click sequence with a single disarm click followed by the service-mode
+  owned HM35 transaction. If the drive cannot leave OP-enabled in time
+  (e.g. brake stuck on or PDO loop unhealthy), the backend returns
+  `NATIVE_HOME_DISARM_PRECONDITION_TIMEOUT` instead of issuing HM35 into an
+  unsafe state.
 
 ## Findings That Look Stable So Far
 
@@ -277,7 +389,15 @@ Those formulas usually match within `0..3` counts rather than exactly zero on ev
 - How stale-anchor detection and refresh should work operationally.
 - Which verification semantics should govern native-home success versus pending versus failed.
 - How tolerant the roundtrip acceptance threshold should be while still failing closed for real semantic mismatches.
-- Whether the long-term host canonical truth should remain `U40.20/.22 + anchor` for all states, or whether the drive's corrected reference or rotation frame should become host truth after native home.
+
+Settled (2026-04-16 Workstream 3): the long-term host canonical truth stays
+rooted in `U40.20/.22 + persistent absolute-home anchor`. Pure `6064` truth
+is not sufficient for multi-turn-capable joints (J1/J4/J5/J6 limits exceed
+one shaft revolution) because `6064` wraps at `RM`. The vendor's "6064 is
+authoritative" claim is interpreted as "authoritative within shaft space":
+we therefore require shaft-frame agreement between the anchored canonical
+view and live `6064` modulo `RM`, failing closed with reason
+`multi_turn_anchor_inconsistent_with_live_6064` otherwise.
 
 ## Bottom Line
 
