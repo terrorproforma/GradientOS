@@ -31,6 +31,7 @@ def _a6ec_startup_drive_configs_for_ratio(
     raw_ratio: object,
     *,
     mode_value: int = 4,
+    reference_direction: int = 0,
 ) -> list[dict[str, int | str]]:
     ratio = Fraction(str(raw_ratio))
     numerator = int(ratio.numerator)
@@ -58,6 +59,14 @@ def _a6ec_startup_drive_configs_for_ratio(
             "commanded": denominator,
             "readback_valid": 1,
             "readback": denominator,
+            "verified": 1,
+        },
+        {
+            "setting_key": "a6ec_rotation_mode_reference_running_direction",
+            "configured": 1,
+            "commanded": reference_direction,
+            "readback_valid": 1,
+            "readback": reference_direction,
             "verified": 1,
         },
     ]
@@ -110,16 +119,16 @@ def test_render_rtcore_systemd_env_contains_scaling_and_profile():
         + ",".join(str(value) for value in expected_ratio_numerators)
         + ";a6ec_rotation_mode_gear_ratio_denominator|u16|0x2010|0x1A|"
         + ",".join(str(value) for value in expected_ratio_denominators)
+        + ";a6ec_rotation_mode_reference_running_direction|u16|0x2010|0x17|0,0,0,0,0,0"
     )
     expected_native_home = (
         "steady_state_mode|8;commissioning_mode|6;truth_source|0x607C|0x00|i32;"
-        "op|set_mode|6;op|write_sdo|0x60E6|0x00|u8|0;op|write_sdo|0x607C|0x00|i32|0;"
+        "op|set_mode|6;op|write_sdo|0x60E6|0x00|u8|0;"
+        "op|write_sdo_wrap_fraction|0x607C|0x00|i32|1|2;"
         "op|write_sdo|0x6098|0x00|i8|35;op|controlword_sequence|6,7,15;"
         "op|wait_statusword|0x0227|0x2048;op|controlword_sequence|31;"
         "op|wait_statusword|0x9000|0x2000;op|refresh_truth;op|restore_mode|8;"
-        "op|release_service_override;"
-        "op|write_sdo|0x2031|0x11|u16|1;op|wait_sdo|0x2031|0x11|u16|0;"
-        "op|write_sdo|0x2031|0x11|u16|2;op|wait_sdo|0x2031|0x11|u16|0"
+        "op|release_service_override"
     )
     expected_absolute_feedback = (
         "absolute_position_reference|0x2040|0x17|i32;"
@@ -153,6 +162,13 @@ def test_render_rtcore_systemd_env_contains_scaling_and_profile():
     assert f'GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG="{expected_absolute_feedback}"' in rendered
     assert f'GRADIENT_RT_NATIVE_HOME_CONFIG="{expected_native_home}"' in rendered
     assert 'GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK="0x3f"' in rendered
+    # A6-EC rotation mode (C00.07=4) requires continuous 0x607A per vendor
+    # Chapter 5 Figure 5-1. The rendered env must include an explicit
+    # command-wrap mask of 0x0 so RTCore's wrap of the CSP target is
+    # disabled (while the feedback-wrap 0x3f keeps 6064 comparisons and
+    # completion checks modulo-RM). This regression catches any accidental
+    # revert of the 2026-04-19 continuous-607A landing.
+    assert 'GRADIENT_RT_COMMAND_WRAP_AXIS_MASK="0x0"' in rendered
 
 
 def test_build_rtcore_drive_startup_config_uses_drive_profile_defaults_when_robot_has_no_override():
@@ -169,6 +185,7 @@ def test_build_rtcore_drive_startup_config_uses_drive_profile_defaults_when_robo
         "a6ec_encoder_position_tracking_mode": [4, 4, 4, 4, 4, 4],
         "a6ec_rotation_mode_gear_ratio_numerator": expected_ratio_numerators,
         "a6ec_rotation_mode_gear_ratio_denominator": expected_ratio_denominators,
+        "a6ec_rotation_mode_reference_running_direction": [0, 0, 0, 0, 0, 0],
     }
 
 
@@ -186,6 +203,7 @@ def test_build_rtcore_drive_startup_config_uses_drive_profile_module():
         "a6ec_encoder_position_tracking_mode": [4, 4, 4, 4, 4, 4],
         "a6ec_rotation_mode_gear_ratio_numerator": expected_ratio_numerators,
         "a6ec_rotation_mode_gear_ratio_denominator": expected_ratio_denominators,
+        "a6ec_rotation_mode_reference_running_direction": [0, 0, 0, 0, 0, 0],
     }
     assert startup["env"]["GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG"] == (
         "a6ec_encoder_position_tracking_mode|u16|0x2000|0x08|4,4,4,4,4,4;"
@@ -193,6 +211,7 @@ def test_build_rtcore_drive_startup_config_uses_drive_profile_module():
         + ",".join(str(value) for value in expected_ratio_numerators)
         + ";a6ec_rotation_mode_gear_ratio_denominator|u16|0x2010|0x1A|"
         + ",".join(str(value) for value in expected_ratio_denominators)
+        + ";a6ec_rotation_mode_reference_running_direction|u16|0x2010|0x17|0,0,0,0,0,0"
     )
 
 
@@ -301,11 +320,13 @@ def test_drive_fault_snapshot_decodes_axis_fault_and_master_state():
             "a6ec_encoder_position_tracking_mode",
             "a6ec_rotation_mode_gear_ratio_numerator",
             "a6ec_rotation_mode_gear_ratio_denominator",
+            "a6ec_rotation_mode_reference_running_direction",
         ],
         "present_setting_keys": ["a6ec_encoder_position_tracking_mode"],
         "missing_setting_keys": [
             "a6ec_rotation_mode_gear_ratio_numerator",
             "a6ec_rotation_mode_gear_ratio_denominator",
+            "a6ec_rotation_mode_reference_running_direction",
         ],
         "unconfigured_setting_keys": [],
         "unverified_setting_keys": [],

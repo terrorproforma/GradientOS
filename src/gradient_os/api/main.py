@@ -3457,7 +3457,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("GRADIENT_API_PORT", "4000")),
+        default=int(os.environ.get("GRADIENT_API_PORT", "4400")),
         help="Port for the HTTP API (env: GRADIENT_API_PORT)",
     )
     parser.add_argument(

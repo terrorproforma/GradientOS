@@ -36,11 +36,30 @@ Environment=GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG=
 Environment=GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG=
 Environment=GRADIENT_RT_NATIVE_HOME_CONFIG=
 Environment=GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK=0x0
+# 0xffffffff is the RTCore sentinel meaning "mirror
+# GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK" (pre-2026-04-19 behavior: the CSP
+# target 0x607A gets wrapped into [0, RM) on every wrapped axis). The
+# controller renders an explicit override (from the active drive
+# profile's MOTION_FEEDBACK_CONFIG["command_counts_wrap"]) into
+# /etc/default/gradient-rt-motion before launching the stack, so the
+# A6-EC rotation-mode install writes 0x0 here (continuous 0x607A per
+# Chapter 5 Figure 5-1). This default only applies if the env-file
+# override is absent.
+Environment=GRADIENT_RT_COMMAND_WRAP_AXIS_MASK=0xffffffff
 Environment=GRADIENT_RT_METRICS_STARTUP_READBACK_ENABLED=1
 Environment=GRADIENT_RT_METRICS_NATIVE_HOME_REFRESH_ENABLED=1
 Environment=GRADIENT_RT_METRICS_ABSOLUTE_FEEDBACK_POLL_ENABLED=1
+# Fast-trace writer: defaults to disabled. When GRADIENT_RT_FAST_TRACE_PATH is
+# a non-empty absolute path and GRADIENT_RT_FAST_TRACE_HZ > 0, RTCore spawns a
+# dedicated thread that snapshots per-axis 6064/607A/6041/603F + polled
+# U40.20/U40.22 at the requested Hz (capped at cycle rate). See
+# docs of plan/j6_seam_whip_verification_b8c230f3. Intended for
+# short-duration seam/whip captures. Override in /etc/default/gradient-rt-motion.
+Environment=GRADIENT_RT_FAST_TRACE_PATH=
+Environment=GRADIENT_RT_FAST_TRACE_HZ=0
+Environment=GRADIENT_RT_FAST_TRACE_AXIS_MASK=0
 EnvironmentFile=-/etc/default/gradient-rt-motion
-ExecStart=/usr/local/bin/gradient-rt-motion --num-axes ${GRADIENT_RT_NUM_AXES} --counts-per-rev ${GRADIENT_RT_COUNTS_PER_REV} --gear-ratio ${GRADIENT_RT_GEAR_RATIO} --sign ${GRADIENT_RT_SIGN} --drive-profile ${GRADIENT_RT_DRIVE_PROFILE} --max-rpm ${GRADIENT_RT_MAX_RPM} --slave-vendor-id ${GRADIENT_RT_DRIVE_VENDOR_ID} --slave-product-code ${GRADIENT_RT_DRIVE_PRODUCT_CODE} --slave-revision-no ${GRADIENT_RT_DRIVE_REVISION_NO} --rx-sync-index ${GRADIENT_RT_DRIVE_RX_SYNC_INDEX} --tx-sync-index ${GRADIENT_RT_DRIVE_TX_SYNC_INDEX} --dc-cycle-multiple-ns ${GRADIENT_RT_DRIVE_DC_CYCLE_MULTIPLE_NS} --rx-pdo ${GRADIENT_RT_DRIVE_RX_PDO} --tx-pdo ${GRADIENT_RT_DRIVE_TX_PDO} --rx-pdo-layout "${GRADIENT_RT_DRIVE_RX_PDO_LAYOUT}" --tx-pdo-layout "${GRADIENT_RT_DRIVE_TX_PDO_LAYOUT}" --startup-sdo-config "${GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG}" --absolute-feedback-config "${GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG}" --native-home-config "${GRADIENT_RT_NATIVE_HOME_CONFIG}" --feedback-wrap-axis-mask ${GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK}
+ExecStart=/usr/local/bin/gradient-rt-motion --num-axes ${GRADIENT_RT_NUM_AXES} --counts-per-rev ${GRADIENT_RT_COUNTS_PER_REV} --gear-ratio ${GRADIENT_RT_GEAR_RATIO} --sign ${GRADIENT_RT_SIGN} --drive-profile ${GRADIENT_RT_DRIVE_PROFILE} --max-rpm ${GRADIENT_RT_MAX_RPM} --slave-vendor-id ${GRADIENT_RT_DRIVE_VENDOR_ID} --slave-product-code ${GRADIENT_RT_DRIVE_PRODUCT_CODE} --slave-revision-no ${GRADIENT_RT_DRIVE_REVISION_NO} --rx-sync-index ${GRADIENT_RT_DRIVE_RX_SYNC_INDEX} --tx-sync-index ${GRADIENT_RT_DRIVE_TX_SYNC_INDEX} --dc-cycle-multiple-ns ${GRADIENT_RT_DRIVE_DC_CYCLE_MULTIPLE_NS} --rx-pdo ${GRADIENT_RT_DRIVE_RX_PDO} --tx-pdo ${GRADIENT_RT_DRIVE_TX_PDO} --rx-pdo-layout "${GRADIENT_RT_DRIVE_RX_PDO_LAYOUT}" --tx-pdo-layout "${GRADIENT_RT_DRIVE_TX_PDO_LAYOUT}" --startup-sdo-config "${GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG}" --absolute-feedback-config "${GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG}" --native-home-config "${GRADIENT_RT_NATIVE_HOME_CONFIG}" --feedback-wrap-axis-mask ${GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK} --command-wrap-axis-mask ${GRADIENT_RT_COMMAND_WRAP_AXIS_MASK} --fast-trace-path "${GRADIENT_RT_FAST_TRACE_PATH}" --fast-trace-hz ${GRADIENT_RT_FAST_TRACE_HZ} --fast-trace-axis-mask ${GRADIENT_RT_FAST_TRACE_AXIS_MASK}
 
 # RT scheduling + memory locking (actual thread policy is set in RTCore).
 LimitRTPRIO=95

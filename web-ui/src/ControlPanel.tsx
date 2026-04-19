@@ -43,6 +43,9 @@ type JointInfoResponse = {
 	gripper_deg?: number;
 	gripper_rad?: number;
 	read_source?: string;
+	raw_canonical_joint_truth_available?: boolean;
+	display_joint_truth_available?: boolean;
+	canonical_joint_truth_available?: boolean;
 };
 
 function normalizeJointAngles(values: JointInfoValue[] | null | undefined): number[] | null {
@@ -52,17 +55,95 @@ function normalizeJointAngles(values: JointInfoValue[] | null | undefined): numb
 	return null;
 }
 
+function mergeDisplayWithCanonicalFallback(
+	primary: number[] | null,
+	fallback: number[] | null,
+): number[] | null {
+	// Per-joint display/canonical merge, scoped deliberately narrow:
+	//   * Display snapshot fully missing -> return null. The commissioning
+	//     panel has always treated "no operator display at all" as a
+	//     distinct state; we do NOT substitute canonical wholesale because
+	//     that would leak cached/canonical values into the visualizer as
+	//     if they were live operator display.
+	//   * Display snapshot partially present (e.g. five joints finite and
+	//     one NaN after a full-shaft-turn excursion makes the per-joint
+	//     display-mode command-roundtrip gate fail) -> fill the NaN slots
+	//     from canonical. This preserves the operator's ability to SEE
+	//     the live angle of the affected joint (otherwise the panel flips
+	//     to "--" and the Drive Home button becomes unreachable while the
+	//     fallback poller flickers the state) without disturbing joints
+	//     whose display truth IS live.
+	// The caller is responsible for only passing a canonical `fallback`
+	// array when canonical truth is explicitly authoritative (see the
+	// call sites in preferredJointAnglesDeg / preferredTelemetryJointAnglesRad).
+	if (!primary) {
+		return null;
+	}
+	if (!fallback) {
+		return primary;
+	}
+	const length = Math.max(primary.length, fallback.length);
+	const merged: number[] = [];
+	for (let index = 0; index < length; index += 1) {
+		const primaryValue = primary[index];
+		const fallbackValue = fallback[index];
+		if (Number.isFinite(primaryValue)) {
+			merged.push(Number(primaryValue));
+		} else if (Number.isFinite(fallbackValue)) {
+			merged.push(Number(fallbackValue));
+		} else {
+			merged.push(Number.NaN);
+		}
+	}
+	return merged;
+}
+
 function preferredJointAnglesDeg(payload: JointInfoResponse | null | undefined): number[] | null {
-	return normalizeJointAngles(payload?.arm_display_deg);
+	const display = normalizeJointAngles(payload?.arm_display_deg);
+	// Only fall back to canonical `arm_deg` when the backend tells us raw
+	// canonical truth is live. If canonical itself is cached/unavailable
+	// (e.g. read_source="unavailable"), arm_deg can be a stale setpoint
+	// and we must NOT leak it into the commissioning panel.
+	const canonicalAuthoritative = Boolean(
+		payload?.raw_canonical_joint_truth_available
+			?? payload?.canonical_joint_truth_available
+			?? (payload?.read_source === "live_feedback"),
+	);
+	const canonical = canonicalAuthoritative ? normalizeJointAngles(payload?.arm_deg) : null;
+	return mergeDisplayWithCanonicalFallback(display, canonical);
 }
 
 function preferredTelemetryJointAnglesRad(
-	telemetry: { display_joints?: JointInfoValue[]; joints?: JointInfoValue[] } | null | undefined,
+	telemetry: {
+		display_joints?: JointInfoValue[];
+		joints?: JointInfoValue[];
+		raw_canonical_joint_truth_available?: boolean;
+		canonical_joint_truth_available?: boolean;
+	} | null | undefined,
 ): number[] | null {
-	if (Array.isArray(telemetry?.display_joints) && telemetry.display_joints.length > 0) {
-		return normalizeJointAngles(telemetry.display_joints);
-	}
-	return null;
+	const display = Array.isArray(telemetry?.display_joints) && telemetry.display_joints.length > 0
+		? normalizeJointAngles(telemetry.display_joints)
+		: null;
+	// Same rule as preferredJointAnglesDeg: only treat `joints` as a
+	// per-joint fallback when canonical truth is explicitly live. On the
+	// SSE monitor stream the field may be missing; if it is missing AND
+	// we have finite `joints` values AND `display_joints` has nothing,
+	// we still prefer to surface the canonical values (the operator
+	// needs to see something) so allow a missing flag to count as
+	// "available" when it is accompanied by a finite joints array.
+	const canonicalExplicitlyAvailable = Boolean(
+		telemetry?.raw_canonical_joint_truth_available
+			?? telemetry?.canonical_joint_truth_available,
+	);
+	const hasCanonicalArray = Array.isArray(telemetry?.joints) && telemetry.joints.length > 0;
+	const canonicalAuthoritative = canonicalExplicitlyAvailable
+		|| (telemetry?.raw_canonical_joint_truth_available === undefined
+			&& telemetry?.canonical_joint_truth_available === undefined
+			&& hasCanonicalArray);
+	const canonical = canonicalAuthoritative && hasCanonicalArray
+		? normalizeJointAngles(telemetry?.joints)
+		: null;
+	return mergeDisplayWithCanonicalFallback(display, canonical);
 }
 
 function hasAnyFiniteJointAngles(values: number[] | null | undefined): values is number[] {
@@ -1358,8 +1439,22 @@ export function ControlPanel({
 		setJointFeedbackError(null);
 	}, [isMonitorFresh, latestTelemetry]);
 
+	// Boolean summary of "does the monitor stream already carry a usable
+	// joint-angle snapshot?" — stable across SSE ticks that don't change the
+	// availability flag. Keeping the fallback-polling effect below keyed off
+	// this boolean (instead of the whole `latestTelemetry` object) stops it
+	// from tearing down and re-creating its interval ~5-10 times a second,
+	// which was flickering the commissioning panel between its "live angles"
+	// and "waiting for joint feedback..." states on every monitor event.
+	const hasFreshTelemetryJointAngles = useMemo(() => {
+		if (!isMonitorFresh) {
+			return false;
+		}
+		return hasAnyFiniteJointAngles(preferredTelemetryJointAnglesRad(latestTelemetry));
+	}, [isMonitorFresh, latestTelemetry]);
+
 	useEffect(() => {
-		if (isMonitorFresh && hasAnyFiniteJointAngles(preferredTelemetryJointAnglesRad(latestTelemetry))) {
+		if (hasFreshTelemetryJointAngles) {
 			return;
 		}
 		let disposed = false;
@@ -1389,7 +1484,7 @@ export function ControlPanel({
 			disposed = true;
 			window.clearInterval(timer);
 		};
-	}, [isMonitorFresh, latestTelemetry, refreshJointAngles]);
+	}, [hasFreshTelemetryJointAngles, refreshJointAngles]);
 
 	useEffect(() => {
 		if (controlledMotionStatus !== undefined || liveState) {

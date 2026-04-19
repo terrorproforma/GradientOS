@@ -768,6 +768,56 @@ def _build_drive_fault_snapshot(
         return None
     axis_to_joint_raw = getattr(backend_instance, "_axis_to_joint", None)
     axis_to_joint = axis_to_joint_raw if isinstance(axis_to_joint_raw, list) else []
+    # Adopt the backend's already-computed per-axis drive-native-truth
+    # decision. Without this, drive_faults.py re-derives truth from the
+    # RTCore metrics axis alone and cannot evaluate the
+    # persisted-home-anchor restart-trust path, which makes the /monitor
+    # stream disagree with /info/joints-detailed (UI ends up saying
+    # "coordinate_system_invalid" even when the anchor-based trust path
+    # upgraded the axis to "persisted_home_anchor_agreement").
+    axis_drive_native_truth_context: dict[int, dict[str, object]] | None = None
+    display_snapshotter = (
+        getattr(backend_instance, "get_display_feedback_snapshot", None)
+        if backend_instance is not None
+        else None
+    )
+    if callable(display_snapshotter):
+        try:
+            feedback_snapshot = display_snapshotter()
+        except Exception:
+            feedback_snapshot = None
+        if isinstance(feedback_snapshot, dict):
+            axis_details = feedback_snapshot.get("axis_absolute_feedback")
+            if isinstance(axis_details, list):
+                collected: dict[int, dict[str, object]] = {}
+                for entry in axis_details:
+                    if not isinstance(entry, dict):
+                        continue
+                    try:
+                        axis_index = int(entry.get("axis"))
+                    except Exception:
+                        continue
+                    collected[axis_index] = {
+                        "drive_native_truth_valid": bool(
+                            entry.get("drive_native_truth_valid", False)
+                        ),
+                        "drive_native_truth_reason": str(
+                            entry.get("drive_native_truth_reason", "unknown")
+                        ),
+                        "drive_native_truth_signature_valid": bool(
+                            entry.get("drive_native_truth_signature_valid", False)
+                        ),
+                        "coordinate_system_valid": bool(
+                            entry.get("coordinate_system_valid", False)
+                        ),
+                        "drive_native_truth_verification_source": str(
+                            entry.get(
+                                "drive_native_truth_verification_source", "unverified"
+                            )
+                        ),
+                    }
+                if collected:
+                    axis_drive_native_truth_context = collected
     snapshot = _build_normalized_drive_fault_snapshot(
         metrics=metrics,
         servo_backend=servo_backend,
@@ -777,6 +827,7 @@ def _build_drive_fault_snapshot(
         fieldbus_profile=fieldbus_profile,
         axis_to_joint=axis_to_joint,
         socket_present=os.path.exists(os.path.join(os.path.dirname(_rtcore_metrics_path()), "ipc.sock")),
+        axis_drive_native_truth_context=axis_drive_native_truth_context,
     )
     snapshot["metrics_path"] = _rtcore_metrics_path()
     return snapshot
@@ -1442,6 +1493,8 @@ Examples:
             1.0, _env_float("GRADIENT_UDP_RESET_LOG_THROTTLE_S", 5.0)
         )
 
+        _last_drive_faults_attach_error_ts: list[float] = [0.0]
+
         def _telemetry_loop():
             period = 1.0 / max(1, int(telemetry_hz))
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1573,8 +1626,31 @@ Examples:
                                 servo_backend=servo_backend,
                                 backend_instance=backend,
                             )
-                        except Exception:
-                            pass
+                        except Exception as drive_faults_exc:
+                            # 2026-04-17: this except used to be a silent
+                            # `pass`, which hid a live bug where the monitor
+                            # stream stopped carrying the aggregate
+                            # `drive_faults` block entirely. The UI's
+                            # commissioning panel depends on that block for
+                            # per-joint drive-native-truth status, so when
+                            # the attacher fails the panel can get stuck on
+                            # a stale `drive_faults` payload from earlier in
+                            # the session (e.g. J1/J3 showing
+                            # `persisted_home_anchor_inconsistent_with_live_6064`
+                            # long after the underlying state recovered).
+                            # Keep the raising telemetry path resilient but
+                            # surface the reason at a throttled cadence so
+                            # the next incident is diagnosable from the
+                            # controller log instead of the frontend.
+                            now_exc = time.monotonic()
+                            if now_exc - _last_drive_faults_attach_error_ts[0] >= 5.0:
+                                _last_drive_faults_attach_error_ts[0] = now_exc
+                                print(
+                                    "[Controller] Drive-faults attach failed"
+                                    f" ({type(drive_faults_exc).__name__}): {drive_faults_exc}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
                     try:
                         rtcore_servos = _build_rtcore_axis_telemetry_samples(backend)
                         if rtcore_servos:

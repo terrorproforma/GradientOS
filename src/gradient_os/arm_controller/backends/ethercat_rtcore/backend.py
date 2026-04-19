@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import array
 import json
+import math
 import mmap
 import os
 import select
@@ -122,6 +123,35 @@ _ABSOLUTE_HOME_ANCHOR_STALE_TOLERANCE_COUNTS = 8.0
 # a physically stationary joint, so keep this gate comfortably above the
 # observed jitter band while still catching real sub-shaft-turn drift.
 _SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS = 16.0
+# Per-trajectory safety cage (2026-04-17 J6 incident hardening).
+#
+# Background: the write path folds each queued point's canonical_q to the
+# nearest shaft turn of live 6064, so the wire-frame delta between
+# consecutive points should be small and the FIRST point should land
+# essentially on top of live 6064. Any violation of those invariants is
+# a turn-selection bug (host fold flip, drive-side rotation-direction
+# config, or stale live counts) that would otherwise show up as a full
+# shaft revolution of physical motion from a tiny operator command.
+#
+# Both bounds are expressed in joint-space radians so the threshold means
+# the same operator-facing motion envelope on every axis regardless of
+# gear ratio or counts-per-unit.
+#
+# FIRST-point deviation from live 6064: tight, because the upload must
+# start from where the drive actually is. 0.35 rad ~= 20 deg of joint
+# space is wider than any legitimate read-vs-live skew we have ever
+# observed while allowing a tiny "commanded hold offset" at commit time
+# if the controller nudged the setpoint forward between snapshot and
+# commit. A full shaft revolution is 6.28 rad, so this bound rejects the
+# pathological case by a factor of ~18.
+_TRAJECTORY_MAX_FIRST_POINT_DEVIATION_FROM_LIVE_RAD = 0.35
+# Per-point step between consecutive uploaded points, joint-space rad.
+# Long bounded moves are planned from many small steps (the bounded
+# path generator already caps step size via max_motor_rpm and 100 Hz
+# quantization), so each per-point delta sits well under this bound.
+# A mid-trajectory fold flip would produce a step of roughly a full
+# shaft revolution (6.28 rad), which this gate rejects by ~18x.
+_TRAJECTORY_MAX_PER_POINT_STEP_RAD = 0.35
 # Synthesized RTCore abort code for "HM35 precondition never saw a drive-
 # confirmed disarmed statusword". Must match
 # NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT in ipc_v1.hpp.
@@ -416,6 +446,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 self._auto_arm_mask = int(raw_mask, 0)
             except ValueError:
                 print(f"[EtherCAT RTCore] WARNING: invalid GRADIENT_RTCORE_AUTO_ARM_MASK='{raw_mask}'")
+        # Continuous 607A command emission is now driven by the active
+        # drive profile's `MOTION_FEEDBACK_CONFIG["command_counts_wrap"]`
+        # flag (False => continuous, True => wrapped) and plumbed into
+        # RTCore via `GRADIENT_RT_COMMAND_WRAP_AXIS_MASK`. The historical
+        # `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS` env var
+        # only affected the Python-side fold, not RTCore's wire output,
+        # so it was a no-op on actual motion and has been retired.
 
         self._sock: Optional[socket.socket] = None
 
@@ -1008,12 +1045,16 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if self._rt_num_axes <= 0:
             raise RuntimeError("RTCore did not report a valid num_axes")
         total = len(points)
-        # Pre-commit sanity gate: each point's 607A counts must not step more
-        # than half a shaft revolution against the previous point. This does
-        # not clamp motion (RTCore still enforces max_step per cycle); it just
-        # refuses to ship a trajectory whose upload-space delta proves the
-        # host frame-selection is wrong by a whole shaft turn.
+        # Pre-commit safety cage (2026-04-17 J6 incident). For every axis the
+        # queued 607A wire-frame target must (a) stay close to the drive's
+        # live 6064 at upload time, and (b) not step by more than a small
+        # per-point joint-space bound between consecutive points. See
+        # _enforce_trajectory_wire_frame_safety for the rationale and the
+        # explicit bound values.
         previous_axis_counts: list[int | None] = [None] * self._rt_num_axes
+        initial_live_counts: list[int | None] = [None] * self._rt_num_axes
+        for axis_i in range(self._rt_num_axes):
+            initial_live_counts[axis_i] = self._live_reference_counts_for_axis(axis_i)
         for idx, point in enumerate(points):
             t_from_start_ns = int(point.get("t_from_start_ns", 0))
             axis_mask = int(point.get("axis_mask", (1 << self._rt_num_axes) - 1))
@@ -1033,10 +1074,11 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 raise ValueError(
                     f"Expected {self._rt_num_axes} RT axis values, got {len(axis_q)}"
                 )
-            self._enforce_trajectory_step_within_half_rm(
+            self._enforce_trajectory_wire_frame_safety(
                 axis_q=axis_q,
                 axis_mask=int(axis_mask),
                 previous_axis_counts=previous_axis_counts,
+                initial_live_counts=initial_live_counts,
                 point_index=int(idx),
                 traj_id=int(traj_id),
             )
@@ -1515,12 +1557,17 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 else 0
             ),
         )
-        if bool(wait_result.get("verified", False)):
+        def _complete_verified_native_home(
+            verified_result: dict[str, object],
+            *,
+            verification_retry_after_timeout: bool = False,
+        ) -> dict[str, object]:
             anchor_required = self._absolute_home_anchor_required()
             post_home_detail: dict[str, object] = {
                 "absolute_home_anchor_required": bool(anchor_required),
                 "absolute_home_anchor_capture_succeeded": False,
                 "absolute_home_anchor_refresh_ok": False,
+                "post_home_verification_retry_after_timeout": bool(verification_retry_after_timeout),
             }
             try:
                 settle_timeout_s = self._env_float(
@@ -1597,7 +1644,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                             joint_i,
                             raw_positions=raw_positions,
                             actor=f"ethercat_rtcore:joint{joint_i + 1}:native_home",
-                            reference_mode="display",
+                            reference_mode="raw",
                         )
                         if captured_anchor is None:
                             raise RuntimeError(
@@ -1616,7 +1663,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     validation = self._absolute_home_anchor_validation_for_joint(
                         joint_i,
                         raw_positions=raw_positions,
-                        reference_mode="display",
+                        reference_mode="raw",
                     )
                     post_home_detail["absolute_home_anchor_refresh_ok"] = (
                         bool(validation.get("ok", False))
@@ -1804,14 +1851,38 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 ),
                 joint=joint_i + 1,
                 axis_mask=axis_mask,
-                terminal_state=str(wait_result.get("terminal_state", "succeeded")),
-                native_home_state=int(wait_result.get("native_home_state", 2)),
-                native_home_last_abort_code=int(wait_result.get("native_home_last_abort_code", 0)),
-                metrics_time_ns=int(wait_result.get("metrics_time_ns", 0)),
+                    terminal_state=str(verified_result.get("terminal_state", "succeeded")),
+                    native_home_state=int(verified_result.get("native_home_state", 2)),
+                    native_home_last_abort_code=int(
+                        verified_result.get("native_home_last_abort_code", 0)
+                    ),
+                    metrics_time_ns=int(verified_result.get("metrics_time_ns", 0)),
                 extra=post_home_detail,
             )
+        if bool(wait_result.get("verified", False)):
+            return _complete_verified_native_home(wait_result)
 
         if bool(wait_result.get("timed_out", False)):
+            late_snapshot = self._load_rtcore_metrics_snapshot()
+            if isinstance(late_snapshot, dict):
+                target_axes = [
+                    axis_i
+                    for axis_i, mapped_joint in enumerate(self._axis_to_joint)
+                    if mapped_joint == joint_i
+                ]
+                late_result = self._native_home_metrics_result(
+                    target_axes,
+                    snapshot=late_snapshot,
+                )
+                if bool(late_result.get("verified", False)):
+                    print(
+                        "[EtherCAT RTCore] Native drive-home verified after timeout via late metrics retry:"
+                        f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
+                    )
+                    return _complete_verified_native_home(
+                        late_result,
+                        verification_retry_after_timeout=True,
+                    )
             print(
                 "[EtherCAT RTCore] WARNING: native drive-home is still awaiting verified terminal state:"
                 f" joint={joint_i + 1} axis_mask=0x{axis_mask:x}"
@@ -2934,6 +3005,72 @@ class EthercatRTCoreBackend(ActuatorBackend):
         # Default mapping policy: axis0..axisN maps to joint0..jointN in order.
         return list(range(min(num_axes, num_joints)))
 
+    def _command_counts_wrap_for_joint(self, logical_joint_idx: int) -> bool:
+        """True when the active drive profile wraps 0x607A into the
+        single-turn window for this joint (default), False for profiles
+        that have opted into continuous 0x607A emission (A6-EC rotation
+        mode per vendor Chapter 5 Figure 5-1).
+
+        Reads the profile's `MOTION_FEEDBACK_CONFIG` via the drive-profile
+        registry so the decision stays drive-family-specific. Defaults to
+        True on unknown profiles to preserve the historical wrap
+        behavior.
+        """
+        payload = None
+        try:
+            payload = drive_profile_registry.get_drive_motion_feedback_config(
+                self._effective_drive_profile_id()
+            )
+        except Exception:
+            payload = None
+        if isinstance(payload, Mapping):
+            if "command_counts_wrap" in payload:
+                return bool(payload.get("command_counts_wrap"))
+            command_axes = payload.get("command_wrap_axes")
+            if isinstance(command_axes, list):
+                return int(logical_joint_idx) in {int(x) for x in command_axes if isinstance(x, int)}
+            if "feedback_counts_wrap" in payload:
+                return bool(payload.get("feedback_counts_wrap"))
+        return True
+
+    def _resolve_experimental_continuous_607a_joint_indices(self, num_joints: int) -> set[int]:
+        # Retired path kept for API compatibility with any test helper
+        # that still constructs the set directly. The returned value is
+        # always empty because the decision has moved to
+        # `_command_counts_wrap_for_joint`.
+        raw = os.environ.get("GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS", "").strip()
+        if not raw:
+            return set()
+        joints: set[int] = set()
+        invalid_tokens: list[str] = []
+        for token in [part.strip() for part in raw.split(",") if part.strip()]:
+            normalized = token.upper()
+            if normalized.startswith("J"):
+                normalized = normalized[1:]
+            try:
+                joint_1based = int(normalized)
+            except ValueError:
+                invalid_tokens.append(token)
+                continue
+            joint_i = joint_1based - 1
+            if 0 <= joint_i < num_joints:
+                joints.add(joint_i)
+            else:
+                invalid_tokens.append(token)
+        if invalid_tokens:
+            print(
+                "[EtherCAT RTCore] WARNING: invalid "
+                f"GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS='{raw}' "
+                f"(ignored tokens: {', '.join(invalid_tokens)})"
+            )
+        return joints
+
+    def _experimental_continuous_607a_enabled_for_joint(self, logical_joint_idx: int) -> bool:
+        # Retained as a thin alias of `_command_counts_wrap_for_joint` so
+        # existing callers keep their signatures. Returns True when the
+        # profile emits continuous (unwrapped) 0x607A for this joint.
+        return not self._command_counts_wrap_for_joint(logical_joint_idx)
+
     def _env_float(self, name: str, default: float) -> float:
         raw = os.environ.get(name, str(default)).strip()
         try:
@@ -3362,6 +3499,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
         payload = self._drive_position_semantics_config(profile_id)
         return bool(payload.get("accept_persisted_home_anchor_as_restart_trust", False))
 
+    def _command_frame_seam_crossing_unsafe(self, profile_id: Optional[str] = None) -> bool:
+        payload = self._drive_position_semantics_config(profile_id)
+        return bool(payload.get("command_frame_seam_crossing_unsafe", False))
+
     def _drive_native_startup_validity(
         self,
         axis_snapshot: Optional[dict[str, object]],
@@ -3740,6 +3881,27 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 return None
             return int(self._axis_counts[axis_i])
 
+    def _native_home_offset_counts_for_axis(self, axis_i: int) -> int:
+        self._refresh_native_home_offsets_from_metrics()
+        with self._status_lock:
+            if axis_i < 0 or axis_i >= len(self._native_home_offset_counts):
+                return 0
+            return int(self._native_home_offset_counts[axis_i])
+
+    def _logicalized_live_reference_counts_for_axis(
+        self,
+        axis_i: int,
+        *,
+        logical_joint_idx: int,
+        live_reference_counts: int | None,
+    ) -> int | None:
+        if live_reference_counts is None:
+            return None
+        resolved_counts = int(live_reference_counts)
+        if self._experimental_continuous_607a_enabled_for_joint(logical_joint_idx):
+            resolved_counts += int(self._native_home_offset_counts_for_axis(axis_i))
+        return int(resolved_counts)
+
     def _nearest_turn_fold_axis_q_for_axis(
         self,
         axis_i: int,
@@ -3747,13 +3909,36 @@ class EthercatRTCoreBackend(ActuatorBackend):
         *,
         observed_reference_counts: int | None = None,
         observed_reference_q: float | None = None,
+        wrap_to_single_turn: bool = False,
     ) -> tuple[float, int]:
         # Stateless per-write nearest-turn fold. Takes the desired axis-space
-        # target and the live 6064 reference, and returns the axis-space value
-        # whose 607A wire counts are the nearest-turn equivalent of the target
-        # against the live reading. No per-axis wrap-lift state is carried
-        # between calls, so consecutive seam-adjacent jogs cannot lose track of
-        # which shaft turn the axis is currently on.
+        # target and the live 6064 reference and returns an axis-space
+        # value in one of two output frames:
+        #
+        # * Default (`wrap_to_single_turn=False`): value is within RM/2 of
+        #   the live reference in LINEAR counts. This is the historical
+        #   "windowed" behavior used by the roundtrip diagnostic and the
+        #   canonical-from-axis reverse map. Linear comparisons against
+        #   the observed reference stay meaningful in this frame.
+        # * Command mode (`wrap_to_single_turn=True`): value is further
+        #   folded into the drive's [0, RM) single-turn presentation
+        #   range. The A6-EC command path must use this because the drive
+        #   misinterprets 607A values outside [0, RM) in rotation mode -
+        #   see the 2026-04-17 J6 incident note below.
+        #
+        # 2026-04-17 incident note: the A6-EC misinterprets 607A values
+        # outside [0, RM) in rotation mode. Even with C10.16=0 (Nearest),
+        # commanding 607A = RM + 3,623 (= one turn + 1 deg above 6064)
+        # while 6064 was at 1,310,694 (near the seam) caused J6 to rotate
+        # the LONG way by ~RM counts while the drive reported no fault.
+        # Wrapping the command-path output into [0, RM) gives the drive a
+        # canonical target it can parse without ambiguity; the shortest-
+        # path decision then rests on the drive's C10.16 setting, not on
+        # whatever undefined behavior the A6-EC uses for out-of-range
+        # commands. The non-command callers keep the linear-windowed
+        # value because they compare against reference_q directly and a
+        # seam-crossing wrap would produce false-positive "roundtrip
+        # inconsistent" diagnostics.
         cfg = self._axis_config
         period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
         if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes) or period_counts <= 0:
@@ -3763,19 +3948,55 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if counts_per_unit <= 0.0 or sign not in (-1, 1):
             return float(base_axis_q), 0
         base_counts = float(base_axis_q) * float(sign) * float(counts_per_unit)
+        # observed_counts must live in the SAME frame as base_counts
+        # (raw/axis-q) for the nearest-turn round to be meaningful.
+        # `observed_reference_counts` is the live 6064 value which lives
+        # in the drive's single-turn WIRE frame; the raw/axis-q frame
+        # differs by native_home_position_offset (= -607C after HM35).
+        # Without this correction the fold frame-mismatches by RM/2 when
+        # home sits at the midpoint of the wire sawtooth, and a small
+        # canonical move snaps the rounded turn up by 1, emitting a
+        # target one full revolution above the intended wire position.
+        # This was the 2026-04-19 Move A 350-deg long-way excursion: the
+        # drive saw 0x607A = RM + 618,951 instead of 618,951 and took
+        # the long way to the same single-turn position.
+        # `observed_reference_q` is already in axis-q space and needs no
+        # correction; the live-counts fallback below also comes from
+        # `_live_reference_counts_for_axis` which returns raw wire
+        # counts and therefore needs the same correction applied.
+        native_home_offset_counts = int(self._native_home_offset_counts_for_axis(axis_i))
         if observed_reference_counts is not None:
-            observed_counts = float(observed_reference_counts)
+            observed_counts = (
+                float(observed_reference_counts) + float(native_home_offset_counts)
+            )
         elif observed_reference_q is not None:
             observed_counts = float(observed_reference_q) * float(sign) * float(counts_per_unit)
         else:
             live_counts = self._live_reference_counts_for_axis(axis_i)
             if live_counts is None:
                 return float(base_axis_q), 0
-            observed_counts = float(live_counts)
+            observed_counts = float(live_counts) + float(native_home_offset_counts)
+        # Step 1: classical nearest-turn fold so adjusted_counts lands
+        # within RM/2 of the live reference (the diagnostic "wrap_lift"
+        # we still expose for downstream roundtrip telemetry).
         delta = float(observed_counts) - float(base_counts)
         wrap_turns = int(round(delta / float(period_counts)))
         wrap_lift_counts = int(wrap_turns * int(period_counts))
         adjusted_counts = float(base_counts) + float(wrap_lift_counts)
+        # Step 2 (command mode only): wrap into the drive's [0, RM)
+        # single-turn presentation range. Python's integer math on
+        # `float % positive` returns a value in [0, period), which is
+        # exactly what the A6-EC rotation mode expects for 607A.
+        if wrap_to_single_turn:
+            period_float = float(period_counts)
+            adjusted_counts = adjusted_counts - period_float * math.floor(
+                adjusted_counts / period_float
+            )
+            # Defensive clamp in case of IEEE-754 drift near the seam.
+            if adjusted_counts < 0.0:
+                adjusted_counts += period_float
+            if adjusted_counts >= period_float:
+                adjusted_counts -= period_float
         adjusted_axis_q = float(adjusted_counts) / (float(sign) * float(counts_per_unit))
         return float(adjusted_axis_q), int(wrap_lift_counts)
 
@@ -3791,17 +4012,27 @@ class EthercatRTCoreBackend(ActuatorBackend):
         live_reference_counts: int | None = None,
     ) -> float:
         base_axis_q = self._base_command_axis_q_for_joint_value(logical_joint_idx, canonical_q)
+        wrap_to_single_turn = not self._experimental_continuous_607a_enabled_for_joint(
+            logical_joint_idx
+        )
         adjusted_axis_q, lift_counts = self._nearest_turn_fold_axis_q_for_axis(
             axis_i,
             base_axis_q,
             observed_reference_counts=live_reference_counts,
+            wrap_to_single_turn=wrap_to_single_turn,
         )
         period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
         if period_counts > 0:
-            # After folding, the signed delta against the live reference must
-            # fit inside half a shaft revolution. This is a regression guard:
-            # with the nearest-turn fold in place it should always hold; we
-            # surface the counts/turn details if it ever does not.
+            # After folding, the signed SHORTEST-ANGULAR delta against the
+            # live reference must fit inside half a shaft revolution. The
+            # fold now wraps its output into [0, RM) so the drive can
+            # unambiguously parse 607A, which means the raw linear delta
+            # between adjusted_counts and live_counts can legitimately be
+            # up to RM (when they are on opposite sides of the seam). We
+            # compare the angular (mod-RM) residual instead so the gate
+            # fires only when the host really did pick the wrong shaft
+            # turn, not when adjusted happens to land on the far side of
+            # the wrap boundary.
             cfg = self._axis_config
             if cfg is not None and 0 <= axis_i < int(cfg.num_axes):
                 counts_per_unit = float(cfg.counts_per_unit[axis_i])
@@ -3818,12 +4049,21 @@ class EthercatRTCoreBackend(ActuatorBackend):
                             if live_counts is not None
                             else float(adjusted_counts) - float(lift_counts)
                         )
-                    fold_delta_counts = adjusted_counts - resolved_live_counts
-                    if abs(fold_delta_counts) > 0.5 * float(period_counts):
+                    linear_delta_counts = adjusted_counts - resolved_live_counts
+                    period_float = float(period_counts)
+                    half_period = 0.5 * period_float
+                    # Fold linear delta into (-RM/2, +RM/2] for a true
+                    # shortest-angular-distance measurement. This matches
+                    # how the drive computes motion under C10.16=0.
+                    angular_delta_counts = (
+                        (linear_delta_counts + half_period) % period_float
+                    ) - half_period
+                    if abs(angular_delta_counts) > half_period:
                         raise RuntimeError(
                             "command_frame_oversized_delta:"
                             f" axis={axis_i} joint={logical_joint_idx + 1}"
-                            f" delta_counts={fold_delta_counts:.1f}"
+                            f" angular_delta_counts={angular_delta_counts:.1f}"
+                            f" linear_delta_counts={linear_delta_counts:.1f}"
                             f" period_counts={int(period_counts)}"
                             f" live_counts={resolved_live_counts:.1f}"
                         )
@@ -3956,7 +4196,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
         # counts in the wire frame, and compare modulo RM.
         expected_reference_q = float(canonical_q) + self._master_offset_for_joint(logical_joint_idx)
         expected_counts = float(expected_reference_q) * float(sign) * float(counts_per_unit)
-        delta_counts = float(expected_counts) - float(live_reference_counts)
+        live_reference_logical_counts = float(live_reference_counts) + float(
+            self._native_home_offset_counts_for_axis(axis_i)
+        )
+        delta_counts = float(expected_counts) - float(live_reference_logical_counts)
         # Fold to nearest shaft turn so the mod-RM distance is the
         # sub-shaft-turn residual.
         period = float(period_counts)
@@ -3978,6 +4221,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
             "shaft_frame_wrap_turns": int(wrap_turns),
             "shaft_frame_expected_reference_counts": float(expected_counts),
             "shaft_frame_live_reference_counts": int(live_reference_counts),
+            "shaft_frame_live_reference_logical_counts": float(live_reference_logical_counts),
         }
 
     def _absolute_home_anchor_diagnostic_for_axis(
@@ -4731,49 +4975,159 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 )
         return axis_q
 
-    def _enforce_trajectory_step_within_half_rm(
+    def _enforce_trajectory_wire_frame_safety(
         self,
         *,
         axis_q: list[float],
         axis_mask: int,
         previous_axis_counts: list[int | None],
+        initial_live_counts: list[int | None],
         point_index: int,
         traj_id: int,
     ) -> None:
-        # Guardrail: reject trajectories whose delivered wire-space step
-        # between consecutive points would exceed half a shaft revolution on
-        # any axis. Such a step is the pathological case that historically
-        # produced Er87.1 / Er47.0 on seam-adjacent jogs. This is a frame
-        # sanity gate, not a motion clamp.
+        # Per-point wire-frame safety cage (2026-04-17 J6 incident hardening).
+        #
+        # For every axis actually included in the trajectory:
+        #   1. On point 0 specifically, the queued target must stay within
+        #      a tight joint-space bound of the drive's live 6064 at upload
+        #      time. The fold is supposed to land point 0 essentially on
+        #      top of live 6064 (since its canonical_q is drawn from live
+        #      feedback); any bigger deviation means the fold or the
+        #      drive's rotation-mode config picked the wrong shaft turn,
+        #      and executing that trajectory would teleport the joint by
+        #      roughly a full shaft revolution.
+        #   2. On every point, the step between this point and the previous
+        #      point must stay inside a tight joint-space bound. This
+        #      catches mid-trajectory fold flips (e.g. live 6064 drifted
+        #      between upload calls) before RTCore executes them.
+        #
+        # Both bounds are in joint-space radians so the threshold means the
+        # same operator-facing motion envelope on every axis regardless of
+        # gear ratio. Long bounded moves are safe because they are planned
+        # from many small per-point steps; only pathological wrap-turn
+        # mis-selections ever violate these bounds, and when they do we
+        # fail closed BEFORE the drive ever sees the upload.
         cfg = self._axis_config
         if cfg is None:
             return
+        seam_crossing_unsafe = self._command_frame_seam_crossing_unsafe()
         num_axes = min(int(cfg.num_axes), self._rt_num_axes, len(axis_q))
         for axis_i in range(num_axes):
             if axis_mask != 0 and (axis_mask & (1 << axis_i)) == 0:
                 continue
+            logical_joint_idx = (
+                self._axis_to_joint[axis_i] if 0 <= axis_i < len(self._axis_to_joint) else axis_i
+            )
+            seam_crossing_guard_enabled = (
+                seam_crossing_unsafe
+                and not self._experimental_continuous_607a_enabled_for_joint(logical_joint_idx)
+            )
             counts_per_unit = float(cfg.counts_per_unit[axis_i])
             sign = int(cfg.sign[axis_i])
             if counts_per_unit <= 0.0 or sign not in (-1, 1):
                 continue
-            period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
-            if period_counts <= 0:
-                previous_axis_counts[axis_i] = int(
-                    round(float(axis_q[axis_i]) * float(sign) * float(counts_per_unit))
-                )
-                continue
             current_counts = int(
                 round(float(axis_q[axis_i]) * float(sign) * float(counts_per_unit))
             )
+            period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
+            max_step_counts = int(
+                round(_TRAJECTORY_MAX_PER_POINT_STEP_RAD * float(counts_per_unit))
+            )
             prev = previous_axis_counts[axis_i]
-            if prev is not None:
-                step_counts = current_counts - int(prev)
-                if abs(step_counts) > (period_counts // 2):
+            if prev is not None and max_step_counts > 0:
+                # After the 2026-04-17 fold wrap-to-[0, RM) change, two
+                # legitimate consecutive points can sit on opposite sides
+                # of the wrap boundary (e.g. 1,310,700 -> 50 is physically
+                # a +70-count step, not a -1,310,650-count one). Compare
+                # on the SHORTEST ANGULAR distance so we only trip on real
+                # mid-trajectory wrap-turn mis-selections.
+                linear_step = current_counts - int(prev)
+                if period_counts > 0:
+                    period_float = float(period_counts)
+                    half_period = 0.5 * period_float
+                    step_counts = int(round(
+                        ((float(linear_step) + half_period) % period_float) - half_period
+                    ))
+                else:
+                    step_counts = linear_step
+                if abs(step_counts) > max_step_counts:
                     raise RuntimeError(
                         "command_frame_oversized_step:"
-                        f" axis={axis_i} point_index={point_index} traj_id={traj_id}"
-                        f" step_counts={step_counts} period_counts={int(period_counts)}"
+                        f" axis={axis_i} joint={axis_i + 1}"
+                        f" point_index={point_index} traj_id={traj_id}"
+                        f" step_counts={step_counts}"
+                        f" linear_step_counts={linear_step}"
+                        f" max_step_counts={max_step_counts}"
+                        f" max_step_rad={_TRAJECTORY_MAX_PER_POINT_STEP_RAD:.3f}"
                     )
+                if period_counts > 0 and seam_crossing_guard_enabled and abs(linear_step) > half_period:
+                    # Live A6-EC verification showed that seam-straddling
+                    # absolute 607A point sequences can still execute the long
+                    # way by ~RM counts even when the shortest-angular step is
+                    # tiny. Profiles that opt into this guard fail closed until
+                    # a seam-biased wire-frame policy is validated on hardware.
+                    raise RuntimeError(
+                        "command_frame_seam_crossing_step_disallowed:"
+                        f" axis={axis_i} joint={axis_i + 1}"
+                        f" point_index={point_index} traj_id={traj_id}"
+                        f" step_counts={step_counts}"
+                        f" linear_step_counts={linear_step}"
+                        f" period_counts={int(period_counts)}"
+                    )
+            # Only gate point 0 against live 6064; later points may legitimately
+            # travel far from live by the end of a long bounded move.
+            if prev is None:
+                live_counts = initial_live_counts[axis_i]
+                max_live_deviation_counts = int(
+                    round(
+                        _TRAJECTORY_MAX_FIRST_POINT_DEVIATION_FROM_LIVE_RAD
+                        * float(counts_per_unit)
+                    )
+                )
+                if live_counts is not None and max_live_deviation_counts > 0:
+                    comparison_live_counts = self._logicalized_live_reference_counts_for_axis(
+                        axis_i,
+                        logical_joint_idx=logical_joint_idx,
+                        live_reference_counts=live_counts,
+                    )
+                    if comparison_live_counts is None:
+                        comparison_live_counts = int(live_counts)
+                    # Same shortest-angular treatment as per-point step:
+                    # after wrap-to-[0, RM), point 0's `current_counts`
+                    # can be on the opposite side of the seam from
+                    # live_6064 even when the physical delta is tiny.
+                    linear_deviation = current_counts - int(comparison_live_counts)
+                    if period_counts > 0:
+                        period_float = float(period_counts)
+                        half_period = 0.5 * period_float
+                        deviation_counts = int(round(
+                            ((float(linear_deviation) + half_period) % period_float) - half_period
+                        ))
+                    else:
+                        deviation_counts = linear_deviation
+                    if abs(deviation_counts) > max_live_deviation_counts:
+                        raise RuntimeError(
+                            "command_frame_live_deviation_out_of_range:"
+                            f" axis={axis_i} joint={axis_i + 1}"
+                            f" point_index={point_index} traj_id={traj_id}"
+                            f" target_counts={current_counts}"
+                            f" live_counts={int(comparison_live_counts)}"
+                            f" deviation_counts={deviation_counts}"
+                            f" linear_deviation_counts={linear_deviation}"
+                            f" max_deviation_counts={max_live_deviation_counts}"
+                            f" max_deviation_rad={_TRAJECTORY_MAX_FIRST_POINT_DEVIATION_FROM_LIVE_RAD:.3f}"
+                        )
+                    if period_counts > 0 and seam_crossing_guard_enabled and abs(linear_deviation) > half_period:
+                        raise RuntimeError(
+                            "command_frame_seam_crossing_first_point_disallowed:"
+                            f" axis={axis_i} joint={axis_i + 1}"
+                            f" point_index={point_index} traj_id={traj_id}"
+                            f" target_counts={current_counts}"
+                            f" live_counts={int(comparison_live_counts)}"
+                            f" deviation_counts={deviation_counts}"
+                            f" linear_deviation_counts={linear_deviation}"
+                            f" period_counts={int(period_counts)}"
+                        )
             previous_axis_counts[axis_i] = current_counts
 
     def _axis_qd_from_joint_velocities(self, joint_velocities_rad_s: list[float]) -> list[float]:

@@ -11,7 +11,7 @@ rotation dataset captured on 2026-04-16 and asserts:
   jumps);
 - the stateless nearest-turn fold keeps per-write ``607A`` within half
   of ``RM`` of the live ``6064`` at every sample;
-- ``_enforce_trajectory_step_within_half_rm`` refuses a synthetic
+- ``_enforce_trajectory_wire_frame_safety`` refuses a synthetic
   ``+360 deg`` jog at the seam-crossing sample;
 - overriding the captured statusword to ``0x1650`` still yields
   ``verification_source = "persisted_home_anchor_agreement"`` on every
@@ -251,6 +251,14 @@ def _startup_drive_config_entries(axis_i: int) -> list[dict[str, object]]:
             "readback": denominator,
             "verified": 1,
         },
+        {
+            "setting_key": "a6ec_rotation_mode_reference_running_direction",
+            "configured": 1,
+            "commanded": 0,
+            "readback_valid": 1,
+            "readback": 0,
+            "verified": 1,
+        },
     ]
 
 
@@ -381,18 +389,21 @@ def test_a6ec_j6_watch_replay_preserves_continuous_canonical_truth(monkeypatch, 
 
 
 def test_a6ec_j6_watch_replay_small_jog_stays_within_half_rm(monkeypatch, tmp_path):
-    """A +0.5 deg synthetic jog at every captured sample stays within RM/2 on the wire.
+    """A +0.5 deg synthetic jog at every captured sample stays within RM/2 on the SHORTEST-ANGULAR wire delta.
 
-    Exercises the stateless nearest-turn fold directly against the
-    captured live 6064 values. The fold does not depend on the
-    shaft-frame consistency gate so motion-induced SDO skew does not
-    perturb the assertion.
+    Since the 2026-04-17 wrap-to-[0, RM) fold change, the command path
+    lands 607A in the drive's single-turn range. A seam-adjacent jog can
+    have a large linear wire delta while the physical motion is tiny.
+    The fold must keep the shortest-angular (mod-RM) delta inside half
+    a shaft revolution - a larger angular delta would indicate a
+    shaft-scale wrong-turn bug.
     """
     samples = _load_fixture()
     anchor_rad = _anchor_from_first_sample(samples[0])
     backend = _build_replay_backend(monkeypatch, tmp_path, anchor_rad=anchor_rad)
 
     jog_rad = math.radians(0.5)
+    half_period = _J6_RM // 2
     for sample in samples:
         expected = sample["expected"]
         assert isinstance(expected, dict)
@@ -406,28 +417,37 @@ def test_a6ec_j6_watch_replay_small_jog_stays_within_half_rm(monkeypatch, tmp_pa
             canonical_q=recovered_q + jog_rad,
         )
         wire_counts = int(round(target_axis_q * float(_J6_SIGN) * _J6_CPU))
-        delta = wire_counts - counts_6064
-        # The half-RM bound is the essential property: however far U40
-        # and 6064 disagree due to inter-read motion skew in the capture,
-        # the stateless nearest-turn fold must always land the output
-        # within one shaft revolution of live 6064. Any larger delta
-        # would indicate a shaft-scale wrong-turn bug in the fold.
-        assert abs(delta) <= _J6_RM // 2, (
-            f"source_index={sample.get('source_index')} delta={delta} "
-            f"RM/2={_J6_RM // 2}"
+        # Since the 2026-04-19 continuous-607A landing, wire_counts is
+        # continuous and can fall outside [0, RM). The SHORTEST-ANGULAR
+        # delta from live 6064 is the live invariant (host fold keeps
+        # every point within RM/2 of live in angular terms, even when
+        # the linear delta crosses the seam).
+        linear_delta = wire_counts - counts_6064
+        angular_delta = ((linear_delta + half_period) % _J6_RM) - half_period
+        assert abs(angular_delta) <= half_period, (
+            f"source_index={sample.get('source_index')} angular_delta={angular_delta} "
+            f"RM/2={half_period}"
         )
 
 
-def test_a6ec_j6_watch_replay_rejects_would_be_whole_turn_jump(monkeypatch, tmp_path):
-    """A +360 deg synthetic jog at any sample must trip command_frame_oversized_step."""
+def test_a6ec_j6_watch_replay_rejects_large_angular_jump(monkeypatch, tmp_path):
+    """A +100 deg synthetic jog at a seam sample must trip command_frame_oversized_step.
+
+    Since 2026-04-17 the command path wraps into [0, RM) and the cage
+    measures shortest-angular (mod-RM) distance. A literal "one shaft
+    revolution" linear jump collapses to angular 0 under the new cage
+    (both points map to the same single-turn position, the drive does
+    not move). The canonical pathological input now is a large angular
+    step like 100 deg that genuinely exceeds
+    _TRAJECTORY_MAX_PER_POINT_STEP_RAD.
+    """
     samples = _load_fixture()
     anchor_rad = _anchor_from_first_sample(samples[0])
     backend = _build_replay_backend(monkeypatch, tmp_path, anchor_rad=anchor_rad)
 
-    # Find a sample whose 6064 is near the seam (small raw counts near 0
-    # or near RM-1) so the "next" trajectory point would straddle the
-    # seam if mis-aligned. We use the backend-visible raw_counts here
-    # (consistent with the seed path) rather than the direct SDO read.
+    # Find a sample whose 6064 is near the seam so the "next" trajectory
+    # point straddles the seam if mis-aligned. The specific sample does
+    # not matter much for this assertion; we only need a valid base state.
     seam_sample = None
     for sample in samples:
         expected = sample["expected"]
@@ -438,41 +458,45 @@ def test_a6ec_j6_watch_replay_rejects_would_be_whole_turn_jump(monkeypatch, tmp_
             break
     assert seam_sample is not None, "fixture has no seam-adjacent sample"
 
-    # Seed just the J6 live counts so the fold has the right anchor for
-    # this sample; we bypass the snapshot path because the replay skew
-    # can fail the shaft-frame gate and mask the trajectory assertion.
     seam_expected = seam_sample["expected"]
     assert isinstance(seam_expected, dict)
     backend._axis_counts[_J6_AXIS_INDEX] = int(seam_expected["raw_counts"])
     recovered_q = _expected_canonical_q(seam_sample, anchor_rad)
 
-    # Construct two trajectory points whose target axis_q values differ
-    # by exactly one shaft revolution on the wire. This mimics a
-    # "host math wrongly added a shaft turn" bug at upload time.
     first_axis_q = backend._command_axis_q_for_joint_value(
         axis_i=_J6_AXIS_INDEX,
         logical_joint_idx=_J6_AXIS_INDEX,
         canonical_q=recovered_q,
     )
-    turn_axis_q = first_axis_q + float(_J6_RM) / (float(_J6_SIGN) * _J6_CPU)
+    # Second point at ~100 deg angular from first. Use axis_q directly
+    # (bypassing the fold) to simulate the "host math wrongly jumped
+    # angular by 100 deg" bug the cage should catch.
+    big_step_rad = math.radians(100.0)
+    big_step_axis_q = first_axis_q + big_step_rad / float(_J6_SIGN)
 
     previous_axis_counts: list[int | None] = [None] * backend._rt_num_axes
+    initial_live_counts: list[int | None] = [
+        backend._live_reference_counts_for_axis(i)
+        for i in range(backend._rt_num_axes)
+    ]
     first_vec = [0.0] * backend._rt_num_axes
     first_vec[_J6_AXIS_INDEX] = first_axis_q
-    backend._enforce_trajectory_step_within_half_rm(
+    backend._enforce_trajectory_wire_frame_safety(
         axis_q=first_vec,
         axis_mask=(1 << _J6_AXIS_INDEX),
         previous_axis_counts=previous_axis_counts,
+        initial_live_counts=initial_live_counts,
         point_index=0,
         traj_id=21,
     )
     second_vec = [0.0] * backend._rt_num_axes
-    second_vec[_J6_AXIS_INDEX] = turn_axis_q
+    second_vec[_J6_AXIS_INDEX] = big_step_axis_q
     with pytest.raises(RuntimeError, match="command_frame_oversized_step"):
-        backend._enforce_trajectory_step_within_half_rm(
+        backend._enforce_trajectory_wire_frame_safety(
             axis_q=second_vec,
             axis_mask=(1 << _J6_AXIS_INDEX),
             previous_axis_counts=previous_axis_counts,
+            initial_live_counts=initial_live_counts,
             point_index=1,
             traj_id=21,
         )

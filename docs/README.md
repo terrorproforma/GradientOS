@@ -154,7 +154,7 @@ running controller/API modules.
 Defaults:
 
 - Web UI: `http://localhost:8000`
-- API: `http://localhost:4000`
+- API: `http://localhost:4400` (override with `GRADIENT_API_PORT`; moved from the historic `4000` because Windows `iphlpsvc` dynamically grabs `4000` and breaks Cursor Remote-SSH port forwarding)
 
 ## Capture Runtime Diagnostics
 
@@ -178,7 +178,7 @@ This writes a JSON artifact under `logs/diagnostics/<timestamp>-runtime.json`.
 If the API is still reachable, you can also fetch the same class of snapshot over HTTP:
 
 ```bash
-curl http://127.0.0.1:4000/debug/runtime
+curl http://127.0.0.1:4400/debug/runtime
 ```
 
 The payload includes host memory/swap/load, Pi temperature + throttling flags when available,
@@ -356,7 +356,7 @@ Notes:
 
 - Start the proxy manually once the environment is prepared:
   ```bash
-  gradient-api --host 0.0.0.0 --port 4000
+  gradient-api --host 0.0.0.0 --port 4400
   ```
   With no `GRADIENT_API_CORS` set, the API allows requests from any origin. Override `GRADIENT_CONTROLLER_HOST`/`PORT` if the UDP controller runs elsewhere.
 - A React-based telemetry dashboard lives under `web-ui/`. During development:
@@ -365,14 +365,14 @@ Notes:
   npm install
   npm run dev -- --host 0.0.0.0 --port 8000
   ```
-  Visiting `http://<pi-ip>:8000` auto-fills the API endpoint to `http://<pi-ip>:4000`; click **Connect** to subscribe to the `/monitor` SSE stream. The `/monitor` packet is the primary shared live-state feed for the UI and carries joints, gripper, alerts, drive-fault snapshots, connectivity metadata, and the normalized motion summary. Treat dedicated REST endpoints such as `/info/joints`, `/control/motion-status`, and `/debug/performance` as fallback or opt-in paths rather than the default high-rate live feed.
+  Visiting `http://<pi-ip>:8000` auto-fills the API endpoint to `http://<pi-ip>:4400`; click **Connect** to subscribe to the `/monitor` SSE stream. The `/monitor` packet is the primary shared live-state feed for the UI and carries joints, gripper, alerts, drive-fault snapshots, connectivity metadata, and the normalized motion summary. Treat dedicated REST endpoints such as `/info/joints`, `/control/motion-status`, and `/debug/performance` as fallback or opt-in paths rather than the default high-rate live feed.
 - For unattended setups, install the API as a systemd service using the helper scripts in `web-ui/systemd/` (mirrors the arm-controller tooling):
   ```bash
   cd web-ui/systemd
   ./install.sh
   # ./status.sh / ./restart.sh / ./stop.sh / ./uninstall.sh as needed
   ```
-  The unit runs `gradient-api` from the repo virtualenv and binds to `0.0.0.0:4000` by default.
+  The unit runs `gradient-api` from the repo virtualenv and binds to `0.0.0.0:4400` by default.
 
 ### Web jog controls (Control Panel)
 

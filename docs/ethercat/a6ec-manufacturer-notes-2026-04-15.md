@@ -446,6 +446,10 @@ Normal Operation
 
 email 3::
 
+{our model b: Model B:
+- Even after correct ratio setup and successful HM35, the host should reconstruct authoritative multi-turn semantic position from `U40.20/U40.22` plus host-side offsets/anchors
+- `6064h` is not sufficient by itself for multi-turn planning or restart recovery}
+
 --Core Conclusion: Model B is the correct choice.
 
 Even if parameters C00.07 = 4 and C10.18/C10.19 are configured correctly, and the HM35 command is executed successfully, the host controller must still utilize the values ​​from U40.20/U40.22 to reconstruct the authoritative multi-turn semantic position.

@@ -363,6 +363,108 @@ describe("ControlPanel jog session lifecycle", () => {
 		});
 	});
 
+	it("fills per-joint display gaps from live canonical angles so a 360-deg-offset joint stays visible", async () => {
+		// Regression for the 2026-04-17 J6 incident: after a full-shaft
+		// excursion the display-mode command-roundtrip gate can reject a
+		// single joint (J6) even though raw/canonical truth stays live and
+		// shaft-frame-consistent. Before the fix the commissioning panel
+		// flickered between "5 angles + J6 '--'" and "all '--' + Waiting
+		// for joint feedback..." ~10 times a second because the fallback
+		// polling effect was keyed off the whole monitor telemetry object
+		// instead of a stable availability boolean. The panel must now show
+		// J6's canonical angle in place of the missing display slot so the
+		// operator can read the state and reach the Drive Home button.
+		const onJointFeedback = vi.fn();
+		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+			const url = typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+			const parsed = new URL(url, "http://localhost");
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
+				return mockJsonResponse({
+					arm_deg: [5.45, -4.91, 0.06, -0.01, -0.02, 360.01],
+					arm_display_deg: [5.45, -4.91, 0.06, -0.01, -0.02, null],
+					read_source: "live_feedback",
+					raw_canonical_joint_truth_available: true,
+					display_joint_truth_available: false,
+					canonical_joint_truth_available: true,
+				});
+			}
+			if (parsed.pathname === "/control/motion-status") {
+				return mockJsonResponse({
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						controller_thread_running: false,
+						rtcore_status_present: true,
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				});
+			}
+			return mockJsonResponse({});
+		}));
+
+		render(<ControlPanel apiHost="" onJointFeedback={onJointFeedback} />);
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		await waitFor(() => {
+			expect(screen.getAllByText("5.45°").length).toBeGreaterThan(0);
+			expect(screen.getAllByText("360.01°").length).toBeGreaterThan(0);
+		});
+		expect(screen.queryAllByText("--")).toHaveLength(0);
+	});
+
+	it("does not fall back to canonical when display truth is partial but canonical is not authoritative", async () => {
+		// Counter-regression for the above: if raw canonical truth is NOT
+		// live (e.g. read_source="unavailable" after a cold boot with no
+		// persisted anchor), missing display slots must stay as "--"
+		// rather than being papered over by cached `arm_deg` values. This
+		// preserves the existing "don't leak cached canonical into the
+		// operator display" contract.
+		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+			const url = typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+			const parsed = new URL(url, "http://localhost");
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
+				return mockJsonResponse({
+					arm_deg: [5.45, -4.91, 0.06, -0.01, -0.02, 360.01],
+					arm_display_deg: [5.45, -4.91, 0.06, -0.01, -0.02, null],
+					read_source: "unavailable",
+					raw_canonical_joint_truth_available: false,
+				});
+			}
+			if (parsed.pathname === "/control/motion-status") {
+				return mockJsonResponse({ status: "ok", state: "idle" });
+			}
+			return mockJsonResponse({});
+		}));
+
+		render(<ControlPanel apiHost="" />);
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		await waitFor(() => {
+			expect(screen.getAllByText("5.45°").length).toBeGreaterThan(0);
+			expect(screen.queryAllByText("360.01°")).toHaveLength(0);
+			expect(screen.getAllByText("--").length).toBeGreaterThan(0);
+		});
+	});
+
 	it("keeps drive-home enabled when canonical angles are unavailable but drive telemetry is live", async () => {
 		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 			const url = typeof input === "string"

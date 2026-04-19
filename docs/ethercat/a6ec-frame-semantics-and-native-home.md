@@ -158,6 +158,13 @@ or `Er87.1` (excessive per-cycle increment).
   delivered `607A` step exceeds `0.5 * RM` against the previous point
   (`command_frame_oversized_step`). This is a host-side sanity fence; the
   motion clamp itself still lives in RTCore `max_step_counts_per_cycle`.
+- Live 2026-04-17 J6 verification refined that contract: on the current
+  A6-EC firmware, absolute `607A` trajectories that STRADDLE the `0/RM` seam
+  are not safe even when their shortest-angular delta is tiny. A point sequence
+  like `RM-10 -> +140` can still execute the long way by ~one shaft turn. The
+  `a6ec_ds402` profile now fails closed on seam-straddling first points and
+  per-point steps until a seam-biased native-home / wire-frame policy is
+  validated on hardware.
 
 `U40.20/.22` remain the multi-turn truth source; they are NOT demoted to
 diagnostics because pure `6064` truth cannot carry multi-turn continuity for

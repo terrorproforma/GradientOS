@@ -34,10 +34,12 @@ from typing import Any
 
 
 COUNTS_PER_MOTOR_REV = 131072  # 17-bit encoder, per Chapter 5
-DEFAULT_API_URL = "http://127.0.0.1:4000"
+DEFAULT_API_URL = "http://127.0.0.1:4400"
 DEFAULT_CONTROLLER_HOST = "127.0.0.1"
 DEFAULT_CONTROLLER_PORT = 3000
 DEFAULT_MONITOR_TIMEOUT_S = 1.0
+WATCH_INTERVAL_FLOOR_S = 0.05
+FAST_PROOF_INTERVAL_FLOOR_S = 0.02
 CONTROLLER_REPLY_MAX_BYTES = 65535
 AXIS_NAME_TO_INDEX = {f"J{joint}": joint - 1 for joint in range(1, 7)}
 STANDARD_WANDER_COUNTS = 2.0
@@ -46,13 +48,17 @@ LARGE_WANDER_COUNTS = 10.0
 EXTREME_WANDER_COUNTS = 100.0
 RTCORE_METRICS_PATH = Path("/run/gradient-rt-motion/metrics.json")
 
-SDO_OBJECTS: list[tuple[str, str, str, str]] = [
+SdoDescriptor = tuple[str, str, str, str]
+
+SDO_OBJECTS: list[SdoDescriptor] = [
     ("C00.07", "0x2000", "0x08", "uint16"),
     ("C10.16", "0x2010", "0x17", "uint16"),
     ("C10.18", "0x2010", "0x19", "uint16"),
     ("C10.19", "0x2010", "0x1A", "uint16"),
     ("C10.1A", "0x2010", "0x1B", "uint32"),
     ("C10.1C", "0x2010", "0x1D", "uint32"),
+    ("203F", "0x203F", "0x00", "uint16"),
+    ("603F", "0x603F", "0x00", "uint16"),
     ("6041", "0x6041", "0x00", "uint16"),
     ("6060", "0x6060", "0x00", "int8"),
     ("6061", "0x6061", "0x00", "int8"),
@@ -63,6 +69,7 @@ SDO_OBJECTS: list[tuple[str, str, str, str]] = [
     ("607C", "0x607C", "0x00", "int32"),
     ("6091.01", "0x6091", "0x01", "uint32"),
     ("6091.02", "0x6091", "0x02", "uint32"),
+    ("60B0", "0x60B0", "0x00", "int32"),
     ("60E6", "0x60E6", "0x00", "uint8"),
     ("60FC", "0x60FC", "0x00", "int32"),
     ("U40.16", "0x2040", "0x17", "int32"),
@@ -76,6 +83,24 @@ SDO_OBJECTS: list[tuple[str, str, str, str]] = [
     ("U40.2A", "0x2040", "0x2B", "int32"),
     ("U40.2C", "0x2040", "0x2D", "int32"),
 ]
+
+FAST_PROOF_SDO_LABELS: frozenset[str] = frozenset(
+    {
+        "203F",
+        "603F",
+        "6041",
+        "6062",
+        "6064",
+        "607A",
+        "607C",
+        "60B0",
+        "U40.20",
+        "U40.22",
+    }
+)
+FAST_PROOF_SDO_OBJECTS: tuple[SdoDescriptor, ...] = tuple(
+    entry for entry in SDO_OBJECTS if entry[0] in FAST_PROOF_SDO_LABELS
+)
 
 
 def _repo_root() -> Path:
@@ -107,6 +132,17 @@ def _normalize_experiment_id(value: str | None) -> str:
     if value is None or not value.strip():
         return f"{_timestamp_token()}-a6ec-ch5-probe"
     return _normalize_label(value)
+
+
+def _resolve_watch_interval(requested_interval_s: float, *, fast_proof: bool) -> float:
+    floor_s = FAST_PROOF_INTERVAL_FLOOR_S if fast_proof else WATCH_INTERVAL_FLOOR_S
+    return max(floor_s, float(requested_interval_s))
+
+
+def _select_watch_sdo_objects(*, fast_proof: bool) -> tuple[SdoDescriptor, ...]:
+    if fast_proof:
+        return FAST_PROOF_SDO_OBJECTS
+    return tuple(SDO_OBJECTS)
 
 
 def _sign_extend_u16(value: int) -> int:
@@ -296,6 +332,15 @@ def _fetch_json(url: str) -> dict[str, Any] | None:
     return _extract_json_capture(capture)
 
 
+def _skipped_capture(kind: str, reason: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "skipped": True,
+        "kind": str(kind),
+        "reason": str(reason),
+    }
+
+
 def _resolve_controller_endpoint(
     *,
     controller_host: str | None = None,
@@ -384,25 +429,33 @@ def _capture_controller_views(
     *,
     controller_host: str | None = None,
     controller_port: int | None = None,
+    include_joint_state: bool = True,
+    include_motion_status: bool = True,
 ) -> dict[str, Any]:
     host, port = _resolve_controller_endpoint(
         controller_host=controller_host,
         controller_port=controller_port,
     )
-    joint_state = _send_controller_command_capture(
-        "GET_JOINT_STATE",
-        controller_host=host,
-        controller_port=port,
-    )
-    if bool(joint_state.get("ok")):
-        joint_state["json"] = _parse_joint_state_response(joint_state.get("raw"))
-    motion_status = _send_controller_command_capture(
-        "GET_MOTION_STATUS",
-        controller_host=host,
-        controller_port=port,
-    )
-    if bool(motion_status.get("ok")):
-        motion_status["json"] = _parse_motion_status_response(motion_status.get("raw"))
+    if include_joint_state:
+        joint_state = _send_controller_command_capture(
+            "GET_JOINT_STATE",
+            controller_host=host,
+            controller_port=port,
+        )
+        if bool(joint_state.get("ok")):
+            joint_state["json"] = _parse_joint_state_response(joint_state.get("raw"))
+    else:
+        joint_state = _skipped_capture("controller_joint_state", "skipped by --fast-proof")
+    if include_motion_status:
+        motion_status = _send_controller_command_capture(
+            "GET_MOTION_STATUS",
+            controller_host=host,
+            controller_port=port,
+        )
+        if bool(motion_status.get("ok")):
+            motion_status["json"] = _parse_motion_status_response(motion_status.get("raw"))
+    else:
+        motion_status = _skipped_capture("controller_motion_status", "skipped by caller")
     return {
         "endpoint": {
             "host": host,
@@ -444,15 +497,35 @@ def _capture_api_views(
     *,
     api_url: str,
     monitor_timeout_s: float = DEFAULT_MONITOR_TIMEOUT_S,
+    include_joints: bool = True,
+    include_joints_detailed: bool = True,
+    include_motion_status: bool = True,
+    include_monitor_event: bool = True,
 ) -> dict[str, Any]:
     base_url = api_url.rstrip("/")
     return {
-        "joints": _fetch_json_capture(f"{base_url}/info/joints"),
-        "joints_detailed": _fetch_json_capture(f"{base_url}/info/joints-detailed"),
-        "motion_status": _fetch_json_capture(f"{base_url}/control/motion-status"),
-        "monitor_event": _fetch_monitor_event_capture(
-            f"{base_url}/monitor",
-            timeout_s=monitor_timeout_s,
+        "joints": (
+            _fetch_json_capture(f"{base_url}/info/joints")
+            if include_joints
+            else _skipped_capture("api_joints", "skipped by --fast-proof")
+        ),
+        "joints_detailed": (
+            _fetch_json_capture(f"{base_url}/info/joints-detailed")
+            if include_joints_detailed
+            else _skipped_capture("api_joints_detailed", "skipped by --fast-proof")
+        ),
+        "motion_status": (
+            _fetch_json_capture(f"{base_url}/control/motion-status")
+            if include_motion_status
+            else _skipped_capture("api_motion_status", "skipped by --fast-proof")
+        ),
+        "monitor_event": (
+            _fetch_monitor_event_capture(
+                f"{base_url}/monitor",
+                timeout_s=monitor_timeout_s,
+            )
+            if include_monitor_event
+            else _skipped_capture("api_monitor_event", "skipped by --fast-proof")
         ),
     }
 
@@ -505,13 +578,19 @@ def _delta_summary(delta: float | int | None) -> dict[str, float | str | None]:
     }
 
 
-def _collect_axis_snapshot(axis_name: str, axis_index: int) -> dict[str, Any]:
+def _collect_axis_snapshot(
+    axis_name: str,
+    axis_index: int,
+    *,
+    sdo_objects: tuple[SdoDescriptor, ...] | None = None,
+) -> dict[str, Any]:
     row: dict[str, Any] = {
         "axis_name": axis_name,
         "axis_index": axis_index,
         "reads": {},
     }
-    for label, object_index, subindex, data_type in SDO_OBJECTS:
+    selected_sdo_objects = sdo_objects if sdo_objects is not None else tuple(SDO_OBJECTS)
+    for label, object_index, subindex, data_type in selected_sdo_objects:
         row["reads"][label] = _read_sdo(axis_index, object_index, subindex, data_type)
 
     reads = row["reads"]
@@ -665,6 +744,16 @@ def _render_markdown(snapshot: dict[str, Any]) -> str:
                 f"- Axis index: `{axis_snapshot.get('axis_index')}`",
                 f"- Vendor HM success bits valid: `{statusword_bits.get('vendor_hm_success_signature') if isinstance(statusword_bits, dict) else None}`",
                 f"- Statusword bits: `{axis_snapshot.get('statusword_bits')}`",
+                f"- Fault/status registers: `603F={_value(axis_snapshot.get('reads', {}), '603F')}`"
+                f" `203F={_value(axis_snapshot.get('reads', {}), '203F')}`"
+                f" `6041={_value(axis_snapshot.get('reads', {}), '6041')}`",
+                f"- Command/reference registers: `6062={_value(axis_snapshot.get('reads', {}), '6062')}`"
+                f" `6064={_value(axis_snapshot.get('reads', {}), '6064')}`"
+                f" `607A={_value(axis_snapshot.get('reads', {}), '607A')}`"
+                f" `607C={_value(axis_snapshot.get('reads', {}), '607C')}`"
+                f" `60B0={_value(axis_snapshot.get('reads', {}), '60B0')}`",
+                f"- Absolute/rotation registers: `U40.16={_value(axis_snapshot.get('reads', {}), 'U40.16')}`"
+                f" `U40.28={_value(axis_snapshot.get('reads', {}), 'U40.28')}`",
                 f"- `6091 = {derived.get('ratio_6091_motor_over_shaft')}`",
                 f"- `C10.18/C10.19 = {derived.get('ratio_c10_rotation_mode')}`",
                 f"- Raw formula match: `{derived.get('matches_u4020_22_formula_within_one_count')}`"
@@ -809,6 +898,7 @@ def _build_watch_axis_sample(
     api_payload: dict[str, Any] | None,
     *,
     controller_joint_state: dict[str, Any] | None = None,
+    controller_motion_status: dict[str, Any] | None = None,
     frontend_payload: dict[str, Any] | None = None,
     monitor_payload: dict[str, Any] | None = None,
     metrics_payload: dict[str, Any] | None = None,
@@ -816,6 +906,17 @@ def _build_watch_axis_sample(
     reads = axis_snapshot.get("reads", {})
     derived = axis_snapshot.get("derived", {})
     statusword = _value(reads, "6041")
+    vendor_fault = _value(reads, "203F")
+    bus_fault = _value(reads, "603F")
+    v6062 = _value(reads, "6062")
+    v6064 = _value(reads, "6064")
+    v607a = _value(reads, "607A")
+    v607c = _value(reads, "607C")
+    v60b0 = _value(reads, "60B0")
+    v_u4016 = _value(reads, "U40.16")
+    v_u4028 = _value(reads, "U40.28")
+    v6063 = _value(reads, "6063")
+    v60fc = _value(reads, "60FC")
     axis_index = int(axis_snapshot.get("axis_index", AXIS_NAME_TO_INDEX[axis_name]))
     statusword_bits = axis_snapshot.get("statusword_bits", {})
 
@@ -829,12 +930,27 @@ def _build_watch_axis_sample(
             if isinstance(statusword_bits, dict)
             else None
         ),
-        "6064": _value(reads, "6064"),
-        "607C": _value(reads, "607C"),
-        "U40.16": _value(reads, "U40.16"),
-        "U40.28": _value(reads, "U40.28"),
-        "6063": _value(reads, "6063"),
-        "60FC": _value(reads, "60FC"),
+        "203F": vendor_fault,
+        "203F_hex": (
+            f"0x{int(vendor_fault) & 0xFFFFFFFF:08X}"
+            if vendor_fault is not None
+            else None
+        ),
+        "603F": bus_fault,
+        "603F_hex": (
+            f"0x{int(bus_fault) & 0xFFFF:04X}"
+            if bus_fault is not None
+            else None
+        ),
+        "6062": v6062,
+        "6064": v6064,
+        "607A": v607a,
+        "607C": v607c,
+        "60B0": v60b0,
+        "U40.16": v_u4016,
+        "U40.28": v_u4028,
+        "6063": v6063,
+        "60FC": v60fc,
         "combined_u4020_22_signed_counts": derived.get("combined_u4020_22_signed_counts"),
         "combined_u402a_2c_signed_counts": derived.get("combined_u402a_2c_signed_counts"),
     }
@@ -878,6 +994,26 @@ def _build_watch_axis_sample(
             values = controller_joint_state.get(key)
             if isinstance(values, list) and 0 <= axis_index < len(values):
                 result[f"controller_{key}"] = values[axis_index]
+
+    if isinstance(controller_motion_status, dict):
+        result["controller_motion_status_state"] = controller_motion_status.get("state")
+        result["controller_motion_status_trajectory_id"] = controller_motion_status.get("trajectory_id")
+        execution = controller_motion_status.get("execution")
+        if isinstance(execution, dict):
+            for key in (
+                "controller_motion_state",
+                "active_mode_name",
+                "state_name",
+                "active_traj_id",
+                "queue_depth",
+                "current_point_index",
+                "last_event_code",
+                "active_command_seq",
+                "motion_done",
+                "stale_command",
+            ):
+                if key in execution:
+                    result[f"controller_motion_{key}"] = execution.get(key)
 
     if isinstance(frontend_payload, dict):
         result["frontend_read_source"] = frontend_payload.get("read_source")
@@ -929,29 +1065,43 @@ def _capture_watch_sample(
     controller_host: str | None = None,
     controller_port: int | None = None,
     monitor_timeout_s: float = DEFAULT_MONITOR_TIMEOUT_S,
+    fast_proof: bool = False,
 ) -> dict[str, Any]:
+    sdo_objects = _select_watch_sdo_objects(fast_proof=fast_proof)
     controller_views = _capture_controller_views(
         controller_host=controller_host,
         controller_port=controller_port,
+        include_joint_state=not fast_proof,
+        include_motion_status=True,
     )
     api_views = _capture_api_views(
         api_url=api_url,
         monitor_timeout_s=monitor_timeout_s,
+        include_joints=not fast_proof,
+        include_joints_detailed=not fast_proof,
+        include_motion_status=not fast_proof,
+        include_monitor_event=not fast_proof,
     )
     metrics_capture = _load_rtcore_metrics_capture()
     controller_joint_state = _extract_json_capture(controller_views.get("joint_state"))
+    controller_motion_status = _extract_json_capture(controller_views.get("motion_status"))
     api_payload = _extract_json_capture(api_views.get("joints_detailed"))
     frontend_payload = _extract_json_capture(api_views.get("joints"))
     monitor_payload = _extract_json_capture(api_views.get("monitor_event"))
     metrics_payload = _extract_json_capture(metrics_capture)
     axes: dict[str, Any] = {}
     for axis_name in axis_names:
-        axis_snapshot = _collect_axis_snapshot(axis_name, AXIS_NAME_TO_INDEX[axis_name])
+        axis_snapshot = _collect_axis_snapshot(
+            axis_name,
+            AXIS_NAME_TO_INDEX[axis_name],
+            sdo_objects=sdo_objects,
+        )
         axes[axis_name] = _build_watch_axis_sample(
             axis_name,
             axis_snapshot,
             api_payload,
             controller_joint_state=controller_joint_state,
+            controller_motion_status=controller_motion_status,
             frontend_payload=frontend_payload,
             monitor_payload=monitor_payload,
             metrics_payload=metrics_payload,
@@ -989,8 +1139,13 @@ def _format_watch_line(sample: dict[str, Any]) -> str:
                 " ".join(
                     [
                         str(axis_name),
+                        f"603F={axis.get('603F_hex')}",
+                        f"203F={axis.get('203F_hex')}",
+                        f"6062={axis.get('6062')}",
                         f"6064={axis.get('6064')}",
+                        f"607A={axis.get('607A')}",
                         f"607C={axis.get('607C')}",
+                        f"60B0={axis.get('60B0')}",
                         f"U40.16={axis.get('U40.16')}",
                         f"abs={axis.get('combined_u4020_22_signed_counts')}",
                         f"rot={axis.get('combined_u402a_2c_signed_counts')}",
@@ -999,6 +1154,10 @@ def _format_watch_line(sample: dict[str, Any]) -> str:
                         f"api_deg={axis.get('api_arm_deg')}",
                         f"api_display_deg={axis.get('api_arm_display_deg')}",
                         f"mon_disp_rad={axis.get('monitor_display_joints_rad')}",
+                        f"rt_state={axis.get('controller_motion_state_name')}",
+                        f"rt_traj={axis.get('controller_motion_active_traj_id')}",
+                        f"rt_evt={axis.get('controller_motion_last_event_code')}",
+                        f"rt_seq={axis.get('controller_motion_active_command_seq')}",
                         f"hm_ok={axis.get('vendor_hm_success_signature')}",
                     ]
                 )
@@ -1094,6 +1253,11 @@ def main(argv: list[str] | None = None) -> int:
         help="optional max capture duration in seconds; omit to run until Ctrl-C",
     )
     watch_parser.add_argument(
+        "--fast-proof",
+        action="store_true",
+        help="lower the watch floor to 20 ms and skip low-priority captures for Phase 1 proof runs",
+    )
+    watch_parser.add_argument(
         "--samples",
         type=int,
         default=None,
@@ -1160,7 +1324,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "watch":
         parser.error("unsupported command")
 
-    interval_s = max(0.05, float(args.interval_s))
+    interval_s = _resolve_watch_interval(float(args.interval_s), fast_proof=bool(args.fast_proof))
     duration_s = float(args.duration_s) if args.duration_s is not None else None
     max_samples = int(args.samples) if args.samples is not None else None
     jsonl_path = experiment_dir / f"{label}.watch.jsonl"
@@ -1169,13 +1333,16 @@ def main(argv: list[str] | None = None) -> int:
         "experiment_id": experiment_id,
         "label": label,
         "axes": axis_names,
+        "fast_proof": bool(args.fast_proof),
         "interval_s": interval_s,
+        "interval_floor_s": FAST_PROOF_INTERVAL_FLOOR_S if args.fast_proof else WATCH_INTERVAL_FLOOR_S,
         "duration_s": duration_s,
         "samples": max_samples,
         "api_url": str(args.api_url),
         "controller_host": str(args.controller_host),
         "controller_port": int(args.controller_port),
         "monitor_timeout_s": float(args.monitor_timeout_s),
+        "sdo_labels": [label for label, _index, _subindex, _type in _select_watch_sdo_objects(fast_proof=bool(args.fast_proof))],
         "jsonl_path": str(jsonl_path),
         "started_at": _utc_now().isoformat(timespec="seconds"),
     }
@@ -1194,6 +1361,7 @@ def main(argv: list[str] | None = None) -> int:
                     controller_host=str(args.controller_host),
                     controller_port=int(args.controller_port),
                     monitor_timeout_s=float(args.monitor_timeout_s),
+                    fast_proof=bool(args.fast_proof),
                 )
                 handle.write(json.dumps(sample) + "\n")
                 handle.flush()

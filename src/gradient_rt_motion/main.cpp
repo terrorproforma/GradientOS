@@ -80,6 +80,16 @@ int32_t clamp_round_to_i32(double value) {
   return static_cast<int32_t>(std::llround(clamped));
 }
 
+int32_t clamp_i64_to_i32(int64_t value) {
+  if (value < static_cast<int64_t>(std::numeric_limits<int32_t>::min())) {
+    return std::numeric_limits<int32_t>::min();
+  }
+  if (value > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+    return std::numeric_limits<int32_t>::max();
+  }
+  return static_cast<int32_t>(value);
+}
+
 // RTCore writes drive-facing CSP targets in the same raw PDO count frame that
 // the drive publishes through 0x6064 and expects on 0x607A. Controller-side
 // logical targets still include persisted native-home truth, so RTCore must
@@ -107,6 +117,32 @@ int64_t shortest_periodic_error_counts(int64_t error_counts, uint32_t period_cou
   int64_t wrapped = (error_counts + half_turn) % period;
   if (wrapped < 0) {
     wrapped += period;
+  }
+  return wrapped - half_turn;
+}
+
+double wrap_counts_into_period_double(double counts, double period_counts) {
+  if (!(period_counts > 0.0)) {
+    return counts;
+  }
+  double wrapped = std::fmod(counts, period_counts);
+  if (wrapped < 0.0) {
+    wrapped += period_counts;
+  }
+  return wrapped;
+}
+
+double shortest_periodic_error_counts_double(double error_counts, double period_counts) {
+  if (!(period_counts > 0.0)) {
+    return error_counts;
+  }
+  const double half_turn = 0.5 * period_counts;
+  if (!(half_turn > 0.0)) {
+    return error_counts;
+  }
+  double wrapped = std::fmod(error_counts + half_turn, period_counts);
+  if (wrapped < 0.0) {
+    wrapped += period_counts;
   }
   return wrapped - half_turn;
 }
@@ -164,6 +200,14 @@ struct AxisConfig {
   double gear_ratio = 1.0;
   int sign = +1; // +1 or -1 (mechanical orientation)
   bool feedback_counts_wrap = false; // compare feedback modulo the configured wrap period when true
+  // Wrap the emitted CSP target (0x607A) into the configured single-turn
+  // window [0, wrap_period) when true. When false, the host-supplied
+  // continuous target is passed through unchanged, which is what the
+  // A6-EC Chapter 5 Figure 5-1 specifies for Absolute Position Rotation
+  // Mode (target = continuous linear ramp, feedback = sawtooth). Only
+  // affects CSP command emission; feedback comparison and completion
+  // checks still use `feedback_counts_wrap` so they stay modulo-RM.
+  bool command_counts_wrap = false;
   uint8_t axis_type = gradient::ipc::v1::AXIS_TYPE_ROTARY; // q is radians by default
   double lead_m_per_rev = 0.0; // only used when axis_type==AXIS_TYPE_LINEAR
 
@@ -175,14 +219,15 @@ struct AxisConfig {
   uint32_t max_profile_vel_counts_per_s = 0;
 };
 
-uint32_t completion_wrap_period_counts(const AxisConfig& axis) {
+uint32_t wrapped_axis_period_counts(const AxisConfig& axis) {
   const uint32_t fallback_period_counts = axis.counts_per_rev;
   if (axis.axis_type != gradient::ipc::v1::AXIS_TYPE_ROTARY || !(axis.counts_per_unit > 0.0)) {
     return fallback_period_counts;
   }
 
-  // Wrapped rotary completion needs the geared/output-shaft period so seam-crossing
-  // moves settle against the same frame used to derive counts_per_unit.
+  // Wrapped rotary commands and completion checks both need the geared/output-shaft
+  // period so seam-crossing motion stays in the same frame used to derive
+  // counts_per_unit and the drive's 6064/607A presentation.
   constexpr double kCompletionWrapTwoPi = 6.28318530717958647692;
   const long long derived_period_counts =
       std::llround(axis.counts_per_unit * kCompletionWrapTwoPi);
@@ -191,6 +236,60 @@ uint32_t completion_wrap_period_counts(const AxisConfig& axis) {
     return static_cast<uint32_t>(derived_period_counts);
   }
   return fallback_period_counts;
+}
+
+int32_t wrap_counts_into_period(int64_t counts, uint32_t period_counts) {
+  if (period_counts == 0) {
+    return clamp_i64_to_i32(counts);
+  }
+  const int64_t period = static_cast<int64_t>(period_counts);
+  int64_t wrapped = counts % period;
+  if (wrapped < 0) {
+    wrapped += period;
+  }
+  return clamp_i64_to_i32(wrapped);
+}
+
+int32_t advance_csp_hold_target_counts(int32_t current_counts,
+                                       int32_t desired_counts,
+                                       int32_t max_step_counts,
+                                       uint32_t wrap_period_counts) {
+  if (wrap_period_counts == 0) {
+    if (max_step_counts <= 0) {
+      return desired_counts;
+    }
+    const int64_t cur = static_cast<int64_t>(current_counts);
+    const int64_t desired = static_cast<int64_t>(desired_counts);
+    const int64_t delta = desired - cur;
+    const int64_t max_step = static_cast<int64_t>(max_step_counts);
+    if (delta > max_step) {
+      return clamp_i64_to_i32(cur + max_step);
+    }
+    if (delta < -max_step) {
+      return clamp_i64_to_i32(cur - max_step);
+    }
+    return desired_counts;
+  }
+
+  const int32_t current_wrapped = wrap_counts_into_period(current_counts, wrap_period_counts);
+  const int32_t desired_wrapped = wrap_counts_into_period(desired_counts, wrap_period_counts);
+  if (max_step_counts <= 0) {
+    return desired_wrapped;
+  }
+  const int64_t delta =
+      shortest_periodic_error_counts(static_cast<int64_t>(desired_wrapped) -
+                                         static_cast<int64_t>(current_wrapped),
+                                     wrap_period_counts);
+  const int64_t max_step = static_cast<int64_t>(max_step_counts);
+  if (delta > max_step) {
+    return wrap_counts_into_period(static_cast<int64_t>(current_wrapped) + max_step,
+                                   wrap_period_counts);
+  }
+  if (delta < -max_step) {
+    return wrap_counts_into_period(static_cast<int64_t>(current_wrapped) - max_step,
+                                   wrap_period_counts);
+  }
+  return desired_wrapped;
 }
 
 struct PdoLayoutEntry {
@@ -265,12 +364,15 @@ enum class NativeHomeOpKind : uint8_t {
   kRestoreMode = 6,
   kWaitSdo = 7,
   kReleaseServiceOverride = 8,
+  kWriteSdoWrapFraction = 9,
 };
 
 struct NativeHomeOp {
   NativeHomeOpKind kind = NativeHomeOpKind::kNone;
   SdoObjectSpec object{};
   int32_t value_i32 = 0;
+  uint32_t fraction_numerator = 0;
+  uint32_t fraction_denominator = 0;
   std::array<uint16_t, 8> controlword_values{};
   uint32_t controlword_count = 0;
   uint16_t wait_all_set_mask = 0;
@@ -324,6 +426,13 @@ struct Options {
   std::array<AxisConfig, gradient::ipc::v1::GRADIENT_MAX_AXES> axis{};
   std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_position{};
   uint32_t feedback_wrap_axis_mask = 0;
+  // Per-axis bitmask controlling whether emitted CSP targets (0x607A) are
+  // wrapped into the single-turn window. The sentinel value UINT32_MAX
+  // means "mirror feedback_wrap_axis_mask"; any explicit value (including
+  // 0) overrides the mirror. Back-compat: a deployment that only sets
+  // --feedback-wrap-axis-mask retains the pre-2026-04-19 behavior where
+  // command emission also wrapped.
+  uint32_t command_wrap_axis_mask = std::numeric_limits<uint32_t>::max();
 
   // Safety: cap commanded motor speed (rpm). 0 disables clamping.
   double max_rpm = 100.0;
@@ -341,6 +450,22 @@ struct Options {
   uint32_t safeop_to_op_timeout_ms = 5000;
   uint32_t startup_passive_ms = 0;
   uint32_t startup_skip_domain_queue_ms = 0;
+
+  // Fast-trace writer: when enabled, a dedicated thread snapshots per-axis
+  // feedback + last commanded 0x607A at a configurable Hz and writes a
+  // compact JSONL file. Designed for post-mortem seam/whip analysis where
+  // HTTP/SDO sampling is too coarse. Default disabled. See:
+  //   docs of plan/j6_seam_whip_verification_b8c230f3
+  // All three fields must be set for the thread to start.
+  //   fast_trace_path: absolute path to the output JSONL. Typically under
+  //     /run/gradient-rt-motion/ (tmpfs) to avoid actual disk IO.
+  //   fast_trace_hz: target Hz. The thread sleeps with CLOCK_MONOTONIC /
+  //     TIMER_ABSTIME and drops frames if the RT kernel delays it.
+  //   fast_trace_axis_mask: bitmask of axis indexes to include per sample.
+  //     0 means "all num_axes axes". The file is compact per-axis.
+  std::string fast_trace_path;
+  uint32_t fast_trace_hz = 0;
+  uint32_t fast_trace_axis_mask = 0;
 };
 
 std::string format_pdo_profile_label(uint16_t rx_pdo, uint16_t tx_pdo) {
@@ -863,6 +988,29 @@ bool parse_native_home_config_spec(const std::string& spec, NativeHomeConfig* ou
       op.object.subindex = static_cast<uint8_t>(subindex & 0xFFu);
       op.object.type = type;
       op.value_i32 = static_cast<int32_t>(value);
+    } else if (op_name == "write_sdo_wrap_fraction") {
+      uint16_t index = 0;
+      uint16_t subindex = 0;
+      SdoScalarType type = SdoScalarType::kNone;
+      uint32_t numerator = 0;
+      uint32_t denominator = 0;
+      if (fields.size() != 7 ||
+          !parse_u16_auto(fields[2].c_str(), &index) ||
+          !parse_u16_auto(fields[3].c_str(), &subindex) ||
+          !parse_sdo_scalar_type_token(fields[4], &type) ||
+          !parse_u32_auto(fields[5].c_str(), &numerator) ||
+          !parse_u32_auto(fields[6].c_str(), &denominator) ||
+          denominator == 0 ||
+          numerator > denominator) {
+        return false;
+      }
+      op.kind = NativeHomeOpKind::kWriteSdoWrapFraction;
+      op.object.valid = true;
+      op.object.index = index;
+      op.object.subindex = static_cast<uint8_t>(subindex & 0xFFu);
+      op.object.type = type;
+      op.fraction_numerator = numerator;
+      op.fraction_denominator = denominator;
     } else if (op_name == "controlword_sequence") {
       std::vector<uint32_t> values{};
       if (fields.size() != 3 || !parse_u32_csv_allow_zero(fields[2], &values) || values.empty() ||
@@ -1282,7 +1430,7 @@ void print_usage(const char* argv0) {
       stderr,
       "Usage: %s [--socket-path PATH] [--cycle-ns NS] [--num-axes N] "
       "[--counts-per-rev N[,N..]] [--gear-ratio R[,R..]] [--sign S[,S..]] "
-      "[--feedback-wrap-axis-mask MASK] "
+      "[--feedback-wrap-axis-mask MASK] [--command-wrap-axis-mask MASK] "
       "[--axis-type T[,T..]] [--lead-m-per-rev M[,M..]] [--drive-profile ID] [--max-rpm RPM] "
       "[--startup-sdo-config SPEC] "
       "[--absolute-feedback-config SPEC] "
@@ -1295,7 +1443,8 @@ void print_usage(const char* argv0) {
       "[--split-domains-per-axis] [--queue-split-domains-round-robin] [--explicit-pdo-config] "
       "[--wait-before-safeop-ms MS] [--preop-safeop-timeout-ms MS] "
       "[--safeop-op-timeout-ms MS] [--startup-passive-ms MS] "
-      "[--startup-skip-domain-queue-ms MS] [--ipc-group NAME]\n\n"
+      "[--startup-skip-domain-queue-ms MS] [--ipc-group NAME] "
+      "[--fast-trace-path PATH] [--fast-trace-hz HZ] [--fast-trace-axis-mask MASK]\n\n"
       "Defaults:\n"
       "  --socket-path /run/gradient-rt-motion/ipc.sock\n"
       "  --cycle-ns     1000000\n"
@@ -1304,6 +1453,7 @@ void print_usage(const char* argv0) {
       "  --gear-ratio   1.0\n"
       "  --sign         +1\n"
       "  --feedback-wrap-axis-mask 0x0\n"
+      "  --command-wrap-axis-mask  (unset -> mirror feedback mask)\n"
       "  --axis-type    rotary\n"
       "  --drive-profile <profile-or-id>\n"
       "  --max-rpm      100\n"
@@ -1331,7 +1481,10 @@ void print_usage(const char* argv0) {
       "  --safeop-op-timeout-ms 5000\n"
       "  --startup-passive-ms 0\n"
       "  --startup-skip-domain-queue-ms 0\n"
-      "  --ipc-group    pi\n",
+      "  --ipc-group    pi\n"
+      "  --fast-trace-path    (empty -> disabled)\n"
+      "  --fast-trace-hz      0 (0 -> disabled)\n"
+      "  --fast-trace-axis-mask 0 (0 -> all num_axes axes)\n",
       argv0);
 }
 
@@ -1570,6 +1723,17 @@ int main(int argc, char** argv) {
       }
       continue;
     }
+    if (arg == "--command-wrap-axis-mask" && i + 1 < argc) {
+      // Explicit 0 means "do not wrap 0x607A on any axis" (continuous
+      // command emission). Omitting this flag leaves the mask at its
+      // sentinel default which mirrors --feedback-wrap-axis-mask for
+      // back-compat with older configs.
+      if (!parse_u32_auto(argv[++i], &opt.command_wrap_axis_mask)) {
+        logf("ERROR: invalid --command-wrap-axis-mask");
+        return 2;
+      }
+      continue;
+    }
     if (arg == "--axis-type" && i + 1 < argc) {
       axis_type_spec = argv[++i];
       continue;
@@ -1588,6 +1752,24 @@ int main(int argc, char** argv) {
     if (arg == "--max-rpm" && i + 1 < argc) {
       if (!parse_double(argv[++i], &opt.max_rpm) || opt.max_rpm < 0.0) {
         logf("ERROR: invalid --max-rpm (must be >= 0)");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--fast-trace-path" && i + 1 < argc) {
+      opt.fast_trace_path = argv[++i];
+      continue;
+    }
+    if (arg == "--fast-trace-hz" && i + 1 < argc) {
+      if (!parse_u32(argv[++i], &opt.fast_trace_hz)) {
+        logf("ERROR: invalid --fast-trace-hz");
+        return 2;
+      }
+      continue;
+    }
+    if (arg == "--fast-trace-axis-mask" && i + 1 < argc) {
+      if (!parse_u32_auto(argv[++i], &opt.fast_trace_axis_mask)) {
+        logf("ERROR: invalid --fast-trace-axis-mask");
         return 2;
       }
       continue;
@@ -1749,9 +1931,20 @@ int main(int argc, char** argv) {
                             lead_m_per_rev_spec)) {
     return 2;
   }
+  // Command-wrap sentinel: when the CLI did not explicitly set
+  // --command-wrap-axis-mask, mirror the feedback mask. This preserves
+  // pre-2026-04-19 behavior for older configs while letting profiles
+  // that have validated continuous 607A on live hardware opt into
+  // unwrapped command emission per-axis.
+  const uint32_t effective_command_wrap_axis_mask =
+      (opt.command_wrap_axis_mask == std::numeric_limits<uint32_t>::max())
+          ? opt.feedback_wrap_axis_mask
+          : opt.command_wrap_axis_mask;
   for (uint32_t axis_i = 0; axis_i < opt.num_axes; ++axis_i) {
     opt.axis[axis_i].feedback_counts_wrap =
         (opt.feedback_wrap_axis_mask & (1u << axis_i)) != 0u;
+    opt.axis[axis_i].command_counts_wrap =
+        (effective_command_wrap_axis_mask & (1u << axis_i)) != 0u;
   }
   if (!finalize_slave_positions(&opt, slave_positions_spec)) {
     return 2;
@@ -1981,6 +2174,10 @@ int main(int argc, char** argv) {
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> mode_display{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ds402_state{};
     std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> di_bits{};
+    // Last value written to 0x607A (target_pos) on the wire this cycle.
+    // Populated in the RT loop alongside the feedback fields so the fast-trace
+    // thread can observe the command stream at cycle rate without reading SDO.
+    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> target_pos_counts{};
     std::array<AbsoluteFeedbackAxis, gradient::ipc::v1::GRADIENT_MAX_AXES> absolute_feedback{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_al_state{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_online{};
@@ -2225,6 +2422,16 @@ int main(int argc, char** argv) {
            static_cast<unsigned int>(native_home_cfg.truth_source.subindex),
            static_cast<unsigned int>(abort_code));
       return false;
+    }
+    // 607C is the drive's persisted home/reference value in the wire frame:
+    // after HM35, 6064 at home becomes 607C. Host-side
+    // native_home_position_offset, however, is the additive correction that
+    // maps raw wire counts back into the logical zero-centered frame
+    // (logical = raw + offset). Therefore a positive 607C must be imported as
+    // a negative host offset.
+    if (native_home_cfg.truth_source.index == 0x607C &&
+        native_home_cfg.truth_source.subindex == 0x00) {
+      *truth_out = clamp_i64_to_i32(-static_cast<int64_t>(*truth_out));
     }
     return true;
 #else
@@ -3276,6 +3483,29 @@ int main(int argc, char** argv) {
             target_counts_interp = point.target_counts;
             target_velocity_counts_per_s = point.velocity_counts_per_s;
           };
+          // The trajectory interpolation step picks the shortest-periodic
+          // path between two queued waypoints and wraps the interpolated
+          // output into [0, period). That is the right behavior for
+          // wrapped-COMMAND axes (the host emits targets in [0, RM) and
+          // the drive wraps the same way). For continuous-COMMAND axes
+          // (A6-EC Absolute Position Rotation Mode per Chapter 5 Figure
+          // 5-1) the host already emits a continuous, monotonic target
+          // and the host's `_enforce_trajectory_step_within_half_rm`
+          // guarantees consecutive waypoints stay within RM/2. Plain
+          // linear interpolation between them produces the correct
+          // continuous wire stream; wrapping it would resurrect the
+          // 2026-04-19 Move-B+ "long-way around the seam" bug because
+          // the per-cycle wrapped output discontinuity (+131 -> RM-20)
+          // is interpreted by the drive as a forward leap of ~RM,
+          // overriding C10.16=0 nearest-path selection.
+          auto interpolation_wrap_period_for_axis = [&](uint32_t axis_i) -> uint32_t {
+            if (axis_i >= opt.num_axes || axis_i >= gradient::ipc::v1::GRADIENT_MAX_AXES) {
+              return 0;
+            }
+            return opt.axis[axis_i].command_counts_wrap
+                ? wrapped_axis_period_counts(opt.axis[axis_i])
+                : 0u;
+          };
           auto segment_velocity_for_axis = [&](const TrajectoryPointRuntime& p0,
                                                const TrajectoryPointRuntime& p1,
                                                uint32_t axis_i) -> double {
@@ -3296,6 +3526,20 @@ int main(int argc, char** argv) {
             }
             if (p1_has_velocity) {
               return p1.velocity_counts_per_s[axis_i];
+            }
+            // Mirror the per-cycle interpolation policy: continuous-
+            // command axes use the linear delta (host has already
+            // emitted a continuous, monotonic ramp), wrapped-command
+            // axes use the shortest-periodic delta (host emitted
+            // wrapped targets that may straddle the seam).
+            const uint32_t wrap_period_counts = interpolation_wrap_period_for_axis(axis_i);
+            if (wrap_period_counts > 0) {
+              const double period = static_cast<double>(wrap_period_counts);
+              const double p0_wrapped =
+                  wrap_counts_into_period_double(p0.target_counts[axis_i], period);
+              const double p1_wrapped =
+                  wrap_counts_into_period_double(p1.target_counts[axis_i], period);
+              return shortest_periodic_error_counts_double(p1_wrapped - p0_wrapped, period) / dt_s;
             }
             return (p1.target_counts[axis_i] - p0.target_counts[axis_i]) / dt_s;
           };
@@ -3326,6 +3570,13 @@ int main(int argc, char** argv) {
               const auto& p0 = active_traj_points[current_index];
               const auto& p1 = active_traj_points[current_index + 1];
               if (p1.t_from_start_ns <= p0.t_from_start_ns) {
+                logf("FAULT_EXEC_E1 diag_now_ns=%llu traj_id=%llu current_index=%u "
+                     "p0_t_from_start_ns=%llu p1_t_from_start_ns=%llu",
+                     static_cast<unsigned long long>(diag_now_ns),
+                     static_cast<unsigned long long>(active_traj_id_rt),
+                     static_cast<unsigned int>(current_index),
+                     static_cast<unsigned long long>(p0.t_from_start_ns),
+                     static_cast<unsigned long long>(p1.t_from_start_ns));
                 active_trajectory = false;
                 sp_mask = 0;
                 motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_FAULTED, std::memory_order_relaxed);
@@ -3360,8 +3611,21 @@ int main(int argc, char** argv) {
                     target_velocity_counts_per_s[i] = 0.0;
                     continue;
                   }
-                  target_counts_interp[i] =
-                      p0.target_counts[i] + ((p1.target_counts[i] - p0.target_counts[i]) * alpha);
+                  const uint32_t wrap_period_counts = interpolation_wrap_period_for_axis(i);
+                  if (wrap_period_counts > 0) {
+                    const double period = static_cast<double>(wrap_period_counts);
+                    const double p0_wrapped =
+                        wrap_counts_into_period_double(p0.target_counts[i], period);
+                    const double p1_wrapped =
+                        wrap_counts_into_period_double(p1.target_counts[i], period);
+                    const double delta =
+                        shortest_periodic_error_counts_double(p1_wrapped - p0_wrapped, period);
+                    target_counts_interp[i] =
+                        wrap_counts_into_period_double(p0_wrapped + (delta * alpha), period);
+                  } else {
+                    target_counts_interp[i] =
+                        p0.target_counts[i] + ((p1.target_counts[i] - p0.target_counts[i]) * alpha);
+                  }
                   const bool p0_has_velocity =
                       (p0.flags & gradient::ipc::v1::TRAJ_POINTF_HAS_VELOCITY) != 0u;
                   const bool p1_has_velocity =
@@ -3384,6 +3648,21 @@ int main(int argc, char** argv) {
               target_counts[i] = 0;
               target_velocity_counts_per_s[i] = 0.0;
               continue;
+            }
+            // Only wrap the emitted CSP target into the single-turn
+            // window when the axis profile requests it. Axes using
+            // continuous-command emission (e.g. A6-EC Absolute Position
+            // Rotation Mode per Chapter 5 Figure 5-1) let the
+            // continuous host-space interpolation pass through to 0x607A
+            // unchanged, so the drive can absorb seam crossings via its
+            // own internal modulus + C10.16 shortest-path handling.
+            const uint32_t command_wrap_period = i < opt.num_axes &&
+                    opt.axis[i].command_counts_wrap
+                ? wrapped_axis_period_counts(opt.axis[i])
+                : 0u;
+            if (command_wrap_period > 0) {
+              target_counts_interp[i] = wrap_counts_into_period_double(
+                  target_counts_interp[i], static_cast<double>(command_wrap_period));
             }
             target_counts[i] = clamp_round_to_i32(target_counts_interp[i]);
           }
@@ -3458,6 +3737,12 @@ int main(int argc, char** argv) {
                   have_jog_target[i] = true;
                 }
                 jog_target_counts_float[i] += active_jog_velocity_counts_per_s[i] * period_s;
+                const uint32_t wrap_period_counts =
+                    opt.axis[i].feedback_counts_wrap ? wrapped_axis_period_counts(opt.axis[i]) : 0;
+                if (wrap_period_counts > 0) {
+                  jog_target_counts_float[i] = wrap_counts_into_period_double(
+                      jog_target_counts_float[i], static_cast<double>(wrap_period_counts));
+                }
                 target_counts[i] = static_cast<int32_t>(std::llround(jog_target_counts_float[i]));
                 target_velocity_counts_per_s[i] = active_jog_velocity_counts_per_s[i];
               }
@@ -3569,19 +3854,22 @@ int main(int argc, char** argv) {
                   const int32_t desired = target_counts[i];
                   const int32_t max_step = opt.axis[i].max_step_counts_per_cycle;
                   const double desired_velocity = target_velocity_counts_per_s[i];
-                  if (max_step > 0) {
-                    const int32_t cur = hold_target_counts[i];
-                    const int64_t delta = static_cast<int64_t>(desired) - static_cast<int64_t>(cur);
-                    if (delta > max_step) {
-                      hold_target_counts[i] = cur + max_step;
-                    } else if (delta < -max_step) {
-                      hold_target_counts[i] = cur - max_step;
-                    } else {
-                      hold_target_counts[i] = desired;
-                    }
-                  } else {
-                    hold_target_counts[i] = desired;
-                  }
+                  // Select the modulo frame for stepping based on the
+                  // command-wrap policy:
+                  //   - command_counts_wrap=true: step in [0, RM) using
+                  //     shortest-periodic math so seam-adjacent targets
+                  //     do not become synthetic near-one-revolution ramps
+                  //     on the wire.
+                  //   - command_counts_wrap=false: step in linear
+                  //     continuous counts; 0x607A drifts with the
+                  //     trajectory and the drive absorbs wrap internally.
+                  //     The linear `max_step` clamp in
+                  //     advance_csp_hold_target_counts still bounds the
+                  //     per-cycle wire delta.
+                  const uint32_t wrap_period_counts =
+                      opt.axis[i].command_counts_wrap ? wrapped_axis_period_counts(opt.axis[i]) : 0;
+                  hold_target_counts[i] = advance_csp_hold_target_counts(
+                      hold_target_counts[i], desired, max_step, wrap_period_counts);
                   const double max_velocity_from_step = static_cast<double>(max_step) / period_s;
                   if (max_step > 0) {
                     if (desired_velocity > max_velocity_from_step) {
@@ -3664,6 +3952,9 @@ int main(int argc, char** argv) {
           latest_feedback.mode_display[i] = mode_disp;
           latest_feedback.ds402_state[i] = static_cast<uint8_t>(st);
           latest_feedback.di_bits[i] = di;
+          // Mirror the wire-frame 0x607A we just emitted so the fast-trace
+          // thread can observe the command stream at cycle rate.
+          latest_feedback.target_pos_counts[i] = target_pos_out;
         }
 
         latest_jog_debug.num_axes = opt.num_axes;
@@ -3700,6 +3991,9 @@ int main(int argc, char** argv) {
               (diag_now_ns >= active_traj_start_ns) ? (diag_now_ns - active_traj_start_ns) : 0;
           const bool final_due = elapsed_ns >= final_point.t_from_start_ns;
           bool any_faulted = false;
+          uint32_t first_faulted_axis = std::numeric_limits<uint32_t>::max();
+          uint16_t first_faulted_error_code = 0;
+          uint8_t first_faulted_ds402_state = 0;
           bool all_axes_at_target = final_due;
           for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
             if ((final_point.axis_mask & (1u << i)) == 0u) {
@@ -3710,19 +4004,26 @@ int main(int argc, char** argv) {
                 ds402 == gradient::ipc::v1::DS402_FAULT ||
                 ds402 == gradient::ipc::v1::DS402_FAULT_REACTION_ACTIVE) {
               any_faulted = true;
+              if (first_faulted_axis == std::numeric_limits<uint32_t>::max()) {
+                first_faulted_axis = i;
+                first_faulted_error_code = latest_feedback.error_code[i];
+                first_faulted_ds402_state = ds402;
+              }
             }
-            const int32_t final_target_counts = clamp_round_to_i32(final_point.target_counts[i]);
+            const uint32_t wrap_period_counts =
+                opt.axis[i].feedback_counts_wrap ? wrapped_axis_period_counts(opt.axis[i]) : 0;
+            int32_t final_target_counts = clamp_round_to_i32(final_point.target_counts[i]);
+            if (wrap_period_counts > 0) {
+              final_target_counts = wrap_counts_into_period(final_target_counts, wrap_period_counts);
+            }
             const int32_t final_feedback_counts =
                 csp_wire_counts_from_feedback(latest_feedback.pos_counts[i]);
             const int64_t error_counts =
                 static_cast<int64_t>(final_feedback_counts) -
                 static_cast<int64_t>(final_target_counts);
-            const uint32_t wrap_period_counts =
-                opt.axis[i].feedback_counts_wrap ? completion_wrap_period_counts(opt.axis[i]) : 0;
             const int64_t comparable_error_counts =
-                opt.axis[i].feedback_counts_wrap
-                    ? shortest_periodic_error_counts(error_counts, wrap_period_counts)
-                    : error_counts;
+                wrap_period_counts > 0 ? shortest_periodic_error_counts(error_counts, wrap_period_counts)
+                                       : error_counts;
             if (comparable_error_counts <
                     -static_cast<int64_t>(kTrajectoryCompletionToleranceCounts) ||
                 comparable_error_counts >
@@ -3731,6 +4032,14 @@ int main(int argc, char** argv) {
             }
           }
           if (any_faulted) {
+            logf("FAULT_EXEC_E2 diag_now_ns=%llu traj_id=%llu final_due=%u axis_index=%u "
+                 "error_code=0x%04X ds402_state=%u",
+                 static_cast<unsigned long long>(diag_now_ns),
+                 static_cast<unsigned long long>(active_traj_id_rt),
+                 final_due ? 1u : 0u,
+                 static_cast<unsigned int>(first_faulted_axis),
+                 static_cast<unsigned int>(first_faulted_error_code),
+                 static_cast<unsigned int>(first_faulted_ds402_state));
             active_trajectory = false;
             motion_exec_state.store(gradient::ipc::v1::EXEC_STATE_FAULTED, std::memory_order_relaxed);
             motion_last_event_code.store(
@@ -4048,6 +4357,173 @@ int main(int argc, char** argv) {
     }
 #endif
   });
+
+  // Optional fast-trace writer. Dedicated thread that snapshots the small set
+  // of per-axis feedback fields that the RT thread already refreshes every
+  // cycle (1 kHz) and writes a compact JSONL line at up to the configured Hz
+  // (capped at cycle rate). Designed for J6 seam/whip post-mortem where the
+  // coarse 5 Hz metrics.json cadence is inadequate. Disabled by default.
+  //
+  // Schema (one JSON object per line):
+  //   { "t_ns": <monotonic ns>, "seq": <latest_feedback seq>,
+  //     "ax": [ { "i": axis_idx,
+  //               "p": pos_counts (6064),
+  //               "tp": target_pos_counts (last 607A written),
+  //               "sw": statusword (6041),
+  //               "er": error_code (603F),
+  //               "mfr": manufacturer_error_code,
+  //               "af": [ { "k": key, "v": value, "ok": valid }, ... ] }, ... ] }
+  //
+  // The absolute_feedback (e.g. U40.20 / U40.22) stays at whatever rate
+  // RTCore's existing SDO poll refreshes (currently ~5 Hz) so consecutive
+  // fast-trace samples will typically show the same absolute_feedback value
+  // for ~200 ms at a time. Post-processors should treat "af" as a ground-truth
+  // anchor and reconstruct per-cycle multi-turn motion from the 1 kHz
+  // "p" (6064) stream using shortest-periodic deltas.
+  std::thread fast_trace_thread;
+  const bool fast_trace_enabled =
+      !opt.fast_trace_path.empty() && opt.fast_trace_hz > 0;
+  if (fast_trace_enabled) {
+    fast_trace_thread = std::thread([&]() {
+      pthread_setname_np(pthread_self(), "fasttrace");
+
+      // Axis selection: zero mask = all axes (compat with single-client).
+      const uint32_t axis_mask =
+          (opt.fast_trace_axis_mask == 0)
+              ? ((1u << opt.num_axes) - 1u)
+              : (opt.fast_trace_axis_mask & ((1u << opt.num_axes) - 1u));
+      if (axis_mask == 0) {
+        logf("fast_trace: axis_mask resolved to 0 after clamp; disabling");
+        return;
+      }
+
+      // Period clamped to cycle rate (writing faster than the RT loop
+      // updates feedback would just duplicate samples).
+      uint64_t period_ns = 1000000000ULL / opt.fast_trace_hz;
+      if (period_ns < opt.cycle_ns) {
+        period_ns = opt.cycle_ns;
+      }
+
+      FILE* fp = std::fopen(opt.fast_trace_path.c_str(), "w");
+      if (!fp) {
+        logf("ERROR: fast_trace: could not open %s: %s",
+             opt.fast_trace_path.c_str(), std::strerror(errno));
+        return;
+      }
+      // Line-buffered so `tail -f` sees data promptly.
+      std::setvbuf(fp, nullptr, _IOLBF, 0);
+      logf("fast_trace: writing to %s at %u Hz (period %llu ns) mask=0x%x",
+           opt.fast_trace_path.c_str(),
+           static_cast<unsigned int>(opt.fast_trace_hz),
+           static_cast<unsigned long long>(period_ns),
+           static_cast<unsigned int>(axis_mask));
+
+      struct timespec next{};
+      clock_gettime(CLOCK_MONOTONIC, &next);
+
+      auto add_ns = [](struct timespec& ts, uint64_t ns) {
+        ts.tv_nsec += static_cast<long>(ns % 1000000000ULL);
+        ts.tv_sec += static_cast<time_t>(ns / 1000000000ULL);
+        if (ts.tv_nsec >= 1000000000L) {
+          ts.tv_sec += ts.tv_nsec / 1000000000L;
+          ts.tv_nsec = ts.tv_nsec % 1000000000L;
+        }
+      };
+
+      uint64_t samples_written = 0;
+      uint64_t samples_skipped_inconsistent = 0;
+      uint64_t samples_skipped_no_fb = 0;
+
+      while (!g_stop.load(std::memory_order_relaxed)) {
+        add_ns(next, period_ns);
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+
+        // Consistent snapshot via seq double-read. If the RT thread races
+        // through a publish between our reads, skip this sample rather than
+        // publish torn state.
+        const uint64_t s1 =
+            latest_feedback.seq.load(std::memory_order_acquire);
+        if (s1 == 0) {
+          ++samples_skipped_no_fb;
+          continue;
+        }
+        std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> pos{};
+        std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> tgt{};
+        std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> sw{};
+        std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> er{};
+        std::array<uint32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> mfr{};
+        std::array<AbsoluteFeedbackAxis, gradient::ipc::v1::GRADIENT_MAX_AXES> af{};
+        pos = latest_feedback.pos_counts;
+        tgt = latest_feedback.target_pos_counts;
+        sw = latest_feedback.statusword;
+        er = latest_feedback.error_code;
+        mfr = latest_feedback.manufacturer_error_code;
+        af = latest_feedback.absolute_feedback;
+        const uint64_t s2 =
+            latest_feedback.seq.load(std::memory_order_acquire);
+        if (s1 != s2) {
+          ++samples_skipped_inconsistent;
+          continue;
+        }
+
+        const uint64_t t_ns = now_monotonic_ns();
+
+        std::fprintf(fp, "{\"t_ns\":%llu,\"seq\":%llu,\"ax\":[",
+                     static_cast<unsigned long long>(t_ns),
+                     static_cast<unsigned long long>(s1));
+        bool first_axis = true;
+        for (uint32_t i = 0; i < opt.num_axes; ++i) {
+          if ((axis_mask & (1u << i)) == 0) {
+            continue;
+          }
+          if (!first_axis) {
+            std::fputc(',', fp);
+          }
+          first_axis = false;
+          std::fprintf(fp,
+                       "{\"i\":%u,\"p\":%d,\"tp\":%d,\"sw\":%u,\"er\":%u,\"mfr\":%u",
+                       static_cast<unsigned int>(i),
+                       pos[i], tgt[i],
+                       static_cast<unsigned int>(sw[i]),
+                       static_cast<unsigned int>(er[i]),
+                       static_cast<unsigned int>(mfr[i]));
+          if (absolute_feedback_cfg.valid &&
+              absolute_feedback_cfg.field_count > 0) {
+            std::fprintf(fp, ",\"af\":[");
+            bool first_field = true;
+            for (uint32_t field_i = 0;
+                 field_i < absolute_feedback_cfg.field_count; ++field_i) {
+              const auto& field_cfg = absolute_feedback_cfg.fields[field_i];
+              if (!field_cfg.valid || field_cfg.key.empty()) {
+                continue;
+              }
+              if (!first_field) {
+                std::fputc(',', fp);
+              }
+              first_field = false;
+              const auto& field = af[i].fields[field_i];
+              std::fprintf(fp,
+                           "{\"k\":\"%s\",\"v\":%d,\"ok\":%u}",
+                           field_cfg.key.c_str(),
+                           field.value,
+                           static_cast<unsigned int>(field.valid));
+            }
+            std::fputc(']', fp);
+          }
+          std::fputc('}', fp);
+        }
+        std::fputs("]}\n", fp);
+        ++samples_written;
+      }
+
+      std::fflush(fp);
+      std::fclose(fp);
+      logf("fast_trace: closed; written=%llu skipped_inconsistent=%llu skipped_no_fb=%llu",
+           static_cast<unsigned long long>(samples_written),
+           static_cast<unsigned long long>(samples_skipped_inconsistent),
+           static_cast<unsigned long long>(samples_skipped_no_fb));
+    });
+  }
 
   // Periodic metrics file for dashboards/monitoring. This intentionally does NOT
   // require an IPC client (RTCore is single-client today).
@@ -4899,6 +5375,20 @@ int main(int argc, char** argv) {
       auto clear_motion_intent = [&](uint64_t active_cmd_seq,
                                      uint32_t last_event_code,
                                      uint32_t exec_state) {
+        const uint64_t clear_now_ns = now_monotonic_ns();
+        if (pending_upload.active) {
+          logf("FAULT_CLEAR_M1 clear_now_ns=%llu clear_cmd_seq=%llu last_event_code=%u "
+               "exec_state=%u pending_traj_id=%llu pending_axis_mask=0x%x "
+               "pending_point_count=%u expected_points=%u",
+               static_cast<unsigned long long>(clear_now_ns),
+               static_cast<unsigned long long>(active_cmd_seq),
+               static_cast<unsigned int>(last_event_code),
+               static_cast<unsigned int>(exec_state),
+               static_cast<unsigned long long>(pending_upload.traj_id),
+               static_cast<unsigned int>(pending_upload.axis_mask),
+               static_cast<unsigned int>(pending_upload.point_count),
+               static_cast<unsigned int>(pending_upload.expected_points));
+        }
         pending_upload = PendingTrajectoryUpload{};
         trajectory_abort_request.store(
             std::numeric_limits<uint64_t>::max(),
@@ -4928,7 +5418,7 @@ int main(int argc, char** argv) {
             0,
             1,
             active_cmd_seq,
-            now_monotonic_ns());
+            clear_now_ns);
       };
 
       auto read_stable_axis_feedback_counts = [&](uint32_t axis, int32_t* pos_counts_out) {
@@ -5027,6 +5517,51 @@ int main(int argc, char** argv) {
                      static_cast<unsigned int>(step.object.subindex),
                      static_cast<unsigned int>(abort_code),
                      step.value_i32);
+                succeeded = false;
+              }
+              break;
+            }
+            case NativeHomeOpKind::kWriteSdoWrapFraction: {
+              const uint32_t wrap_period_counts = wrapped_axis_period_counts(opt.axis[axis]);
+              uint32_t abort_code = 0;
+              if (!step.object.valid || wrap_period_counts == 0 || step.fraction_denominator == 0) {
+                latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+                latest_feedback.native_home_last_abort_code[axis] = 0;
+                logf("WARNING: native_home write_sdo_wrap_fraction invalid axis=%u slave_pos=%u index=0x%04x sub=0x%02x wrap_period=%u num=%u den=%u",
+                     axis,
+                     static_cast<unsigned int>(opt.slave_position[axis]),
+                     static_cast<unsigned int>(step.object.index),
+                     static_cast<unsigned int>(step.object.subindex),
+                     static_cast<unsigned int>(wrap_period_counts),
+                     static_cast<unsigned int>(step.fraction_numerator),
+                     static_cast<unsigned int>(step.fraction_denominator));
+                succeeded = false;
+                break;
+              }
+              const double fraction =
+                  static_cast<double>(step.fraction_numerator) /
+                  static_cast<double>(step.fraction_denominator);
+              const int64_t raw_value =
+                  static_cast<int64_t>(std::llround(static_cast<double>(wrap_period_counts) * fraction));
+              const int32_t wrapped_value = wrap_counts_into_period(raw_value, wrap_period_counts);
+              if (!write_sdo_scalar_axis(axis,
+                                         step.object.index,
+                                         step.object.subindex,
+                                         step.object.type,
+                                         wrapped_value,
+                                         &abort_code)) {
+                latest_feedback.native_home_last_abort_code[axis] = abort_code;
+                latest_feedback.native_home_state[axis] = gradient::ipc::v1::NATIVE_HOME_STATE_FAILED;
+                logf("WARNING: native_home write_sdo_wrap_fraction failed axis=%u slave_pos=%u index=0x%04x sub=0x%02x abort=0x%08x value=%d wrap_period=%u num=%u den=%u",
+                     axis,
+                     static_cast<unsigned int>(opt.slave_position[axis]),
+                     static_cast<unsigned int>(step.object.index),
+                     static_cast<unsigned int>(step.object.subindex),
+                     static_cast<unsigned int>(abort_code),
+                     wrapped_value,
+                     static_cast<unsigned int>(wrap_period_counts),
+                     static_cast<unsigned int>(step.fraction_numerator),
+                     static_cast<unsigned int>(step.fraction_denominator));
                 succeeded = false;
               }
               break;
@@ -5545,11 +6080,122 @@ int main(int argc, char** argv) {
                   if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::TrajectoryPointV1)) {
                     auto* cmd =
                         reinterpret_cast<const gradient::ipc::v1::TrajectoryPointV1*>(payload);
-                    if (!pending_upload.active ||
-                        cmd->traj_id != pending_upload.traj_id ||
-                        pending_upload.point_count >= kMaxTrajectoryPoints ||
-                        cmd->point_index != pending_upload.point_count) {
+                    if (!pending_upload.active) {
                       const uint64_t update_ns = now_monotonic_ns();
+                      logf("FAULT_UPLOAD_U1 update_ns=%llu cmd_seq=%llu cmd_traj_id=%llu "
+                           "pending_traj_id=%llu pending_active=%u pending_axis_mask=0x%x "
+                           "pending_point_count=%u expected_points=%u cmd_point_index=%u "
+                           "expected_point_index=%u cmd_t_from_start_ns=%llu axis_mask=0x%x",
+                           static_cast<unsigned long long>(update_ns),
+                           static_cast<unsigned long long>(mh->seq),
+                           static_cast<unsigned long long>(cmd->traj_id),
+                           static_cast<unsigned long long>(pending_upload.traj_id),
+                           pending_upload.active ? 1u : 0u,
+                           static_cast<unsigned int>(pending_upload.axis_mask),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned int>(pending_upload.expected_points),
+                           static_cast<unsigned int>(cmd->point_index),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned long long>(cmd->t_from_start_ns),
+                           static_cast<unsigned int>(cmd->axis_mask));
+                      publish_motion_status(
+                          gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                          gradient::ipc::v1::EXEC_STATE_FAULTED,
+                          cmd->traj_id,
+                          std::numeric_limits<uint32_t>::max(),
+                          pending_upload.point_count,
+                          gradient::ipc::v1::EVT_TRAJECTORY_FAULTED,
+                          0,
+                          1,
+                          mh->seq,
+                          update_ns);
+                      pending_upload = PendingTrajectoryUpload{};
+                      break;
+                    }
+                    if (cmd->traj_id != pending_upload.traj_id) {
+                      const uint64_t update_ns = now_monotonic_ns();
+                      logf("FAULT_UPLOAD_U2 update_ns=%llu cmd_seq=%llu cmd_traj_id=%llu "
+                           "pending_traj_id=%llu pending_active=%u pending_axis_mask=0x%x "
+                           "pending_point_count=%u expected_points=%u cmd_point_index=%u "
+                           "expected_point_index=%u cmd_t_from_start_ns=%llu axis_mask=0x%x",
+                           static_cast<unsigned long long>(update_ns),
+                           static_cast<unsigned long long>(mh->seq),
+                           static_cast<unsigned long long>(cmd->traj_id),
+                           static_cast<unsigned long long>(pending_upload.traj_id),
+                           pending_upload.active ? 1u : 0u,
+                           static_cast<unsigned int>(pending_upload.axis_mask),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned int>(pending_upload.expected_points),
+                           static_cast<unsigned int>(cmd->point_index),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned long long>(cmd->t_from_start_ns),
+                           static_cast<unsigned int>(cmd->axis_mask));
+                      publish_motion_status(
+                          gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                          gradient::ipc::v1::EXEC_STATE_FAULTED,
+                          cmd->traj_id,
+                          std::numeric_limits<uint32_t>::max(),
+                          pending_upload.point_count,
+                          gradient::ipc::v1::EVT_TRAJECTORY_FAULTED,
+                          0,
+                          1,
+                          mh->seq,
+                          update_ns);
+                      pending_upload = PendingTrajectoryUpload{};
+                      break;
+                    }
+                    if (pending_upload.point_count >= kMaxTrajectoryPoints) {
+                      const uint64_t update_ns = now_monotonic_ns();
+                      logf("FAULT_UPLOAD_U3 update_ns=%llu cmd_seq=%llu cmd_traj_id=%llu "
+                           "pending_traj_id=%llu pending_active=%u pending_axis_mask=0x%x "
+                           "pending_point_count=%u expected_points=%u max_points=%u "
+                           "cmd_point_index=%u expected_point_index=%u cmd_t_from_start_ns=%llu "
+                           "axis_mask=0x%x",
+                           static_cast<unsigned long long>(update_ns),
+                           static_cast<unsigned long long>(mh->seq),
+                           static_cast<unsigned long long>(cmd->traj_id),
+                           static_cast<unsigned long long>(pending_upload.traj_id),
+                           pending_upload.active ? 1u : 0u,
+                           static_cast<unsigned int>(pending_upload.axis_mask),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned int>(pending_upload.expected_points),
+                           static_cast<unsigned int>(kMaxTrajectoryPoints),
+                           static_cast<unsigned int>(cmd->point_index),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned long long>(cmd->t_from_start_ns),
+                           static_cast<unsigned int>(cmd->axis_mask));
+                      publish_motion_status(
+                          gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                          gradient::ipc::v1::EXEC_STATE_FAULTED,
+                          cmd->traj_id,
+                          std::numeric_limits<uint32_t>::max(),
+                          pending_upload.point_count,
+                          gradient::ipc::v1::EVT_TRAJECTORY_FAULTED,
+                          0,
+                          1,
+                          mh->seq,
+                          update_ns);
+                      pending_upload = PendingTrajectoryUpload{};
+                      break;
+                    }
+                    if (cmd->point_index != pending_upload.point_count) {
+                      const uint64_t update_ns = now_monotonic_ns();
+                      logf("FAULT_UPLOAD_U4 update_ns=%llu cmd_seq=%llu cmd_traj_id=%llu "
+                           "pending_traj_id=%llu pending_active=%u pending_axis_mask=0x%x "
+                           "pending_point_count=%u expected_points=%u cmd_point_index=%u "
+                           "expected_point_index=%u cmd_t_from_start_ns=%llu axis_mask=0x%x",
+                           static_cast<unsigned long long>(update_ns),
+                           static_cast<unsigned long long>(mh->seq),
+                           static_cast<unsigned long long>(cmd->traj_id),
+                           static_cast<unsigned long long>(pending_upload.traj_id),
+                           pending_upload.active ? 1u : 0u,
+                           static_cast<unsigned int>(pending_upload.axis_mask),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned int>(pending_upload.expected_points),
+                           static_cast<unsigned int>(cmd->point_index),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned long long>(cmd->t_from_start_ns),
+                           static_cast<unsigned int>(cmd->axis_mask));
                       publish_motion_status(
                           gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
                           gradient::ipc::v1::EXEC_STATE_FAULTED,
@@ -5569,6 +6215,25 @@ int main(int argc, char** argv) {
                       const auto& prev = pending_upload.points[pending_upload.point_count - 1];
                       if (cmd->t_from_start_ns < prev.t_from_start_ns) {
                         const uint64_t update_ns = now_monotonic_ns();
+                        logf("FAULT_UPLOAD_U5 update_ns=%llu cmd_seq=%llu cmd_traj_id=%llu "
+                             "pending_traj_id=%llu pending_active=%u pending_axis_mask=0x%x "
+                             "pending_point_count=%u expected_points=%u cmd_point_index=%u "
+                             "expected_point_index=%u cmd_t_from_start_ns=%llu "
+                             "prev_t_from_start_ns=%llu prev_point_index=%u axis_mask=0x%x",
+                             static_cast<unsigned long long>(update_ns),
+                             static_cast<unsigned long long>(mh->seq),
+                             static_cast<unsigned long long>(cmd->traj_id),
+                             static_cast<unsigned long long>(pending_upload.traj_id),
+                             pending_upload.active ? 1u : 0u,
+                             static_cast<unsigned int>(pending_upload.axis_mask),
+                             static_cast<unsigned int>(pending_upload.point_count),
+                             static_cast<unsigned int>(pending_upload.expected_points),
+                             static_cast<unsigned int>(cmd->point_index),
+                             static_cast<unsigned int>(pending_upload.point_count),
+                             static_cast<unsigned long long>(cmd->t_from_start_ns),
+                             static_cast<unsigned long long>(prev.t_from_start_ns),
+                             static_cast<unsigned int>(pending_upload.point_count - 1),
+                             static_cast<unsigned int>(cmd->axis_mask));
                         publish_motion_status(
                             gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
                             gradient::ipc::v1::EXEC_STATE_FAULTED,
@@ -5619,10 +6284,73 @@ int main(int argc, char** argv) {
                   if (mh->bytes >= sizeof(*mh) + sizeof(gradient::ipc::v1::CmdTrajectoryControlV1)) {
                     auto* cmd =
                         reinterpret_cast<const gradient::ipc::v1::CmdTrajectoryControlV1*>(payload);
-                    if (!pending_upload.active ||
-                        cmd->traj_id != pending_upload.traj_id ||
-                        pending_upload.point_count == 0) {
+                    if (!pending_upload.active) {
                       const uint64_t update_ns = now_monotonic_ns();
+                      logf("FAULT_COMMIT_C1 update_ns=%llu cmd_seq=%llu cmd_traj_id=%llu "
+                           "pending_traj_id=%llu pending_active=%u pending_axis_mask=0x%x "
+                           "pending_point_count=%u expected_points=%u",
+                           static_cast<unsigned long long>(update_ns),
+                           static_cast<unsigned long long>(mh->seq),
+                           static_cast<unsigned long long>(cmd->traj_id),
+                           static_cast<unsigned long long>(pending_upload.traj_id),
+                           pending_upload.active ? 1u : 0u,
+                           static_cast<unsigned int>(pending_upload.axis_mask),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned int>(pending_upload.expected_points));
+                      publish_motion_status(
+                          gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                          gradient::ipc::v1::EXEC_STATE_FAULTED,
+                          cmd->traj_id,
+                          std::numeric_limits<uint32_t>::max(),
+                          0,
+                          gradient::ipc::v1::EVT_TRAJECTORY_FAULTED,
+                          0,
+                          1,
+                          mh->seq,
+                          update_ns);
+                      pending_upload = PendingTrajectoryUpload{};
+                      break;
+                    }
+                    if (cmd->traj_id != pending_upload.traj_id) {
+                      const uint64_t update_ns = now_monotonic_ns();
+                      logf("FAULT_COMMIT_C2 update_ns=%llu cmd_seq=%llu cmd_traj_id=%llu "
+                           "pending_traj_id=%llu pending_active=%u pending_axis_mask=0x%x "
+                           "pending_point_count=%u expected_points=%u",
+                           static_cast<unsigned long long>(update_ns),
+                           static_cast<unsigned long long>(mh->seq),
+                           static_cast<unsigned long long>(cmd->traj_id),
+                           static_cast<unsigned long long>(pending_upload.traj_id),
+                           pending_upload.active ? 1u : 0u,
+                           static_cast<unsigned int>(pending_upload.axis_mask),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned int>(pending_upload.expected_points));
+                      publish_motion_status(
+                          gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
+                          gradient::ipc::v1::EXEC_STATE_FAULTED,
+                          cmd->traj_id,
+                          std::numeric_limits<uint32_t>::max(),
+                          0,
+                          gradient::ipc::v1::EVT_TRAJECTORY_FAULTED,
+                          0,
+                          1,
+                          mh->seq,
+                          update_ns);
+                      pending_upload = PendingTrajectoryUpload{};
+                      break;
+                    }
+                    if (pending_upload.point_count == 0) {
+                      const uint64_t update_ns = now_monotonic_ns();
+                      logf("FAULT_COMMIT_C3 update_ns=%llu cmd_seq=%llu cmd_traj_id=%llu "
+                           "pending_traj_id=%llu pending_active=%u pending_axis_mask=0x%x "
+                           "pending_point_count=%u expected_points=%u",
+                           static_cast<unsigned long long>(update_ns),
+                           static_cast<unsigned long long>(mh->seq),
+                           static_cast<unsigned long long>(cmd->traj_id),
+                           static_cast<unsigned long long>(pending_upload.traj_id),
+                           pending_upload.active ? 1u : 0u,
+                           static_cast<unsigned int>(pending_upload.axis_mask),
+                           static_cast<unsigned int>(pending_upload.point_count),
+                           static_cast<unsigned int>(pending_upload.expected_points));
                       publish_motion_status(
                           gradient::ipc::v1::MOTION_MODE_TRAJECTORY,
                           gradient::ipc::v1::EXEC_STATE_FAULTED,
@@ -5876,6 +6604,9 @@ int main(int argc, char** argv) {
   }
   if (metrics_thread.joinable()) {
     metrics_thread.join();
+  }
+  if (fast_trace_thread.joinable()) {
+    fast_trace_thread.join();
   }
 
   unlink(opt.socket_path.c_str());

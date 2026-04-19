@@ -73,6 +73,7 @@ def _a6ec_startup_drive_configs_for_ratio(
     raw_ratio: object,
     *,
     mode_value: int = 4,
+    reference_direction: int = 0,
 ) -> list[dict[str, int | str]]:
     ratio = Fraction(str(raw_ratio))
     numerator = int(ratio.numerator)
@@ -100,6 +101,14 @@ def _a6ec_startup_drive_configs_for_ratio(
             "commanded": denominator,
             "readback_valid": 1,
             "readback": denominator,
+            "verified": 1,
+        },
+        {
+            "setting_key": "a6ec_rotation_mode_reference_running_direction",
+            "configured": 1,
+            "commanded": reference_direction,
+            "readback_valid": 1,
+            "readback": reference_direction,
             "verified": 1,
         },
     ]
@@ -896,9 +905,12 @@ def test_ethercat_backend_translates_canonical_truth_back_into_raw_wire_counts(m
 
 
 def test_a6ec_small_jog_at_seam_stays_within_half_rm_wire_delta(monkeypatch, tmp_path):
-    # Near the RM-1 seam, a small positive canonical jog should land a 607A
-    # target in the nearest shaft turn of live 6064 rather than jumping by
-    # +/-RM. This is the stateless nearest-turn fold contract.
+    # Near the RM-1 seam, a small canonical jog must produce a 607A target
+    # whose SHORTEST-ANGULAR distance from live 6064 is the requested jog
+    # amount, even if that means the linear counts land on the opposite
+    # side of the [0, RM) seam (which is now the command path's output
+    # range, see the 2026-04-17 wrap-to-[0,RM) change in
+    # _nearest_turn_fold_axis_q_for_axis).
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     monkeypatch.setenv(
         "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
@@ -911,9 +923,12 @@ def test_a6ec_small_jog_at_seam_stays_within_half_rm_wire_delta(monkeypatch, tmp
     gear_ratio = 10.0
     counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
     rm = int(round(counts_per_unit * 2.0 * math.pi))
-    backend = _force_legacy_truth_fallback(
-        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
-    )
+    # Use the real drive-native-ratio fold path (not legacy fallback). The
+    # wrap-to-[0, RM) behavior under test only matters when `period_counts`
+    # is the joint-revolution period, which is what the A6-EC native ratio
+    # mode produces (counts_per_unit * 2*pi = 1,310,720 for J6-style 10:1
+    # gearing).
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
     backend._connected = True
     backend._rt_num_axes = 1
     backend._axis_to_joint = [0]
@@ -941,18 +956,191 @@ def test_a6ec_small_jog_at_seam_stays_within_half_rm_wire_delta(monkeypatch, tmp
         canonical_q=target_canonical,
     )
     target_counts = int(round(target_axis_q * -1.0 * counts_per_unit))
-    delta_counts = target_counts - live_counts
 
-    assert abs(delta_counts) <= rm // 2, (
-        f"607A delta must stay within half-RM, got {delta_counts} vs RM/2={rm // 2}"
+    # 1. Command output must live in the drive's [0, RM) single-turn
+    #    presentation range. Anything outside is ambiguous for the A6-EC
+    #    in rotation mode regardless of C10.16.
+    assert 0 <= target_counts < rm, (
+        f"607A target must land in [0, RM), got {target_counts} vs RM={rm}"
     )
-    # Physical intent: deliver ~counts_per_unit*0.5deg on the shaft (with
-    # axis sign applied at the wire frame).
-    expected_step = counts_per_unit * math.radians(0.5)
-    assert abs(abs(delta_counts) - expected_step) < 2.0, (
-        f"|607A delta| should match the 0.5 deg jog, got {delta_counts} "
-        f"(expected ~+/-{expected_step:.1f})"
+    # 2. Physical intent: deliver ~counts_per_unit*0.5deg on the shaft,
+    #    measured as the SHORTEST-ANGULAR distance from live 6064.
+    linear_delta = target_counts - live_counts
+    half_period = rm // 2
+    angular_delta = ((linear_delta + half_period) % rm) - half_period
+    expected_step = int(round(counts_per_unit * math.radians(0.5)))
+    assert abs(abs(angular_delta) - expected_step) < 2, (
+        f"|shortest-angular 607A delta| should match the 0.5 deg jog, got "
+        f"{angular_delta} (linear={linear_delta}, expected ~+/-{expected_step})"
     )
+    # 3. And the linear delta itself must NOT exceed RM/2 in magnitude
+    #    along the wrap boundary - otherwise a naive drive that doesn't
+    #    do shortest-path would pick the wrong direction. The wrap-to-
+    #    [0, RM) invariant + the small-jog requirement together bound
+    #    the linear delta to a single shaft revolution minus the jog.
+    assert abs(linear_delta) <= rm - 1, (
+        f"607A linear delta must stay within one shaft turn, got {linear_delta}"
+    )
+
+
+def test_a6ec_experimental_continuous_607a_keeps_nearest_turn_without_single_turn_wrap(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    monkeypatch.setenv("GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS", "1")
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    _write_rtcore_metrics_snapshot(metrics_path, [{"absolute_feedback": {}}])
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    live_counts = rm - 4
+    target_wrapped_counts = 5
+    target_canonical = float(target_wrapped_counts) / (-1.0 * counts_per_unit)
+    target_axis_q = backend._command_axis_q_for_joint_value(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=target_canonical,
+        live_reference_counts=live_counts,
+    )
+    target_counts = int(round(target_axis_q * -1.0 * counts_per_unit))
+
+    assert target_counts >= rm, "experimental path should preserve the continuous nearest-turn frame"
+    assert abs(target_counts - (rm + target_wrapped_counts)) <= 1
+    assert abs(target_counts - live_counts) <= 16
+
+
+def test_a6ec_experimental_continuous_607a_first_point_uses_logicalized_live_counts(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    monkeypatch.setenv("GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS", "1")
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    half_rm = rm // 2
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": -half_rm,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 35771},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    live_counts = half_rm - 4
+    target_wrapped_counts = -4
+    target_canonical = float(target_wrapped_counts) / (-1.0 * counts_per_unit)
+    target_axis_q = backend._command_axis_q_for_joint_value(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=target_canonical,
+        live_reference_counts=live_counts,
+    )
+
+    backend._enforce_trajectory_wire_frame_safety(
+        axis_q=[target_axis_q],
+        axis_mask=0x1,
+        previous_axis_counts=[None],
+        initial_live_counts=[live_counts],
+        point_index=0,
+        traj_id=19,
+    )
+
+
+def test_a6ec_experimental_continuous_607a_bypasses_seam_fail_closed_guard(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    monkeypatch.setenv("GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS", "1")
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    half_rm = rm // 2
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": -half_rm,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 35771},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    previous_axis_counts: list[int | None] = [None]
+    initial_live_counts: list[int | None] = [half_rm - 4]
+
+    first_target_counts = rm - 4
+    first_axis_q = float(first_target_counts) / (-1.0 * counts_per_unit)
+    backend._enforce_trajectory_wire_frame_safety(
+        axis_q=[first_axis_q],
+        axis_mask=0x1,
+        previous_axis_counts=previous_axis_counts,
+        initial_live_counts=initial_live_counts,
+        point_index=0,
+        traj_id=23,
+    )
+    assert previous_axis_counts == [first_target_counts]
 
 
 def test_a6ec_native_home_waits_for_drive_disarmed_before_hm35(monkeypatch, tmp_path):
@@ -1082,10 +1270,16 @@ def test_a6ec_truth_unavailable_when_anchor_and_6064_disagree_modulo_rm(
 
 
 def test_a6ec_command_frame_rejects_oversized_trajectory_step(monkeypatch, tmp_path):
-    # A trajectory whose consecutive points step by more than half a shaft
-    # revolution on the wire is a symptom of wrong-turn command-frame math.
-    # The host pre-commit gate must refuse the upload with
-    # command_frame_oversized_step.
+    # A trajectory whose consecutive points step by more than the per-point
+    # angular safety cage on the wire is a symptom of wrong-turn command-
+    # frame math. The host pre-commit gate must refuse the upload with
+    # command_frame_oversized_step. Since 2026-04-17 the cage measures
+    # SHORTEST-ANGULAR distance (mod RM) instead of linear count distance
+    # because the command path now wraps into [0, RM) and seam-adjacent
+    # points can legitimately sit on opposite sides of the wrap while
+    # being physically adjacent. The pathological case to catch is an
+    # angular step near half-RM that can't be anything other than a
+    # fold bug.
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
     backend._connected = True
@@ -1102,26 +1296,175 @@ def test_a6ec_command_frame_rejects_oversized_trajectory_step(monkeypatch, tmp_p
     )
     backend._rt_drive_profile_id = "a6ec_ds402"
 
+    # First point sits at live 6064 = 0 exactly; second point is offset by
+    # ~100 deg in the angular-step frame (far above _TRAJECTORY_MAX_PER_POINT_STEP_RAD
+    # of 0.35 rad ~= 20 deg), which can only come from a host fold bug that
+    # lost track of which shaft turn the axis is on mid-trajectory.
     first_axis_q = 0.0
-    second_counts = rm * 0.6  # intentionally > RM/2
+    second_counts = int(round(counts_per_unit * math.radians(100.0)))
     second_axis_q = float(second_counts) / counts_per_unit
 
     previous_axis_counts: list[int | None] = [None]
-    backend._enforce_trajectory_step_within_half_rm(
+    initial_live_counts: list[int | None] = [0]
+    backend._enforce_trajectory_wire_frame_safety(
         axis_q=[first_axis_q],
         axis_mask=0x1,
         previous_axis_counts=previous_axis_counts,
+        initial_live_counts=initial_live_counts,
         point_index=0,
         traj_id=7,
     )
     with pytest.raises(RuntimeError, match="command_frame_oversized_step"):
-        backend._enforce_trajectory_step_within_half_rm(
+        backend._enforce_trajectory_wire_frame_safety(
             axis_q=[second_axis_q],
             axis_mask=0x1,
             previous_axis_counts=previous_axis_counts,
+            initial_live_counts=initial_live_counts,
             point_index=1,
             traj_id=7,
         )
+
+
+def test_a6ec_command_frame_allows_seam_crossing_step_in_linear_counts(monkeypatch, tmp_path):
+    # Regression for the 2026-04-19 continuous-607A landing: with
+    # `command_frame_seam_crossing_unsafe=False` on the A6-EC profile and
+    # RTCore emitting continuous `0x607A`, consecutive trajectory points
+    # that straddle the single-turn seam in linear counts are valid. The
+    # drive absorbs the wrap internally via its rotation-mode position
+    # loop (C00.07=4, C10.16=0), so the host upload path must pass the
+    # seam-crossing sequence through instead of failing closed on it.
+    # Fails loudly if anyone re-enables the old
+    # `command_frame_seam_crossing_unsafe=True` posture without the live
+    # evidence that the new drive firmware semantics no longer hold.
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    # Point 0 a few counts below the seam; point 1 a few counts above 0.
+    # Linear step magnitude approaches RM; angular step is only ~+10 counts.
+    first_counts = rm - 5
+    second_counts = 5
+    first_axis_q = float(first_counts) / counts_per_unit
+    second_axis_q = float(second_counts) / counts_per_unit
+
+    previous_axis_counts: list[int | None] = [None]
+    initial_live_counts: list[int | None] = [first_counts]
+    backend._enforce_trajectory_wire_frame_safety(
+        axis_q=[first_axis_q],
+        axis_mask=0x1,
+        previous_axis_counts=previous_axis_counts,
+        initial_live_counts=initial_live_counts,
+        point_index=0,
+        traj_id=13,
+    )
+    # Must NOT raise: seam-crossing step is allowed under continuous 607A.
+    backend._enforce_trajectory_wire_frame_safety(
+        axis_q=[second_axis_q],
+        axis_mask=0x1,
+        previous_axis_counts=previous_axis_counts,
+        initial_live_counts=initial_live_counts,
+        point_index=1,
+        traj_id=13,
+    )
+    assert previous_axis_counts == [second_counts]
+
+
+def test_a6ec_command_frame_rejects_point_far_from_live_reference(monkeypatch, tmp_path):
+    # Direct regression for the 2026-04-17 J6 incident: a single point whose
+    # 607A target lands far from live 6064 in SHORTEST-ANGULAR terms must
+    # be rejected with command_frame_live_deviation_out_of_range. This
+    # catches any fold/turn-selection bug before RTCore sees the upload.
+    # Since the wrap-to-[0, RM) fold change, we measure angular distance
+    # (mod RM) so a seam-straddling legitimate jog does not false-fail.
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    live_counts = int(round(0.0 * counts_per_unit))
+    # Target 45 deg away from live 6064 in angular terms - far above the
+    # _TRAJECTORY_MAX_FIRST_POINT_DEVIATION_FROM_LIVE_RAD of 0.35 rad
+    # (~20 deg). That is the pathological case a first-point teleport
+    # bug would produce: canonical_q being badly mismatched with live 6064.
+    target_counts = live_counts + int(round(counts_per_unit * math.radians(45.0)))
+    target_axis_q = float(target_counts) / counts_per_unit
+
+    previous_axis_counts: list[int | None] = [None]
+    initial_live_counts: list[int | None] = [live_counts]
+    with pytest.raises(RuntimeError, match="command_frame_live_deviation_out_of_range"):
+        backend._enforce_trajectory_wire_frame_safety(
+            axis_q=[target_axis_q],
+            axis_mask=0x1,
+            previous_axis_counts=previous_axis_counts,
+            initial_live_counts=initial_live_counts,
+            point_index=0,
+            traj_id=9,
+        )
+
+
+def test_a6ec_command_frame_allows_seam_straddling_first_point(monkeypatch, tmp_path):
+    # Regression for the 2026-04-19 continuous-607A landing: under the
+    # A6-EC profile's `command_frame_seam_crossing_unsafe=False` posture
+    # plus RTCore's continuous `0x607A` emission, a first-point target
+    # that lands across the single-turn seam from live `6064` in LINEAR
+    # counts must be accepted. The shortest-angular deviation is what
+    # matters for Chapter 5 Figure 5-1 rotation-mode semantics, and the
+    # host gate now uses that metric instead of the linear one.
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    live_counts = rm - 4
+    target_counts = 3
+    target_axis_q = float(target_counts) / counts_per_unit
+
+    previous_axis_counts: list[int | None] = [None]
+    initial_live_counts: list[int | None] = [live_counts]
+    # Must NOT raise: seam-straddling first point is allowed under
+    # continuous 607A emission.
+    backend._enforce_trajectory_wire_frame_safety(
+        axis_q=[target_axis_q],
+        axis_mask=0x1,
+        previous_axis_counts=previous_axis_counts,
+        initial_live_counts=initial_live_counts,
+        point_index=0,
+        traj_id=17,
+    )
+    assert previous_axis_counts == [target_counts]
 
 
 def test_ethercat_backend_refuses_display_feedback_when_absolute_anchor_does_not_roundtrip(
@@ -1399,6 +1742,104 @@ def test_ethercat_backend_native_home_requires_post_home_anchor_validation(monke
             "present in the post-home detail"
         )
         assert abs(float(shaft_delta_counts)) == pytest.approx(1000.0)
+
+
+def test_ethercat_backend_native_home_uses_raw_reference_mode_for_post_home_anchor_refresh(
+    monkeypatch, tmp_path
+):
+    zero_offsets_path = tmp_path / "joint_zero_offsets.json"
+    absolute_anchor_path = tmp_path / "absolute_encoder_anchors.json"
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(zero_offsets_path))
+    monkeypatch.setenv("GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH", str(absolute_anchor_path))
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": 655360,
+                "statusword": 0x9650,
+                "error_code": 0,
+                "manufacturer_error_code": 0,
+                "native_home_state": 2,
+                "native_home_last_abort_code": 0,
+                "slave_online": 1,
+                "slave_operational": 1,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 35771},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[(131072.0 * 10.0) / (2.0 * math.pi)] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[131072] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    backend._axis_counts[0] = 655360
+    monkeypatch.setattr(backend, "prepare_for_power_transition", lambda **kwargs: None)
+    monkeypatch.setattr(backend, "_send_cmd_native_home", lambda axis_mask: None)
+    monkeypatch.setattr(
+        backend,
+        "_wait_for_native_home_result",
+        lambda *args, **kwargs: {
+            "verified": True,
+            "terminal_state": "succeeded",
+            "native_home_state": 2,
+            "native_home_last_abort_code": 0,
+            "metrics_time_ns": 123456789,
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        "_wait_for_native_home_post_settle_result",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "timed_out": False,
+            "hard_failure": False,
+            "failure_reason": None,
+            "metrics_time_ns": 456,
+            "axis_results": [],
+        },
+    )
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+    monkeypatch.setattr(backend, "sync_read_positions", lambda: {0: 655360})
+
+    captured_modes: list[str] = []
+    validated_modes: list[str] = []
+
+    def _capture(*args, **kwargs):
+        captured_modes.append(str(kwargs.get("reference_mode")))
+        return {"home_anchor_rad": 1.0, "source": "encoder_multi_turn_counts", "axis_indices": [0]}
+
+    def _validate(*args, **kwargs):
+        validated_modes.append(str(kwargs.get("reference_mode")))
+        return {
+            "ok": True,
+            "truth_available": True,
+            "truth_reason": None,
+            "axis": 0,
+            "logical_joint": 1,
+        }
+
+    monkeypatch.setattr(backend, "_capture_absolute_home_anchor_for_joint", _capture)
+    monkeypatch.setattr(backend, "_absolute_home_anchor_validation_for_joint", _validate)
+
+    result = backend.native_home_joint(0)
+
+    assert result["accepted"] is True
+    assert result["verified"] is True
+    assert captured_modes == ["raw"]
+    assert validated_modes == ["raw"]
 
 
 def test_ethercat_backend_software_zero_refreshes_absolute_encoder_anchor(monkeypatch, tmp_path):
@@ -2351,6 +2792,14 @@ def test_ethercat_backend_native_home_reports_pending_when_verification_times_ou
             }
         ),
     )
+    monkeypatch.setattr(
+        backend,
+        "_load_rtcore_metrics_snapshot",
+        lambda: {
+            "time_ns": 999,
+            "axes": [{}, {"native_home_state": 1, "native_home_last_abort_code": 0, "statusword": 0x0233}, {}],
+        },
+    )
 
     result = backend.native_home_joint(1)
     assert result["accepted"] is True
@@ -2373,6 +2822,110 @@ def test_ethercat_backend_native_home_reports_pending_when_verification_times_ou
     assert wait_timeout_s == 20.0
     assert wait_time_ns >= 0
     assert wait_mtime_ns >= 0
+
+
+def test_ethercat_backend_native_home_recovers_clean_success_after_wait_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    _write_rtcore_metrics_snapshot(metrics_path, [{"absolute_feedback": {}}])
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 3
+    backend._axis_to_joint = [0, 1, 2]
+    backend._axis_config = _AxisConfig(
+        num_axes=3,
+        counts_per_unit=[100.0, 100.0, 100.0] + [0.0] * 13,
+        sign=[1, 1, 1] + [0] * 13,
+        counts_per_rev=[131072, 131072, 131072] + [0] * 13,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        backend,
+        "prepare_for_power_transition",
+        lambda **kwargs: calls.append(("prepare", dict(kwargs))),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_send_cmd_native_home",
+        lambda axis_mask: calls.append(("native_home", axis_mask)),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_wait_for_native_home_result",
+        lambda *args, **kwargs: {
+            "verified": False,
+            "timed_out": True,
+            "terminal_state": "pending",
+            "native_home_state": 1,
+            "native_home_last_abort_code": 0,
+            "metrics_time_ns": 456,
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        "_load_rtcore_metrics_snapshot",
+        lambda: {
+            "time_ns": 789,
+            "axes": [
+                {},
+                {
+                    "native_home_state": 2,
+                    "native_home_last_abort_code": 0,
+                    "statusword": 0x9650,
+                    "error_code": 0,
+                    "manufacturer_error_code": 0,
+                },
+                {},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        backend,
+        "_wait_for_native_home_post_settle_result",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "timed_out": False,
+            "hard_failure": False,
+            "failure_reason": None,
+            "metrics_time_ns": 987,
+            "axis_results": [],
+        },
+    )
+    monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+    monkeypatch.setattr(backend, "sync_read_positions", lambda: {0: 0, 1: 25, 2: 0})
+    monkeypatch.setattr(
+        backend,
+        "_capture_absolute_home_anchor_for_joint",
+        lambda *args, **kwargs: {"home_anchor_rad": 1.25, "source": "encoder_multi_turn_counts"},
+    )
+    monkeypatch.setattr(
+        backend,
+        "_absolute_home_anchor_validation_for_joint",
+        lambda *args, **kwargs: {
+            "ok": True,
+            "truth_available": True,
+            "truth_reason": None,
+            "axis": 1,
+            "logical_joint": 2,
+        },
+    )
+
+    result = backend.native_home_joint(1)
+
+    assert result["accepted"] is True
+    assert result["verified"] is True
+    assert result["code"] == "NATIVE_HOME_VERIFIED"
+    assert result["post_home_verification_retry_after_timeout"] is True
+    assert result["absolute_home_anchor_capture_succeeded"] is True
+    assert result["absolute_home_anchor_refresh_ok"] is True
+    assert result["metrics_time_ns"] == 789
 
 
 def test_native_home_metrics_result_accepts_statusword_hm_success_bits_fallback(monkeypatch, tmp_path):
@@ -2886,6 +3439,96 @@ def test_ethercat_backend_applies_native_home_offsets_to_feedback_but_not_comman
     assert commanded_axis_q[0] == pytest.approx(0.0)
 
 
+def test_a6ec_midpoint_native_home_offset_cancels_raw_midpoint_reference(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    half_rm = rm // 2
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": -half_rm,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 35771},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
+    backend._axis_to_joint = [0]
+    backend._rt_num_axes = 1
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    reference_q = backend._reference_q_before_master_offset_for_axis(
+        0,
+        half_rm,
+        reference_mode="raw",
+    )
+
+    assert reference_q == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a6ec_shaft_frame_consistency_uses_logicalized_live_reference_counts(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    half_rm = rm // 2
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": -half_rm,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 35771},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
+    backend._axis_to_joint = [0]
+    backend._rt_num_axes = 1
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    detail = backend._shaft_frame_consistency_detail(
+        axis_i=0,
+        canonical_q=0.0,
+        logical_joint_idx=0,
+        live_reference_counts=half_rm,
+    )
+
+    assert detail is not None
+    assert detail["shaft_frame_consistent"] is True
+    assert detail["shaft_frame_mod_rm_delta_counts"] == pytest.approx(0.0)
+    assert detail["shaft_frame_live_reference_logical_counts"] == pytest.approx(0.0)
+
+
 def test_ethercat_backend_enqueue_trajectory_points_keeps_controller_logical_frame_with_native_home_offset(
     monkeypatch, tmp_path
 ):
@@ -2897,6 +3540,20 @@ def test_ethercat_backend_enqueue_trajectory_points_keeps_controller_logical_fra
     backend._master_offsets_rad[0] = 0.5
     backend._native_home_offset_counts[0] = -25
     monkeypatch.setattr(backend, "_refresh_native_home_offsets_from_metrics", lambda: None)
+
+    # Stage live 6064 to match the commanded point so the pre-commit
+    # wire-frame safety cage (which blocks first-point teleports) does
+    # not reject this synthetic single-point upload. The test checks
+    # frame conversion, not operator motion safety.
+    robot_cfg = Gradient05Config().get_config_dict()
+    axis0_cpu = (
+        float(robot_cfg["actuator_encoder_counts_per_rev"][0])
+        * float(robot_cfg["actuator_gear_ratios"][0])
+        / (2.0 * math.pi)
+    )
+    axis0_sign = int(robot_cfg["actuator_position_signs"][0])
+    staged_axis_q = 1.0 + 0.5  # positions_rad[0] + master_offset
+    backend._axis_counts[0] = int(round(staged_axis_q * axis0_sign * axis0_cpu))
 
     captured: list[tuple[int, bytes]] = []
     monkeypatch.setattr(
@@ -2961,6 +3618,11 @@ def test_ethercat_backend_enqueue_trajectory_points_keeps_nonunit_a6ec_axis_in_l
     )
 
     commanded_joint_q = 0.4
+    # Stage live 6064 to match the commanded point so the pre-commit
+    # wire-frame safety cage (which blocks first-point teleports) does
+    # not reject this synthetic single-point upload. The test checks
+    # frame conversion, not operator motion safety.
+    backend._axis_counts[0] = int(round(commanded_joint_q * -1 * legacy_counts_per_unit))
     backend.enqueue_trajectory_points(
         11,
         [
@@ -3594,6 +4256,47 @@ def test_a6ec_encoder_retention_fault_distinguishes_battery_alarm(
     assert "Encoder battery voltage low" in retention_detail.get("names", [])
 
 
+def test_a6ec_encoder_retention_fault_includes_multi_turn_overflow(
+    monkeypatch, tmp_path
+):
+    # ErA0.1 "Multi-turn overflow fault" (manufacturer_error_code 0xA01)
+    # is a primary signal of U40.20/.22 unreliability per vendor email 4
+    # Q2(a). Its bus-level 0x603F value is 0X7305 (same encoder-error
+    # class as Er20.8 / Er20.9), and the vendor notes flag it as one of
+    # the three conditions requiring F31.10 recovery. It must be treated
+    # as retention-family and block the persisted-home-anchor restart
+    # trust path with the specific "encoder_retention_fault_present"
+    # reason rather than falling into the generic
+    # "manufacturer_fault_present" label.
+    joint_index = 5
+    backend, _ = _build_a6ec_restart_trust_test_backend(
+        monkeypatch,
+        tmp_path,
+        joint_index=joint_index,
+        statusword=0x1650,
+        hm35_6064_counts=8,
+        hm35_u40_20_counts=120191,
+        live_6064_counts=9,
+        live_u40_20_counts=120189,
+        multi_turn_valid=True,
+        encoder_retention_fault_code=0xA01,
+    )
+
+    snapshot = backend._canonical_joint_positions_from_raw_feedback(
+        {axis_i: int(backend._axis_counts[axis_i]) for axis_i in range(6)},
+        reference_mode="raw",
+    )
+    target_detail = snapshot["axis_absolute_feedback"][joint_index]
+
+    assert target_detail["truth_available"] is False
+    assert target_detail["coordinate_system_valid"] is False
+    assert target_detail["drive_native_truth_reason"] == "encoder_retention_fault_present"
+    retention_detail = target_detail.get("encoder_retention_fault")
+    assert isinstance(retention_detail, dict)
+    assert "ErA0.1" in retention_detail.get("codes", [])
+    assert "Multi-turn overflow fault" in retention_detail.get("names", [])
+
+
 def test_a6ec_firmware_bit15_retention_flag_documented_false():
     # The bit-15 restart-trust path in derive_drive_native_truth_validity
     # is intentionally kept as vestigial coverage for future firmware /
@@ -3607,6 +4310,128 @@ def test_a6ec_firmware_bit15_retention_flag_documented_false():
 
     assert "firmware_bit15_retention_expected" in POSITION_SEMANTICS_CONFIG
     assert POSITION_SEMANTICS_CONFIG["firmware_bit15_retention_expected"] is False
+
+
+def test_a6ec_profile_emits_continuous_607a_command_in_rotation_mode():
+    # Regression for the 2026-04-19 continuous-607A landing. Vendor
+    # Chapter 5 §5.3 Figure 5-1 shows target position as a continuous
+    # linear ramp while 6064 is a sawtooth. The A6-EC profile must
+    # therefore (a) keep `feedback_counts_wrap=True` so 6064 comparisons
+    # and completion checks stay modulo-RM, (b) set `command_counts_wrap`
+    # to False so RTCore pipes continuous 0x607A to the drive, and (c)
+    # classify the seam as safe so the host-side safety guard stops
+    # rejecting seam-crossing trajectories. All three flags together are
+    # the documented rotation-mode contract; flipping any one of them
+    # back is a regression that breaks multi-turn.
+    from gradient_os.arm_controller.profiles.drive.a6ec_ds402 import (
+        MOTION_FEEDBACK_CONFIG,
+        POSITION_SEMANTICS_CONFIG,
+    )
+
+    assert MOTION_FEEDBACK_CONFIG["feedback_counts_wrap"] is True
+    assert "command_counts_wrap" in MOTION_FEEDBACK_CONFIG
+    assert MOTION_FEEDBACK_CONFIG["command_counts_wrap"] is False
+    assert POSITION_SEMANTICS_CONFIG["command_frame_seam_crossing_unsafe"] is False
+
+
+def test_a6ec_backend_routes_profile_command_counts_wrap_to_fold_decision(
+    monkeypatch, tmp_path
+):
+    # The backend must read `command_counts_wrap` from the active drive
+    # profile's MOTION_FEEDBACK_CONFIG (not from an env var) and pass the
+    # negation as `wrap_to_single_turn` to `_nearest_turn_fold_axis_q_for_axis`.
+    # This is the regression that caught the original
+    # GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS env var being a
+    # no-op on the wire: env was set, host-side fold stayed linear, but
+    # RTCore wrapped anyway.
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    # A6-EC profile says command_counts_wrap=False -> continuous emission
+    # -> helper returns False -> alias returns True ("experimental
+    # continuous enabled"). Both helpers must agree.
+    for joint_idx in range(6):
+        assert backend._command_counts_wrap_for_joint(joint_idx) is False
+        assert backend._experimental_continuous_607a_enabled_for_joint(joint_idx) is True
+
+
+def test_a6ec_continuous_607a_fold_does_not_flip_turn_at_midpoint_home(
+    monkeypatch, tmp_path
+):
+    # Regression for the 2026-04-19 Move A 350-deg long-way excursion.
+    # With the A6-EC drive homed at 607C = RM/2 (midpoint bias), a
+    # small +10 deg canonical move from home MUST emit a wire target
+    # close to the current 6064 reading, NOT one turn above it. The
+    # fold was previously comparing base_counts (raw axis-q frame)
+    # against observed_counts (live 6064, wire frame) which differ by
+    # native_home_position_offset = -607C; at midpoint home that bias
+    # is exactly RM/2, so a small move produced delta/period ~= 0.528
+    # which round() snapped to 1 turn and emitted 0x607A = RM + 618_952
+    # instead of 618_952. Under continuous-607A emission (RTCore no
+    # longer wraps) that 1-turn error leaks onto the wire and the
+    # drive takes the long way by ~1 rev. This test asserts the fold
+    # returns +0.1745 rad (+10 deg) given canonical_q=+10 deg, not
+    # -6.111 rad (-350 deg).
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    half_rm = rm // 2
+    # Mirror the live Move A state: drive at midpoint home, native home
+    # offset = -RM/2 (from 607C = +RM/2).
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": -half_rm,
+                "absolute_feedback": {},
+            }
+        ],
+    )
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    # Live 6064 at midpoint home (= RM/2), canonical target +10 deg.
+    live_counts = half_rm  # 655,360 (home, wire frame)
+    target_canonical_rad = math.radians(10.0)
+    target_axis_q = backend._command_axis_q_for_joint_value(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=target_canonical_rad,
+        live_reference_counts=live_counts,
+    )
+    # Under the bugged fold this returned -6.111 rad (-350 deg) because
+    # observed was compared to base in mismatched frames. The fix
+    # normalizes observed to the axis-q frame before the round.
+    assert math.isclose(target_axis_q, target_canonical_rad, abs_tol=1e-6), (
+        f"fold snapped to wrong turn: got {target_axis_q!r} rad "
+        f"({math.degrees(target_axis_q):.3f} deg), expected "
+        f"{target_canonical_rad!r} rad (+10.000 deg)"
+    )
+    # Derived wire value must stay near live.
+    wire_counts = int(round(target_axis_q * (-1) * counts_per_unit)) - (-half_rm)
+    wire_distance_from_live = abs(wire_counts - live_counts)
+    assert wire_distance_from_live < half_rm, (
+        f"wire_counts={wire_counts} too far from live_counts={live_counts}: "
+        f"distance={wire_distance_from_live} > RM/2={half_rm}"
+    )
 
 
 def test_a6ec_last_seen_sidecar_surfaces_delta_when_joint_unchanged_while_off(

@@ -128,7 +128,27 @@ def build_drive_fault_snapshot(
     fieldbus_profile: str | None = None,
     axis_to_joint: Sequence[int] | None = None,
     socket_present: bool | None = None,
+    axis_drive_native_truth_context: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Build the monitor/telemetry drive-fault snapshot.
+
+    When ``axis_drive_native_truth_context`` is supplied (typically by
+    ``run_controller._build_drive_fault_snapshot`` calling the active
+    backend's ``get_display_feedback_snapshot()``), the per-axis
+    ``drive_native_truth_*`` and ``coordinate_system_valid`` fields
+    published here are taken directly from that context instead of
+    being re-derived locally. This preserves the backend's
+    persisted-home-anchor restart-trust decision for the /monitor
+    stream and keeps the UI's drive-native-truth surface consistent
+    with /info/joints-detailed. Without the context the local
+    ``derive_drive_native_truth_validity`` fallback still runs but
+    only has access to the signals visible on the RTCore metrics
+    axis payload (statusword, error codes, slave state) and cannot
+    evaluate the anchor-based trust path, so it will report
+    ``coordinate_system_invalid`` for axes whose bit 15 is clear even
+    though the backend may have upgraded them to
+    ``persisted_home_anchor_agreement``.
+    """
     num_axes = coerce_int(metrics.get("num_axes"), 0)
     armed = coerce_int(metrics.get("armed"), 0)
     enable_mask = coerce_int(metrics.get("axis_enable_mask"), 0)
@@ -253,6 +273,51 @@ def build_drive_fault_snapshot(
             require_hm_success_signature=startup_truth_requires_hm_success_signature,
             encoder_retention_fault_present=encoder_retention_fault_present,
         )
+        # When the active backend already ran the full truth-derivation
+        # pipeline (with access to the persisted-home-anchor sidecar,
+        # shaft-frame consistency, and retention-fault decoding) adopt
+        # its per-axis result verbatim. The local call above is kept so
+        # callers without backend context still get a best-effort
+        # answer; but when the override is present it wins. This keeps
+        # /monitor, /info/joints-detailed, and the UI aligned on a
+        # single drive-native-truth decision per axis.
+        if axis_drive_native_truth_context is not None:
+            override = axis_drive_native_truth_context.get(axis_index)
+            if isinstance(override, Mapping):
+                drive_native_truth = {
+                    "drive_native_truth_valid": bool(
+                        override.get(
+                            "drive_native_truth_valid",
+                            drive_native_truth.get("drive_native_truth_valid", False),
+                        )
+                    ),
+                    "drive_native_truth_reason": str(
+                        override.get(
+                            "drive_native_truth_reason",
+                            drive_native_truth.get("drive_native_truth_reason", "unknown"),
+                        )
+                    ),
+                    "drive_native_truth_signature_valid": bool(
+                        override.get(
+                            "drive_native_truth_signature_valid",
+                            drive_native_truth.get("drive_native_truth_signature_valid", False),
+                        )
+                    ),
+                    "coordinate_system_valid": bool(
+                        override.get(
+                            "coordinate_system_valid",
+                            drive_native_truth.get("coordinate_system_valid", False),
+                        )
+                    ),
+                    "drive_native_truth_verification_source": str(
+                        override.get(
+                            "drive_native_truth_verification_source",
+                            drive_native_truth.get(
+                                "drive_native_truth_verification_source", "unverified"
+                            ),
+                        )
+                    ),
+                }
         if bool(drive_native_truth.get("coordinate_system_valid", False)):
             coordinate_system_valid_axes += 1
         if drive_native_ratio_enabled:

@@ -35,7 +35,7 @@ Use this file for power transitions, safe restarts, commissioning motion flows, 
 - Manufacturer guidance on rotary-mode homing:
   - manually writing `607C` alone does not establish a valid homed/reference state; HM Method 35 must still run
   - keep `607C` within `0 .. RM-1` in rotary mode; avoid negative seam-crossing offsets and prefer a positive value near `RM-1`
-- If encoder battery health or multi-turn retention is suspect, expect vendor faults such as `ALF9.0` (battery voltage low), `Er20.8` (encoder battery failure), or `Er20.9` (encoder multi-turn error), and re-validate native home before trusting the pose after a power cycle.
+- If encoder battery health or multi-turn retention is suspect, expect vendor faults such as `ALF9.0` (battery voltage low), `Er20.8` (encoder battery failure), `Er20.9` (encoder multi-turn error), or `ErA0.1` (multi-turn overflow fault), and re-validate native home before trusting the pose after a power cycle. Vendor email 4 Q2(a) lists these four codes as the primary signals that `U40.20/U40.22` is no longer reliable.
 
 ## Native-Home Disarm Precondition
 
@@ -78,7 +78,7 @@ Contract:
 - Initial HM35 is always required to establish the anchor file entry per joint. The restart-trust path reuses state; it does not invent trust.
 - After that initial home, power cycles do NOT require re-homing as long as the encoder's multi-turn counter stays valid.
 - Manual joint rotation while the drive is off is accepted by the restart-trust path because `absolute_axis_q − reference_q` is invariant under shaft motion. Only encoder data loss (battery death, `> 32,767` motor turns, or catastrophic encoder fault) breaks the invariant and forces a re-home.
-- Live `Er20.1 .. Er20.9` / `ALF9.0` (encoder-retention-family fault codes decoded from `manufacturer_error_code` / `error_code`) surface as `encoder_retention_fault_present` and block trust regardless of anchor agreement. This outranks the generic `fault_present` / `manufacturer_fault_present` branches because retention is a more specific interpretation of the same underlying 0x603F / 0x203F signal.
+- Live `Er20.1 .. Er20.9` / `ErA0.1` / `ALF9.0` (encoder-retention-family fault codes decoded from `manufacturer_error_code` / `error_code`) surface as `encoder_retention_fault_present` and block trust regardless of anchor agreement. This outranks the generic `fault_present` / `manufacturer_fault_present` branches because retention is a more specific interpretation of the same underlying 0x603F / 0x203F signal.
 - `F31.10 = 4` (encoder data reset) always requires a fresh HM35 afterward; restart trust is not a substitute.
 - Optional last-seen U40.20/.22 sidecar: the backend persists the live `absolute_counts` onto the anchor entry under `last_seen` on every trusted-axis canonical-truth cycle (rate-limited to once per 5 s per joint). When the shaft-frame consistency gate later fails AND the delta from the stored sidecar exceeds `32,767 × counts_per_rev` (physically impossible during an off-window), the rejection reason upgrades to `multi_turn_feedback_lost_across_power_cycle` instead of the generic anchor-disagreement label, so operators can tell "joint moved while off" apart from "encoder data lost while off".
 

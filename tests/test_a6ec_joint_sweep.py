@@ -350,6 +350,14 @@ def _startup_drive_config_entries(raw_ratio: object) -> list[dict[str, object]]:
             "readback": denominator,
             "verified": 1,
         },
+        {
+            "setting_key": "a6ec_rotation_mode_reference_running_direction",
+            "configured": 1,
+            "commanded": 0,
+            "readback_valid": 1,
+            "readback": 0,
+            "verified": 1,
+        },
     ]
 
 
@@ -444,7 +452,19 @@ def test_a6ec_joint_full_range_sweep_fresh_hm_keeps_truth_continuous(
 def test_a6ec_joint_sweep_fresh_hm_small_jog_stays_within_half_rm(
     monkeypatch, tmp_path, joint_index
 ):
-    """A +0.5 deg canonical jog at every seam sample stays within half-RM on the wire."""
+    """A +0.5 deg canonical jog at every seam sample stays within half-RM on the SHORTEST-ANGULAR wire delta.
+
+    Since the 2026-04-19 continuous-607A landing the command-path emits
+    `wire_counts` in linear-continuous counts, NOT in [0, RM). That was
+    the explicit purpose of the change: Chapter 5 §5.3 Figure 5-1 shows
+    target position as a continuous linear ramp while 6064 follows a
+    sawtooth, and emitting wrapped 607A produced an artificial near-RM
+    single-cycle delta at the seam that tripped Er87.1.
+    The host fold still guarantees targets stay within RM/2 of live 6064
+    in the SHORTEST-ANGULAR sense, so the angular-delta assertion below
+    is the live invariant; the linear `[0, RM)` assertion is explicitly
+    retired.
+    """
     scaling = _axis_scaling_for_joint(joint_index)
     cpu = scaling["counts_per_unit"]
     rm = int(scaling["rm"])
@@ -468,14 +488,19 @@ def test_a6ec_joint_sweep_fresh_hm_small_jog_stays_within_half_rm(
             canonical_q=target_q,
         )
         wire_counts = int(round(target_axis_q * float(sign) * float(cpu)))
-        delta = wire_counts - live_6064
-        assert abs(delta) <= rm // 2, (
-            f"joint={joint_index} q={q:.6f} delta={delta} RM/2={rm // 2}"
+        linear_delta = wire_counts - live_6064
+        half_period = rm // 2
+        angular_delta = ((linear_delta + half_period) % rm) - half_period
+        assert abs(angular_delta) <= rm // 2, (
+            f"joint={joint_index} q={q:.6f} angular_delta={angular_delta} RM/2={rm // 2}"
         )
-        # Magnitude of the step should match the expected jog modulo the
-        # per-count rounding band.
-        assert abs(abs(delta) - expected_step_counts) < 2.0, (
-            f"joint={joint_index} q={q:.6f} delta={delta} expected~+/-{expected_step_counts:.1f}"
+        # Magnitude of the angular step should match the expected jog
+        # modulo per-count rounding band. Linear delta is allowed to be
+        # much larger if the jog straddles the seam (continuous emission
+        # lets 607A go negative or above RM-1 by design).
+        assert abs(abs(angular_delta) - expected_step_counts) < 2.0, (
+            f"joint={joint_index} q={q:.6f} angular_delta={angular_delta} "
+            f"expected~+/-{expected_step_counts:.1f} linear_delta={linear_delta}"
         )
 
 
@@ -483,7 +508,7 @@ def test_a6ec_joint_sweep_fresh_hm_small_jog_stays_within_half_rm(
 def test_a6ec_joint_sweep_fresh_hm_trajectory_pre_commit_gate_accepts_monotone(
     monkeypatch, tmp_path, joint_index
 ):
-    """A 20-point contiguous trajectory across a seam must NOT trip the half-RM gate.
+    """A 20-point contiguous trajectory away from the seam must NOT trip the gate.
 
     Models the real trajectory upload path: ``live_6064`` is frozen at the
     first point, and the nearest-turn fold runs against that fixed
@@ -495,13 +520,14 @@ def test_a6ec_joint_sweep_fresh_hm_trajectory_pre_commit_gate_accepts_monotone(
     lim_min = scaling["lim_min"]
     lim_max = scaling["lim_max"]
 
-    # Pick a small monotone sweep centred at the joint midpoint. Step size
-    # is small (0.25 deg) so any wrap-class step between consecutive points
-    # would be the sign of a command-frame bug, not a legitimate motion.
+    # Pick a small monotone sweep centred well away from the 0/RM seam. Live
+    # hardware disproved the earlier assumption that seam-straddling absolute
+    # A6-EC trajectories are safe, so this positive-path regression now checks
+    # only the non-seam case: ordinary small monotone uploads must still pass.
     n_points = 20
     step_rad = math.radians(0.25)
-    midpoint = 0.5 * (lim_min + lim_max)
-    points = [midpoint + (i - n_points // 2) * step_rad for i in range(n_points)]
+    center = min(max(1.0, lim_min + 0.25), lim_max - 0.25)
+    points = [center + (i - n_points // 2) * step_rad for i in range(n_points)]
     points = [p for p in points if lim_min <= p <= lim_max]
 
     # Stage the backend ONCE at the first trajectory point (mirrors a real
@@ -516,6 +542,10 @@ def test_a6ec_joint_sweep_fresh_hm_trajectory_pre_commit_gate_accepts_monotone(
     )
 
     previous_axis_counts: list[int | None] = [None] * backend._rt_num_axes
+    initial_live_counts: list[int | None] = [
+        backend._live_reference_counts_for_axis(i)
+        for i in range(backend._rt_num_axes)
+    ]
     for idx, q in enumerate(points):
         axis_q_vector = [0.0] * backend._rt_num_axes
         axis_q_vector[joint_index] = backend._command_axis_q_for_joint_value(
@@ -523,30 +553,37 @@ def test_a6ec_joint_sweep_fresh_hm_trajectory_pre_commit_gate_accepts_monotone(
             logical_joint_idx=joint_index,
             canonical_q=q,
         )
-        backend._enforce_trajectory_step_within_half_rm(
+        backend._enforce_trajectory_wire_frame_safety(
             axis_q=axis_q_vector,
             axis_mask=(1 << joint_index),
             previous_axis_counts=previous_axis_counts,
+            initial_live_counts=initial_live_counts,
             point_index=idx,
             traj_id=7,
         )
 
 
 @pytest.mark.parametrize("joint_index", _JOINT_INDICES)
-def test_a6ec_joint_sweep_fresh_hm_trajectory_pre_commit_gate_rejects_whole_turn_jump(
+def test_a6ec_joint_sweep_fresh_hm_trajectory_pre_commit_gate_rejects_large_angular_jump(
     monkeypatch, tmp_path, joint_index
 ):
-    """Two trajectory points differing by one shaft revolution raise command_frame_oversized_step."""
+    """Two trajectory points with a ~100 deg angular step trip command_frame_oversized_step.
+
+    Since 2026-04-17 the command path wraps into [0, RM) and the cage
+    measures shortest-angular (mod-RM) distance. A literal "one shaft
+    revolution" linear jump now maps to angular 0 (both points at the
+    same single-turn position), so it is no longer the canonical
+    pathological input - instead we use a 100 deg angular step which
+    is five times the _TRAJECTORY_MAX_PER_POINT_STEP_RAD cage.
+    """
     scaling = _axis_scaling_for_joint(joint_index)
     cpu = scaling["counts_per_unit"]
     sign = scaling["sign"]
-    rm = int(scaling["rm"])
+    big_step_rad = math.radians(100.0)
 
-    # Use two axis_q values that map to the SAME wire-frame counts mod RM
-    # but are one shaft revolution apart in the continuous frame. That is
-    # exactly the "off by one turn" command-frame bug the gate must catch.
     base_axis_q = 0.0
-    turn_axis_q = float(rm) / (float(sign) * float(cpu))
+    # An axis_q that produces a wire-frame delta ~100 deg from base.
+    big_axis_q = float(int(round(cpu * big_step_rad))) / (float(sign) * float(cpu))
     backend, _ctx = _build_sweep_backend(
         monkeypatch,
         tmp_path,
@@ -556,22 +593,30 @@ def test_a6ec_joint_sweep_fresh_hm_trajectory_pre_commit_gate_rejects_whole_turn
     )
 
     previous_axis_counts: list[int | None] = [None] * backend._rt_num_axes
+    initial_live_counts: list[int | None] = [
+        backend._live_reference_counts_for_axis(i)
+        for i in range(backend._rt_num_axes)
+    ]
     axis_q_vec_first = [0.0] * backend._rt_num_axes
     axis_q_vec_first[joint_index] = base_axis_q
-    backend._enforce_trajectory_step_within_half_rm(
+    backend._enforce_trajectory_wire_frame_safety(
         axis_q=axis_q_vec_first,
         axis_mask=(1 << joint_index),
         previous_axis_counts=previous_axis_counts,
+        initial_live_counts=initial_live_counts,
         point_index=0,
         traj_id=11,
     )
     axis_q_vec_second = [0.0] * backend._rt_num_axes
-    axis_q_vec_second[joint_index] = turn_axis_q
+    axis_q_vec_second[joint_index] = big_axis_q
+    # A 100 deg angular step from the first point trips the per-point
+    # step cage.
     with pytest.raises(RuntimeError, match="command_frame_oversized_step"):
-        backend._enforce_trajectory_step_within_half_rm(
+        backend._enforce_trajectory_wire_frame_safety(
             axis_q=axis_q_vec_second,
             axis_mask=(1 << joint_index),
             previous_axis_counts=previous_axis_counts,
+            initial_live_counts=initial_live_counts,
             point_index=1,
             traj_id=11,
         )

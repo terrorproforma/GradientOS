@@ -222,6 +222,10 @@ type DriveFaultSnapshot = {
   metrics_path?: string;
 };
 
+type SynthesizedDriveFaultSnapshot = DriveFaultSnapshot & {
+  __synthesized_from_monitor_axes?: true;
+};
+
 type TelemetryEvent = {
   timestamp: number;
   raw: string;
@@ -4191,7 +4195,7 @@ function SettingsDialog({
               type="text"
               value={apiHost}
               onChange={(event) => onHostChange(event.target.value)}
-              placeholder="http://localhost:4000"
+              placeholder="http://localhost:4400"
               autoComplete="off"
             />
             </label>
@@ -4828,6 +4832,248 @@ function AlertsPanel({
       ))}
     </div>
   );
+}
+
+const OP_ENABLED_DS402_STATES = new Set(["operationenabled"]);
+const FAULTED_DS402_STATES = new Set(["fault", "faultreactionactive"]);
+const ENABLE_REQUESTED_DS402_STATES = new Set([
+  "readytoswitchon",
+  "switchedon",
+  "operationenabled",
+  "quickstopactive",
+  "fault",
+  "faultreactionactive",
+]);
+
+function normalizeDs402StateToken(value: unknown): string {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function stripSynthesizedDriveFaultMarker(
+  snapshot: DriveFaultSnapshot | null | undefined,
+): DriveFaultSnapshot | null {
+  if (!snapshot) {
+    return null;
+  }
+  const { __synthesized_from_monitor_axes: _ignored, ...clean } =
+    snapshot as SynthesizedDriveFaultSnapshot;
+  return clean;
+}
+
+function isSynthesizedDriveFaultSnapshot(
+  snapshot: DriveFaultSnapshot | null | undefined,
+): snapshot is SynthesizedDriveFaultSnapshot {
+  return Boolean(
+    snapshot
+    && (snapshot as SynthesizedDriveFaultSnapshot).__synthesized_from_monitor_axes === true,
+  );
+}
+
+export function mergeDriveFaultSnapshots(
+  previous: DriveFaultSnapshot | null | undefined,
+  next: DriveFaultSnapshot | null | undefined,
+): DriveFaultSnapshot | null {
+  if (!next) {
+    return previous ?? null;
+  }
+  const cleanNext = stripSynthesizedDriveFaultMarker(next);
+  if (!cleanNext) {
+    return previous ?? null;
+  }
+  if (!isSynthesizedDriveFaultSnapshot(next)) {
+    return cleanNext;
+  }
+  if (!previous) {
+    return cleanNext;
+  }
+  // Synthesized monitor snapshots only know the fields derivable from the
+  // current event. Overlay them onto the previous full snapshot so richer
+  // metadata (for example `ethercat_master_state`) survives, while the live
+  // power/jog gating fields are always refreshed from current axis data.
+  return {
+    ...previous,
+    ...cleanNext,
+    axes: cleanNext.axes,
+  };
+}
+
+export function synthesizeDriveFaultSnapshotFromAxes(
+  event: Record<string, unknown>,
+): DriveFaultSnapshot | null {
+  // Build a DriveFaultSnapshot from the monitor event's per-axis
+  // `axis_absolute_feedback` + `servos` payloads when the aggregate
+  // `drive_faults` block is missing. This is intentionally conservative:
+  // anything not derivable from the current event stays undefined, but the
+  // UI-critical power/jog gating fields are recomputed fresh so the frontend
+  // does not preserve a stale ACTIVE/DISARMED snapshot across power
+  // transitions when `/monitor` temporarily drops `drive_faults`.
+  const rawAxes = event.axis_absolute_feedback;
+  if (!Array.isArray(rawAxes) || rawAxes.length === 0) {
+    return null;
+  }
+  const servos = event.servos && typeof event.servos === "object"
+    ? (event.servos as Record<string, Record<string, unknown>>)
+    : {};
+  const servosByLogicalJoint = new Map<number, Record<string, unknown>>();
+  const servosByAxisIndex = new Map<number, Record<string, unknown>>();
+  for (const value of Object.values(servos)) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    if (typeof value.logical_joint === "number" && Number.isFinite(value.logical_joint)) {
+      servosByLogicalJoint.set(value.logical_joint, value);
+    }
+    if (typeof value.axis_index === "number" && Number.isFinite(value.axis_index)) {
+      servosByAxisIndex.set(value.axis_index, value);
+    }
+  }
+  const axes: DriveFaultAxis[] = [];
+  let maxAxisIndex = -1;
+  let opEnabledAxes = 0;
+  let faultedAxes = 0;
+  let statuswordFeedbackAxes = 0;
+  let axisEnableMask = 0;
+  let requestedAxes = 0;
+  let nativeHomeActiveAxisMask = 0;
+  for (const entry of rawAxes) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const axisRaw = (entry as Record<string, unknown>).axis;
+    const axis = typeof axisRaw === "number" ? axisRaw : Number(axisRaw);
+    if (!Number.isFinite(axis)) {
+      continue;
+    }
+    const logicalJointRaw = (entry as Record<string, unknown>).logical_joint;
+    const logical_joint =
+      typeof logicalJointRaw === "number" ? logicalJointRaw : undefined;
+    if (axis > maxAxisIndex) {
+      maxAxisIndex = axis;
+    }
+    const servoEntry = (
+      (typeof logical_joint === "number" ? servosByLogicalJoint.get(logical_joint) : undefined)
+      ?? servosByAxisIndex.get(axis)
+    );
+    const statuswordRaw = (entry as Record<string, unknown>).statusword;
+    const statusword =
+      typeof statuswordRaw === "number"
+        ? statuswordRaw
+        : (servoEntry && typeof servoEntry.statusword === "number" ? servoEntry.statusword : 0);
+    const errorCodeRaw = (entry as Record<string, unknown>).error_code;
+    const error_code =
+      typeof errorCodeRaw === "number"
+        ? errorCodeRaw
+        : (servoEntry && typeof servoEntry.error_code === "number" ? servoEntry.error_code : 0);
+    const manufacturerErrorRaw = (entry as Record<string, unknown>).manufacturer_error_code;
+    const manufacturer_error_code =
+      typeof manufacturerErrorRaw === "number"
+        ? manufacturerErrorRaw
+        : (
+          servoEntry && typeof servoEntry.manufacturer_error_code === "number"
+            ? servoEntry.manufacturer_error_code
+            : undefined
+        );
+    const ds402State =
+      servoEntry && typeof servoEntry.ds402_state === "string"
+        ? (servoEntry.ds402_state as string)
+        : "";
+    const ds402StateToken = normalizeDs402StateToken(ds402State);
+    const truthValidRaw = (entry as Record<string, unknown>).drive_native_truth_valid;
+    const truthReasonRaw = (entry as Record<string, unknown>).drive_native_truth_reason;
+    const truthVerificationRaw =
+      (entry as Record<string, unknown>).drive_native_truth_verification_source;
+    const coordValidRaw = (entry as Record<string, unknown>).coordinate_system_valid;
+    const nativeHomeStateRaw = servoEntry && typeof servoEntry.native_home_state === "number"
+      ? (servoEntry.native_home_state as number)
+      : undefined;
+    const nativeHomeStateNameRaw =
+      servoEntry && typeof servoEntry.native_home_state_name === "string"
+        ? (servoEntry.native_home_state_name as string)
+        : undefined;
+    const nativeHomeActiveRaw =
+      (entry as Record<string, unknown>).native_home_active;
+    const nativeHomeActive =
+      typeof nativeHomeActiveRaw === "boolean"
+        ? nativeHomeActiveRaw
+        : Boolean(servoEntry && typeof servoEntry.native_home_active === "boolean" && servoEntry.native_home_active);
+    if (statusword !== 0) {
+      statuswordFeedbackAxes += 1;
+    }
+    if (OP_ENABLED_DS402_STATES.has(ds402StateToken)) {
+      opEnabledAxes += 1;
+    }
+    if (error_code !== 0 || FAULTED_DS402_STATES.has(ds402StateToken)) {
+      faultedAxes += 1;
+    }
+    if (ENABLE_REQUESTED_DS402_STATES.has(ds402StateToken) || nativeHomeActive) {
+      axisEnableMask |= (1 << axis);
+      requestedAxes += 1;
+    }
+    if (nativeHomeActive) {
+      nativeHomeActiveAxisMask |= (1 << axis);
+    }
+    axes.push({
+      axis,
+      logical_joint: typeof logical_joint === "number" ? logical_joint : null,
+      ds402_state: ds402State,
+      statusword,
+      error_code,
+      manufacturer_error_code,
+      drive_native_truth_valid:
+        typeof truthValidRaw === "boolean" ? truthValidRaw : undefined,
+      drive_native_truth_reason:
+        typeof truthReasonRaw === "string" ? truthReasonRaw : undefined,
+      drive_native_truth_verification_source:
+        typeof truthVerificationRaw === "string" ? truthVerificationRaw : undefined,
+      coordinate_system_valid:
+        typeof coordValidRaw === "boolean" ? coordValidRaw : undefined,
+      native_home_state: nativeHomeStateRaw,
+      native_home_state_name: nativeHomeStateNameRaw,
+      native_home_active: nativeHomeActive,
+    });
+  }
+  if (axes.length === 0) {
+    return null;
+  }
+  const hasDriveFeedback = maxAxisIndex >= 0 || statuswordFeedbackAxes > 0;
+  const driverState = faultedAxes > 0
+    ? "FAULTED"
+    : opEnabledAxes > 0
+      ? "ACTIVE"
+      : hasDriveFeedback
+        ? "DISARMED"
+        : "INACTIVE";
+  const physicalState = faultedAxes > 0
+    ? "FAULTED"
+    : opEnabledAxes > 0
+      ? "ACTIVE"
+      : hasDriveFeedback
+        ? "BUS_UP_DISARMED"
+        : "INACTIVE";
+  const numAxes = maxAxisIndex >= 0 ? maxAxisIndex + 1 : axes.length;
+  const backendNameRaw = event.backend_name;
+  const servoBackend =
+    typeof backendNameRaw === "string" && backendNameRaw.trim().length > 0
+      ? backendNameRaw.trim()
+      : undefined;
+  return {
+    __synthesized_from_monitor_axes: true,
+    servo_backend: servoBackend,
+    physical_state: physicalState,
+    driver_state: driverState,
+    armed: axisEnableMask !== 0 ? 1 : 0,
+    axis_enable_mask: axisEnableMask,
+    axis_enable_mask_hex: `0x${axisEnableMask.toString(16)}`,
+    native_home_active_axis_mask: nativeHomeActiveAxisMask,
+    native_home_active_axis_mask_hex: `0x${nativeHomeActiveAxisMask.toString(16)}`,
+    enable_requested: axisEnableMask !== 0,
+    requested_axes: requestedAxes,
+    op_enabled_axes: opEnabledAxes,
+    num_axes: numAxes,
+    faulted_axes: faultedAxes,
+    statusword_feedback_axes: statuswordFeedbackAxes,
+    axes,
+  };
 }
 
 export default function App() {
@@ -6490,6 +6736,21 @@ export default function App() {
         }
         if (maybeObj.drive_faults && typeof maybeObj.drive_faults === "object") {
           driveFaultsValue = maybeObj.drive_faults as DriveFaultSnapshot;
+        } else if (Array.isArray(maybeObj.axis_absolute_feedback) && maybeObj.axis_absolute_feedback.length > 0) {
+          // Fallback path when the monitor event omits the aggregate
+          // `drive_faults` block (currently happens when the controller's
+          // drive-fault attacher throws silently or while the extra-
+          // telemetry cadence hasn't fired yet). The per-axis truth
+          // fields the commissioning panel needs — verification source,
+          // truth reason, truth-valid, coordinate-system-valid, native-
+          // home state — are already present on every event via
+          // `axis_absolute_feedback` + `servos`, so we synthesize a
+          // minimal DriveFaultSnapshot in-place so the UI doesn't fall
+          // back to a stale drive_faults snapshot from earlier in the
+          // session (which was the root cause of the J1/J3
+          // "persisted_home_anchor_inconsistent_with_live_6064" message
+          // stuck on the commissioning panel after a cold start).
+          driveFaultsValue = synthesizeDriveFaultSnapshotFromAxes(maybeObj);
         }
         if (typeof maybeObj.weld_active === "boolean") {
           weldActiveValue = maybeObj.weld_active;
@@ -6556,13 +6817,13 @@ export default function App() {
       lastAcceptedJointsRef.current = poseJoints.slice();
     }
 
-    setLatest((prev) => ({
-      ...next,
-      // The monitor stream only includes drive fault snapshots on some packets.
-      // Preserve the last known drive-power state between those updates so the
-      // power controls do not flicker back to an indeterminate/disarmed UI.
-      drive_faults: next.drive_faults ?? prev?.drive_faults ?? null,
-    }));
+    setLatest((prev) => {
+      const mergedDriveFaults = mergeDriveFaultSnapshots(prev?.drive_faults, next.drive_faults);
+      return {
+        ...next,
+        drive_faults: mergedDriveFaults,
+      };
+    });
     if (motionStatusValue) {
       setMotionStatus(motionStatusValue);
     }

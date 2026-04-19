@@ -18,7 +18,8 @@ ACTIVE_STATE="${STATE_DIR}/active.env"
 
 SYSTEM_PYTHON="$(command -v python3 || command -v python || true)"
 if [[ -z "${SYSTEM_PYTHON}" ]]; then
-  echo "[start-stack] ERROR: python3 (or python) is required for health probes." >&2
+  printf '[%s] [start-stack] ERROR: python3 (or python) is required for health probes.\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S%z')" >&2
   exit 1
 fi
 PROJECT_PYTHON="${REPO_ROOT}/.venv/bin/python"
@@ -41,7 +42,7 @@ MANIFEST_PATH=""
 
 CONTROLLER_HOST="${GRADIENT_CONTROLLER_HOST:-127.0.0.1}"
 CONTROLLER_PORT="${GRADIENT_CONTROLLER_PORT:-3000}"
-API_PORT="${GRADIENT_API_PORT:-4000}"
+API_PORT="${GRADIENT_API_PORT:-4400}"
 WEB_PORT="${GRADIENT_WEB_PORT:-8000}"
 RTCORE_METRICS_PATH="${GRADIENT_RTCORE_METRICS:-/run/gradient-rt-motion/metrics.json}"
 RTCORE_SERVICE_NAME="gradient-rt-motion.service"
@@ -118,7 +119,7 @@ Options:
 Environment:
   GRADIENT_CONTROLLER_HOST           Controller probe host (default: 127.0.0.1)
   GRADIENT_CONTROLLER_PORT           Controller probe UDP port (default: 3000)
-  GRADIENT_API_PORT                  API HTTP port (default: 4000)
+  GRADIENT_API_PORT                  API HTTP port (default: 4400; 4000 collides with Windows iphlpsvc under Cursor port-forwarding)
   GRADIENT_WEB_PORT                  Web UI HTTP port (default: 8000)
   GRADIENT_RTCORE_METRICS            RTCore metrics path (default: /run/gradient-rt-motion/metrics.json)
   GRADIENT_RTCORE_READY_TIMEOUT_S    Controller-side RTCore readiness timeout (default: 30 via start-stack.sh)
@@ -838,7 +839,17 @@ start_tail() {
   local label
   label="$(service_label "${name}")"
 
-  "${SYSTEM_PYTHON}" -u - "${label}" "${log_file}" <<'PY' &
+  init_banner_palette
+  local clear_spinner_flag="0"
+  if ui_can_render; then
+    clear_spinner_flag="1"
+  fi
+
+  GRADIENT_STACK_STYLE_MUTED="${BANNER_MUTED}" \
+  GRADIENT_STACK_STYLE_LABEL="${UI_INFO}" \
+  GRADIENT_STACK_STYLE_RESET="${BANNER_RESET}" \
+  GRADIENT_STACK_TAIL_CLEAR_SPINNER="${clear_spinner_flag}" \
+    "${SYSTEM_PYTHON}" -u - "${label}" "${log_file}" <<'PY' &
 import io
 import os
 import sys
@@ -852,13 +863,34 @@ try:
         with redirect_stdout(_sink):
             from gradient_os.telemetry.terminal_dashboard import (
                 TerminalDashboardState,
+                format_log_entry,
+                log_palette_from_env,
                 process_service_log_line,
             )
 except Exception:
     TerminalDashboardState = None
+    format_log_entry = None
+    log_palette_from_env = None
     process_service_log_line = None
 
 state = TerminalDashboardState() if TerminalDashboardState is not None else None
+palette = log_palette_from_env() if callable(log_palette_from_env) else None
+clear_spinner = os.environ.get("GRADIENT_STACK_TAIL_CLEAR_SPINNER", "") == "1"
+spinner_clear_seq = "\r\x1b[2K" if clear_spinner else ""
+
+
+def _emit(rendered_label: str, rendered_message: str) -> None:
+    if callable(format_log_entry):
+        formatted = format_log_entry(
+            rendered_label,
+            rendered_message,
+            palette=palette,
+        )
+    else:
+        formatted = f"[{rendered_label}] {rendered_message}"
+    sys.stdout.write(spinner_clear_seq + formatted + "\n")
+    sys.stdout.flush()
+
 
 with open(path, "r", encoding="utf-8", errors="replace") as handle:
     while True:
@@ -866,12 +898,11 @@ with open(path, "r", encoding="utf-8", errors="replace") as handle:
         if line:
             if state is not None and callable(process_service_log_line):
                 emitted = process_service_log_line(label, line, state)
-                for output_line in emitted:
-                    sys.stdout.write(output_line + "\n")
-                    sys.stdout.flush()
+                for entry in emitted:
+                    entry_label, entry_message = entry
+                    _emit(entry_label, entry_message)
             else:
-                sys.stdout.write(f"[{label}] {line}")
-                sys.stdout.flush()
+                _emit(label, line.rstrip("\n"))
             continue
         time.sleep(0.1)
 PY
@@ -1348,6 +1379,22 @@ for axis in data.get("axes", []):
             details.append("resettable")
         if details:
             fault_suffix = "[" + " | ".join(details) + "]"
+    # Also surface the manufacturer-specific fault (0x203F) decode when the
+    # drive profile reports it as decoded. The bus-level 0x603F code is
+    # intentionally ambiguous (e.g. 0xFF00 is shared by Er11.0, Er45.0,
+    # Er84.3, Er87.1..Er87.4). The 0x203F code resolves the ambiguity and
+    # is the single most useful datum during seam-crossing fault triage.
+    mfr_fault = axis.get("manufacturer_fault") if isinstance(axis, dict) else None
+    if isinstance(mfr_fault, dict) and mfr_fault.get("decoded") is True:
+        mfr_details = []
+        mfr_code = str(mfr_fault.get("code", "")).strip()
+        mfr_name = str(mfr_fault.get("name", "")).strip()
+        if mfr_code:
+            mfr_details.append(mfr_code)
+        if mfr_name:
+            mfr_details.append(mfr_name)
+        if mfr_details:
+            fault_suffix = f"{fault_suffix}[mfr {' | '.join(mfr_details)}]"
     print(
         "\x1f".join(
             [
@@ -1884,10 +1931,30 @@ if "ec_generic is in use" in unit_journal or "ec_generic is in use" in systemd_s
 if re.search(r"task metrics:\d+ blocked for more than", kernel_journal):
     match = re.search(r"task (metrics:\d+) blocked for more than", kernel_journal)
     summary.append(f"hung_kernel_task={match.group(1) if match else 'metrics'}")
-if "[gradient-rt-mot] <defunct>" in processes:
+zombie_present = "[gradient-rt-mot] <defunct>" in processes
+if zombie_present:
     summary.append("rtcore_zombie_marker_present=1")
 if "ec_generic" in modules or "ec_master" in modules:
     summary.append("ethercat_modules_loaded=1")
+
+# Strong signature of the kernel-level wedge that only a reboot
+# clears: a zombie gradient-rt-motion combined with either the
+# kernel saying "ec_generic is in use" OR the EtherCAT service
+# failing to reserve the master. Mirror `detect_rtcore_kernel_wedge`
+# in the shell preflight so operator tooling and the diagnostic
+# summary agree on the classification.
+ec_master_busy_signal = (
+    "ec_generic is in use" in unit_journal
+    or "ec_generic is in use" in systemd_status
+    or "Failed to reserve master" in unit_journal
+    or "Failed to reserve master" in systemd_status
+    or "Master already in use!" in kernel_journal
+)
+if zombie_present and ec_master_busy_signal:
+    summary.append("reboot_required=1")
+    summary.append(
+        "recovery=reboot_pi_then_rerun_start_stack"
+    )
 
 if len(summary) == 2:
     summary.append("likely_cause=unknown")
@@ -1992,7 +2059,68 @@ wait_for_probe_soft_stop_safe() {
   done
 }
 
+# Detect unrecoverable kernel-level RTCore / EtherCAT wedges:
+#   * a zombie `gradient-rt-motion` process still listed in /proc (State=Z),
+#     which means a previous SIGKILL landed while the binary was blocked
+#     inside an `ecrt_request_master`-family kernel call;
+#   * AND `ec_master` kernel module refcount > 1, which means the stuck
+#     master reservation was never released by the kernel.
+# When both hold, no userspace recovery exists: `rmmod ec_generic` and
+# `rmmod ec_master` both fail with "Module is in use", and systemd has
+# already given up waiting on the zombie so it will never be reaped.
+# Only a reboot clears this state. Return 0 on wedge, 1 otherwise.
+# Populates RTCORE_KERNEL_WEDGE_ZOMBIE_PID and
+# RTCORE_KERNEL_WEDGE_EC_MASTER_REFCNT for callers that want to log the
+# exact signature. Pure /proc + /sys reads, no privilege required.
+detect_rtcore_kernel_wedge() {
+  RTCORE_KERNEL_WEDGE_ZOMBIE_PID=""
+  RTCORE_KERNEL_WEDGE_EC_MASTER_REFCNT=""
+
+  local zombie_pid=""
+  local pid_dir name state
+  for pid_dir in /proc/[0-9]*; do
+    [[ -r "${pid_dir}/status" ]] || continue
+    name="$(awk -F: '/^Name:/ {gsub(/[ \t]/, "", $2); print $2; exit}' "${pid_dir}/status" 2>/dev/null)"
+    [[ "${name}" == gradient-rt-mot* ]] || continue
+    state="$(awk -F: '/^State:/ {gsub(/[ \t]/, "", $2); print substr($2,1,1); exit}' "${pid_dir}/status" 2>/dev/null)"
+    if [[ "${state}" == "Z" ]]; then
+      zombie_pid="${pid_dir##*/}"
+      break
+    fi
+  done
+  [[ -n "${zombie_pid}" ]] || return 1
+
+  local refcnt=""
+  if [[ -r /sys/module/ec_master/refcnt ]]; then
+    refcnt="$(cat /sys/module/ec_master/refcnt 2>/dev/null)"
+  fi
+  # Module not loaded at all is NOT a reboot-required wedge: the module
+  # can be (re)loaded cleanly. Only a loaded-but-leaked refcount is.
+  if [[ ! "${refcnt}" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  (( refcnt > 1 )) || return 1
+
+  RTCORE_KERNEL_WEDGE_ZOMBIE_PID="${zombie_pid}"
+  RTCORE_KERNEL_WEDGE_EC_MASTER_REFCNT="${refcnt}"
+  return 0
+}
+
 wait_for_bus_operational() {
+  # Preflight: if the kernel is wedged on a zombie gradient-rt-motion
+  # still holding the EtherCAT master, the readiness loop will never
+  # succeed and waiting 20+ s for proof just delays the inevitable.
+  # Short-circuit with an explicit REBOOT REQUIRED banner instead.
+  if detect_rtcore_kernel_wedge; then
+    ui_status_clear
+    error "REBOOT REQUIRED: RTCore / EtherCAT master wedged in kernel space"
+    warn "zombie gradient-rt-motion pid=${RTCORE_KERNEL_WEDGE_ZOMBIE_PID} still holds the EtherCAT master; systemd cannot reap it"
+    warn "ec_master module refcnt=${RTCORE_KERNEL_WEDGE_EC_MASTER_REFCNT} (expected 1 when idle); rmmod ec_generic/ec_master will both fail with 'Module is in use'"
+    warn "no userspace recovery exists for this state - please run: sudo reboot"
+    warn "after the reboot, ./start-stack.sh will come up cleanly and your persisted-home anchors are unaffected"
+    return 2
+  fi
+
   local started_at
   local started_ms
   local deadline_at
@@ -2343,12 +2471,42 @@ stop_ethercat_master_runtime() {
   stop_systemd_service_if_active "${ETHERCAT_SERVICE_NAME}" || true
 }
 
+# Preserve the RTCore fast_trace JSONL (if enabled) to logs/j6-multiturn-fast/
+# BEFORE the RTCore service is stopped, since systemd wipes
+# /run/gradient-rt-motion/ on service stop (RuntimeDirectory default).
+# Non-fatal: never aborts shutdown. See Phase 2 of
+# /home/pi/.cursor/plans/j6_seam_whip_verification_b8c230f3.plan.md.
+preserve_rtcore_fast_trace_if_any() {
+  local src="/run/gradient-rt-motion/j6-fast-trace.jsonl"
+  if [[ ! -e "${src}" ]]; then
+    return 0
+  fi
+  local helper="${REPO_ROOT:-$(pwd)}/scripts/j6_multiturn_fast_capture.py"
+  if [[ ! -x "${helper}" && ! -f "${helper}" ]]; then
+    return 0
+  fi
+  local label="autosave"
+  local python_bin="${SYSTEM_PYTHON:-python3}"
+  local out=""
+  out="$("${python_bin}" "${helper}" save --if-exists --label "${label}" 2>&1 || true)"
+  if [[ -n "${out}" ]]; then
+    while IFS= read -r line; do
+      log "rtcore-trace: ${line}"
+    done <<< "${out}"
+  fi
+}
+
 perform_shutdown_sequence() {
   local initial_probe=""
   initial_probe="$(capture_probe_json || true)"
   if [[ -n "${initial_probe}" ]]; then
     log_probe_snapshot "${initial_probe}"
   fi
+
+  # Preserve the fast_trace JSONL while RTCore is still up (runtime dir is
+  # wiped on service stop). Runs regardless of soft/hard stop; safe no-op
+  # if the fast_trace drop-in is not enabled.
+  preserve_rtcore_fast_trace_if_any
 
   stop_child_process "web" "${WEB_PID}"
 
@@ -3079,7 +3237,11 @@ print_failed_log_excerpt() {
 }
 
 run_interactive_console() {
-  "${SYSTEM_PYTHON}" - "${REPO_ROOT}" "${CONTROLLER_LOG}" "${API_LOG}" "${WEB_LOG}" "${HEADLESS}" "${CONTROLLER_PID:-}" "${API_PID:-}" "${WEB_PID:-}" "${TTY_DEVICE}" <<'PY'
+  init_banner_palette
+  GRADIENT_STACK_STYLE_MUTED="${BANNER_MUTED}" \
+  GRADIENT_STACK_STYLE_LABEL="${UI_INFO}" \
+  GRADIENT_STACK_STYLE_RESET="${BANNER_RESET}" \
+    "${SYSTEM_PYTHON}" - "${REPO_ROOT}" "${CONTROLLER_LOG}" "${API_LOG}" "${WEB_LOG}" "${HEADLESS}" "${CONTROLLER_PID:-}" "${API_PID:-}" "${WEB_PID:-}" "${TTY_DEVICE}" <<'PY'
 import _thread
 import os
 import readline  # type: ignore
@@ -3105,11 +3267,24 @@ help_text = "Commands: stop | stop --hard | probe | status | help | clear"
 try:
     from gradient_os.telemetry.terminal_dashboard import (
         TerminalDashboardState,
+        format_log_entry,
+        log_palette_from_env,
         process_service_log_line,
     )
 except Exception:
     TerminalDashboardState = None
+    format_log_entry = None
+    log_palette_from_env = None
     process_service_log_line = None
+
+palette = log_palette_from_env() if callable(log_palette_from_env) else None
+
+
+def fmt(label: str, message: str) -> str:
+    if callable(format_log_entry):
+        return format_log_entry(label, message, palette=palette)
+    return f"[{label}] {message}"
+
 
 if tty_device and tty_device != "not a tty":
     tty_fd = os.open(tty_device, os.O_RDWR)
@@ -3158,6 +3333,10 @@ def pid_alive(pid: int) -> bool:
 def run_stack_command(args: list[str]) -> list[str]:
     env = os.environ.copy()
     env["GRADIENT_STACK_INTERACTIVE_CONSOLE"] = "0"
+    # Subprocess output has no TTY, so force-enable the launcher palette so
+    # nested probe/status output keeps the same [timestamp] [start-stack]
+    # styling the parent console uses for every other line.
+    env.setdefault("GRADIENT_STACK_COLOR", "1")
     proc = subprocess.run(
         [str(script_path), *args],
         cwd=str(repo_root),
@@ -3171,9 +3350,9 @@ def run_stack_command(args: list[str]) -> list[str]:
     if proc.stderr:
         lines.extend(proc.stderr.rstrip("\n").splitlines())
     if not lines:
-        lines.append(f"(no output, exit={proc.returncode})")
+        lines.append(fmt("console", f"(no output, exit={proc.returncode})"))
     elif proc.returncode != 0:
-        lines.append(f"(command exit={proc.returncode})")
+        lines.append(fmt("console", f"(command exit={proc.returncode})"))
     return lines
 
 
@@ -3224,10 +3403,12 @@ def monitor_loop() -> None:
         for tail in tails:
             for line in tail.poll():
                 if dashboard_state is not None and callable(process_service_log_line):
-                    for output_line in process_service_log_line(tail.label, line, dashboard_state):
-                        safe_print_line(output_line)
+                    emitted = process_service_log_line(tail.label, line, dashboard_state)
+                    for entry in emitted:
+                        entry_label, entry_message = entry
+                        safe_print_line(fmt(entry_label, entry_message))
                 else:
-                    safe_print_line(line)
+                    safe_print_line(fmt(tail.label, line))
 
         failed: list[str] = []
         if controller_pid and not pid_alive(controller_pid):
@@ -3239,7 +3420,12 @@ def monitor_loop() -> None:
         if failed:
             failed_children[:] = failed
             child_failure_evt.set()
-            safe_print_line(f"[start-stack] supervised process exited: {' '.join(failed)}")
+            safe_print_line(
+                fmt(
+                    "start-stack",
+                    f"ERROR: supervised process exited: {' '.join(failed)}",
+                )
+            )
             _thread.interrupt_main()
             return
 
@@ -3248,11 +3434,17 @@ def monitor_loop() -> None:
 
 safe_print_block(
     [
-        "[start-stack] Interactive line console active.",
-        "[start-stack] Commands: stop | stop --hard | probe | status | help | clear",
-        "[dashboard] controller=ONLINE api=ONLINE"
-        + ("" if headless else " web=ONLINE")
-        + " canonical_truth=MONITORING",
+        fmt("start-stack", "Interactive line console active."),
+        fmt(
+            "start-stack",
+            "Commands: stop | stop --hard | probe | status | help | clear",
+        ),
+        fmt(
+            "dashboard",
+            "controller=ONLINE api=ONLINE"
+            + ("" if headless else " web=ONLINE")
+            + " canonical_truth=MONITORING",
+        ),
     ]
 )
 
@@ -3278,7 +3470,7 @@ try:
         if not command:
             continue
 
-        safe_print_line(f"[console] command> {command}")
+        safe_print_line(fmt("console", f"command> {command}"))
 
         if command in {"stop", "quit", "exit"}:
             exit_code = 10
@@ -3287,7 +3479,12 @@ try:
             exit_code = 11
             break
         if command == "help":
-            safe_print_line("[console] Commands: stop, stop --hard, probe, status, help, clear")
+            safe_print_line(
+                fmt(
+                    "console",
+                    "Commands: stop, stop --hard, probe, status, help, clear",
+                )
+            )
             continue
         if command == "clear":
             with print_lock:
@@ -3295,13 +3492,19 @@ try:
                 sys.stdout.flush()
             continue
         if command == "probe":
-            safe_print_block([f"[probe] {line}" for line in run_stack_command(["probe"])])
+            block = [fmt("console", "executing: probe")]
+            block.extend(run_stack_command(["probe"]))
+            block.append(fmt("console", "probe complete"))
+            safe_print_block(block)
             continue
         if command == "status":
-            safe_print_block([f"[status] {line}" for line in run_stack_command(["status"])])
+            block = [fmt("console", "executing: status")]
+            block.extend(run_stack_command(["status"]))
+            block.append(fmt("console", "status complete"))
+            safe_print_block(block)
             continue
-        safe_print_line(f"[console] Unknown command: {command}")
-        safe_print_line("[console] Type 'help' to list available commands.")
+        safe_print_line(fmt("console", f"Unknown command: {command}"))
+        safe_print_line(fmt("console", "Type 'help' to list available commands."))
 finally:
     stop_evt.set()
     monitor_thread.join(timeout=0.5)

@@ -485,7 +485,7 @@ From the repo root:
 
 # 3) Confirm the stack comes back disarmed
 ./start-stack.sh probe
-curl http://127.0.0.1:4000/control/motion-status
+curl http://127.0.0.1:4400/control/motion-status
 
 # Expect before power-up:
 # - physical_state=BUS_UP_DISARMED
@@ -495,7 +495,7 @@ curl http://127.0.0.1:4000/control/motion-status
 #   safe_for_power_transition=true
 
 # 4) Explicitly enable drives
-curl -X POST http://127.0.0.1:4000/control/power-up \
+curl -X POST http://127.0.0.1:4400/control/power-up \
   -H "Content-Type: application/json" \
   -d '{}'
 
@@ -512,13 +512,13 @@ curl -X POST http://127.0.0.1:4000/control/power-up \
 # 6) Send NO motion commands
 
 # 7) Explicitly power down using the safe path
-curl -X POST http://127.0.0.1:4000/control/power-down \
+curl -X POST http://127.0.0.1:4400/control/power-down \
   -H "Content-Type: application/json" \
   -d '{"wait_for_idle": true}'
 
 # 8) Verify the stack returns to a disarmed-safe state
 ./start-stack.sh probe
-curl http://127.0.0.1:4000/control/motion-status
+curl http://127.0.0.1:4400/control/motion-status
 
 # Expect after power-down:
 # - physical_state=BUS_UP_DISARMED

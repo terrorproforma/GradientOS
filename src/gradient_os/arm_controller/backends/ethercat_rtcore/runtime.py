@@ -57,6 +57,7 @@ RTCORE_JOG_STOP_REASON_ID_TO_NAME: dict[int, str] = {
 }
 
 RTCORE_FEEDBACK_WRAP_AXIS_MASK_ENV_VAR = "GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK"
+RTCORE_COMMAND_WRAP_AXIS_MASK_ENV_VAR = "GRADIENT_RT_COMMAND_WRAP_AXIS_MASK"
 
 
 def _rtcore_drive_profile_hash(token: str) -> int:
@@ -240,6 +241,52 @@ def build_rtcore_absolute_feedback_env(
     return {str(key): str(value) for key, value in env.items()}
 
 
+def _resolve_wrap_mask(
+    payload: dict[str, Any] | None,
+    *,
+    num_axes: int,
+    mask_key: str,
+    axes_key: str,
+    flag_key: str,
+    profile_id: str | None,
+    valid_mask: int,
+) -> int | None:
+    """Resolve a per-axis wrap bitmask from a motion-feedback config payload.
+
+    Returns ``None`` when the payload did not specify the mask at all,
+    letting the caller decide whether to supply a default or emit a
+    sentinel (for example "mirror the feedback mask" on the command
+    side).
+    """
+    if not isinstance(payload, dict):
+        return None
+    raw_mask = payload.get(mask_key)
+    if raw_mask is not None:
+        try:
+            value = int(raw_mask, 0) if isinstance(raw_mask, str) else int(raw_mask)
+        except Exception as exc:
+            raise ValueError(
+                f"Invalid {mask_key} for RTCore drive profile '{profile_id}'."
+            ) from exc
+        return value & valid_mask
+    raw_axes = payload.get(axes_key)
+    if isinstance(raw_axes, list):
+        mask = 0
+        for raw_axis in raw_axes:
+            axis_i = int(raw_axis)
+            if axis_i < 0 or axis_i >= int(num_axes):
+                raise ValueError(
+                    f"{axes_key} entry {axis_i} is out of range for num_axes={int(num_axes)}."
+                )
+            mask |= 1 << axis_i
+        return mask & valid_mask
+    if flag_key in payload:
+        if bool(payload.get(flag_key)):
+            return valid_mask
+        return 0
+    return None
+
+
 def build_rtcore_motion_feedback_env(
     *,
     num_axes: int,
@@ -250,33 +297,39 @@ def build_rtcore_motion_feedback_env(
         "ethercat_rtcore",
         drive_profile_id=normalized_profile,
     )
-    wrap_mask = 0
-    if isinstance(payload, dict):
-        raw_mask = payload.get("feedback_wrap_axis_mask")
-        if raw_mask is not None:
-            try:
-                wrap_mask = int(raw_mask, 0) if isinstance(raw_mask, str) else int(raw_mask)
-            except Exception as exc:
-                raise ValueError(
-                    f"Invalid feedback_wrap_axis_mask for RTCore drive profile '{normalized_profile}'."
-                ) from exc
-        else:
-            raw_axes = payload.get("feedback_wrap_axes")
-            if isinstance(raw_axes, list):
-                for raw_axis in raw_axes:
-                    axis_i = int(raw_axis)
-                    if axis_i < 0 or axis_i >= int(num_axes):
-                        raise ValueError(
-                            f"feedback_wrap_axes entry {axis_i} is out of range for num_axes={int(num_axes)}."
-                        )
-                    wrap_mask |= 1 << axis_i
-            elif bool(payload.get("feedback_counts_wrap")):
-                wrap_mask = (1 << int(num_axes)) - 1 if int(num_axes) > 0 else 0
     valid_mask = (1 << int(num_axes)) - 1 if int(num_axes) > 0 else 0
-    wrap_mask &= valid_mask
-    return {
-        RTCORE_FEEDBACK_WRAP_AXIS_MASK_ENV_VAR: f"0x{wrap_mask:x}",
+    feedback_mask = _resolve_wrap_mask(
+        payload if isinstance(payload, dict) else None,
+        num_axes=int(num_axes),
+        mask_key="feedback_wrap_axis_mask",
+        axes_key="feedback_wrap_axes",
+        flag_key="feedback_counts_wrap",
+        profile_id=normalized_profile,
+        valid_mask=valid_mask,
+    )
+    if feedback_mask is None:
+        feedback_mask = 0
+    # Command-wrap mask is independent. When the profile explicitly
+    # disables command-wrap (command_counts_wrap=False), emit mask=0 so
+    # RTCore pipes continuous 0x607A to the drive. When the profile does
+    # NOT specify any command-wrap signal, leave the env unset; the
+    # RTCore CLI sentinel will mirror --feedback-wrap-axis-mask for
+    # backward compatibility.
+    command_mask = _resolve_wrap_mask(
+        payload if isinstance(payload, dict) else None,
+        num_axes=int(num_axes),
+        mask_key="command_wrap_axis_mask",
+        axes_key="command_wrap_axes",
+        flag_key="command_counts_wrap",
+        profile_id=normalized_profile,
+        valid_mask=valid_mask,
+    )
+    env = {
+        RTCORE_FEEDBACK_WRAP_AXIS_MASK_ENV_VAR: f"0x{feedback_mask:x}",
     }
+    if command_mask is not None:
+        env[RTCORE_COMMAND_WRAP_AXIS_MASK_ENV_VAR] = f"0x{command_mask:x}"
+    return env
 
 
 def build_rtcore_startup_env(
@@ -323,6 +376,11 @@ def build_rtcore_startup_env(
     env.setdefault("GRADIENT_RT_NATIVE_HOME_CONFIG", "")
     env.setdefault("GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG", "")
     env.setdefault(RTCORE_FEEDBACK_WRAP_AXIS_MASK_ENV_VAR, "0x0")
+    # The command-wrap mask env is intentionally NOT defaulted here. When
+    # a profile does not emit it, the RTCore CLI sentinel (UINT32_MAX)
+    # causes the command mask to mirror --feedback-wrap-axis-mask, which
+    # preserves the historical pre-2026-04-19 behavior where command
+    # emission wrapped in lock-step with feedback.
     return env
 
 

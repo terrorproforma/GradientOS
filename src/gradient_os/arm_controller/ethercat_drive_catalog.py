@@ -42,6 +42,16 @@ ETHERCAT_DRIVE_CATALOG: dict[str, dict[str, Any]] = {
             "a6ec_encoder_position_tracking_mode": 4,
             "a6ec_rotation_mode_gear_ratio_numerator": None,
             "a6ec_rotation_mode_gear_ratio_denominator": None,
+            # C10.16 "Reference running mode in rotation mode".
+            # 0=Nearest (shortest path), 1=Forward only, 2=Reverse only,
+            # 3=Keep current direction, 4=Not specified. Drive NVM defaults
+            # to 0, but we pin it explicitly because a non-zero value causes
+            # the drive to take the LONG path in rotation mode (C00.07=4)
+            # when commanded near the seam, which produces full-shaft 360 deg
+            # excursions from tiny jog commands. Leaving this implicit is a
+            # safety hazard on larger joints (e.g. J6 with 10:1 gearing can
+            # wrap a full joint revolution from a 1 deg jog request).
+            "a6ec_rotation_mode_reference_running_direction": 0,
         },
         "startup_schema": {
             "a6ec_encoder_position_tracking_mode": {
@@ -66,6 +76,14 @@ ETHERCAT_DRIVE_CATALOG: dict[str, dict[str, Any]] = {
                 "max": 65535,
                 "label": "A6-EC rotation-mode gear ratio denominator",
                 "object": {"index": 0x2010, "subindex": 0x1A},
+                "env_var": "GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG",
+            },
+            "a6ec_rotation_mode_reference_running_direction": {
+                "type": "u16",
+                "min": 0,
+                "max": 4,
+                "label": "A6-EC rotation-mode reference running direction",
+                "object": {"index": 0x2010, "subindex": 0x17},
                 "env_var": "GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG",
             },
         },

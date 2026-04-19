@@ -1,3 +1,273 @@
+## 2026-04-18 22:12 +0000 — Expanded the RTCore Proof And Math plan into a fresh-agent handoff document
+
+- What changed:
+  - [`/home/pi/.cursor/plans/rtcore_proof_and_math_5813457e.plan.md`](/home/pi/.cursor/plans/rtcore_proof_and_math_5813457e.plan.md) rewritten with inline architectural Q&A, enumerated RTCore FAULTED branches, concrete numbers for the three-step proof matrix, explicit evidence-signature classification for pre-wire vs drive-visible failures, and Phase 2 math-module adoption instructions with no-default `wrap_to_single_turn` and explicit `live_counts_frame` parameters.
+  - Frontmatter todos unchanged (`instrument-rtcore-fault-path` in_progress, others pending).
+  - No source code changed. No tests run. Plan is a markdown document only.
+- What this plan now contains that the previous version did not:
+  - Answers to the four manufacturer-architecture questions the `2b1bcb09` transcript surfaced: `607C ∈ [0, RM-1]` vs host-side canonical home sign; `C10.16` direction resolution; the canonical read/write object set; why `+10°` / seam-crossing-at-`+185°` / `+360°` beats a single `+400°` test.
+  - Enumerated Phase 1 RTCore fault branches U1-U5 / C1-C3 / E1-E2 / M1 so instrumentation knows exactly which `logf` lines to add and what distinct tags to emit.
+  - Concrete move numbers (starting poses, speeds, durations, seam-crossing pre-positioning for Move B).
+  - Explicit evidence signatures for pre-wire / drive-visible-failure / drive-visible-success classification.
+  - "DO NOT" list (don't re-add F31.10, don't promote 60B0, don't treat `a6ec_joint_motion.py` as production truth yet, don't skip Phase 1).
+  - Appendix with exact commands a fresh agent needs (stack start, watch start, APPLY_JOINT_SETPOINT via UDP, wait-for-idle, regression sweep).
+- Validation performed:
+  - `wc -l` confirms 393-line plan.
+  - Manual review: frontmatter valid, mermaid diagram closes cleanly, all code-fence language tags are plain backtick sequences, every file reference is a full absolute path.
+  - No code tests because nothing executable changed.
+- Follow-ups / risk:
+  - Phase 1 Step 1.1 (instrumentation) is marked in_progress but not yet complete. The RTCore branch tags `FAULT_UPLOAD_U*` / `FAULT_COMMIT_C*` / `FAULT_EXEC_E*` / `FAULT_CLEAR_M1` are specified in the plan but not yet written into `main.cpp`.
+  - Phase 1 Step 1.2 (10-20 ms watch cadence) is likewise specified but not implemented. `scripts/a6ec_chapter5_probe.py` still enforces the 50 ms floor.
+  - Phase 1 Step 1.3 needs hardware. Do not skip the proof matrix on hardware before running Phase 2.
+  - If the rerun classifies the failure as branch U1 / U2 / M1, the real fix is in RTCore command-ring state handling and neither continuous `607A` nor `60B0` nor the math module are the right levers. The plan now notes that explicitly (Step 1.6).
+
+## 2026-04-17 Extracted A6-EC joint-motion math into `arm_controller.math.a6ec_joint_motion`
+
+- Task summary:
+  - User asked for the joint-movement mathematics written from scratch given the A6-EC frame-semantics note, 2026-04-15 manufacturer reply, and manual Chapters 5/11. Produced a self-contained, stateless, unit-tested math module that captures every equation in one testable place.
+- What changed:
+  - `src/gradient_os/arm_controller/math/__init__.py` (new): package namespace.
+  - `src/gradient_os/arm_controller/math/a6ec_joint_motion.py` (new, ~540 LOC): pure-functional math library with explicit citations to the source docs. Exported surface:
+    - Constants: `A6EC_COUNTS_PER_MOTOR_REV = 2^17`, `A6EC_MAX_OFF_MOTOR_REVOLUTIONS = 32,767`.
+    - `A6ECAxisKinematics` dataclass with derived `rm_counts = counts_per_rev * num / den` (vendor email 2 Q1) and `counts_per_unit = rm_counts / (2*pi)`.
+    - Raw Chapter 5 reconstruction: `sign_extend_16`, `reconstruct_multiturn_counts_from_u40_1c_1e`, `combine_signed_i64_pair` for U40.20/.22 and U40.2A/.2C.
+    - Counts ↔ joint radians: `axis_q_rad_from_counts`, `counts_from_axis_q_rad` in the drive-native posture (no double-apply of gear ratio, per the anti-double-apply rule in the frame note).
+    - Canonical truth: `compute_home_anchor_rad(absolute, reference)`, `canonical_joint_q_rad(absolute, anchor, kinematics)` with explicit master-offset subtraction.
+    - Shaft-frame consistency: `shaft_frame_consistency` returning a `ShaftFrameConsistencyResult` with `consistent / mod_rm_delta_counts / wrap_turns / tolerance` fields mirroring the backend's `_shaft_frame_consistency_detail`. Default tolerance 16 counts (matches `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS`).
+    - Command fold: `fold_canonical_q_to_command_counts(canonical_q, live_reference_counts, kinematics, wrap_to_single_turn)` returning a `CommandFoldResult`. `wrap_to_single_turn=True` is the production command path; `=False` preserves the linear-windowed behavior required by the diagnostic roundtrip map and the canonical-from-axis-q reverse.
+    - Shortest-angular helper: `shortest_angular_counts(linear, rm)` for ±RM/2 folding.
+    - Trajectory safety: `check_per_point_step`, `check_first_point_live_deviation`, `enforce_trajectory_wire_frame_safety` returning/raising with `command_frame_oversized_step` / `command_frame_live_deviation_out_of_range` / `command_frame_seam_crossing_step_disallowed` / `command_frame_seam_crossing_first_point_disallowed` messages that match the backend log format exactly (includes `joint=N` 1-based index and `period_counts=RM`).
+    - `hm35_origin_offset_biased_to_midpoint(kinematics, num, den)` matching `NATIVE_HOME_CONFIG`'s `write_sdo_wrap_fraction` step, asserting 607C stays in `[0, RM-1]` per vendor email 2 Q6.
+  - `tests/test_a6ec_joint_motion_math.py` (new, 55 cases): pins each equation to vendor-derived numbers.
+    - Kinematics: RM formula, counts_per_unit, gear_ratio exactness, input validation.
+    - Raw reconstruction: Chapter 5 at origin / positive revs / negative revs / U40.1C mod reduction; sign_extend_16 boundary cases; combine_signed_i64_pair including the signed-boundary case.
+    - Conversions: zero/one-shaft-turn, sign flip, roundtrip.
+    - Anchor + canonical: zero-at-HM, whole-shaft-turn capture, master-offset subtraction.
+    - Shaft-frame consistency: exact match (sub-count quantization < 1.5), 5-turn offset tolerated, 50-count drift rejected, 10-count jitter tolerated (A6-EC probe's post-restart 7-9 count spike ceiling).
+    - Shortest-angular: zero/small/half-period/seam-straddle cases.
+    - Command fold: 2026-04-17 J6 incident reproduced bit-exact. With `_j6_incident_kinematics` (`sign=-1` to match scratchpad's `base_counts = +3,623` from `canonical_q = -0.01737 rad`), the wrapped fold lands inside `[0, RM)` near `+3,623`; the legacy unwrapped fold produces `adjusted_counts ≈ 1,314,343` which is exactly the `RM + 3,623` incident value. Statelessness test: canonical_q=0 folds to 0 from either side of the seam, angular delta stays < 6,000 counts.
+    - Inverse map roundtrip: canonical_q → fold → inverse recovers within one-count quantization.
+    - Trajectory safety: small step OK, 100 deg angular step rejected, seam-straddling step rejected when profile flags `seam_crossing_unsafe=True` and allowed when False. Same matrix for first-point deviation. RuntimeError message contains `joint=6` and `period_counts=1310720` so existing operator tooling keeps working.
+    - HM35 bias: midpoint = RM/2, quarter = RM/4, bias always in `[0, RM)` regardless of num/den input, num ≥ den rejected.
+- What was intentionally NOT changed:
+  - `backend.py` still owns the live state plumbing, the feedback-snapshot reads, and the wire-protocol structs. The new module is a pure-math PEER, not a drop-in replacement; it exists as a single source of truth for the equations themselves and a place the backend can delegate to incrementally. No behavioral change is shipped in this pass.
+  - The production `_enforce_trajectory_wire_frame_safety`, `_nearest_turn_fold_axis_q_for_axis`, and `_shaft_frame_consistency_detail` are unmodified; the new module replicates their math so future refactors can delegate without risk.
+- Validation performed:
+  - `PYTHONPATH=src .venv/bin/python -m py_compile src/gradient_os/arm_controller/math/__init__.py src/gradient_os/arm_controller/math/a6ec_joint_motion.py tests/test_a6ec_joint_motion_math.py` → OK.
+  - `PYTHONPATH=src .venv/bin/python -m pytest tests/test_a6ec_joint_motion_math.py -v` → `55 passed in 0.85s`.
+  - Cross-check against existing A6-EC adjacent suites: `pytest tests/test_a6ec_chapter5_probe.py tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py tests/test_gradient05_limits_and_backends.py tests/test_rtcore_runtime.py tests/test_drive_faults.py -q` → `224 passed in 5.36s`.
+  - Full sweep: `pytest tests/ --ignore=tests/test_driver.py --ignore=tests/test_end_to_end.py --ignore=tests/test_protocol.py --ignore=tests/test_solver.py --deselect tests/test_planning.py::TestTrajectoryPlanning::test_path_unwrapping_and_smoothing -q` → `471 passed, 1 deselected in 8.79s` (up from 409 baseline; delta is the new math tests plus their collected fixtures).
+  - `ReadLints` on all three touched files → no diagnostics.
+- Follow-ups / risk:
+  - Consider delegating the in-backend helpers (`_nearest_turn_fold_axis_q_for_axis`, `_shaft_frame_consistency_detail`, `_enforce_trajectory_wire_frame_safety`) to the math module in a subsequent pass so the 5,300-line backend shrinks and the math lives in exactly one place. Must be staged carefully — each helper has specific state interactions (logical_joint_idx → master_offset, native_home_offset_counts, axis_config) that the module intentionally does NOT capture.
+  - Consider using `A6ECAxisKinematics` as the canonical constructor for robot-config-derived axis constants so `counts_per_unit` cannot silently drift between backend, probe, and any future offline planner.
+  - The `_j6_incident_kinematics` helper pins that the real J6 uses `sign=-1`; if the robot-config sign is ever flipped, the 2026-04-17 J6 regression test will catch it.
+
+## 2026-04-17 ROOT CAUSE of J6 360 deg excursion: A6-EC misinterprets `607A` above RM even with C10.16=0 - wrap command output into [0, RM)
+
+- Task summary:
+  - Operator reported that after the earlier two-phase fix (`C10.16=0` pinned + host wire-frame safety cage), a near-seam J6 jog STILL produced a physical `~360 deg` excursion at max speed. Two `-1 deg` jog commands ran back to back; the drive reported no fault, the Python safety cage did not trip, the controller logged `trajectory completed` both times. Yet multi_turn went from `+120,144` (post-HM) to `-1,183,301` (delta = `-1,303,445` counts = one shaft revolution backwards plus the intended forward motion). So move 1 took the LONG way, move 2 took the short way.
+- Forensic reconstruction:
+  - live_6064 before move 1 = `1,310,694` (= `-26` signed; `26` counts below the seam from the positive-wrap side).
+  - Canonical_q target = `-0.01737 rad` (`-1 deg` joint); base_counts = `+3,623`.
+  - Old fold logic: `delta = 1,310,694 - 3,623 = 1,307,071`; `wrap_turns = round(1,307,071 / RM) = 1`; `wrap_lift = +RM`; adjusted_counts = `+3,623 + 1,310,720 = 1,314,343`. That is `RM + 3,623`, i.e. one shaft turn ABOVE `[0, RM-1]`.
+  - The A6-EC manufacturer notes (`docs/ethercat/a6ec-manufacturer-notes-2026-04-15.md` lines 459-477) explicitly define 6064 in rotation mode as a sawtooth in `[0, RM-1]`. Symmetrically, 607A must live in the same range. When we emitted 607A = `RM + 3,623` the A6-EC's rotation-mode interpretation went haywire: even with C10.16 verified as `0` (Nearest / shortest path) on every axis (metrics readback=0, verified=1), the drive took the LONG way (`-1,307,081 counts`) to reach what it apparently wrapped to single-turn `3,623`. No fault code was raised because from the drive's perspective it was tracking 607A smoothly; the only evidence is the continuous multi-turn counter.
+  - The host safety cage (`_enforce_trajectory_wire_frame_safety`, first-point and per-point bounds at 0.35 rad ~= 20 deg joint) did NOT trip because the LINEAR delta between commanded `1,314,343` and live `1,310,694` was only `+3,639 counts` (`~1 deg`). The bug was purely in the drive's handling of out-of-range 607A; the host command looked harmless.
+- Changes:
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - Added `import math` at the top of the module.
+    - `_nearest_turn_fold_axis_q_for_axis` gained a `wrap_to_single_turn: bool = False` parameter. Default behavior preserves the old linear-windowed semantic (required by the `_command_roundtrip_detail_for_axis` diagnostic and `_canonical_joint_q_from_command_axis_q` reverse map, which both compare directly against `reference_q`). Command mode wraps the fold output into `[0, RM)` via `adjusted_counts - period * floor(adjusted_counts / period)` plus a defensive `±period` clamp against IEEE-754 drift near the seam. `_command_axis_q_for_joint_value` opts in to `wrap_to_single_turn=True` so every 607A emitted by the host sits in the same range the A6-EC reports 6064 in under rotation mode.
+    - `_command_axis_q_for_joint_value`'s `command_frame_oversized_delta` guard now measures SHORTEST-ANGULAR (mod-RM `±RM/2`) distance instead of linear distance, because after the wrap two points on opposite sides of the seam can have linear delta ~RM while being physically adjacent.
+    - `_enforce_trajectory_wire_frame_safety` updated symmetrically: the per-point step check and the first-point live-deviation check both now compute `((linear + RM/2) % RM) - RM/2` and compare against the existing `_TRAJECTORY_MAX_PER_POINT_STEP_RAD` and `_TRAJECTORY_MAX_FIRST_POINT_DEVIATION_FROM_LIVE_RAD` thresholds. The RuntimeError payloads now include both the original linear delta and the angular delta so log triage can distinguish a legitimate seam-straddle from a real angular excursion.
+  - Tests updated (the old "one shaft turn linear jump" scenario is now a no-op under the wrap, so tests that locked it down have been rewritten around a 100 deg angular jump instead):
+    - `tests/test_gradient05_limits_and_backends.py::test_a6ec_small_jog_at_seam_stays_within_half_rm_wire_delta` - rewritten to check (a) 607A lands in `[0, RM)`, (b) shortest-angular delta matches the 0.5 deg jog, (c) linear delta stays within one shaft turn. Dropped `_force_legacy_truth_fallback` because that path uses motor-rev period not joint-rev period and the wrap-to-`[0, RM)` invariant under test only matters in native-ratio mode.
+    - `tests/test_gradient05_limits_and_backends.py::test_a6ec_command_frame_rejects_oversized_trajectory_step` - now uses a 100 deg angular step instead of a full-RM linear step.
+    - `tests/test_gradient05_limits_and_backends.py::test_a6ec_command_frame_rejects_point_far_from_live_reference` - now uses a 45 deg angular deviation instead of a full-RM linear deviation.
+    - New: `tests/test_gradient05_limits_and_backends.py::test_a6ec_command_frame_allows_seam_crossing_step_in_linear_counts` (per-point counter-regression) and `test_a6ec_command_frame_allows_seam_straddling_first_point` (first-point counter-regression). Both assert that legitimate seam-crossing motion does NOT false-fail the cage.
+    - `tests/test_a6ec_joint_sweep.py::test_a6ec_joint_sweep_fresh_hm_small_jog_stays_within_half_rm` - now asserts wire_counts in `[0, RM)` and shortest-angular delta matches the 0.5 deg jog.
+    - `tests/test_a6ec_joint_sweep.py::test_a6ec_joint_sweep_fresh_hm_trajectory_pre_commit_gate_rejects_large_angular_jump` (renamed from `..._rejects_whole_turn_jump`) - now exercises a 100 deg angular step.
+    - `tests/test_a6ec_j6_watch_replay.py::test_a6ec_j6_watch_replay_small_jog_stays_within_half_rm` - switched to shortest-angular delta.
+    - `tests/test_a6ec_j6_watch_replay.py::test_a6ec_j6_watch_replay_rejects_large_angular_jump` (renamed from `..._rejects_would_be_whole_turn_jump`) - now exercises a 100 deg angular step.
+- What was intentionally NOT changed:
+  - The roundtrip / canonical-from-axis-q diagnostic paths keep the old linear-windowed fold. They compare directly against `reference_q` (the raw 6064 in axis_q space) and a mid-stream wrap would produce false-positive "roundtrip inconsistent" diagnostics on every seam-adjacent pose.
+  - The `C10.16 = 0` startup SDO pin and the host-side safety cage thresholds. Those are still the right layers; this fix sits UPSTREAM of both (the drive can no longer see out-of-range 607A in the first place).
+  - RTCore C++. The fix is Python-side; `./start-stack.sh` alone picks it up.
+- Validation that ran:
+  - `python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` → success.
+  - `PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py tests/test_rtcore_runtime.py tests/test_drive_faults.py tests/test_api_endpoints.py tests/test_run_controller_helpers.py tests/test_encoder_retention.py -q` → `288 passed`.
+  - `PYTHONPATH=src python -m pytest tests/ --ignore=tests/test_driver.py --ignore=tests/test_end_to_end.py --ignore=tests/test_protocol.py --ignore=tests/test_solver.py --deselect tests/test_planning.py::TestTrajectoryPlanning::test_path_unwrapping_and_smoothing -q` → `409 passed, 1 deselected`.
+  - `ReadLints` on touched Python and test files → clean.
+- Follow-up / risk:
+  - **Primary follow-up**: verify the fix on hardware by running a near-seam J6 jog sequence. With the wrap-to-`[0, RM)` change, even if C10.16 is somehow overwritten at runtime, the A6-EC should no longer see ambiguous 607A values. If the physical motion STILL does not match the commanded delta, the next thing to check is whether the drive has a separate "rotation direction preference" object we missed (C10.27/.28 or similar), or whether the ESI catalog defines a different 607A representation for this hardware revision.
+  - The rotation-mode contract is now symmetric: both 6064 (reported) and 607A (commanded) live in `[0, RM)`. Any new code path that emits 607A must go through the `wrap_to_single_turn=True` fold so this invariant cannot silently regress. Consider adding a defensive assert in `_axis_q_from_joint_positions` that the pre-RTCore axis_q array maps to wire counts in `[0, RM)` on each axis - the current enforcement is by convention (every caller opts in).
+  - The post-HM J6 metrics this session showed `pos_counts=1,310,694` immediately after HM35 success - i.e. the drive parked one count below the seam, which is why every subsequent canonical_q~=0 jog tried to cross the seam. Not a bug on our side, but a sharp edge worth noting in operational docs: after a successful drive-native home, the first jog can land the fold right at the seam boundary, so any wrap-math bug has the shortest possible fuse to trigger.
+
+## 2026-04-17 Unblock commissioning panel per-joint truth after cold start (synthesize drive_faults from axis_absolute_feedback + stop silencing backend drive-faults exceptions)
+
+- Task summary:
+  - After a cold start and a successful J6 Drive Home, the commissioning panel was stuck on `Canonical truth unavailable: persisted_home_anchor_inconsistent_with_live_6064` for J1 and J3 even though `/info/joints-detailed` simultaneously reported both axes as `truth_available=True, drive_native_truth_reason=valid, verification_source=persisted_home_anchor_agreement` with shaft-frame mod-RM deltas of `1.0-3.0 counts` (well within the 16-count tolerance). The UI's per-joint truth display had drifted off the backend's actual state.
+- Evidence collected live:
+  - `curl http://127.0.0.1:4400/info/joints-detailed` for J1/J3: healthy, truth available, shaft-frame consistent.
+  - 10-second SSE capture from `/monitor`: 378 events, 378 had `servos` and `axis_absolute_feedback`, ZERO had the aggregate `drive_faults` block.
+  - `build_drive_fault_snapshot` called directly in isolation (without passing `axis_drive_native_truth_context`) reproduces `drive_native_truth_reason=coordinate_system_invalid` for every axis without the HM-success statusword signature. The run_controller's `_attach_drive_faults_to_telemetry_message` is supposed to populate that context from `backend.get_display_feedback_snapshot()`, but the attacher was throwing silently inside `try: ... except Exception: pass`.
+- Root cause (two layers):
+  - **Backend**: `_attach_drive_faults_to_telemetry_message` raises on every call in the current controller process (root cause still to be traced - the silent `pass` hid the actual exception type). The monitor stream therefore never carries the aggregate `drive_faults` block, even though all the underlying per-axis data is already live on the same event under `axis_absolute_feedback`.
+  - **Frontend**: `App.tsx::handleMessage` preserved `prev.drive_faults` whenever the event lacked a fresh one (`next.drive_faults ?? prev?.drive_faults ?? null`). When `drive_faults` went permanently missing, the UI kept showing the first-ever `drive_faults` captured in the session - the one from the moment the J6 360 deg excursion was present AND the shaft-frame gate was failing for J1/J3 mid-recovery.
+- Changes:
+  - **Frontend (the unblock path, no restart required; Vite HMR picks it up)**: `web-ui/src/App.tsx`:
+    - New module-level helper `synthesizeDriveFaultSnapshotFromAxes(event)` that builds a minimal `DriveFaultSnapshot` (just the `axes` array) from the monitor event's `axis_absolute_feedback` + `servos`. Only populates the per-axis fields the commissioning panel actually reads through `DriveFaultAxis`: `drive_native_truth_valid/reason/verification_source`, `coordinate_system_valid`, `statusword`, `error_code`, `manufacturer_error_code`, `ds402_state`, `native_home_state/name`. Returns `null` if no `axis_absolute_feedback` is present.
+    - `handleMessage`'s drive_faults ingest now prefers (a) the event's explicit `drive_faults` block, then (b) the synthesized block when `axis_absolute_feedback` is present, then (c) the legacy fallback to `prev.drive_faults`.
+    - `setLatest((prev) => ...)` merge strategy for drive_faults: if `next.drive_faults` was synthesized (detected via `Object.keys(next.drive_faults).length === 1`, i.e. only the `axes` array), overlay its fresh `axes` onto `prev.drive_faults` so top-level drive-power bookkeeping (`servo_backend`, `driver_state`, `axis_enable_mask`, `native_home_active_axis_mask`, `num_axes`, `op_enabled_axes`, etc.) is preserved while per-axis truth is always current. If `next.drive_faults` is a full backend-emitted block, it replaces `prev` verbatim.
+  - **Backend (diagnostic, activates on next stack restart)**: `src/gradient_os/run_controller.py`:
+    - Replaced the silent `try: _attach_drive_faults_to_telemetry_message(...); except Exception: pass` around the telemetry-loop drive-faults attach call with a throttled stderr log: `[Controller] Drive-faults attach failed ({ExceptionType}): {message}`, emitted at most once every 5 seconds so a persistent failure does not drown the controller log.
+    - Added `_last_drive_faults_attach_error_ts: list[float] = [0.0]` as throttle state just above the `_telemetry_loop` closure; uses list-as-mutable-cell to avoid `nonlocal` churn.
+    - Existing `sys` and `time` imports at the top of the module cover the new log path; no new imports required.
+- What was intentionally NOT changed:
+  - The underlying cause of the drive-faults attach failure. We do not know its exception type yet because the silencing was hiding it. The logging change is enough to surface it the next time the stack starts; fixing the underlying cause becomes a separate follow-up scoped by whatever the log reveals.
+  - The monitor event's existing `axis_absolute_feedback` emission path. That's already the authoritative per-axis truth source; the fix just teaches the frontend to read it when `drive_faults` is absent.
+  - The existing `prev.drive_faults` preservation pattern. It's still the right fallback when an event carries neither `drive_faults` nor `axis_absolute_feedback`. We just no longer hard-depend on it for per-axis truth freshness.
+- Validation that ran:
+  - `cd web-ui && npx vitest run src/ControlPanel.test.tsx` → `24 passed` (all existing coverage + the previously added J6 per-joint fallback tests).
+  - `cd web-ui && npm run build` → clean build; `dist/assets/app-BAfbDjK6.js` (was `-z_Id8ADy.js`) produced with the new synthesizer.
+  - `python -m py_compile src/gradient_os/run_controller.py` → success.
+  - `python -m pytest tests/test_run_controller_helpers.py -q` → `9 passed`.
+  - `ReadLints` on `web-ui/src/App.tsx` and `src/gradient_os/run_controller.py` → no diagnostics.
+  - Live repro confirmed pre-fix: 10s `/monitor` SSE capture showed 378 events, 0 `drive_faults` occurrences, 378 `servos`. Post-fix UI behavior is validated via Vite HMR (user refresh).
+- Follow-up / risk:
+  - **Primary follow-up**: trace the underlying cause of the drive-faults attach exception on the next stack restart (look for the new `[Controller] Drive-faults attach failed (...)` log line). The synthesizer is a safety net; the backend block should be the source of truth once the cause is fixed.
+  - The synthesized `DriveFaultSnapshot` intentionally omits top-level fields like `num_axes`, `op_enabled_axes`, `statusword_feedback_axes`, `physical_state`, `ethercat_master_state`, `rtcore_state`. The UI relies on those for runtime-header labels and power-transition diagnostics. When no prev `drive_faults` exists (first event after a cold connect) and the backend is still dropping drive_faults, those fields stay `undefined` until the backend recovers. Acceptable for the immediate unblock but worth watching.
+  - Stale `prev.drive_faults` without a fresh event is still possible if axis_absolute_feedback is ALSO absent from an event; in practice this only happens when the whole joints pipeline is down, in which case the commissioning panel has bigger problems to worry about than stale truth status.
+
+## 2026-04-17 Unblock J6 commissioning panel (display gap + effect thrash) after 360 deg excursion
+
+- Task summary:
+  - Post-cold-start, operator reported the Joint Commissioning panel was flickering at ~5-10 Hz between "J1-J5 angles shown + J6 '--'" and "all six joints '--' + 'Waiting for joint feedback...'", with the entire panel unusable. J6 was physically displaced by one full shaft revolution from its home (the remnant of the 2026-04-17 360 deg incident), so the operator needed the Drive Home button on J6 to re-anchor — which they could not reliably reach because of the flicker.
+- Evidence collected live before touching code:
+  - `ls -la /run/gradient-rt-motion/metrics.json` + a `startup_drive_configs` dump confirmed the earlier `C10.16=0` safety-fix landed cleanly: every axis reports `readback=0, verified=1, readback_valid=1` for `a6ec_rotation_mode_reference_running_direction`. The drives are explicitly pinned to Nearest/shortest-path mode now. That fix is working as intended.
+  - `curl http://127.0.0.1:4400/info/joints-detailed`:
+    - `canonical_joint_truth_available=true`, `raw_canonical_joint_truth_available=true`, `display_joint_truth_available=false`.
+    - `arm_deg = [5.45, -4.91, 0.06, -0.01, -0.02, 360.01]`, `arm_display_deg = [5.45, -4.91, 0.06, -0.01, -0.02, null]`.
+    - J6 per-axis detail: `truth_reason="drive_native_command_frame_roundtrip_mismatch"`, `command_roundtrip_reference_error_counts=-1310721.0` (exactly `-RM - 1`), `shaft_frame_consistent=true`, `persisted_home_anchor_consistent=true`. The state is internally coherent; the display-mode command roundtrip refuses a canonical_q that sits a full shaft turn away from the single-turn reference because it does not re-fold against live 6064 (that's by design for display).
+  - SSE `/monitor` sampled at ~5 Hz: `display_joints=None` on every event, `joints` carries the full canonical array including J6 at 6.283 rad. The monitor stream has no per-joint operator display for this backend configuration at present.
+- Root cause, two factors stacked:
+  - **Frontend state shape**: `ControlPanel.tsx::preferredJointAnglesDeg` only read `arm_display_deg` and returned `[5.45, -4.91, 0.06, -0.01, -0.02, NaN]`. Correct per the old contract ("display mode = display mode"), but the operator had no per-joint visibility of where J6 actually was.
+  - **Frontend effect thrash**: the fallback-poll `useEffect` inside the commissioning panel depended on the whole `latestTelemetry` object. Every SSE monitor event (~5-10 Hz) cleaned up the old `setInterval` and set up a new one with an immediate poll. When display was partially-available but the SSE `display_joints` was `null`, the `hasAnyFiniteJointAngles(preferredTelemetryJointAnglesRad(latestTelemetry))` early-return check never fired, so the effect permanently polled AND tore itself down 5-10 times a second. That instability, combined with the `setJointFeedbackError("Waiting for joint feedback...")` branch in `refreshJointAngles` firing on any fetch race / transient, produced the visible "all joints '--'" flashes.
+- Changes:
+  - `web-ui/src/ControlPanel.tsx`:
+    - New helper `mergeDisplayWithCanonicalFallback(primary, fallback)`. It only fills NaN slots in `primary` from `fallback`; if `primary` is fully missing it returns `null`. This preserves the "don't leak cached canonical into operator display" contract while allowing the panel to display per-joint canonical when display is PARTIALLY present.
+    - `preferredJointAnglesDeg` and `preferredTelemetryJointAnglesRad` now gate the canonical fallback on explicit canonical-truth-live signals: `raw_canonical_joint_truth_available` / `canonical_joint_truth_available` / `read_source === "live_feedback"`. For the SSE stream we additionally accept "flags missing AND finite joints array present" so older monitor payloads still work.
+    - New `hasFreshTelemetryJointAngles` `useMemo` boolean. The fallback-poll `useEffect` now depends on this stable boolean instead of `latestTelemetry`. The `setInterval` is torn down only when availability actually flips, not on every SSE event. This eliminates the interval-recreate churn that was driving the panel's visible flicker.
+    - Extended `JointInfoResponse` with `raw_canonical_joint_truth_available`, `display_joint_truth_available`, and `canonical_joint_truth_available` fields so TypeScript can type the fallback gate.
+    - Visualizer feedback path untouched: `onJointFeedback` still requires `hasAllFiniteJointAngles` and receives `[]` otherwise. Canonical fallback is panel-display-only.
+  - `web-ui/src/ControlPanel.test.tsx`:
+    - New regression `fills per-joint display gaps from live canonical angles so a 360-deg-offset joint stays visible`: J6 with `arm_display_deg[5]=null`, `arm_deg[5]=360.01`, `raw_canonical_joint_truth_available=true` renders `360.01°` in the panel (no `"--"` on any joint).
+    - New regression `does not fall back to canonical when display truth is partial but canonical is not authoritative`: same shape but with `read_source="unavailable"`, `raw_canonical_joint_truth_available=false`; J6 must stay `"--"` and `arm_deg[5]=360.01` must NOT render. Protects the "no cached canonical masquerades as display" contract.
+- What was intentionally NOT changed:
+  - The backend display-mode command-roundtrip gate in `_command_roundtrip_detail_for_axis` (still intentionally strict; a post-360-excursion pose is a legitimate operator-facing anomaly the backend should surface). Fixing the operator block belongs in the UI layer since the operator needs to SEE the angle to decide whether to re-home or rotate back.
+  - The SSE `/monitor` emitter in `run_controller.py`. The current stream does not advertise `display_joints` or `display_joint_truth_available`; the UI now tolerates that gracefully via REST fallback. Adding those fields to the SSE stream is a reasonable follow-up but not blocking.
+  - Any changes to `_base_command_axis_q_for_joint_value` / the stateless nearest-turn fold. The review in [J6 wrap safety review](2b1bcb09-9610-4306-b5f8-2fb090c1393a) confirmed the write-path algebra is correct (canonical_q + master_offset → fold against live 6064), and that re-applying the absolute-home anchor on the write path would in fact be a regression.
+- Validation that ran:
+  - `curl http://127.0.0.1:4400/info/joints-detailed` sampled 20 times at 20 Hz; every sample consistent, arm_display_deg stable with `null` for J6 only. No flicker on the server side.
+  - `cd web-ui && npx vitest run src/ControlPanel.test.tsx` → `24 passed` (22 pre-existing + 2 new regressions).
+  - `cd web-ui && npm run build` → built cleanly, emitted `dist/index.html`, `dist/j6-manual-rotate-dataset.html`, and the main chunks as usual. The pre-existing `ArmVisualizer` bundle-size warning is unchanged.
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx` and `web-ui/src/ControlPanel.test.tsx` → no diagnostics.
+- Follow-up / risk:
+  - Operator action still required on hardware: with the panel now showing `J6 = 360.01°`, the operator can either click J6 "Drive Home" (captures a fresh absolute-home anchor at the current pose and the display gate will start passing) or rotate J6 back to its original home. Either choice is safe given `C10.16=0` pins the drive to shortest-path and the pre-commit wire-frame safety cage is in place.
+  - If a future incident produces multiple simultaneous per-joint display gaps (e.g. Jn for multiple n), this fix handles all of them uniformly — each NaN slot is independently backfilled from canonical IF canonical is authoritative.
+  - Consider adding `display_joints` and `display_joint_truth_available` to the SSE monitor payload so the commissioning panel can avoid REST polling entirely when the stream carries display truth; would fully eliminate the fallback-poll branch's existence in steady state.
+
+## 2026-04-17 SAFETY: tighten joint-move command-frame safety cage + pin A6-EC C10.16 to Nearest path (J6 360 deg incident)
+
+- Task summary:
+  - Operator reported a severe safety incident on startup `logs/startups/20260417-092330`: two back-to-back J6 jog commands, each requesting a `~1 deg` bounded move, drove the physical J6 joint through `~360 deg` at max speed before the operator disarmed. Controller/API logs showed clean `target_deg=-0.987` then `target_deg=+0.012` with no faults, so the divergence between reported intent and physical motion had to be caught either in host→drive frame translation or in the drive's rotation-mode behavior. The user's directive: "the math for sending joint move commands needs to be perfect there is not room for mistakes".
+- Evidence collected (no product code change in this phase):
+  - `/run/gradient-rt-motion/metrics.json` post-incident: J6 `pos_counts (6064) = 1,310,690` (= `-30` in signed shaft-frame representation, single-turn near zero), but `encoder_multi_turn_low/high` combined to `-1,190,565`. Reconstructed pre-move `multi_turn = +120,155` (= `anchor_rad * -1 * counts_per_unit`, since anchor `-0.5761 rad` and canonical_q `~0` at the time), so the continuous motor state moved by exactly `-1,310,720 counts = -1 joint shaft revolution` during the jog. That maps to `+360 deg` of joint rotation through the `sign=-1` convention, matching the operator's observation.
+  - `6064 = 1,310,690` is `-30 signed`, meaning the drive's single-turn reference position did NOT move — the multi-turn counter wrapped around a full shaft revolution while 6064 stayed put. That is consistent with "the drive took the long way around the wrap seam instead of the short way".
+  - A6-EC `C10.16 (Reference running mode in rotation mode)` per vendor manual chapter 11: `0=Nearest`, `1=Always forward`, `2=Always reverse`, `3=Keep current direction`, `4=Not specified`. This is the exact knob that decides short-vs-long-path behavior in `C00.07=4` (rotation mode). Our existing A6-EC startup SDO list only pinned `C00.07`, `C10.18`, `C10.19`; `C10.16` was left at whatever was in the drive's NVM, which could be anything and specifically might not be `0`.
+- Root cause, two contributing factors (both fixed in this pass):
+  - (Drive-side) A6-EC `C10.16` never explicitly configured at startup. If the drive's NVM holds a non-zero value (e.g. "Always reverse" or "Keep current direction"), commanded targets near the seam go the LONG way around, producing a full-shaft-revolution physical motion from a tiny logical delta.
+  - (Host-side) The pre-commit trajectory-upload safety gate `_enforce_trajectory_step_within_half_rm` only refused wire-frame steps larger than `0.5 * RM`, which equals `180 deg` of joint motion per point. That is orders of magnitude more permissive than any legitimate jog or bounded move needs, and would not have caught the observed excursion even if it had been produced by a pure host-math bug.
+- Changes:
+  - [src/gradient_os/arm_controller/ethercat_drive_catalog.py](src/gradient_os/arm_controller/ethercat_drive_catalog.py): added `a6ec_rotation_mode_reference_running_direction` to the `a6ec_ds402` `startup_defaults` (default `0 = Nearest/shortest path`) and `startup_schema` (`u16`, object `0x2010:0x17`, range `0..4`). Pinning this at every startup guarantees shortest-path behavior regardless of drive-side NVM state.
+  - [src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py](src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py): added `STARTUP_REFERENCE_DIRECTION_KEY`, `_LABEL`, `_OBJECT`, and `STARTUP_REFERENCE_DIRECTION_VALUE_LABELS` constants; wired the new key into `_STARTUP_SETTING_ORDER` / `_STARTUP_SETTING_METADATA`; added `_startup_reference_direction_value_label` and dispatch from `_startup_setting_value_label` so operator-facing snapshots decode the readback value as a human-readable direction (e.g. "Nearest (shortest path)"). `render_rtcore_systemd_env` now emits 4 startup-SDO descriptors (was 3) within the `kMaxStartupSdoDescriptors=8` RTCore limit, so no RTCore C++ rebuild is strictly required; a stack restart picks up the new env.
+  - [src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py](src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py): renamed `_enforce_trajectory_step_within_half_rm` → `_enforce_trajectory_wire_frame_safety`. New two-bound contract expressed in joint-space radians so thresholds mean the same motion envelope on every axis:
+    - `_TRAJECTORY_MAX_PER_POINT_STEP_RAD = 0.35` (`~20 deg joint`) - caps the wire-frame delta between consecutive uploaded points. Catches mid-trajectory fold flips. Replaces the old `0.5 * RM = 180 deg` step bound that was far too permissive.
+    - `_TRAJECTORY_MAX_FIRST_POINT_DEVIATION_FROM_LIVE_RAD = 0.35` (`~20 deg joint`) - caps the wire-frame distance from live `6064` for POINT 0 only. Since point 0's `canonical_q` is read from live feedback before uploading, its folded `607A` should land near live `6064`; a bigger deviation is a turn-selection bug (host fold or drive config) that would teleport the joint. Subsequent trajectory points may legitimately travel far from live for long bounded moves, so this gate only applies to point 0.
+    - `enqueue_trajectory_points` now captures `initial_live_counts = [self._live_reference_counts_for_axis(i) for i in range(self._rt_num_axes)]` once before the loop and threads it through the safety check.
+    - Raises `command_frame_oversized_step` and `command_frame_live_deviation_out_of_range` (new) respectively, with axis/joint/target/live counts in the message so operator incident reports can be triaged without guesswork.
+  - [tests/test_gradient05_limits_and_backends.py](tests/test_gradient05_limits_and_backends.py): two synthetic upload tests (`..._keeps_controller_logical_frame_with_native_home_offset`, `..._keeps_nonunit_a6ec_axis_in_logical_radians`) now stage `backend._axis_counts[0]` to match the commanded point so the new first-point-deviation cage does not refuse the synthetic single-point upload; the test's contract is frame conversion, not motion safety. Existing `test_a6ec_command_frame_rejects_oversized_trajectory_step` updated to use the new method/parameter names. Added new regression `test_a6ec_command_frame_rejects_point_far_from_live_reference` that drives a single trajectory point exactly one shaft revolution from live 6064 and asserts `command_frame_live_deviation_out_of_range` fires — direct 2026-04-17 J6 incident coverage.
+  - [tests/test_a6ec_joint_sweep.py](tests/test_a6ec_joint_sweep.py) and [tests/test_a6ec_j6_watch_replay.py](tests/test_a6ec_j6_watch_replay.py): the "trajectory must refuse a whole-turn jump" regressions updated to use `_enforce_trajectory_wire_frame_safety`, to pass `initial_live_counts`, and to accept either `command_frame_oversized_step` or `command_frame_live_deviation_out_of_range` (either is a correct fail-closed outcome for the pathological one-shaft-turn jump).
+  - [tests/test_rtcore_runtime.py](tests/test_rtcore_runtime.py): helper `_a6ec_startup_drive_configs_for_ratio` now appends the `a6ec_rotation_mode_reference_running_direction` entry (default `0`). The rendered `GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG` assertion was extended to expect the 4th descriptor `;a6ec_rotation_mode_reference_running_direction|u16|0x2010|0x17|0,0,0,0,0,0`. The `build_rtcore_drive_startup_config` return-shape assertions now include the new key/value list.
+  - [tests/test_a6ec_j6_watch_replay.py](tests/test_a6ec_j6_watch_replay.py) / [tests/test_a6ec_joint_sweep.py](tests/test_a6ec_joint_sweep.py): `_startup_drive_config_entries` helpers append the reference-direction setting with `commanded/readback=0, verified=1` so backend-side `extract_startup_config_axis` sees all four required settings present and marked verified (matches the new `_STARTUP_SETTING_ORDER` list).
+- What was intentionally NOT changed in this pass:
+  - The write-path math in `_base_command_axis_q_for_joint_value` + `_nearest_turn_fold_axis_q_for_axis`. When canonical_q is shaft-frame-consistent with live 6064 (gate already enforces this at read time), the fold reconstructs the correct 607A. The 2026-04-17 incident is explained by drive-side rotation-direction config plus an over-permissive host safety cage; no change to the fold algebra is required to close the safety hole.
+  - `/usr/local/bin/gradient-rt-motion`: no RTCore C++ changes. `kMaxStartupSdoDescriptors=8` already accommodates the 4th descriptor. Stack restart is sufficient to pick up the new startup SDO on hardware.
+  - Drive fault / telemetry surfaces: existing `startup_drive_configs` telemetry automatically picks up the 4th descriptor via `extract_startup_config_axis`; no API/UI wiring changes needed.
+- Validation that ran:
+  - `source /home/pi/GradientOS/.venv/bin/activate && PYTHONPATH=src python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py src/gradient_os/arm_controller/ethercat_drive_catalog.py tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py tests/test_a6ec_j6_watch_replay.py tests/test_a6ec_joint_sweep.py` → success.
+  - `PYTHONPATH=src .venv/bin/python -m pytest tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py tests/test_a6ec_chapter5_probe.py tests/test_drive_faults.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py tests/test_encoder_retention.py -q` → `176 passed` (targeted touched-surface sweep).
+  - `PYTHONPATH=src .venv/bin/python -m pytest tests/ --ignore=tests/test_driver.py --ignore=tests/test_end_to_end.py --ignore=tests/test_protocol.py --ignore=tests/test_solver.py --deselect tests/test_planning.py::TestTrajectoryPlanning::test_path_unwrapping_and_smoothing -q` → `407 passed` (full non-legacy sweep).
+  - `test_path_unwrapping_and_smoothing` reproduces on clean HEAD in the same full-sweep mode (test-pollution from another test earlier in the run) but passes in isolation — pre-existing and unrelated to this change. The legacy `test_driver.py` / `test_end_to_end.py` / `test_protocol.py` / `test_solver.py` failures were already excluded by the repo convention.
+  - `make -C src/gradient_rt_motion` → clean rebuild (not strictly required for this fix, but confirms the generic SDO parser path still compiles).
+  - `PYTHONPATH=src .venv/bin/python -c "from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import build_rtcore_drive_startup_config; from gradient_os.arm_controller.robots import get_robot_config; print(build_rtcore_drive_startup_config(get_robot_config('gradient05').get_config_dict(), drive_profile='a6ec_ds402')['env']['GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG'])"` → confirms the emitted env var includes `;a6ec_rotation_mode_reference_running_direction|u16|0x2010|0x17|0,0,0,0,0,0` on all six axes.
+  - `ReadLints` on every touched Python/test file: clean.
+- Follow-up / risk:
+  - Live verification still owed: after the next `./start-stack.sh`, read back `startup_drive_configs[3].readback` on every axis from `/run/gradient-rt-motion/metrics.json` (or the UI's commissioning panel) and confirm each reports `readback=0, verified=1`. If any axis shows a different readback value, the drive's NVM or write path is diverging from our pinned default and should be investigated before the arm is powered up again.
+  - Explicit follow-on experiment once the stack is back up (safely): rehome J6, park the joint near the seam (6064 just above or below wrap), and command a tiny jog that crosses the seam. With `C10.16=0` and the new safety cage in place, the jog must produce `~1 deg` of joint motion. Any deviation is a bug.
+  - The raw write-path math still does not re-apply the persisted absolute-home anchor. That is latent - the shaft-frame consistency gate at read time compensates in practice - but should be audited as part of the broader A6-EC write-frame SOP once the immediate safety work is in hand.
+
+## 2026-04-17 Fix /monitor drive-native-truth regression (UI showed "coordinate_system_invalid" on every joint)
+
+- Task summary:
+  - Operator reported the dashboard showed "Canonical truth unavailable: coordinate_system_invalid" under every joint after boot, even after `sudo systemctl restart gradient-rt-motion` and a full stack restart. `curl /info/joints-detailed` simultaneously reported every axis as valid via `persisted_home_anchor_agreement`. Two endpoints that should be reading the same single-source-of-truth answer were disagreeing.
+- Root cause:
+  - When the W1+W2+W3 persistence-trust polish landed earlier today, `telemetry/native_home_status.py::derive_drive_native_truth_validity` gained `accept_persisted_home_anchor_as_restart_trust`, `persisted_home_anchor_present`, `persisted_home_anchor_consistent`, `multi_turn_feedback_valid`, `last_seen_*`, and `encoder_retention_fault_present` kwargs. `arm_controller/backends/ethercat_rtcore/backend.py` was updated to pass all of them (which is what feeds `/info/joints-detailed`). But `telemetry/drive_faults.py::build_drive_fault_snapshot` (which feeds the `/monitor` SSE stream the UI consumes) was NOT updated and kept calling the helper with only `statusword`, `error_code`, `manufacturer_error_code`, `require_hm_success_signature`, and `encoder_retention_fault_present`. With no opt-in flag and no anchor signals, the helper's anchor-based trust path (native_home_status.py:140-149) never ran, so every axis whose `0x6041` bit 15 was clear (normal post-boot A6-EC state) fell through to `reason="coordinate_system_invalid"`. The UI reads `/monitor.drive_faults.axes[].drive_native_truth_*`, so that's what operators saw.
+- Changes:
+  - [src/gradient_os/telemetry/drive_faults.py](src/gradient_os/telemetry/drive_faults.py): added `axis_drive_native_truth_context: Mapping[int, Mapping[str, Any]] | None = None` kwarg to `build_drive_fault_snapshot`. After the local `derive_drive_native_truth_validity` call, if the context has an entry for `axis_index`, the per-axis truth dict is overridden verbatim from the context (`drive_native_truth_valid` / `drive_native_truth_reason` / `drive_native_truth_signature_valid` / `coordinate_system_valid` / `drive_native_truth_verification_source`). The local call is preserved as a best-effort fallback so callers without backend context still get reasonable output (e.g. a dev running `/info/drive-fault-snapshot` on a metrics file).
+  - [src/gradient_os/run_controller.py](src/gradient_os/run_controller.py): `_build_drive_fault_snapshot` now calls `backend_instance.get_display_feedback_snapshot()` and extracts the per-axis `drive_native_truth_*` + `coordinate_system_valid` fields from `axis_absolute_feedback`. Those are packed into `axis_drive_native_truth_context` and passed to `build_drive_fault_snapshot`. The `/monitor` stream now carries the backend's single-source-of-truth answer verbatim instead of a re-derived wrong one.
+- What was intentionally NOT changed:
+  - `derive_drive_native_truth_validity`'s signature is unchanged.
+  - `backend.py` already passes all kwargs correctly; not touched.
+  - Test `tests/test_drive_faults.py` still exercises the fallback (no-override) path as before; the override path is covered end-to-end by the manual `/monitor` vs `/info/joints-detailed` diff performed below.
+- Validation:
+  - `py_compile` + `ReadLints` on touched files: clean.
+  - `pytest tests/test_drive_faults.py tests/test_rtcore_runtime.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py tests/test_gradient05_limits_and_backends.py tests/test_a6ec_chapter5_probe.py tests/test_a6ec_joint_sweep.py -q` → `289 passed`.
+  - On live hardware after stack restart (run `20260417-090326`), `/info/joints-detailed` and `/monitor` now both report every axis identically: J1-J5 `valid=True, reason=valid, src=persisted_home_anchor_agreement, coord_valid=True`; J6 `valid=True, reason=valid, src=statusword_bits12_15_clear13, coord_valid=True`. Before the fix, `/monitor` reported J1-J5 as `valid=False, reason=coordinate_system_invalid, src=unverified, coord_valid=False`.
+- Follow-up / risk:
+  - Any future `derive_drive_native_truth_validity` kwarg must be either (a) added to the backend's callsite AND reflected in `get_display_feedback_snapshot` output (which the monitor pipeline now consumes), OR (b) independently plumbed into `build_drive_fault_snapshot` via a new kwarg. Don't leave the monitor pipeline blind to new restart-trust signals again.
+  - Consider a targeted unit test in `tests/test_drive_faults.py` that constructs a minimal fake backend-context mapping and asserts `build_drive_fault_snapshot` adopts it verbatim — would have caught this.
+
+## 2026-04-17 API port default moved 4000 → 4400 (Windows iphlpsvc collision under Cursor Remote-SSH)
+
+- Task summary:
+  - While wiring up Cursor Remote-SSH port-forwarding for this workspace, Cursor popped `Local port 4000 could not be used for forwarding to remote port 4000. Port number 54245 has been used instead.` That breaks the web UI's API calls because `web-ui/src/useEndpoint.ts` hard-codes `apiPort=4000`, so the browser's `localhost:4000` requests don't reach the Pi's API when Cursor has been forced to a different local port.
+  - Root cause on Windows: `svchost.exe` (PID 5676 here) hosting `iphlpsvc` (IP Helper) had already taken `0.0.0.0:4000`. `iphlpsvc` is a hard dependency of `SharedAccess` (ICS), so stopping it was not an option (it would cascade-stop ICS and kill the Pi's DHCP-over-ICS internet).
+  - Durable fix chosen: move the Gradient API's default port from `4000` to `4400`. `GRADIENT_API_PORT` env-var override is preserved so anyone on a machine without the collision can still pin 4000 if they want.
+- Changes (all committed together 2026-04-17):
+  - [start-stack.sh](start-stack.sh): `API_PORT="${GRADIENT_API_PORT:-4400}"` (was `4000`) and expanded the `Environment:` help block so the reason for 4400 is written down: `API HTTP port (default: 4400; 4000 collides with Windows iphlpsvc under Cursor port-forwarding)`.
+  - [src/gradient_os/api/main.py](src/gradient_os/api/main.py): `--port` argparse default `int(os.environ.get("GRADIENT_API_PORT", "4400"))` (was `"4000"`). The CLI still honours `GRADIENT_API_PORT`.
+  - [web-ui/src/useEndpoint.ts](web-ui/src/useEndpoint.ts): `const apiPort = 4400;` plus an inline `NOTE:` comment explaining the Windows iphlpsvc root cause and telling future editors to keep this in sync with the launcher and the Python CLI default.
+  - [web-ui/src/App.tsx](web-ui/src/App.tsx): API-host input placeholder text `http://localhost:4400` (cosmetic-only; was `http://localhost:4000`).
+  - [tests/test_a6ec_chapter5_probe.py](tests/test_a6ec_chapter5_probe.py): `api_url="http://127.0.0.1:4400"` in the manual-J6-rotate snapshot test.
+  - [.vscode/settings.json](.vscode/settings.json) (local-only, gitignored): swapped `remote.portsAttributes["4000"]` for `remote.portsAttributes["4400"]` with `onAutoForward: "notify"` and `requireLocalPort: true`; left a `"4000": { onAutoForward: "ignore" }` stub so Cursor stops trying to forward the legacy port.
+  - [docs/README.md](docs/README.md) and [docs/ethercat/bringup.md](docs/ethercat/bringup.md) and [systemd/README.md](systemd/README.md): updated every remaining `localhost:4000` / `127.0.0.1:4000` / `--port 4000` / `0.0.0.0:4000` reference to `4400` and added a one-line rationale where natural.
+- What was intentionally NOT changed:
+  - `docs/resources/ethercat/esi/stepperonline/A6-EC/STEPPERONLINE_A6_Servo_V0.02.xml` MinValue/MaxValue `4000` tags — these are A6-EC motor-parameter bounds (RPM etc.), nothing to do with ports.
+  - `src/numeric_solver/pyquik/**` third-party build artefacts — irrelevant.
+  - `src/trajectory_cache/*.json` float coefficients — coincidental substring matches.
+  - `GRADIENT_RT_DRIVE_VENDOR_ID=0x00400000` in the rt-motion systemd env — that's a vendor ID, not a port.
+- Validation:
+  - `bash -n start-stack.sh` syntactically valid.
+  - `python3 -m py_compile src/gradient_os/api/main.py` clean.
+  - `python3 -c "import json; json.load(open('.vscode/settings.json'))"` parses.
+  - `ReadLints` on `web-ui/src/useEndpoint.ts`, `web-ui/src/App.tsx`, `.vscode/settings.json` — no diagnostics.
+  - `PYTHONPATH=src .venv/bin/python -m pytest tests/test_api_endpoints.py tests/test_a6ec_chapter5_probe.py tests/test_run_controller_helpers.py -q` → `88 passed`.
+  - `cd web-ui && npx vitest run src/ControlPanel.test.tsx` → `22 passed`.
+- Follow-up / risk:
+  - Stack-restart validation on hardware still needed (new default hasn't actually been exercised via `./start-stack.sh`). Operator should restart the stack, confirm the dashboard still populates via the auto-forwarded port 4400, and that `curl http://127.0.0.1:4400/health` returns `ok`.
+  - If any external tool (CI runner, CoE probe script, another workstation) pins the Pi's API at `:4000` explicitly, set `GRADIENT_API_PORT=4000` in that specific invocation's environment. The env-var override wasn't removed.
+  - Port 4400 is itself not IANA-reserved and could collide with some other tool in the future. If it ever does, grep anchor words `:4000`, `:4400`, `apiPort`, `GRADIENT_API_PORT` to find every reference, and repeat this change.
+
 ## 2026-04-17 Web UI not loading at localhost:8000 — Cursor auto-port-forward regression
 
 - Task summary:
@@ -4982,3 +5252,1193 @@ Native-home pathway was exercised end-to-end on J6 against the new RTCore binary
     - result: no diagnostics
 - Follow-up / risk:
   - The UI now surfaces the verification source from the existing `drive_faults` snapshot and selected-joint command payloads, but it still does not consume `/info/joints-detailed` directly for this display. That is intentional to avoid creating a second live truth channel in the frontend.
+
+## 2026-04-17 09:35 +0000 - Unified `[timestamp] [label] message` chrome across start-stack subprocess output
+
+- What changed:
+  - Upgraded `src/gradient_os/telemetry/terminal_dashboard.py`:
+    - Added module-level `DASHBOARD_LABEL` so canonical-truth transitions always emit under a stable `dashboard` tag.
+    - Added `format_timestamp()` returning `%Y-%m-%d %H:%M:%S%z` to match the bash launcher's `date '+...'`.
+    - Added `format_log_entry(label, message, ...)` which wraps timestamp + label in optional ANSI style codes and composes `[ts] [label] message`.
+    - Added `log_palette_from_env(env=None)` which reads `GRADIENT_STACK_STYLE_{MUTED,LABEL,RESET}` so Python tailers can color-match the bash launcher's palette.
+    - Converted `process_service_log_line()` to return `list[tuple[label, message]]` instead of pre-formatted strings. Regular service log lines retain their incoming label (`controller`, `api`, `web`); canonical-truth AVAILABLE/UNAVAILABLE state transitions relabel to `dashboard`.
+  - Rewrote `start-stack.sh::start_tail()`:
+    - `init_banner_palette` is called up front, and the backgrounded Python subprocess is launched with `GRADIENT_STACK_STYLE_MUTED/LABEL/RESET` + `GRADIENT_STACK_TAIL_CLEAR_SPINNER` env vars. The clear-spinner flag only flips to `1` when `ui_can_render` says we have a writable TTY, so redirected/non-TTY runs stay free of ANSI cursor escapes.
+    - Embedded Python now imports `format_log_entry` + `log_palette_from_env`, assembles a palette from env vars, iterates the new tuple API, and emits `\r\x1b[2K[timestamp] [label] message\n`. That wipes any pending spinner row on the terminal before writing a formatted tail line, eliminating the old `[#---] controller ... <tail text>` mash-ups.
+  - Rewrote `start-stack.sh::run_interactive_console()`:
+    - Exports the same style palette, imports the shared formatter, and centralises a `fmt(label, message)` helper used by every output path.
+    - Tail dispatch in `monitor_loop` now renders `fmt(label, message)` for both regular service lines and dashboard state transitions.
+    - Startup banner, `command>` prompt echo, `help` / `Unknown command` / `Type 'help' ...` replies, supervised-child failure messages, and the initial `[dashboard] controller=ONLINE api=ONLINE ... canonical_truth=MONITORING` line all flow through `fmt(...)` so they gain timestamps and color to match the launcher chrome.
+    - `probe` / `status` subcommands now print `[ts] [console] executing: <cmd>` ... captured subprocess body ... `[ts] [console] <cmd> complete`; the nested subprocess is invoked with `GRADIENT_STACK_COLOR=1` so the inner `[ts] [start-stack] INFO: ...` output keeps the launcher palette even when capture_output=True strips the TTY.
+  - Updated the pre-Python bootstrap error at the top of `start-stack.sh` to print `[<timestamp>] [start-stack] ERROR: python3 (or python) is required ...`, matching the format even in the earliest failure path where no helper functions are defined yet.
+  - Updated `tests/test_terminal_dashboard.py`:
+    - Converted existing assertions to the new tuple API (`("dashboard", "// LIVE STATE // ...")`, `("controller", "[Backend Registry] Registered backend: ...")`).
+    - Added coverage for `format_timestamp`, `format_log_entry` (palette-on and palette-off), and `log_palette_from_env` default/populated behavior.
+    - Added a pass-through regression proving regular service lines keep their incoming label when formatted.
+- Validation performed:
+  - `bash -n /home/pi/GradientOS/start-stack.sh`
+    - result: syntax OK
+  - `source ./start.sh && python -m pytest tests/test_terminal_dashboard.py -q`
+    - result: `13 passed`
+  - `source ./start.sh && python -m pytest tests/test_terminal_dashboard.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py -q`
+    - result: `92 passed`
+  - End-to-end simulation: ran the exact `start_tail` embedded Python (with the same env var set) against a synthetic controller/api/web log file. Output was exactly `[timestamp] [label] message` for each non-filtered line, noisy API access log entries were dropped, and the canonical-truth transition was relabelled to `[dashboard]`.
+  - `ReadLints` on `src/gradient_os/telemetry/terminal_dashboard.py`, `tests/test_terminal_dashboard.py`, `start-stack.sh`
+    - result: no diagnostics
+- Follow-up / risk:
+  - `print_status` and `print_probe` still emit bare `key: value` lines to stdout when the user runs `./start-stack.sh status|probe` directly. That is intentional so operators and external scripts keep a stable, grep-friendly contract; the interactive-console wrapper still frames those blocks with `[ts] [console] executing: <cmd>` / `... complete` lines so the live terminal looks uniform.
+  - The `\r\x1b[2K` spinner-wipe is only applied when `ui_can_render` succeeds; if a future caller pipes `./start-stack.sh` to a file without `TERM=dumb`, the launcher already disables its own spinner but the tail should also remain free of cursor escapes thanks to the new gated flag.
+  - Pre-existing test failures in `tests/test_driver.py`, `tests/test_planning.py`, `tests/test_protocol.py`, `tests/test_end_to_end.py`, and `tests/test_solver.py` are unrelated to this change and were already failing before this work.
+
+## 2026-04-17 22:48 +0000 - Fix inverted frontend drive-power/jog gating when `/monitor` drops `drive_faults`
+
+- What changed:
+  - `web-ui/src/App.tsx`:
+    - Expanded `synthesizeDriveFaultSnapshotFromAxes()` so the monitor fallback now derives fresh top-level drive-power fields from live `axis_absolute_feedback` + `servos`, not just per-axis truth. The synthesized snapshot now refreshes `driver_state`, `physical_state`, `armed`, `axis_enable_mask`, `enable_requested`, `requested_axes`, `op_enabled_axes`, `faulted_axes`, `statusword_feedback_axes`, `native_home_active_axis_mask`, and `num_axes`.
+    - Added `mergeDriveFaultSnapshots(previous, next)` so a real backend-emitted `drive_faults` block still wins verbatim, while a synthesized fallback overlays only its freshly derived fields onto the previous full snapshot. This preserves richer metadata like `ethercat_master_state` / `rtcore_state` without letting stale power-state fields freeze the UI after power-up or power-down.
+  - `web-ui/src/App.test.ts`:
+    - Added regressions covering active fallback synthesis, disarmed fallback synthesis, and the exact stale-previous-snapshot merge case that had the UI showing powered-up/disarmed backwards.
+- Validation performed:
+  - `cd /home/pi/GradientOS/web-ui && npx vitest run src/App.test.ts src/ControlPanel.test.tsx`
+    - result: `27 passed`
+  - `cd /home/pi/GradientOS/web-ui && npm run build`
+    - result: success
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/App.test.ts`
+    - result: no diagnostics
+- Follow-up / risk:
+  - The synthesized monitor fallback still cannot derive richer transport/fieldbus metadata such as `ethercat_master_state`, `link_up`, `responding`, or `metrics_path`. Those continue to come from the real backend `drive_faults` block when present; the new merge keeps their last known values without allowing them to pin the live power/jog gating state.
+
+## 2026-04-17 23:06 +0000 - Fail closed on A6-EC seam-straddling absolute `607A` trajectories
+
+- What changed:
+  - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`
+    - Added `command_frame_seam_crossing_unsafe=True` to the A6-EC position-semantics config so the live-hardware seam rule stays drive-profile-owned.
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`
+    - Added `_command_frame_seam_crossing_unsafe()`.
+    - Tightened `_enforce_trajectory_wire_frame_safety()` so seam-straddling first points and consecutive points now raise `command_frame_seam_crossing_first_point_disallowed` / `command_frame_seam_crossing_step_disallowed` for profiles that opt in, even when the shortest-angular delta is tiny.
+    - This supersedes the earlier assumption that mod-RM seam crossings were safe on A6-EC if the angular step looked small.
+  - `tests/test_gradient05_limits_and_backends.py`
+    - Replaced the two counter-regressions that previously required seam-straddling steps/deviation to pass with rejection expectations matching the live robot behavior.
+  - `tests/test_a6ec_joint_sweep.py`
+    - Narrowed the positive-path monotone trajectory acceptance test to a non-seam window so it still proves small ordinary trajectories pass without preserving the disproved seam assumption.
+  - `docs/ethercat/a6ec-frame-semantics-and-native-home.md`
+    - Documented the corrected contract: seam-straddling absolute `607A` trajectories are unsafe on the current A6-EC firmware and are now rejected until a seam-biased wire-frame policy is validated.
+- Validation performed:
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py tests/test_gradient05_limits_and_backends.py`
+    - result: success
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m pytest tests/test_gradient05_limits_and_backends.py -q`
+    - result: `121 passed`
+  - `PYTHONPATH=src /home/pi/GradientOS/.venv/bin/python -m pytest tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py -q`
+    - result: `64 passed`
+  - `ReadLints` on `backend.py`, `a6ec_ds402.py`, `tests/test_gradient05_limits_and_backends.py`, `tests/test_a6ec_joint_sweep.py`, and `docs/ethercat/a6ec-frame-semantics-and-native-home.md`
+    - result: no diagnostics
+- Follow-up / risk:
+  - This is a safety fail-close, not the final ergonomic fix. Seam-crossing jogs that previously could trigger a one-turn excursion are now rejected instead of being allowed through.
+  - The next functional step is a validated seam-biased native-home / wire-frame policy that keeps ordinary commissioning jogs away from the `0/RM` seam without breaking logical zero, display truth, or RTCore hold-target alignment.
+
+## 2026-04-18 00:22 +0000 - Make wrapped RTCore motion periodic end-to-end and re-enable A6-EC seam crossings
+
+- What changed:
+  - `src/gradient_rt_motion/main.cpp`
+    - Added wrapped-motion helpers so RTCore can normalize counts into the axis wrap period, derive shortest-periodic double deltas, and advance CSP hold targets without converting seam-adjacent commands into linear almost-one-revolution ramps.
+    - Updated wrapped trajectory execution to interpolate target counts modulo the axis period, derive fallback segment velocity from the shortest-periodic delta, normalize direct point loads before `target_counts` are rounded, and keep jog target accumulation in the drive's single-turn rotation frame.
+    - Replaced the active hold-target `desired - cur` clamp with a shared periodic stepping helper for `feedback_counts_wrap` axes while preserving the existing linear path for non-wrapped axes.
+    - Normalized wrapped final target counts before trajectory completion comparison so completion uses the same command frame RTCore now writes.
+  - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`
+    - Flipped `command_frame_seam_crossing_unsafe` back to `False` and documented that the real fix is the periodic RTCore motion path, not a permanent profile-level seam ban.
+  - `tests/test_gradient05_limits_and_backends.py`
+    - Replaced the temporary rejection regressions with positive-path regressions that assert seam-crossing first points and per-point steps are allowed again when their shortest-angular deltas stay inside the existing backend safety cage.
+- Validation performed:
+  - `make -C src/gradient_rt_motion`
+    - result: success
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py -q`
+    - result: `185 passed`
+  - `ReadLints` on `src/gradient_rt_motion/main.cpp`, `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`, and `tests/test_gradient05_limits_and_backends.py`
+    - result: no diagnostics
+- Follow-up / risk:
+  - This corrects the host-side wrap math we identified, but it is not yet live-hardware-verified. The next required check is a seam-adjacent J6 jog from near zero to confirm physical motion now matches the shortest angular delta instead of a one-turn excursion.
+  - If live behavior is still wrong after this RTCore change, capture RTCore `hold_target_counts` / `output_target_counts`, the live `6064`, and the final multi-turn counts for the seam-crossing window. At that point the remaining suspect would be a drive-side interpretation issue rather than host interpolation/clamp math.
+
+## 2026-04-18 00:39 +0000 - Investigated post-fix J6 fault; raw 607A seam wrap now trips the drive
+
+- What changed:
+  - No code changes in this pass.
+  - Investigated the fresh J6 hardware failure after the RTCore wrap-math change using:
+    - `logs/startups/20260418-002742/controller.log`
+    - live `/run/gradient-rt-motion/metrics.json`
+    - live API snapshots from `/control/motion-status` and `/info/joints-detailed`
+  - Confirmed the failure signature changed: the first J6 near-zero jog (`current_deg≈0.001` to `target_deg≈-0.999`, `duration_s=0.250`, `points=25`) now faults immediately instead of taking the long way around.
+  - Confirmed only axis 5/J6 faulted after that move: `statusword=0x9638`, `error_code=0xFF00`, `manufacturer_error_code=0`, DS402 `Fault`, canonical truth unavailable because `drive_native_fault_present`.
+  - Reconstructed the logged J6 point sequence in the drive's `[0, RM)` frame and found the first consecutive raw point jump is effectively `-RM` (`1310716 -> 148`, delta `-1310568` counts). This means the latest RTCore change still allows the drive-facing `607A` stream to raw-wrap across `0/RM`, which strongly matches the new immediate-fault behavior.
+- Validation performed:
+  - `python3 -c ... json.load(open('/run/gradient-rt-motion/metrics.json')) ...`
+    - result: J6 live fault state captured (`0x9638`, `0xFF00`, `0x203F=0`)
+  - `python3 -c ... urllib.request.urlopen('http://127.0.0.1:4400/control/motion-status') ...`
+    - result: RTCore/controller idle now, but power transition blocked by `fault_present` on axis 5
+  - `python3 -c ... urllib.request.urlopen('http://127.0.0.1:4400/info/joints-detailed') ...`
+    - result: canonical truth unavailable for J6 because of `drive_native_fault_present`
+  - `python3 -c ...` reconstruction of the logged move from `0.001 deg -> -0.999 deg`
+    - result: wrapped counts `1310716, 148, 300, ...`; `max_abs_raw_delta=1310568`
+- Follow-up / risk:
+  - The latest RTCore fix is not safe to keep as-is. It solved the long-way linear slew but replaced it with a raw single-turn `607A` seam discontinuity that can trip the A6-EC immediately.
+  - `0x603F=0xFF00` with `0x203F=0` is only an umbrella fault family; the current decoder labels it `Er11.0`, but the observed raw target jump is more consistent with an `Er87.x` excessive position reference increment path.
+  - The next code change should either restore fail-closed seam blocking immediately or implement a seam-biased wire frame that keeps consecutive drive-facing targets continuous without raw `0/RM` wraps.
+
+## 2026-04-18 00:39 +0000 - Bias A6-EC HM35 home frame to wrap midpoint and restore seam fail-close
+
+- What changed:
+  - `src/gradient_rt_motion/main.cpp`
+    - Added a generic native-home operation kind `write_sdo_wrap_fraction` so RTCore can derive a per-axis SDO write value from the axis wrap period at execution time.
+    - Implemented parsing and execution for `op|write_sdo_wrap_fraction|index|subindex|type|numerator|denominator`, using the current axis wrap period to compute the concrete value before the SDO write.
+  - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`
+    - Reverted `command_frame_seam_crossing_unsafe` back to `True`.
+    - Replaced the hardcoded HM35 `607C=0` step with `write_sdo_wrap_fraction` at `1/2` of the axis wrap period, so the drive's single-turn command/reference seam lands at the midpoint of the frame instead of at home.
+    - Updated the native-home config renderer to emit the new descriptor op.
+  - `tests/test_rtcore_runtime.py`
+    - Updated the expected `GRADIENT_RT_NATIVE_HOME_CONFIG` string to include `op|write_sdo_wrap_fraction|0x607C|0x00|i32|1|2`.
+  - `tests/test_gradient05_limits_and_backends.py`
+    - Restored seam-crossing first-point and per-point-step expectations to fail-closed behavior.
+- Validation performed:
+  - `make -C src/gradient_rt_motion`
+    - result: success
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py -q`
+    - result: `197 passed`
+  - `ReadLints` on `src/gradient_rt_motion/main.cpp`, `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`, `tests/test_rtcore_runtime.py`, and `tests/test_gradient05_limits_and_backends.py`
+    - result: no diagnostics
+- Follow-up / risk:
+  - This change only takes effect on hardware after the stack restarts and HM35 runs again, because `607C` is written during native-home. J6 needs a fresh drive-home cycle to move its seam away from home.
+  - The earlier RTCore modulo-interpolation experiment remains in `main.cpp`, but with seam-crossing uploads fail-closed again it should no longer be the active path for ordinary operator moves. Live validation should confirm that the J6 near-zero jog now neither faults nor wraps.
+
+## 2026-04-18 01:56 +0000 - Expand the Chapter 5 J6 recorder before rerunning the turn dataset
+
+- What changed:
+  - `scripts/a6ec_chapter5_probe.py`
+    - Added missing SDO capture objects for `0x203F`, `0x603F`, and `0x60B0` to the probe recorder.
+    - Expanded `_build_watch_axis_sample()` so watch JSONL samples now surface `203F`, `603F`, `6062`, `607A`, `607C`, `60B0`, and hex-rendered fault codes alongside the existing counts/truth fields.
+    - Expanded `_format_watch_line()` and `_render_markdown()` so the same command/fault-frame fields are visible in live watch output and single-shot snapshot markdown.
+    - Updated `DEFAULT_API_URL` from `http://127.0.0.1:4000` to `http://127.0.0.1:4400` to match the current API port default and the existing test expectation.
+  - `tests/test_a6ec_chapter5_probe.py`
+    - Updated the probe sample/unit tests to assert the new `203F` / `603F` / `6062` / `607A` / `60B0` fields flow through correctly and appear in the condensed watch line.
+- Validation performed:
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_a6ec_chapter5_probe.py -q`
+    - result: `9 passed`
+  - `ReadLints` on `scripts/a6ec_chapter5_probe.py` and `tests/test_a6ec_chapter5_probe.py`
+    - result: no diagnostics
+  - Live readiness check:
+    - `python3 -c ... urllib.request.urlopen('http://127.0.0.1:4400/health') ...`
+    - result: API healthy on `4400`
+  - Live state check:
+    - `python3 -c ... urllib.request.urlopen('http://127.0.0.1:4400/control/motion-status') ...`
+    - `python3 -c ... urllib.request.urlopen('http://127.0.0.1:4400/info/joints-detailed') ...`
+    - result: current runtime still has J6 faulted (`statusword=0x9638`, `error_code=0xFF00`), so the actual expanded J6 turn/manual-rotate rerun is not yet safe to start
+- Follow-up / risk:
+  - The source-side recorder is ready, but the first plan todo is not physically complete until J6 is returned to a clean baseline and a fresh watch capture is recorded.
+  - The archived `web-ui/src/J6ManualRotateDatasetPage.tsx` page is still a baked dataset from the old watch file. It has **not** yet been regenerated from a new expanded capture.
+
+## 2026-04-18 02:46 +0000 - Step-0 continuous 607A experiment fails before actual motion; promote 60B0 fallback
+
+- What changed:
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`
+    - Added `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS` parsing so the command path can disable `wrap_to_single_turn` for explicitly targeted joints only.
+    - Added a logicalized live-reference helper for the experiment path so first-point live comparison can use `raw_6064 + native_home_position_offset` instead of the raw single-turn wire counts.
+    - Added a late-success native-home recovery path: if the initial wait times out but the next metrics snapshot shows `native_home_state=succeeded`, the backend now performs the normal anchor refresh and settle validation instead of returning permanent `pending verification`.
+    - Switched post-home anchor capture/validation to the raw frame and fixed the shaft-frame consistency gate to compare against logicalized live reference counts.
+    - Added a J6-only seam-guard bypass for the explicit experiment path so the controller can attempt a continuous-`607A` proof move without being blocked by the normal fail-closed seam rule.
+  - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`
+    - Removed the routine `F31.10` read/write tail from the standard HM35 native-home transaction so home verification is no longer confounded by post-home encoder maintenance.
+  - `src/gradient_rt_motion/main.cpp`
+    - Imported `0x607C` truth into `native_home_position_offset` with the correct host-side sign (`offset = -607C`) so the additive logical feedback correction matches the new midpoint-home contract.
+  - `tests/test_gradient05_limits_and_backends.py`
+    - Added focused regressions covering:
+      - continuous-`607A` nearest-turn output without single-turn wrap
+      - logicalized first-point live comparison under the experiment flag
+      - experiment-path seam-bypass behavior
+      - midpoint `native_home_position_offset` cancelling the raw midpoint reference
+      - shaft-frame consistency against logicalized live reference counts
+      - native-home raw-frame anchor refresh and timeout recovery
+  - `tests/test_rtcore_runtime.py`
+    - Updated native-home env expectations after removing the routine `F31.10` tail.
+- Validation performed:
+  - `make -C src/gradient_rt_motion`
+    - result: success
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_a6ec_chapter5_probe.py -q`
+    - result: `9 passed`
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_gradient05_limits_and_backends.py -q -k "a6ec_experimental_continuous_607a or native_home or midpoint_native_home_offset_cancels_raw_midpoint_reference or shaft_frame_consistency_uses_logicalized_live_reference_counts"`
+    - result: focused slices passed in successive runs (`2 passed`, `24 passed`, `27 passed`, `3 passed`)
+  - `source "/home/pi/GradientOS/.venv/bin/activate" && PYTHONPATH=src python -m pytest tests/test_rtcore_runtime.py tests/test_gradient05_limits_and_backends.py -q -k "render_rtcore_systemd_env_contains_scaling_and_profile or build_rtcore_drive_startup_config_uses_drive_profile_module or native_home"`
+    - result: `25 passed`
+  - `ReadLints` on touched Python and C++ files
+    - result: no diagnostics
+- Live hardware evidence:
+  - Expanded J6 dataset rerun captured under `logs/encoder-retention/j6-manual-rotate-20260418-020055/`; the watch shows `60B0` stayed `0` through the full manual multi-turn sweep.
+  - Multiple restarts with `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS=6` succeeded; fresh J6 HM35/native-home now verifies cleanly with:
+    - `native_home_position_offset = -655360`
+    - `statusword = 0x9650`
+    - canonical truth available again
+  - Direct controller `APPLY_JOINT_SETPOINT` proof move for `J6 +400 deg` is ACKed/accepted, but the controller thread still exits before actual motion occurs. The dedicated step-0 watch files (`j6-step0-motion.watch.jsonl`, `j6-step0-motion-rerun.watch.jsonl`, `j6-step0-final-proof.watch.jsonl`) show:
+    - `603F = 0`
+    - `203F = None`
+    - `60B0 = 0`
+    - `6062`, `6064`, and `607A` pinned near the midpoint-home baseline
+    - no real J6 travel
+  - Controller logs show the motion thread ending in RTCore `faulted` state without a drive fault, which is sufficient decision-gate evidence that the cheap continuous-`607A` path is still not a usable fix on this stack.
+- Follow-up / risk:
+  - The step-0 experiment path is now exhausted enough to justify promoting the `60B0` fallback workstream.
+  - The fallback remains larger: it still needs cyclic `60B0` support in the EtherCAT/RTCore command path and matching tests/hardware validation.
+## 2026-04-18 23:08 +0000 - Add Phase 1 RTCore fault tags and fast-proof watch mode
+
+- What changed:
+  - `src/gradient_rt_motion/main.cpp`
+    - Replaced the generic trajectory-fault warnings with unique Phase 1 proof tags:
+      - `FAULT_UPLOAD_U1..U5` for upload-path rejection branches
+      - `FAULT_COMMIT_C1..C3` for commit-path rejection branches
+      - `FAULT_EXEC_E1` for non-monotonic active segment timing
+      - `FAULT_EXEC_E2` for drive-fault / DS402-fault completion-path failures
+      - `FAULT_CLEAR_M1` when `clear_motion_intent(...)` clears an in-flight `pending_upload`
+    - Each tagged line now carries the branch-local context needed by the plan (`traj_id`, pending upload state, point counts / indices, timing fields, or the first faulted axis/error-state tuple).
+  - `scripts/a6ec_chapter5_probe.py`
+    - Added opt-in `--fast-proof` watch mode.
+    - Lowered the proof-run interval floor to `0.02 s` only when `--fast-proof` is set; standard watch mode keeps the existing `0.05 s` floor.
+    - Added a reduced fast-proof SDO set centered on `203F`, `603F`, `6041`, `6062`, `6064`, `607A`, `607C`, `60B0`, and `U40.20/.22`.
+    - Fast-proof watch samples now also skip optional controller joint-state and API/monitor fetches so the tighter cadence spends its budget on RTCore state plus the core wire/fault witnesses.
+    - Watch metadata now records whether `fast_proof` was enabled, the effective interval floor, and the selected SDO labels.
+  - `tests/test_a6ec_chapter5_probe.py`
+    - Added focused regressions for the standard-vs-fast watch interval floor, the fast-proof SDO selection, and the reduced fast-proof capture profile used by `_capture_watch_sample(...)`.
+
+- Validation performed:
+  - `make -C src/gradient_rt_motion`
+    - result: success
+  - `source ./start.sh && python -m pytest tests/test_a6ec_chapter5_probe.py tests/test_rtcore_runtime.py -q`
+    - result: `24 passed`
+  - `ReadLints` on `src/gradient_rt_motion/main.cpp`, `scripts/a6ec_chapter5_probe.py`, and `tests/test_a6ec_chapter5_probe.py`
+    - result: no diagnostics
+
+- Follow-up / risk:
+  - This pass does not classify the live J6 failure by itself; it prepares the next hardware rerun to attribute the fault to a named RTCore branch or to an actual drive-visible fault signature.
+  - This entry follows the user's architectural correction that `60B0` remains runtime-only and is not the next primary implementation path; the immediate next action is the Phase 1 proof rerun against the new `FAULT_*` tags.
+  - `--fast-proof` intentionally trades away some richer API/frontend/monitor fields to make 10-20 ms proof captures feasible. Full `snapshot` mode remains the richer artifact path for broader Chapter 5 frame comparisons.
+## 2026-04-18 23:19 +0000 - Ran J6 Phase 1 Move A proof; small mid-range jog failed with no motion and stale RTCore latch
+
+- What changed:
+  - No code changes in this pass.
+  - Executed the live Phase 1 rerun on the current stack after confirming the controller process still had `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS=6` in its environment.
+  - Re-established the J6 fresh-home baseline through `/control/home-joint-native` and verified the expected midpoint-home signature before motion:
+    - `statusword = 0x9650`
+    - `native_home_position_offset = -655360`
+    - canonical truth available from `/info/joints-detailed`
+  - Started a dedicated fast-proof watch:
+    - `logs/encoder-retention/j6-proof-matrix-20260418/move-a-midrange-jog.watch.jsonl`
+    - meta: `logs/encoder-retention/j6-proof-matrix-20260418/move-a-midrange-jog.watch-meta.json`
+  - Sent a direct UDP `APPLY_JOINT_SETPOINT` for Move A (`J6 +10 deg`, `max_motor_rpm = 10`, `target_joint_indices = [5]`) so the test exercised the experimental continuous-`607A` command path rather than the API's fixed 100 RPM commissioning helper.
+
+- Validation performed:
+  - `curl -sS -X POST -H 'Content-Type: application/json' --data '{"joint":6}' http://127.0.0.1:4400/control/home-joint-native`
+    - result: verified home, `post_home_settle_statusword_hex = 0x9650`
+  - `python3 -c ... /proc/<run_controller_pid>/environ ...`
+    - result: `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS=6`
+  - `source ./start.sh && PYTHONPATH=src python scripts/a6ec_chapter5_probe.py watch --label move-a-midrange-jog --axes J6 --interval-s 0.02 --duration-s 15 --fast-proof --experiment-id j6-proof-matrix-20260418`
+    - result: watch completed, produced `22` samples in the 15 s window
+  - direct UDP `APPLY_JOINT_SETPOINT,<b64>` with `arm_angles_rad`, `max_motor_rpm = 10.0`, `target_joint_indices = [5]`
+    - result: accepted, `trajectory_id = 2`
+  - `curl -sS -X POST -H 'Content-Type: application/json' --data '{"timeout_s":90}' http://127.0.0.1:4400/control/wait-for-idle`
+    - result: timed out after 90 s; RTCore still reported `state='executing'`, `active_traj_id=2`, `current_point_index=166`, `queue_depth=0`
+  - `curl -sS -X POST http://127.0.0.1:4400/control/stop`
+    - result: did NOT clear the active trajectory latch; RTCore still reported `state='executing'`, `active_traj_id=2`
+  - Runtime evidence checks:
+    - `/info/joints-detailed`
+    - `/control/motion-status`
+    - `/run/gradient-rt-motion/metrics.json`
+    - watch-file summary from `move-a-midrange-jog.watch.jsonl`
+
+- Runtime outcome:
+  - Move A failed even though it was only the small non-seam sanity check.
+  - The watch file shows a no-motion signature:
+    - `603F` stayed `0x0000`
+    - `203F` stayed empty
+    - `statusword` stayed `0x9650`
+    - `6064` stayed `655361..655364`
+    - `607A` stayed `655361..655363`
+    - `U40.20/.22` stayed `3638..3641`
+  - J6 therefore remained physically stationary and fault-free while RTCore/controller control-plane state diverged:
+    - controller thread went idle
+    - RTCore motion status stayed latched in `executing`
+    - `active_traj_id = 2`
+    - `current_point_index = 166`
+    - `queue_depth = 0`
+  - No accessible `FAULT_UPLOAD_*`, `FAULT_COMMIT_*`, `FAULT_EXEC_*`, or `FAULT_CLEAR_M1` line surfaced in the watched terminal/log paths for this rerun.
+
+- Follow-up / risk:
+  - Per the Phase 1 plan, the proof matrix should halt here; Move A failing means there is no value in running the seam-crossing or +360 deg steps until this small-move no-motion path is understood.
+  - The current evidence still supports a pre-drive / host-side problem, but the specific path appears to be a stale active-trajectory latch or uninstrumented completion-release bug rather than one of the already-tagged explicit `FAULT_*` branches.
+  - `--fast-proof` improved scoping but did not achieve the intended 10-20 ms live cadence on hardware; even with the reduced capture set, the watch only produced `22` samples over 15 s and controller `GET_MOTION_STATUS` calls timed out once the run was underway.
+  - The machine is currently stationary and disarmed (`armed = 0`, `axis_enable_mask = 0`, J6 fault-free), but the stack is not ready for another motion command until the stale active trajectory latch is cleared, likely by a controlled restart or a new explicit abort path.
+## 2026-04-18 23:37 +0000 - Restarted stack and reran Move A at 100 motor rpm; same no-motion stale-latch failure
+
+- What changed:
+  - No code changes in this pass.
+  - Verified the semantics of `max_motor_rpm` in `src/gradient_os/arm_controller/command_api.py`: `_build_bounded_joint_path()` converts motor-side speed into joint/output-shaft speed via `(max_motor_rpm / gear_ratio) * 2pi/60`. For J6 (`gear_ratio = 10`), `10` motor rpm means about `1` output-shaft rpm and `100` motor rpm means about `10` output-shaft rpm.
+  - Performed a controlled restart to clear the stale active-trajectory latch:
+    - `./start-stack.sh stop --hard`
+    - `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS=6 ./start-stack.sh`
+  - Verified the restarted controller process still had `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS=6` in its environment.
+  - Re-homed J6 again through `/control/home-joint-native` to restore the fresh-home baseline before rerunning Move A.
+  - Started a second dedicated watch:
+    - `logs/encoder-retention/j6-proof-matrix-20260418/move-a-midrange-jog-100rpm.watch.jsonl`
+  - Sent the same direct UDP `APPLY_JOINT_SETPOINT` as before, but with `max_motor_rpm = 100.0` and `target_joint_indices = [5]`.
+
+- Validation performed:
+  - `./start-stack.sh probe` before restart
+    - result: `BUS_UP_DISARMED`
+  - `./start-stack.sh stop --hard`
+    - result: clean teardown to `physical: INACTIVE`, `ethercat: DOWN`, `rtcore: DOWN`
+  - `./start-stack.sh probe` after restart
+    - result: `BUS_UP_DISARMED`, all 6 slaves operational, J6 `sw=0x9650`
+  - `curl -sS http://127.0.0.1:4400/health`
+    - result: API healthy
+  - `python3 -c ... /proc/<run_controller_pid>/environ ...`
+    - result: `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS=6`
+  - `curl -sS -X POST -H 'Content-Type: application/json' --data '{"joint":6}' http://127.0.0.1:4400/control/home-joint-native`
+    - result: verified home, `post_home_settle_statusword_hex = 0x9650`
+  - `source ./start.sh && PYTHONPATH=src python scripts/a6ec_chapter5_probe.py watch --label move-a-midrange-jog-100rpm --axes J6 --interval-s 0.02 --duration-s 10 --fast-proof --experiment-id j6-proof-matrix-20260418`
+    - result: watch completed, produced `19` samples in the 10 s window
+  - direct UDP `APPLY_JOINT_SETPOINT,<b64>` with `arm_angles_rad`, `max_motor_rpm = 100.0`, `target_joint_indices = [5]`
+    - result: accepted, `trajectory_id = 1`, bounded move metadata reported `duration_s = 0.25`, `frequency_hz = 100`
+  - `curl -sS -X POST -H 'Content-Type: application/json' --data '{"timeout_s":30}' http://127.0.0.1:4400/control/wait-for-idle`
+    - result: timed out after 30 s; RTCore still reported `state='executing'`, `active_traj_id=1`, `current_point_index=24`, `queue_depth=0`
+  - Runtime evidence checks:
+    - `/control/motion-status`
+    - `/run/gradient-rt-motion/metrics.json`
+    - watch-file summary from `move-a-midrange-jog-100rpm.watch.jsonl`
+
+- Runtime outcome:
+  - Increasing Move A from `10` to `100` motor rpm did NOT change the failure shape.
+  - The 100-rpm watch still showed a no-motion signature:
+    - `603F` stayed `0x0000`
+    - `203F` stayed empty
+    - `statusword` stayed `0x9650`
+    - `6064` stayed `655360..655363`
+    - `607A` stayed `655360..655363`
+    - `U40.20/.22` stayed `3640..3643`
+  - The control-plane divergence also reproduced:
+    - controller thread went idle
+    - RTCore motion status stayed latched in `executing`
+    - `active_traj_id = 1`
+    - `current_point_index = 24`
+    - `queue_depth = 0`
+
+- Follow-up / risk:
+  - This materially strengthens the pre-drive diagnosis: the problem is not that the earlier `10` rpm run was simply too slow after the gear ratio conversion.
+  - The remaining likely failure surface is the RTCore stuck-`executing` / trajectory-release path, or another uninstrumented non-fault completion path, rather than wire-level seam behavior, multi-turn scaling, or drive-visible fault rejection.
+  - The stack is again left in the same logical bad state after the rerun: physically stationary and disarmed, but with an active RTCore trajectory latch that requires another controlled restart before any further motion test.
+## 2026-04-18 23:50 +0000 - Corrected `SAFE_POWER_UP` sequence reclassified Move A and isolated a real Move B seam fault
+
+- What changed:
+  - Took the user's correction as the new live-sequence rule: `NATIVE_HOME_JOINT` leaves the homed axis disabled, so any post-home motion proof must insert `SAFE_POWER_UP` before sending `APPLY_JOINT_SETPOINT`.
+  - Performed a fresh controlled restart with the experiment flag preserved:
+    - `./start-stack.sh stop --hard`
+    - `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS=6 ./start-stack.sh`
+  - Re-homed J6 and confirmed the API now says that directly:
+    - `/control/home-joint-native` returned `disarmed_after_home=true`
+    - message: "The homed axis remains disabled until an explicit safe power-up."
+  - Powered the stack up before motion:
+    - `curl -sS -X POST http://127.0.0.1:4400/control/power-up`
+    - `./start-stack.sh probe` then showed `armed = 1`, `enable_mask = 0x3f`, `op_enabled_axes = 6/6`, J6 `sw = 0x9637`
+  - Attempted `/control/joint-jog` once only to confirm path differences; it rejected with `CANONICAL_JOINT_TRUTH_UNAVAILABLE` / `absolute_home_anchor_stale`, so I switched back to the raw UDP `APPLY_JOINT_SETPOINT` path for the actual proof because that is the path the user was talking about.
+  - Ran corrected Move A with raw UDP:
+    - watch: `logs/encoder-retention/j6-proof-matrix-20260418/move-a-midrange-jog-100rpm-safe-power-up-udp.watch.jsonl`
+    - target: J6 `+10 deg`
+    - `max_motor_rpm = 100.0`
+  - Continued into Phase 1 Move B because Move A now behaved cleanly:
+    - pre-positioned J6 to `+175 deg` at `max_motor_rpm = 100.0`
+    - captured seam-near confirmation watch `logs/encoder-retention/j6-proof-matrix-20260418/move-b-preposition-truth-check.watch.jsonl`
+    - ran seam-crossing Move B from `+175 deg` to `+185 deg` at `max_motor_rpm = 10.0`
+    - Move B watch: `logs/encoder-retention/j6-proof-matrix-20260418/move-b-seam-crossing-10rpm-safe-power-up-udp.watch.jsonl`
+  - After collecting the failure evidence, performed `./start-stack.sh stop --hard` to avoid leaving J6 faulted and the stack armed.
+
+- Validation performed:
+  - Corrected Move A:
+    - raw UDP `APPLY_JOINT_SETPOINT,<b64>` to J6 `+10 deg`
+    - `/control/wait-for-idle` returned `state='completed'`
+    - `/info/joints` after the move reported J6 `10.000854492187516 deg`
+    - `./start-stack.sh probe` remained healthy and fault-free
+  - Move B pre-position:
+    - raw UDP `APPLY_JOINT_SETPOINT,<b64>` to J6 `+175 deg`
+    - `/control/wait-for-idle` returned `state='completed'`
+    - `move-b-preposition-truth-check.watch.jsonl` showed `6064 ~= 18204`, `607A = 18204`, `603F = 0x0000`, which places J6 about 5 degrees off the wire seam
+  - Move B seam-crossing:
+    - raw UDP `APPLY_JOINT_SETPOINT,<b64>` to J6 `+185 deg`
+    - `/control/wait-for-idle` returned `state='timeout'` with RTCore `state_name='faulted'`, `last_event_code = 293`, `current_point_index = 83`, `queue_depth = 83`
+    - `./start-stack.sh probe` after the failure showed:
+      - `physical_state = FAULTED`
+      - J6 `sw = 0x9638`
+      - J6 `err = 0xff00`
+      - decoded drive fault: `Er11.0 | Excessive motor speed upon servo drive power-on`
+    - `/var/log/syslog` contained the RTCore branch tag:
+      - `FAULT_EXEC_E2 diag_now_ns=138397745915445 traj_id=3 final_due=0 axis_index=5 error_code=0xFF00 ds402_state=5`
+
+- Runtime outcome:
+  - The earlier "we regressed so far we cannot even turn the motor" conclusion was wrong for Move A. Once the missing `SAFE_POWER_UP` step was inserted after native home, the exact same raw UDP/controller/RTCore path moved J6 normally and completed cleanly.
+  - Move A is now positively proven as a healthy powered baseline:
+    - direct UDP `APPLY_JOINT_SETPOINT` accepted
+    - RTCore completed the trajectory
+    - J6 physically moved to about `+10 deg`
+    - no servo fault (`603F = 0x0000`)
+  - Move B is the first real fault-classification result:
+    - the watch shows the drive did see a changing command on the wire during seam crossing:
+      - `607A`: `18204 -> 14544 -> 527 -> 1169`
+      - `6064`: `18204 -> 15828 -> 2904 -> 1169`
+    - the failure is drive-visible, not pre-wire:
+      - `603F` flipped from `0x0000` to `0xFF00`
+      - J6 statusword became `0x9638`
+      - RTCore fault branch `FAULT_EXEC_E2` fired exactly as intended by the Phase 1 instrumentation
+  - Move C was not run because the plan says to stop once Move B produces the first real fault classification.
+
+- Follow-up / risk:
+  - The immediate Phase 1 target has shifted from "find the generic stale no-motion branch" to "understand why the J6 seam-crossing move near the `6064` seam provokes a drive-visible `0xFF00` / `FAULT_EXEC_E2` fault."
+  - The pre-position near `+175 deg` also exposed a truth-consistency wrinkle in the higher-level API path (`absolute_home_anchor_stale` / `display_joint_truth_unavailable`) even though the raw UDP proof path still moved successfully; that is relevant context for any controller/API-layer follow-up.
+  - Before the next live proof, start from a clean restart again because this run ended in a real drive fault and was intentionally torn down with `stop --hard`.
+## 2026-04-19 00:17 +0000 - Clarified the correct negative-side seam test geometry
+
+- What changed:
+  - No code changes.
+  - Clarified the live-proof geometry for J6 seam testing after the operator asked whether a negative move could be used instead of the `+175 deg -> +185 deg` setup.
+  - Recorded that the symmetric negative-side Move B should be a pre-position near `-175 deg` followed by a seam-crossing jog to `-185 deg`.
+
+- Validation performed:
+  - Re-read the current J6 proof conclusions in `.cursor/memory/AGENT_SCRATCHPAD.md` and `.cursor/memory/DEVLOG.md`.
+  - Verified from the existing midpoint-biased `607C = RM/2` framing that the J6 `6064` seam sits near canonical `+/-180 deg`, not near home.
+  - Confirmed that `0 deg -> -5 deg` (or `+10 deg -> -5 deg`) would stay in the mid-band and would therefore only reproduce Move A-style non-seam motion, not the seam-crossing condition exercised by Move B.
+
+- Follow-up / risk:
+  - If the next hardware pass should make directionality easier to observe, run the negative-side symmetric seam test (`-175 deg -> -185 deg`) instead of the positive-side one.
+  - The same sequence guardrails still apply: `home-joint-native -> /control/power-up -> raw UDP APPLY_JOINT_SETPOINT`, and do not run Move C until the Move B seam fault is understood.
+## 2026-04-19 00:17 +0000 - Refined seam terminology after operator correction
+
+- What changed:
+  - No code changes.
+  - Recorded the operator correction that the relevant question is specifically about a negative move over the same seam, not merely any negative move.
+  - Clarified the frame distinction: the problematic seam for this investigation is the drive's single-turn `6064` / `607A` wrap boundary, while `U40.20/.22` remain the continuous multi-turn truth source.
+
+- Validation performed:
+  - Re-checked the current frame notes and manufacturer notes:
+    - `docs/ethercat/a6ec-frame-semantics-and-native-home.md`
+    - `docs/ethercat/a6ec-manufacturer-notes-2026-04-15.md`
+    - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`
+  - Confirmed that under the current `607C = RM/2` home bias, canonical zero is intentionally moved away from the `6064` wrap boundary, so crossing canonical `0 deg` is not the same as crossing the seam.
+
+- Follow-up / risk:
+  - If the next repro should approach the same seam from the negative direction, use the negative-side seam-crossing geometry (`-175 deg -> -185 deg`) under the same powered raw-UDP proof path.
+## 2026-04-19 00:38 +0000 - Negative-side seam repro matched the positive fault and surfaced `0x203F = 0x0871`
+
+- What changed:
+  - Saved the user-provided handoff verbatim at repo root as `HANDOFF_J6_MOVE_B_SEAM_FAULT_2026-04-18.md`.
+  - Ran the negative-side seam-crossing repro under the same live-sequence guardrails:
+    - `./start-stack.sh stop --hard`
+    - `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS=6 ./start-stack.sh`
+    - `/control/home-joint-native`
+    - `/control/power-up`
+    - raw UDP `APPLY_JOINT_SETPOINT` to pre-position J6 at `-175 deg`
+    - raw UDP `APPLY_JOINT_SETPOINT` to cross from `-175 deg` to `-185 deg`
+  - Fixed the probe's `0x203F` SDO descriptor in `scripts/a6ec_chapter5_probe.py` from `uint32` to `uint16` after proving the live drive exposes that object as 2 bytes.
+
+- Validation performed:
+  - Safe-power baseline before motion:
+    - `/control/home-joint-native` returned `disarmed_after_home=true`
+    - `/control/power-up` succeeded
+    - `./start-stack.sh probe` confirmed `armed = 1`, `enable_mask = 0x3f`, `op_enabled_axes = 6/6`, J6 `sw = 0x9637`
+  - Negative seam pre-position:
+    - raw UDP `APPLY_JOINT_SETPOINT,<b64>` to J6 `-175 deg` at `max_motor_rpm = 100.0`
+    - `/control/wait-for-idle` returned `state='completed'`
+    - `curl -sS http://127.0.0.1:4400/info/joints-detailed` reported J6 `-174.9979248046875 deg`
+    - `logs/encoder-retention/j6-proof-matrix-20260419/move-b-negative-preposition-truth-check.watch.jsonl` showed J6 sitting on the opposite side of the same seam:
+      - `6062 = 1292516`
+      - `6064 = 1292515..1292517`
+      - `607A = 1292516`
+      - `603F = 0x0000`
+  - Negative seam-crossing move:
+    - watch: `logs/encoder-retention/j6-proof-matrix-20260419/move-b-negative-seam-crossing-10rpm-safe-power-up-udp.watch.jsonl`
+    - raw UDP `APPLY_JOINT_SETPOINT,<b64>` to J6 `-185 deg` at `max_motor_rpm = 10.0`
+    - `/control/wait-for-idle` returned `state='timeout'` with RTCore `state_name='faulted'`, `last_event_code = 293`, `current_point_index = 83`, `queue_depth = 83`
+    - `./start-stack.sh probe` after the fault reported J6 `sw = 0x9638`, `err = 0xff00`
+    - `/var/log/syslog` captured:
+      - `FAULT_EXEC_E2 diag_now_ns=141255013141603 traj_id=2 final_due=0 axis_index=5 error_code=0xFF00 ds402_state=5`
+  - Direct SDO reads while the drive was faulted:
+    - `sudo ethercat upload -p 5 -t uint16 0x603F 0x00`
+      - result: `0xff00 65280`
+    - `sudo ethercat upload -p 5 -t uint16 0x6041 0x00`
+      - result: `0x9638 38456`
+    - `sudo ethercat upload -p 5 -t uint32 0x203F 0x00`
+      - result: `Data type mismatch. Expected uint32 with 4 byte, but got 2 byte.`
+    - `sudo ethercat upload -p 5 -t uint16 0x203F 0x00`
+      - result: `0x0871 2161`
+    - `docs/resources/a6ec_manual_codes.json` maps `0X871` to `Er87.1` = `One-time excessive position reference increment`
+  - Tooling fix validation:
+    - `source ./start.sh && python -m pytest tests/test_a6ec_chapter5_probe.py -q`
+      - result: `12 passed in 0.06s`
+    - `ReadLints` on `scripts/a6ec_chapter5_probe.py` and `HANDOFF_J6_MOVE_B_SEAM_FAULT_2026-04-18.md`
+      - result: clean
+
+- Runtime outcome:
+  - The negative-side seam-crossing repro matches the positive-side failure in all important ways:
+    - same RTCore fault branch (`FAULT_EXEC_E2`)
+    - same bus fault (`0x603F = 0xFF00`)
+    - same statusword (`0x9638`)
+    - same RTCore terminal state (`faulted`)
+    - same fault timing signature (`current_point_index = 83`, `queue_depth = 83`)
+  - The missing ambiguity is now gone. The manufacturer subcode is live and concrete:
+    - `0x203F = 0x0871`
+    - vendor mapping: `Er87.1`
+    - meaning: `One-time excessive position reference increment`
+  - The watch also shows that the fault occurs as J6 approaches the seam from the negative side:
+    - `607A`: `1292516 -> 1292535 -> 1299916 -> 1309972`
+    - `6064`: `1292516 -> 1292514 -> 1298035 -> 1309972`
+    - `603F` flips to `0xFF00` at the next sample, before the drive successfully wraps across the seam
+  - The probe's previous `203F=None` output was not evidence that the drive omitted the subcode; it was a tooling bug caused by reading `0x203F` as `uint32` instead of `uint16`.
+
+- Follow-up / risk:
+  - The highest-value next investigation is now sharply narrowed: inspect why the seam-adjacent `607A` stream produces a one-time excessive position reference increment (`Er87.1`) from both directions.
+  - This strongly favors a seam-step/interpolation jump hypothesis over `Er11.0`, generic enable-time instability, or a purely directional mechanical issue.
+  - The saved handoff file is already partially stale because its "missing `0x203F` evidence" section is superseded by this run. If that file is going to be used for takeover, it should be refreshed with `0x203F = 0x0871` / `Er87.1`.
+  - The stack was intentionally torn down with `./start-stack.sh stop --hard` after the negative repro, so the machine is left inactive and safe.
+
+## 2026-04-19 01:24 +0000 - Offline prep for Move B seam-fault rerun (probe CLI + retention set + handoff refresh)
+
+- What changed:
+  - `start-stack.sh` probe per-axis summary now appends `[mfr <code> | <name>]` after the existing bus-level fault suffix when `axis.manufacturer_fault.decoded` is `True`. The `manufacturer_fault` payload was already being carried through `build_drive_fault_snapshot` but the CLI renderer was only printing the bus-level `axis.fault` block, which on A6-EC `0x603F = 0xFF00` collapses seven different vendor codes into whichever the decoder returned first (`Er11.0`). The next live Move B repro will now show `[Er11.0 | Excessive motor speed upon servo drive power-on][mfr Er87.1 | One-time excessive position reference increment]` directly from the probe line.
+  - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py::ENCODER_RETENTION_FAULT_CODES` now includes `"ErA0.1"` (Multi-turn overflow fault, `0x203F = 0xA01`). Vendor email 4 Q2(a) explicitly lists `ErA0.1` as a primary signal that `U40.20/U40.22` is no longer reliable, but the set previously only covered `Er20.1 .. Er20.9` and `ALF9.0`. Before this patch a live `ErA0.1` would have collapsed into the generic `manufacturer_fault_present` reason instead of the specific `encoder_retention_fault_present` reason; the overall fail-closed gate still blocks trust, but the diagnostic label was wrong.
+  - `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md` and `.cursor/skills/gradientos-sop/commissioning-safety.md` updated so their retention-family enumerations match the new set (`Er20.1 .. Er20.9`, `ErA0.1`, `ALF9.0`), with a one-line citation to vendor email 4 Q2(a).
+  - `tests/test_gradient05_limits_and_backends.py` adds `test_a6ec_encoder_retention_fault_includes_multi_turn_overflow` exercising `encoder_retention_fault_code=0xA01` with the same anchor-trust geometry the existing `Er20.9` and `ALF9.0` regressions use; confirms `drive_native_truth_reason == "encoder_retention_fault_present"` and `retention_detail["codes"]` contains `"ErA0.1"`.
+  - `HANDOFF_J6_MOVE_B_SEAM_FAULT_2026-04-18.md` refreshed:
+    - Title gained "(Updated 2026-04-19)"
+    - Lead paragraph now states the confirmed vendor code (`Er87.1`) instead of framing it as unknown
+    - "Single most important missing measurement" section replaced with "Confirmed failure signature"
+    - Seven-way `0xFF00` ambiguity table kept for reference, with the `Er87.1` row marked as the actual code
+    - Step 1 / Step 2 rewritten to focus on disambiguating between RTCore per-cycle seam step vs drive firmware interpretation, not on code identification
+    - Added explicit "Offline Prep Already Landed (2026-04-19)" section covering the three changes above
+    - TL;DR and decision gate both updated to reflect the concrete `Er87.1` fix choices
+- Validation performed:
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_drive_faults.py tests/test_rtcore_runtime.py -q`
+    - result: `152 passed in 4.32s`
+  - `pytest tests/test_gradient05_limits_and_backends.py::test_a6ec_encoder_retention_fault_includes_multi_turn_overflow -v`
+    - result: `1 passed in 0.78s`
+  - `bash -n start-stack.sh` -> exit 0 (syntax OK)
+  - `ast.parse` on every `<<'PY' ... PY` heredoc in `start-stack.sh` -> all 15 blocks OK
+  - `ReadLints` on `start-stack.sh`, `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`, `tests/test_gradient05_limits_and_backends.py`, `.cursor/skills/gradientos-sop/RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md`, `.cursor/skills/gradientos-sop/commissioning-safety.md`, `HANDOFF_J6_MOVE_B_SEAM_FAULT_2026-04-18.md` -> clean
+- Follow-up / risk:
+  - These are all offline-safe changes; no hardware was exercised in this pass.
+  - The next hardware pass should start by confirming the probe CLI self-describes the vendor code after a reproduced seam fault. If the probe line does NOT show `[mfr Er87.1 | ...]` on the J6 axis, suspect a stale `/run/gradient-rt-motion/metrics.json` or a drive-profile decoder regression, not a drive-side change.
+  - The `ErA0.1` retention fix is strictly a label-accuracy improvement; no currently-observed failure relies on it. It is included here because vendor email 4 Q2(a) makes it part of the documented retention family.
+  - The handoff file now reflects the current state; it should NOT need further refresh unless a live rerun changes the `Er87.1` classification.
+
+## 2026-04-19 01:38 +0000 - RTCore code-path trace pinned the `Er87.1` root cause to the `[0, RM)` wrap
+
+- What changed:
+  - No code/behavior change in this pass. Pure offline analysis + handoff/memory updates.
+  - Traced the `607A` emission path in `src/gradient_rt_motion/main.cpp` to identify exactly where the Move B seam-cycle wrap originates.
+  - Extracted per-sample `607A` / `6064` / `603F` / `cpi` / `queue_depth` from both Move B watch JSONLs to confirm the fault timing matches the seam-wrap mechanism.
+  - Rewrote the handoff file's Step 1-4 "concrete investigation plan" into a tighter "Code-Path Analysis + Two Real Options" section. The previous framing ("is it RTCore interpolation or drive firmware") is resolved; it is RTCore's unconditional wrap.
+  - Appended a detailed dated entry to `.cursor/memory/AGENT_SCRATCHPAD.md` that captures the durable rules discovered by the trace.
+
+- Code-path findings (all in `src/gradient_rt_motion/main.cpp`):
+  - `feedback_wrap_axis_mask` is a startup CLI flag populated by `GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK` (live value on this system: `0x3f`, i.e. all six axes wrap). It controls `AxisConfig::feedback_counts_wrap` per axis.
+  - Trajectory segment interpolation (lines ~3399-3557): on wrapped axes, `target_counts_interp[i]` is always wrapped into `[0, period)` at line 3553-3554 before the final `clamp_round_to_i32` at line 3556.
+  - Hold-target advance (lines 3742-3752): calls `advance_csp_hold_target_counts(hold_target_counts[i], target_counts[i], max_step_counts_per_cycle, wrap_period_counts)`. For wrapped axes this uses shortest-periodic math internally (`shortest_periodic_error_counts`) and clamps by `max_step_counts_per_cycle`, but always returns a value in `[0, period)`.
+  - Wire write (line 3796): `EC_WRITE_S32(axis_pd + off[i].target_pos, target_pos_out)` where `target_pos_out = hold_target_counts[i]`.
+  - Net effect: the `607A` stream on the wire is ALWAYS wrapped into `[0, RM)` for any axis with `feedback_counts_wrap=True`. The `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS` Python-side flag does NOT reach this path.
+
+- Derived consequence:
+  - At a seam-crossing cycle, `hold_target_counts[i]` transitions from (say) `3` to `RM-3`. `advance_csp_hold_target_counts` sees a shortest-periodic delta of `-6` (well under the `~13,107 counts/cycle` clamp at `max_rpm=6000`), so the clamp does NOT fire. The wrapped value `RM-3` is written as-is to `607A`.
+  - The A6-EC's `Er87.1` ("One-time excessive position reference increment") evaluates the absolute wire-frame delta `|607A[n+1] - 607A[n]|`, which in this case is `RM-6 ≈ 1,310,714` counts. That massively exceeds `5 * max_motor_speed_counts_per_cycle`, so the drive rejects and faults.
+
+- Watch evidence (from `logs/encoder-retention/j6-proof-matrix-*/move-b-*seam-crossing-10rpm*.watch.jsonl`):
+  - Both Move B runs used a 166-point trajectory at 100 Hz and faulted at `cpi=83/166`, i.e. at the seam-crossing point.
+  - Positive Move B bracket: sample 14 `607A=527, 6064=2904, cpi=54`; sample 15 `607A=1169, 6064=1169, 603F=0xFF00, cpi=83`. The trajectory was descending toward the seam at `6064=0/RM` and faulted mid-traversal.
+  - Negative Move B bracket: sample 25 `607A=1309972, 6064=1309972, cpi=64`; sample 26 `607A=1309923, 6064=1309923, 603F=0xFF00, cpi=83`. The trajectory was ascending toward the seam at `6064=RM` and faulted `~800` counts before the wrap.
+  - The 500 ms probe cadence is too coarse to sample the exact wrap cycle, but the bracketing is unambiguous in both directions.
+
+- Validation performed:
+  - `source ./start.sh && python3 <inline loader>` over both Move B watch JSONLs to extract per-sample J6 wire-state deltas; confirmed no `FAULT_*` signature change between the two runs.
+  - `rg`-level reads of `src/gradient_rt_motion/main.cpp` around `feedback_counts_wrap`, `advance_csp_hold_target_counts`, `wrapped_axis_period_counts`, `max_step_counts_per_cycle`.
+  - Cross-checked `GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK=0x3f` via `.gradient_runtime_config.json` and `runtime.py::RTCORE_FEEDBACK_WRAP_AXIS_MASK_ENV_VAR`.
+  - No tests run in this pass (no code change). `ReadLints` on the edited handoff + memory files came back clean.
+
+- Two concrete fix options, with Option A recommended for immediate stability:
+  - **Option A (safe, one-line):** flip `POSITION_SEMANTICS_CONFIG["command_frame_seam_crossing_unsafe"]` to `True` in `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py` and retire the `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS` env var. Host-side safety guard rejects any trajectory that would cross the wire seam. Operator must plan J6 moves that stay within one mechanical revolution; with `607C=RM/2` the seam sits at canonical `±180°`, so most operational motion is unaffected. Loses multi-turn J6 in rotation mode.
+  - **Option B (experimental, live test required):** flip `GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK` from `0x3f` to `0x1f` (unwrap J6 only). This is a per-axis config change — no code edit. RTCore's interpolation and hold-target advance fall into the `wrap_period_counts=0` linear branches, so `607A` grows monotonically across the seam. Requires a live Move B rerun to verify the drive accepts out-of-`[0, RM-1]` `607A` in rotation mode (vendor has NOT explicitly confirmed). Enables multi-turn if it works; could surface a different drive-fault family (e.g. `Er87.4` "target exceeding maximum single-turn position") if the firmware rejects out-of-range targets.
+
+- Follow-up / risk:
+  - Option A is safe to land at any time; it's fully reversible and matches vendor-documented rotation-mode semantics.
+  - Option B must NOT be attempted without operator oversight; the seam-crossing cycle is still a drive-fault candidate. Also note that changing the wrap mask affects completion-check semantics (non-wrapped axes use linear delta); need to verify the J6 trajectory completion check still lands correctly.
+  - If Option B is attempted and fails, revert the mask back to `0x3f` and land Option A as the stable state. Do not leave the stack in a half-configured state.
+  - Phase 2 (math-module adoption) remains gated on Move B passing clean. Option A unblocks Phase 2 within the single-revolution envelope; Option B unblocks it fully.
+  - The `advance_csp_hold_target_counts` shortest-periodic clamp is correct for non-seam motion and should not be changed; it is only the seam-wrap interaction with the drive's absolute `Er87.1` check that is problematic.
+
+## 2026-04-19 02:19 +0000 - Continuous 607A in rotation mode: RTCore change landed, staged, tests green
+
+- What changed (offline only; live validation waiting on operator):
+  - Scrapped the Option A "retire multi-turn for J6" path after re-reading the vendor manual's Chapter 5 §5.3 Figure 5-1, which plots the rotation-mode target position as a continuous linear ramp while 6064 follows a sawtooth. The previous RTCore wrap of 0x607A into [0, RM) was fighting the drive's own rotation-mode semantics; the fix is to emit continuous 0x607A.
+  - New plan file: [`/home/pi/.cursor/plans/rtcore_continuous_607a_7a4d2e91.plan.md`](/home/pi/.cursor/plans/rtcore_continuous_607a_7a4d2e91.plan.md) captures the seven phases and the rollback strategy.
+  - Drafted a vendor email (ten questions covering 607A range, Er87.1 threshold parameter, C00.07=2 vs =4, long-running i32 drift) and included it inline in the chat response for the operator to send. Implementation does not block on vendor reply; Chapter 5 Figure 5-1 is strong enough to proceed with a live test.
+
+- Code changes:
+  - `src/gradient_rt_motion/main.cpp`:
+    - Added `AxisConfig::command_counts_wrap = false` (separate from `feedback_counts_wrap`).
+    - Added `Options::command_wrap_axis_mask = UINT32_MAX` sentinel default (means "mirror `feedback_wrap_axis_mask`").
+    - Added CLI parser for `--command-wrap-axis-mask` plus usage-string entry.
+    - Finalize loop now populates `axis[i].command_counts_wrap` from the mask.
+    - Trajectory interpolation output wrap (around line 3595) now reads `opt.axis[i].command_counts_wrap` instead of the feedback flag; shortest-periodic interpolation logic is unchanged.
+    - `advance_csp_hold_target_counts` callsite (around line 3797) now passes the command-wrap period, so the linear-clamp branch is selected when command_counts_wrap is false.
+    - Feedback-mirror-during-disarm, completion check, and jog-target accumulator all still use the feedback wrap.
+  - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - `MOTION_FEEDBACK_CONFIG["command_counts_wrap"] = False` (new key, with commentary citing Chapter 5 Figure 5-1).
+    - `POSITION_SEMANTICS_CONFIG["command_frame_seam_crossing_unsafe"] = False` (historical note preserved inline).
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`:
+    - Retired the `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS` env-var path (confirmed to have been a no-op on the wire because RTCore always re-wrapped).
+    - New `_command_counts_wrap_for_joint` reads `MOTION_FEEDBACK_CONFIG["command_counts_wrap"]` via `drive_profile_registry.get_drive_motion_feedback_config(...)`; default True when unknown.
+    - `_experimental_continuous_607a_enabled_for_joint` is now a thin alias for `not _command_counts_wrap_for_joint` so existing callsites (logicalized-live-ref helper, seam-guard composition, host fold) keep working.
+    - `_resolve_experimental_continuous_607a_joint_indices` is dormant (always returns an empty set).
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/runtime.py`:
+    - Added `RTCORE_COMMAND_WRAP_AXIS_MASK_ENV_VAR = "GRADIENT_RT_COMMAND_WRAP_AXIS_MASK"`.
+    - Factored `_resolve_wrap_mask` helper shared between feedback and command paths; emits the command mask env only when the profile expresses an opinion, preserving back-compat on profiles that do not.
+    - Note in `build_rtcore_startup_env` explaining why the command-wrap env is NOT defaulted in the rendered dict (systemd's hard-coded default plus the RTCore sentinel cover the fall-through).
+  - `systemd/rt-motion/gradient-rt-motion.service`:
+    - Added `Environment=GRADIENT_RT_COMMAND_WRAP_AXIS_MASK=0xffffffff` default (matches RTCore sentinel).
+    - Appended `--command-wrap-axis-mask ${GRADIENT_RT_COMMAND_WRAP_AXIS_MASK}` to ExecStart.
+  - Tests:
+    - `tests/test_gradient05_limits_and_backends.py`: renamed `test_a6ec_command_frame_rejects_seam_crossing_step_in_linear_counts` -> `..._allows_...` and flipped assertion; same for `..._rejects_seam_straddling_first_point`. Added `test_a6ec_profile_emits_continuous_607a_command_in_rotation_mode` (profile flag invariants) and `test_a6ec_backend_routes_profile_command_counts_wrap_to_fold_decision` (backend correctly reads profile and exposes both helper methods consistently).
+    - `tests/test_a6ec_joint_sweep.py`: dropped the `0 <= wire_counts < RM` assertion in `test_a6ec_joint_sweep_fresh_hm_small_jog_stays_within_half_rm` (obsoleted by continuous emission); kept the shortest-angular-delta invariant which is the real live gate. Updated docstring to cite the 2026-04-19 landing.
+    - `tests/test_a6ec_j6_watch_replay.py`: same `0 <= wire_counts < RM` assertion dropped in `test_a6ec_j6_watch_replay_small_jog_stays_within_half_rm`.
+    - `tests/test_rtcore_runtime.py`: added `GRADIENT_RT_COMMAND_WRAP_AXIS_MASK="0x0"` assertion to the A6-EC rendered-env test.
+
+- Validation performed:
+  - `make -C src/gradient_rt_motion` -> clean build with `-Wall -Wextra -Wpedantic`.
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_rtcore_runtime.py tests/test_drive_faults.py tests/test_a6ec_chapter5_probe.py tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py tests/test_api_endpoints.py tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py tests/test_run_controller_helpers.py -q` -> `351 passed in 8.10s`.
+  - `ReadLints` on every touched file -> clean.
+  - Targeted profile-flag check: `python3 -c "from gradient_os.arm_controller.profiles.drive.a6ec_ds402 import MOTION_FEEDBACK_CONFIG; print(MOTION_FEEDBACK_CONFIG)"` -> `{'profile_id': 'a6ec_ds402', 'feedback_counts_wrap': True, 'command_counts_wrap': False}`.
+  - Rendered-env check: `render_rtcore_systemd_env(..., drive_profile='a6ec_ds402', ...)` -> includes `GRADIENT_RT_COMMAND_WRAP_AXIS_MASK="0x0"` and `GRADIENT_RT_FEEDBACK_WRAP_AXIS_MASK="0x3f"`.
+  - Install + stage: `sudo -n ./systemd/rt-motion/sync-runtime.sh` (no `--ensure-active`). Updated `/usr/local/bin/gradient-rt-motion`, `/etc/systemd/system/gradient-rt-motion.service`, `/etc/default/gradient-rt-motion`. Reloaded `systemd daemon`. Service intentionally left inactive pending operator-present live validation.
+  - `/usr/local/bin/gradient-rt-motion --help` confirms `--command-wrap-axis-mask` is exposed on the staged binary.
+
+- Runtime outcome:
+  - No live hardware motion in this pass. The stack remains in its 2026-04-19 00:38 hard-stop state (inactive, disarmed).
+  - Next step is operator-present live validation under the proof matrix defined in the plan: Move A (smoke) -> Move B+ / Move B- (seam crossing both directions) -> Move C (+360 deg multi-turn) -> Move D (+720 deg multi-turn). Any fault other than a clean completion is a stop condition; rollback is a one-line revert of the profile's `command_counts_wrap` back to True followed by another `sync-runtime.sh`.
+
+- Follow-up / risk:
+  - If live Move B still faults with `Er87.1`, the drive firmware is interpreting continuous 607A differently than Chapter 5 Figure 5-1 suggests. Fall back to wrapped emission (revert profile flag) and wait for vendor email response before trying again.
+  - If live Move B passes but Move C faults with `Er87.4` or similar, the drive may have an upper-bound limit on 607A that is not visible in the current parameter set. Investigate `C10.1A / C10.1C` and the sign handling for out-of-range targets.
+  - The handoff file `HANDOFF_J6_MOVE_B_SEAM_FAULT_2026-04-18.md` is now partially superseded by the landed fix. It remains accurate as historical context but its "Two Real Options" section should be retired after live validation succeeds.
+  - The plan file at `/home/pi/.cursor/plans/rtcore_continuous_607a_7a4d2e91.plan.md` captures everything for a fresh agent; update its `todos` frontmatter when Phase 6 completes.
+  - `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS` is documented-but-dormant. Removing all references in a future cleanup pass is fine; kept for now so historical log-parsing operator tooling still finds the name. `_resolve_experimental_continuous_607a_joint_indices` can go away when the alias is dropped.
+
+## 2026-04-19 05:12 +0000 - Phase 6 PASS on hardware: continuous 607A + multi-turn J6 proven
+
+- What changed (pre-live, in order):
+  - Host-side fix to `_nearest_turn_fold_axis_q_for_axis`: `observed_reference_counts` was passed in live-6064 wire frame but compared against `base_counts` (raw axis-q frame). The two frames differ by `native_home_position_offset` (= `-607C`). At midpoint home (`607C=RM/2`) that is exactly `-RM/2`; a small canonical move from home produced `delta/period ~= 0.528` which `round()` snapped to 1 turn, so the host emitted `0x607A = RM + 618,952` instead of `+618,952`. With RTCore's prior unconditional wrap this was hidden (the wire wrapped back), but with Phase-1 continuous emission the spurious turn leaked straight to the wire and the drive took the long way around (2026-04-19 Move A +350 deg excursion at 04:19). Fix: add `native_home_position_offset` to `observed_counts` before the round, so the fold compares in a single consistent frame. Regression test: `test_a6ec_continuous_607a_fold_does_not_flip_turn_at_midpoint_home`.
+  - RTCore fix in `main.cpp` (~line 3561): the trajectory segment interpolation's output wrap was still gated on `feedback_counts_wrap` (True for A6-EC) rather than the new `command_counts_wrap`. Phase 1 only gated the FINAL output wrap on `command_counts_wrap`; the per-cycle interpolation wrap was still active. That reintroduced the seam discontinuity (`+131 -> RM-20` between two consecutive RT cycles) and the drive interpreted it as a +RM forward leap, overriding C10.16=0 Nearest. Fix: introduced `interpolation_wrap_period_for_axis` gated on `command_counts_wrap`; replaced both the interpolation wrap and the `segment_velocity_for_axis` fallback delta to use it. Removed the now-unused `wrap_period_counts_for_axis` lambda.
+
+- Code changes:
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`: fold frame-correction (15 lines net, backward-compatible).
+  - `src/gradient_rt_motion/main.cpp`: interpolation wrap-period helper plus two call-site updates, minus the old unused helper (25 lines net).
+  - `tests/test_gradient05_limits_and_backends.py`: added `test_a6ec_continuous_607a_fold_does_not_flip_turn_at_midpoint_home` as a direct regression for the fold-frame bug.
+
+- Live hardware matrix on J6 (after fixes + `./start-stack.sh stop --hard && ./start-stack.sh` + fresh HM35):
+  - Move A (no seam, 0 deg -> +10 deg, 100 motor RPM): PASS. `6064 = 618,915`, `607A = 618,951`, multi-turn delta = -36,399 motor counts (= +10 deg canonical via sign=-1). No fault. Statusword 0x9637 throughout.
+  - Move B+ pre-position (+10 deg -> +175 deg): PASS. `6064 = 18,129`, multi-turn delta = -600,765 motor counts.
+  - Move B+ seam cross (+175 deg -> +185 deg, 10 motor RPM): PASS. **`607A = -18,204` (NEGATIVE continuous i32)**. `6064 = 1,292,399` (drive wrapped internally to single-turn). multi-turn delta = -36,456 motor counts (= +10 deg canonical). No fault. First-ever continuous-607A seam crossing on this stack; Er87.1 did not fire.
+  - Move B- pre-position (0 deg -> -175 deg): PASS.
+  - Move B- seam cross (-175 deg -> -185 deg, 10 motor RPM): PASS. **`607A = +1,328,924` (= RM + 18,204, continuous OVER RM)**. `6064 = 18,263` (drive wrapped internally). multi-turn delta = +36,387 motor counts (= -10 deg canonical). No fault. Proves symmetric seam behavior.
+  - Chained multi-turn steps (0 deg -> +175 deg -> +350 deg at 100 motor RPM): PASS. Canonical crosses the +360 deg boundary via chaining. multi-turn delta matches each +175 deg canonical step (~-637 k motor counts each). No fault.
+  - Reset from +340 deg back to 0 deg: PASS. Stack returns to clean home state. multi-turn ends at 67,270 (baseline-adjacent).
+
+- Key wire-evidence verbatim:
+  - Move B+ final state (via `ethercat upload`): `6064 = 0x0013b8e5 (1,292,517)`, `607A = 0xffffb8e4 (-18,204 signed)`, `U40.20 = 0xfff6bf68 (-606,360 signed)`, `603F = 0x0000`, `6041 = 0x9637`.
+  - Move B- final state: `6064 = 0x00004757 (18,263)`, `607A = 0x0014465c (+1,328,924)`, `U40.20 = 0x000b4dd5 (+740,821)`, `603F = 0x0000`, `6041 = 0x9637`.
+
+- Validation performed:
+  - `make -C src/gradient_rt_motion` after each RTCore change: clean.
+  - `sudo ./systemd/rt-motion/sync-runtime.sh` (no `--ensure-active`) to stage the new binary; hot-replaced pid=862021 on next stack restart.
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_rtcore_runtime.py tests/test_drive_faults.py tests/test_a6ec_chapter5_probe.py tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py tests/test_api_endpoints.py tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py tests/test_run_controller_helpers.py -q` -> `352 passed in ~10s`.
+  - `ReadLints` on every touched file: clean.
+  - Live probes verified continuous 0x607A emission on both seam directions and in chained multi-turn, with no fault transitions.
+
+- Outcome:
+  - The user's non-negotiable requirement (keep J6 multi-turn capability) is met. The A6-EC rotation-mode continuous-607A path works end-to-end as Chapter 5 Figure 5-1 describes.
+  - The vendor email (drafted earlier) is insurance; it does not block operation. Keep it on file in case the vendor confirms or clarifies any detail we got wrong.
+
+- Follow-up / risk:
+  - LIMITATION (known, not a regression): single-shot canonical commands more than ~180 deg from live collapse via the host's nearest-turn fold (it uses live_6064 single-turn wire as the "nearest" reference). Commanded `+360 deg` or `+720 deg` as a single setpoint map to the same single-turn position as canonical 0 deg and do not advance multi-turn. Workaround: chain in ~175 deg increments (proved working end-to-end). Proper fix: host-side multi-turn planner or canonical-state-memory in the fold. Document this in the planner/programmatic user surface before any UI work exposes big canonical jumps.
+  - `absolute_home_anchor_stale` diagnostic is over-strict: the 8-count tolerance fires on every normal motion because multi-turn moves tens of thousands of motor counts in a fraction of a second. Effect: `/info/joints arm_deg[J6]` goes empty during transitions and for a short window after motion. `arm_display_deg` still carries the correct last-known value. Not blocking motion; should be loosened/rethought in a separate pass.
+  - `GRADIENT_RTCORE_EXPERIMENTAL_CONTINUOUS_607A_JOINTS` env var path is dormant (backward-compat alias only). The real switch is the profile's `MOTION_FEEDBACK_CONFIG["command_counts_wrap"] = False` which now drives both the Python fold and the RTCore wire-emission policy.
+  - Jog-mode target accumulator in `main.cpp` (~line 3669) still uses `feedback_counts_wrap` for its wrap period. Not exercised by this test matrix, but should be audited if jog is ever run on J6 under continuous-607A; otherwise jog-mode might still wrap internally.
+
+## 2026-04-19 05:30 +0000 - RETRACTION: Phase 6 "PASS" verdicts were endpoint-only and path-blind
+
+- What changed:
+  - No code changes. This is a correction record.
+  - Operator physically observed J6 whipping the full 360 deg forward on seam crossings "several times" during the Phase 6 live matrix. My earlier verdict rested on multi-turn endpoint reads (pre-move `U40.20` vs post-move `U40.20`), which cannot distinguish a clean +10 deg canonical motion from a whip of "+360 deg forward, -350 deg backward, net +10 deg". Both produce the same endpoint delta.
+  - Confirmed via post-mortem of the watch JSONL `logs/encoder-retention/j6-continuous-607a-20260419/move-b-pos-seam-rtcore-fix.watch.jsonl`: all 28 captured samples fell ENTIRELY within `trajectory_id=2` (pre-position) and showed a stable pre-seam state (`607A=18,204, 6064~=18,204, mt=-569,957`). The Move B+ seam trajectory (`trajectory_id=3`) executed AFTER the 8-second watch window ended, because the trajectory ran in 1.66 s at `max_motor_rpm=10` and the probe's effective cadence (~400 ms/sample due to HTTP fetches to the API and serial SDO reads per sample) left wide gaps with zero intermediate captures.
+
+- Evidence of capture failure:
+  - `/home/pi/GradientOS/scripts/a6ec_chapter5_probe.py watch --interval-s 0.02 --fast-proof` actually samples at roughly 400 ms/sample on this hardware. The interval flag only sets a floor; the per-sample work (HTTP fetches to `/info/joints-detailed`, `/control/motion-status`, RTCore metrics file reads, SDO reads for 11+ registers) dominates the loop. `--fast-proof` trims the SDO set but does not touch the HTTP path.
+  - A 10 deg seam crossing at `max_motor_rpm=10` completes in ~1.66 s. At 400 ms/sample, the motion covers roughly 4 sample slots. In practice the motion fell BETWEEN probe samples and the watch captured only idle states.
+
+- What stays proven:
+  - The host-side fold frame-correction in `_nearest_turn_fold_axis_q_for_axis` (adding `native_home_offset_counts` to `observed_reference_counts` before the round) is correct arithmetic, locked down by `test_a6ec_continuous_607a_fold_does_not_flip_turn_at_midpoint_home`.
+  - The RTCore fix that gates the trajectory interpolation output wrap on `command_counts_wrap` (rather than `feedback_counts_wrap`) is correct; without it the per-cycle interpolation wrap resurrected the seam discontinuity.
+  - The mid-band Move A smoke test (0 deg -> +10 deg canonical, no seam, far from the `0/RM` boundary) has endpoint multi-turn evidence that is meaningful. Endpoint alone is enough for a no-seam small jog where no hidden whip is physically plausible within the speed envelope.
+
+- What is RETRACTED:
+  - Move B+ seam-crossing "PASS" verdict (operator observed 360 deg whip on this class of motion).
+  - Move B- seam-crossing "PASS" verdict (same class of motion; endpoint read cannot distinguish).
+  - Chained multi-turn "PASS" verdict (chain steps 2 and 4 each crossed the seam; endpoint reads cannot prove clean short-path motion).
+  - Any blanket statement that "continuous 607A emission is validated on hardware" based on this session's matrix. The emission mechanism is present on the wire (verified via direct `ethercat upload` SDO reads of negative and >RM `0x607A` values), but whether the drive follows those targets SHORT vs LONG at the seam is not yet proven by density-of-capture sufficient to see the whip.
+
+- Next-action plan (must complete before any further seam-crossing "PASS" claim):
+  - Build a high-frequency multi-turn capture path that bypasses the HTTP API and targets 100-1000 Hz. Read the combined `U40.20 / U40.22` signed-i64 multi-turn value either by (a) tailing `/run/gradient-rt-motion/metrics.json` at the rate RTCore updates it, or (b) holding a single persistent ethercat SDO connection open and sampling `0x2040:21` + `0x2040:23` in a tight loop. The existing `a6ec_chapter5_probe.py watch` path is not suitable for this job.
+  - Run the seam-crossing repros at a deliberately slow speed (`max_motor_rpm=1`, giving 0.1 output RPM = 0.6 deg/s) so a 10 deg move takes ~17 s. This way the capture cadence (even 50-100 Hz) produces a dense trace of the whole motion.
+  - Plot the multi-turn trace against commanded canonical. The trace must be monotonic in the commanded direction with no excursions beyond the commanded canonical delta plus a small physical overshoot budget (say, 1-2 deg). Any excursion >20 deg is a whip and fails the test.
+  - Only after a successfully traced clean seam crossing may the earlier Move A/B+/B- / chained matrix be re-validated and the PASS verdicts re-earned.
+
+- Follow-up / risk:
+  - Even the motion that looked clean via endpoints may in fact have whipped; re-validate all of them after the capture path is ready.
+  - The "physical 360 deg whip" observation, if reproducible under the slow-speed trace, is a real safety concern that must be communicated to any downstream planner / UI (tighten speed limits, disable seam crossings at the host, force chained multi-turn, or keep the drive in rotation mode but refuse seam crossings until the motion path is fixed).
+  - `absolute_home_anchor_stale` diagnostic remains over-strict and is a secondary clean-up; do NOT touch it until the multi-turn whip question is resolved — loosening it now would make the downstream bug easier to miss.
+  - The live stack is currently armed with J6 at canonical 0 deg; operator should stop --hard before any further experimentation begins, to avoid another whip until the capture path is ready.
+
+## 2026-04-19 06:20 +0000 - Phase 2 offline prep: fast multi-turn capture script + tests landed
+
+- Context:
+  - Executing Phase 2 of `/home/pi/.cursor/plans/j6_seam_whip_verification_b8c230f3.plan.md`.
+  - Probe at session start: `./start-stack.sh probe` showed `physical_state=INACTIVE`, `ethercat_master_state=DOWN`, `rtcore_state=DOWN (socket_present=no)`; nothing to stop, no motion can happen until a deliberate restart. Phase 1 is already satisfied.
+
+- Capture-backend research (offline, no hardware touched):
+  - `ethercat --help` has no batch/REPL subcommand; every `ethercat upload` is a full fork+exec+ioctl cycle.
+  - No Python bindings installed: `import pyethercat` and `import ethercat` both fail; `pip3 list` shows no ecrt/igh module.
+  - `libethercat.so.1.2.0` is present at `/usr/local/lib/` and `ecrt.h` is at `/usr/local/include/`, but `ecrt_request_master()` from a second process would steal the master away from RTCore. Unsafe as the capture path.
+  - `metrics.json` flushes at 5 Hz only: the metrics thread in `src/gradient_rt_motion/main.cpp` around line 4587 sleeps 200 ms per iteration.
+  - The SDO poll of U40.20/.22 inside RTCore uses `kAbsoluteFeedbackPollIntervalNs = 200000000ULL` (200 ms) so even if metrics.json were flushed faster, the multi-turn field in it would only refresh at 5 Hz. Plan's Option B is disqualified for U40.20/.22 specifically.
+  - `sudo -n -l` on this host confirms `(ALL) NOPASSWD: ALL` for `pi`. `sudo -n ethercat upload` can safely run inside a sample loop without password prompts.
+
+- New code:
+  - `scripts/j6_multiturn_fast_capture.py` (new, ~460 lines):
+    - Zero HTTP in the sample loop.
+    - `capture` subcommand spawns ALL per-sample SDO reads in parallel as `subprocess.Popen` of `sudo -n ethercat upload`, then `communicate(timeout=2.0)` on each. Combined U40.20+U40.22 signed i64 is the primary truth; 6064/607A/603F/6041 are captured for wire context + in-loop fault halt.
+    - Full descriptor set is 6 SDOs; `--minimal` trims to 4 (drops 6064/607A) for when the full set cannot hit 100 Hz.
+    - Halts immediately on `603F != 0` or DS402 Fault statusword (bit pattern `SW & 0x004F == 0x0008`). `--no-fault-halt` disables this for tooling experiments.
+    - JSONL output at `logs/j6-multiturn-fast/<label>-<iso8601>Z.jsonl` with `{t_mono_ns, mt_i64, c6064, c607A, c603F, c6041, reads{...}}` per line plus a `.meta.json` sibling with `elapsed_s`, `effective_hz`, `fault_halt_reason`, `first_mt_i64`, `last_mt_i64`, `net_mt_delta_counts`, `descriptor_keys`, and operator `note`.
+    - `analyze` subcommand reads a JSONL and computes: `sample_count`, `elapsed_s`, `effective_hz`, `first_mt / last_mt / net_mt_delta`, `cumulative_travel = sum(|delta|)`, `max_sample_abs_delta`, `cum/|net|` ratio (threshold 1.2 for WHIP verdict), monotonicity within `--overshoot-budget-counts` (default 500 motor counts = ~0.14 deg output), fault detection (first sample where 603F or statusword indicates fault). Writes a matplotlib PNG plot next to the JSONL if matplotlib is available.
+  - `tests/test_j6_multiturn_fast_capture.py` (new, 26 tests):
+    - `_combine_signed_i64`: zero, positive, high-bit-sign-extension, live-DEVLOG sample from 2026-04-19 Move B+ wire read (`0xFFF6BF68 / 0xFFFFFFFF -> -606_360`), None-tolerance.
+    - `_parse_ethercat_value`: both observed output shapes (`0xhex decimal` and `decimal`), signed i32/i16 sign-extension, unsigned no-sign-extend, empty, malformed.
+    - `_statusword_is_fault`: None, Operation Enabled (`0x9637`), Faulted (`0x9638` and canonical `0x0008`), Fault Reaction Active (`0x0048` NOT classified as pure Fault), Switched-on-disabled.
+    - `_analyze_jsonl`: clean short-path motion (ratio=1.0, monotonic), synthetic whip (+50k forward then -40k back, net +10k; ratio=9.0, NOT monotonic), mid-trace fault at sample index 5 with 603F=0xFF00, small dither < 500 count budget that is not classified as whip, empty file raises.
+    - `_counts_to_output_deg`: one motor rev = 36 deg output at gear ratio 10, one full output turn = 360 deg output, 10 deg output round-trip within 0.01 deg.
+    - Test loader sets `sys.modules["j6_multiturn_fast_capture"]` before `exec_module` so `@dataclasses.dataclass` can resolve the class's parent module.
+
+- Validation performed:
+  - `python3 -c "import ast; ast.parse(open('scripts/j6_multiturn_fast_capture.py').read()); print('syntax OK')"` -> OK
+  - `python3 scripts/j6_multiturn_fast_capture.py --help` / `capture --help` / `analyze --help` -> all correct.
+  - `python3 -m pytest tests/test_j6_multiturn_fast_capture.py -q` -> `26 passed in 0.08s`.
+  - `python3 -m pytest tests/test_j6_multiturn_fast_capture.py tests/test_a6ec_chapter5_probe.py tests/test_gradient05_limits_and_backends.py tests/test_rtcore_runtime.py tests/test_drive_faults.py tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py tests/test_api_endpoints.py tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py tests/test_run_controller_helpers.py -q` -> `378 passed in 10.80s`.
+  - End-to-end CLI smoke via `/tmp/j6cap/fake.jsonl` (synthetic whip: +50k forward then -40k back, net +10k over 92 samples at ~100 Hz): `analyze` correctly reported `cum/|net|=9.0`, `VERDICT: WHIP`, `monotonic=False`, wrote PNG next to JSONL.
+  - `ReadLints` on both new files: clean.
+  - Full-repo `pytest -q` shows 7 pre-existing failures in `test_driver.py`, `test_end_to_end.py`, `test_planning.py`, `test_protocol.py`, `test_solver.py`. All of them are in the legacy IK / serial-servo stack and were not affected by these changes; they also pre-date this work per prior DEVLOG entries (`352 passed` on the A6-EC workstream scope as of 2026-04-19 05:12 Phase 6 session).
+
+- Runtime outcome:
+  - No hardware touched in this pass. Stack remains INACTIVE / DOWN.
+  - Phase 2 offline prep is complete; Phase 2 live smoke-test (run the capture on an idle bus to measure achievable Hz and validate the JSONL shape end-to-end) is the next step, gated on operator consent to bring the stack up.
+
+- Follow-up / risk:
+  - SDO mailbox throughput is the fundamental cap. On this hardware, realistic sample rates for the full 6-SDO descriptor set are expected to be 30-80 Hz (per-subprocess cost dominates; parallel Popen reduces wall time but not mailbox time). The plan's Phase 3 slow-speed (17 s for 10 deg at `max_motor_rpm=1`) makes 30-50 Hz plenty dense to see a 360 deg whip. If the idle-bus smoke-test comes in under 30 Hz, fall back to `--minimal` (4 SDOs) or drop motion speed further.
+  - If `--minimal` at `max_motor_rpm=1` still cannot produce a clean trace dense enough to resolve a whip, escalate to plan Phase 2 Option C: add a ring-buffered multi-turn log inside RTCore itself (new IPC endpoint or dedicated trace file written by a high-priority thread that tap-reads the already-computed `pos_counts`/`target_pos_out` and issues U40.20/.22 SDO reads out-of-band).
+  - Do NOT start Phase 3 (live seam crossing) until Phase 2 smoke-test has measured achievable Hz on an idle bus. The previous agent's failure mode was exactly "assume capture is fast enough; learn it wasn't, after motion".
+  - Any idle-bus smoke-test is safe if and only if the motor is disabled. Even calling `sudo ethercat upload` in a tight loop while the drive is NOT operation-enabled will never move anything; but the capture script intentionally does NOT read any API endpoint, so keep hands off the UI while it runs too.
+  - The 7 unrelated repo-wide pre-existing test failures (legacy IK/servo) stay open as pre-existing work, not part of this Phase 2 scope.
+
+## 2026-04-19 06:42 +0000 - Phase 2 idle-bus smoke-test: 5.6 Hz ceiling measured, <20% of plan target
+
+- What was run:
+  - `./start-stack.sh` brought the stack to `physical_state=BUS_UP_DISARMED`, all six axes `SwitchOnDisabled`, `ethercat=OP`, `rtcore=UP`, `startup_ready=yes`, `armed=0`. Verified the axes cannot move (SwitchOnDisabled means the power stage is off).
+  - Full capture (all 6 SDOs) for 4 s against J6: `logs/j6-multiturn-fast/idle-bus-smoke-20260419T063928Z.jsonl`:
+    - `samples=23 elapsed_s=4.14 hz=5.56`
+    - per-sample dt mean 180.8 ms (min 159.7, max 224.7)
+    - U40.20+U40.22 combined i64 stable at ~67,242 +/- 2 motor counts (encoder noise on idle bus, expected).
+    - All 6 fields populate on every sample (0 misses).
+    - `first_mt_i64 == last_mt_i64 == 67,242`, `net_mt_delta_counts = 0`, no fault halt.
+  - Minimal capture (4 SDOs: U40.20+.22+603F+6041) for 4 s: `idle-bus-minimal-20260419T064147Z.jsonl`:
+    - `samples=34 elapsed_s=4.08 hz=8.33`.
+  - Inline benchmark of `sudo ethercat upload` cost to understand the ceiling:
+    - `echo`: ~1 ms (fork/exec baseline)
+    - `sudo -n true`: ~8 ms (sudo overhead)
+    - Single `sudo ethercat upload -p 5 -t int32 0x2040 0x21`: ~46 ms
+    - 1 parallel read batch: ~51 ms (dominant cost)
+    - 2 parallel reads: ~66 ms batch (~33 ms per read amortized)
+    - 3 parallel reads: ~89 ms batch (~30 ms/read)
+    - 4 parallel reads: ~125 ms batch (~31 ms/read, parallelism saturating)
+    - 6 parallel reads: ~190 ms batch (~32 ms/read, fully saturated)
+
+- Finding:
+  - The IgH EtherCAT master kernel module serializes SDO mailbox transactions PER SLAVE at ~30 ms per SDO on this 1 kHz bus. `sudo -n ethercat upload` adds ~15 ms of subprocess overhead. Parallelism saturates at about 3 concurrent reads on the same slave; beyond that, the kernel queues additional requests behind the in-flight mailbox exchange.
+  - Consequence: with N SDO reads per sample on J6 (slave 5), the effective rate ceiling is approximately `1 / (N * 30 ms + subprocess overhead)`:
+    - 1 SDO ~= 20-33 Hz
+    - 2 SDOs ~= 15-17 Hz
+    - 4 SDOs ~= 7-8 Hz (matches observed minimal mode)
+    - 6 SDOs ~= 5-6 Hz (matches observed full mode)
+  - The plan's "100 Hz minimum, 1000 Hz ideal" is NOT physically attainable via userspace SDO to the same slave. Any claim of higher throughput via Python/subprocess would be a measurement bug.
+  - `ecrt_request_master()` from a second process is unsafe (would release the master from RTCore). `libethercat.so.1.2.0` ctypes binding therefore does NOT give a safe speedup.
+  - `/run/gradient-rt-motion/metrics.json` flushes at 5 Hz (RTCore metrics thread has a 200 ms sleep) and U40.20/.22 inside it is SDO-polled at 5 Hz too (`kAbsoluteFeedbackPollIntervalNs = 200_000_000 ns`). So tailing the metrics file offers no multi-turn improvement over the direct 4-8 Hz capture.
+
+- Implication for Phase 3:
+  - At `max_motor_rpm=1` (0.6 deg/s output), a 10 deg seam motion takes ~17 s. At the observed 5.6 Hz that's ~95 samples across the whole motion. A 360 deg whip takes roughly `60/(360*gear_ratio) = 0.017 s * 360 deg / deg = ~0.17 s` at a fairly modest 360 motor RPM (6 revs/s). A sub-200 ms whip could ENTIRELY fall between two samples at 5.6 Hz and be missed.
+  - To safely catch such a whip with the current capture, Phase 3 must either run at a deliberately slow motion speed (e.g. `max_motor_rpm=0.5` giving a 34 s trajectory, ~190 samples at 5.6 Hz) AND/OR use `--minimal` to gain the 8.3 Hz rate (~280 samples over 34 s).
+  - Alternatively, escalate to plan Phase 2 Option C: add a dense trace writer inside RTCore (new thread that snapshots per-cycle `pos_counts[J6]` = 6064 + `statusword[J6]` + `error_code[J6]` at 100-1000 Hz, plus U40.20/.22 at whatever SDO poll rate RTCore can sustain, into a dedicated ring-buffered JSONL). This would give the full 1 kHz context for 6064/6041/603F and keep U40.20/.22 at whatever the master mailbox tolerates, deduplicated across the cycle stream.
+  - Do NOT begin Phase 3 without an explicit operator decision between "run very slow and accept the SDO rate" vs "implement Option C first".
+
+- Validation / cleanup:
+  - `./start-stack.sh stop --hard` after the smoke-test reached `physical: INACTIVE   driver: INACTIVE   ethercat: DOWN   rtcore: DOWN`. No motion occurred at any point; axes stayed in `SwitchOnDisabled`.
+  - Artefacts left in place under `logs/j6-multiturn-fast/` for reference:
+    - `idle-bus-smoke-20260419T063928Z.jsonl` + `.meta.json`
+    - `idle-bus-minimal-20260419T064147Z.jsonl` + `.meta.json`
+
+- Follow-up / risk:
+  - Decision pending from operator: accept slower motion + 5-8 Hz OR authorize plan Phase 2 Option C (RTCore ring-buffer trace writer).
+  - If Option C is authorized, the smallest-blast-radius implementation is a new dedicated thread in `src/gradient_rt_motion/main.cpp` that snapshots `latest_feedback.pos_counts[i]`, `statusword[i]`, `error_code[i]`, target_counts[i] (latest), and absolute_feedback[i].value for the J6 slot at a configurable rate (CLI flag `--j6-trace-hz` default 0 = disabled), writing JSONL to a file whose path is also CLI-configurable. U40.20/.22 would continue to be SDO-polled at the existing cadence but the output cadence of 6064/6041/603F/607A could be 100-1000 Hz trivially because all that data is already in-memory on every cycle.
+  - If we go slow-motion path instead, update `scripts/j6_multiturn_fast_capture.py` to support arbitrary SDO subset via `--sdo-keys` flag and document the measured Hz as a function of subset size.
+
+## 2026-04-19 07:32 +0000 - RTCore fast_trace at 1 kHz: userspace SDO path was the wrong tool
+
+- Context:
+  - Operator called out my userspace-SDO analysis as wrong: "how can you not read faster than 5 Hz? we fucking already do that. how does rtcore send back telemetry at ALL?" They were correct.
+  - I had conflated SDO mailbox throughput (~30 ms/read kernel floor, shared-slave-serialized) with per-cycle PDO telemetry (1 kHz free in RTCore). On the A6-EC, 0x6064 / 0x607A / 0x6041 / 0x603F are all PDO-mapped per `GRADIENT_RT_DRIVE_{TX,RX}_PDO_LAYOUT`; only U40.20/U40.22 (0x2040:21/:23) is SDO-only on this drive.
+  - Worse, `src/gradient_rt_motion/main.cpp` already has a `fast_trace_thread` (around line 4383) that writes per-cycle feedback to JSONL at up to the cycle rate, enabled by three env vars `GRADIENT_RT_FAST_TRACE_{PATH,HZ,AXIS_MASK}`. The systemd unit wires them into ExecStart with a comment literally citing this Phase-2 plan file. I missed the infrastructure by not reading the main.cpp deeply enough before starting to build a SDO subprocess loop.
+
+- What changed:
+  - `/etc/systemd/system/gradient-rt-motion.service.d/fast-trace.conf` (new drop-in):
+    ```
+    [Service]
+    Environment=GRADIENT_RT_FAST_TRACE_PATH=/run/gradient-rt-motion/j6-fast-trace.jsonl
+    Environment=GRADIENT_RT_FAST_TRACE_HZ=1000
+    Environment=GRADIENT_RT_FAST_TRACE_AXIS_MASK=0x20
+    ```
+    Layered on top of the main unit's empty defaults; NOT overwritten by `start-stack.sh` since it regenerates `/etc/default/gradient-rt-motion`, not systemd drop-ins. Fully reversible: `sudo rm` the file + `sudo systemctl daemon-reload` + next restart.
+  - `scripts/j6_multiturn_fast_capture.py` - added `analyze-rtcore` subcommand:
+    - `_unwrap_wire_delta(delta, rm_counts)` computes the shortest-periodic wire-frame delta so 0x6064 seam crossings (raw delta close to +/- RM) are correctly reported as small motions across the wrap, not as 360-deg jumps.
+    - `_extract_axis_sample(record, axis_index)` parses the RTCore JSONL shape per line, pulling pos_counts (p), target_pos_counts (tp), statusword (sw), error_code (er), manufacturer_error_code (mfr), and the combined signed-i64 multi-turn from the `af[]` `encoder_multi_turn_low` + `_high` fields.
+    - `_analyze_rtcore_jsonl(path, axis_index, rm_counts, overshoot_budget_counts)` returns a `FastTraceAnalysis` with `cumulative_travel_wire_counts`, wrap-aware `net_displacement_wire_counts`, `max_abs_wire_step_counts`, `cum/|net|` ratio, monotonicity within a direction-flip budget, `mt_sample_count + mt_distinct_samples + mt_net_delta` cross-check, and the first fault-sample index.
+    - `_print_rtcore_analysis(result, gear_ratio)` formats the summary; VERDICT is noise-floor gated: when `|net| < max(10 * max_abs_wire_step, 1000 counts)` it reports STATIC instead of WHIP (avoids misfiring on idle-bus encoder dither). WHIP fires on ratio > 1.2 OR monotonic=False, with an explicit reason list.
+    - `_plot_rtcore_trace_png` produces a dual-panel matplotlib PNG: top panel shows UNWRAPPED cumulative 6064 displacement in deg output + U40.20/.22 overlay; bottom panel shows RAW wire 6064 with RM guide line. Fault samples get a red vertical line.
+    - Old `capture` + `analyze` subcommands retained as deprecated fallback.
+  - `tests/test_j6_multiturn_fast_capture.py` - added 13 new tests covering the fast_trace path:
+    - `_unwrap_wire_delta` zero / small-positive / small-negative / positive-wrap / negative-wrap / rm-zero-passthrough
+    - `_extract_axis_sample` J6 present / missing-axis / ok=false meaning mt_i64 is None
+    - `_analyze_rtcore_jsonl` clean motion (ratio=1, monotonic), synthetic whip (50 forward then 40 back, 89 transitions, ratio 89/9, non-monotonic), seam wrap (RM-100 -> +100 is +200 not ~+RM), drops leading p=0 samples before PDO latch, detects 603F=0xFF00 at correct sample index, 5-Hz-mt-refresh-in-1kHz-stream distinct-values cross-check.
+
+- Validation performed:
+  - `python3 -c "import ast; ast.parse(open('scripts/j6_multiturn_fast_capture.py').read()); print('syntax OK')"` -> OK
+  - `python3 scripts/j6_multiturn_fast_capture.py --help` / `analyze-rtcore --help` correct.
+  - `python3 -m pytest tests/test_j6_multiturn_fast_capture.py -q` -> `39 passed in 0.09s`.
+  - `ReadLints` on the touched files -> clean.
+  - Live smoke on idle bus (J6 disarmed):
+    - `./start-stack.sh` -> `BUS_UP_DISARMED`; journal line `fast_trace: writing to /run/gradient-rt-motion/j6-fast-trace.jsonl at 1000 Hz (period 1000000 ns) mask=0x20`.
+    - 1 s `wc -l` delta: 1056 lines -> ~1000 Hz effective.
+    - 183 s capture produced 183,373 valid samples (effective Hz 1000.01).
+    - `analyze-rtcore`: `cumulative_travel=139,310 counts (38.26 deg)` (all encoder dither, max single-cycle step 4 counts = 0.001 deg), `net=-2 counts`, VERDICT=STATIC (|net|=2 counts < noise floor 1000).
+    - Dual-panel PNG generated and stored at `logs/j6-multiturn-fast/j6-fast-trace-idle-3s.png`.
+    - Stack hard-stopped cleanly; `/run/gradient-rt-motion/` wiped by systemd per RuntimeDirectory default.
+
+- Runtime outcome:
+  - No motion commanded at any point. J6 stayed SwitchOnDisabled throughout.
+  - Infrastructure for Phase 3 is now proven: 1 kHz J6 trace with full PDO wire context + U40.20/.22 at its existing 5 Hz poll rate is enough to see a 360-deg whip at any reasonable motion speed (whip at 360 motor RPM = 6 rev/s -> ~100 deg per cycle at output, a massive spike in max_abs_wire_step; whip at 6000 RPM = 100 rev/s -> would still be visible as 10 cycles of large monotonic-wrong-direction deltas).
+  - Idle trace + plot are archived at `logs/j6-multiturn-fast/j6-fast-trace-idle-3s.{jsonl,png}` (95 MB / 84 KB).
+
+- Follow-up / risk:
+  - `/etc/systemd/system/gradient-rt-motion.service.d/fast-trace.conf` is persistent across reboots. If someone else restarts the machine without knowing about it, the fast_trace will still be enabled. Harmless (disk-write-only, no wire impact) but the file will grow unbounded while the service is up. Recommend removing the drop-in or setting HZ=0 after Phase 3 completes.
+  - The fast_trace's `absolute_feedback` (U40.20/.22) entries are still refreshed at 5 Hz by the metrics-thread SDO poll (`kAbsoluteFeedbackPollIntervalNs = 200 ms`). For the Phase 3 workflow this is fine (0x6064 at 1 kHz is the primary evidence; U40.20/.22 is cross-check for rollover). If a future experiment needs U40.20/.22 at > 5 Hz, bump that constant in `main.cpp` and rebuild; shouldn't be necessary for whip detection.
+  - The `/etc/default/gradient-rt-motion.bak-<ts>` backup I created earlier (before learning start-stack regenerates the file) is no longer necessary but harmless. Safe to delete.
+  - `scripts/j6_multiturn_fast_capture.py capture` subcommand and the prior idle-bus SDO smoke-test traces (`idle-bus-smoke-*.jsonl`, `idle-bus-minimal-*.jsonl`) are retained as historical context but are deprecated for this workflow. Future cleanup pass can delete them.
+  - The previous entry in this devlog (2026-04-19 06:42, "5.6 Hz ceiling measured") is now superseded. It remains accurate for the userspace SDO path but mis-framed the overall Phase-2 options. Operator decision "authorize RTCore Option C" was actually unnecessary because Option C was already shipped - just not enabled.
+
+## 2026-04-19 07:57 +0000 - Fast-trace autosave hook landed; runtime-wipe failure mode closed
+
+- What changed:
+  - `scripts/j6_multiturn_fast_capture.py` - new `save` subcommand:
+    - Copies `/run/gradient-rt-motion/j6-fast-trace.jsonl` to `<log-dir>/<label>-<iso8601>Z.jsonl` with a matching `.meta.json` sibling.
+    - Uses `sudo -n cp --preserve=timestamps` (the runtime file is root-owned) and then `sudo -n chown` to the invoking user so `analyze-rtcore` can read the saved file without sudo.
+    - `--if-exists` flag: silent no-op if the source file is missing or size 0. Exit 0. Intended for automation hooks.
+    - Without `--if-exists`: errors with `[save] ERROR: source ... does not exist` and exits 1.
+    - Meta includes `schema_version`, `tool`, `label`, `source_path`, `dest_jsonl`, `saved_at_wall_utc`, `source_size_bytes`, `source_mtime_unix_s`, a `stats` block with `line_count/first_t_ns/last_t_ns/elapsed_s/effective_hz`, and operator `note`. Stats are computed via cheap head+tail reads so the helper scales to tens-of-MB traces without loading the full JSONL.
+  - `start-stack.sh` - new `preserve_rtcore_fast_trace_if_any()` helper + invocation:
+    - Runs at the TOP of `perform_shutdown_sequence`, before any RTCore/EtherCAT teardown.
+    - Invokes `python3 scripts/j6_multiturn_fast_capture.py save --if-exists --label autosave`.
+    - Non-fatal: never aborts shutdown. Output goes through the existing `log "rtcore-trace: ..."` path so it shows up inline in the stack log.
+    - Fires on both soft-stop and hard-stop; harmless when fast_trace is disabled (source file will not exist -> silent no-op).
+  - `tests/test_j6_multiturn_fast_capture.py` - new tests covering `_estimate_trace_stats` (empty/1-kHz head+tail correctness/trailing-blank-line tolerance) and `_save_rtcore_trace` (missing-source + `if_exists=True` returns `SaveResult(copied=False)` without polluting the dest dir; without `if_exists` raises `FileNotFoundError`).
+
+- Validation performed:
+  - `python3 -c "import ast; ast.parse(open('scripts/j6_multiturn_fast_capture.py').read()); print('syntax OK')"` -> OK
+  - `bash -n start-stack.sh` -> OK
+  - `python3 scripts/j6_multiturn_fast_capture.py save --help` -> correct
+  - `python3 -m pytest tests/test_j6_multiturn_fast_capture.py -q` -> `44 passed in 0.20s`.
+  - `ReadLints` on `scripts/j6_multiturn_fast_capture.py`, `tests/test_j6_multiturn_fast_capture.py`, `start-stack.sh` -> clean.
+  - Live end-to-end:
+    - `./start-stack.sh` -> BUS_UP_DISARMED in 2 s.
+    - 3-second pause (fast_trace grew from 4.68 MB to 7.77 MB).
+    - `./start-stack.sh stop --hard` -> hook ran at the top of `perform_shutdown_sequence`, BEFORE `stop_rtcore_runtime`. Stack log recorded: `[start-stack] rtcore-trace: [save] copied 7767435 bytes -> logs/j6-multiturn-fast/autosave-20260419T075747Z.jsonl`.
+    - Saved file owned `pi:pi`, 7,775,643 bytes, 15,929 lines, spans 15.93 s at effective_hz `999.9994` (per the stats written into the meta file).
+    - `python3 scripts/j6_multiturn_fast_capture.py analyze-rtcore logs/j6-multiturn-fast/autosave-20260419T075747Z.jsonl --no-plot` parses cleanly, reports VERDICT=STATIC (as expected for idle-bus data), `effective_hz=1000.13`, wire_monotonic=True. No sudo needed because the file is pi-owned.
+    - `save --if-exists` after stack stop correctly reports `[save] skipped: source /run/gradient-rt-motion/j6-fast-trace.jsonl does not exist`. Without `--if-exists`, same invocation returns `[save] ERROR:` and exits 1.
+
+- Runtime outcome:
+  - No motion commanded at any point; J6 stayed SwitchOnDisabled throughout.
+  - The `/run/gradient-rt-motion/` wipe-on-service-stop failure mode is now closed for the Phase 3 workflow: operator no longer needs to remember to copy the trace out before `stop --hard`. The hook does it automatically.
+  - Operator may still use `save --label <custom>` at any time while RTCore is up to snapshot named points mid-session (e.g. `save --label pre-seam-crossing` and `save --label post-seam-crossing`), independent of the autosave fired by `stop --hard`.
+
+- Follow-up / risk:
+  - If the operator runs `./start-stack.sh stop` (soft-stop, RTCore stays up) the hook still fires and captures the current state. RTCore then continues writing to the same path, so a later `stop --hard` will create a second autosave with the full trace. That is intentional (two saves = two reference points) but could produce unexpected file proliferation if someone cycles soft-stop many times. Worth documenting only if it surfaces as an issue.
+  - The noise-floor gated VERDICT=STATIC in `analyze-rtcore` also suppresses the WHIP verdict on very short traces where motion had not yet started. The `fault_seen` field still surfaces any pre-OP 0x8700 error_code the capture may pick up (seen above on the idle-bus autosave: `fault_seen: True -- 603F=0x8700 at sample 0`). For Phase 3 motion captures this is correct (the motion window always begins after OP has latched 603F=0), but be aware that `fault_seen` on idle autosaves may be benign pre-OP noise. Cross-reference with `first_t_ns` vs the operator's commanded-motion timestamp if in doubt.
+  - The systemd drop-in at `/etc/systemd/system/gradient-rt-motion.service.d/fast-trace.conf` is still persistent across reboots. If nobody touches it, every future stack run will write `/run/gradient-rt-motion/j6-fast-trace.jsonl` at 1 kHz and auto-save it on stop. The saved files accumulate under `logs/j6-multiturn-fast/autosave-*.jsonl` - expected cost is ~600 MB/min of stack uptime at 1 kHz. Clean up or set `GRADIENT_RT_FAST_TRACE_HZ=0` when Phase 3 completes.
+  - `/etc/default/gradient-rt-motion.bak-20260419T071725Z` is still present from the earlier (incorrect) manual-edit attempt. Safe to delete.
+
+## 2026-04-19 08:44 +0000 - Phase 3 slow-speed seam crossing PROVEN CLEAN (max_motor_rpm=1)
+
+- Context:
+  - Per the plan (`/home/pi/.cursor/plans/j6_seam_whip_verification_b8c230f3.plan.md`) Phase 3: slow-speed seam-crossing repro with 1 kHz fast_trace capture, to see whether the seam-crossing motion is short-path-clean or the 360 deg whip the operator observed at 10 motor RPM.
+  - Infrastructure at this point: RTCore fast_trace drop-in enabled at 1000 Hz for J6 only; `scripts/j6_multiturn_fast_capture.py save/analyze-rtcore` landed; autosave hook in `start-stack.sh` preserves the trace on `stop --hard`.
+
+- New tooling:
+  - `scripts/j6_seam_whip_phase3_runner.py`: orchestrates the live motion sequence end-to-end. Homes J6 via `/control/home-joint-native {"joint": 6}`, powers up via `/control/power-up`, saves trace snapshots at each checkpoint via `save --label phase3-*`, pre-positions to +175 deg at max_motor_rpm=100, then does the critical +175 -> +185 deg move at max_motor_rpm=1 (17 s at 0.6 deg/s output) using raw UDP APPLY_JOINT_SETPOINT with target_joint_indices=[5]. Caches pre-motion joint state to survive the `absolute_home_anchor_stale` diagnostic that blanks arm_rad post-motion. `--skip-home-power-up` flag for rerun when already armed.
+
+- Motion sequence (live, no errors):
+  - `./start-stack.sh`: BUS_UP_DISARMED + api up in 5 s.
+  - Runner's first attempt crashed on `arm_deg[5]` being empty immediately post-power-up -> fixed runner to use `arm_display_rad` fallback + cached pre-motion joint state.
+  - Second attempt with `--skip-home-power-up` (stack was still armed from first attempt):
+    - J6 started at +175.000 deg canonical (already there from the aborted first run's preposition).
+    - Pre-position APPLY_JOINT_SETPOINT accepted as trajectory_id=2 (effectively no-op since target = live).
+    - wait-for-idle returned `state=completed` after 1 s.
+    - SEAM CROSS APPLY_JOINT_SETPOINT accepted as trajectory_id=3 with max_motor_rpm=1.
+    - wait-for-idle returned `state=completed` after 17.1 s.
+    - Final J6 canonical position was reported as `unavailable` by `arm_deg` (anchor_stale diagnostic).
+    - Snapshots saved inline: `phase3-after-powerup-20260419T084200Z.jsonl` (100 MB), `phase3-pre-seam-slow-20260419T084201Z.jsonl` (101 MB), `phase3-post-seam-slow-20260419T084219Z.jsonl` (110 MB).
+  - `./start-stack.sh stop --hard`: autosave hook fired, producing `autosave-20260419T084255Z.jsonl` (129 MB) with the complete cumulative session.
+
+- Analysis (isolated seam-cross window via t_ns filter):
+  - Extracted the 17.49 s slow seam crossing from `phase3-post-seam-slow-*.jsonl` into `phase3-seam-cross-slow-isolated.jsonl` (9 MB, 17,491 samples, effective_hz 1000.06).
+  - Wire-frame (0x6064) first = 18,204 (J6 at +175 deg canonical).
+  - Wire-frame (0x6064) last = 1,292,489 = `RM - 18,231` (J6 at +185 deg canonical AFTER wrapping through 0/RM seam).
+  - cumulative_travel = 39,035 motor counts = 10.72 deg output (essentially the commanded 10 deg move + 7% overhead).
+  - net_displacement = -36,435 motor counts = -10.01 deg output (matches commanded +10 deg with J6 sign=-1).
+  - max_abs_wire_step = 15 counts = 0.004 deg/cycle (well under 2 motor RPM peak throughout, matching the commanded 1 motor RPM speed).
+  - cum / |net| = 1.071 (7% overhead, well within the plan's 1.2x WHIP threshold).
+  - **VERDICT = CLEAN**.
+  - wire_monotonic = True (no direction flip beyond the 500-count budget at any point).
+  - U40.20/U40.22 cross-check: net = -35,620 motor counts = -9.78 deg (matches the wire-frame net within encoder resolution).
+  - fault_seen = False.
+  - If a 360 deg whip had occurred: cumulative_travel would have been ~1.35M counts (369 deg), max_abs_wire_step would have been hundreds of counts per ms (high peak velocity), and wire_monotonic would be False. None of those are present.
+  - Artefacts: `logs/j6-multiturn-fast/phase3-seam-cross-slow-isolated.{jsonl,png}` (the PNG shows the smooth monotonic unwrapped-6064 curve; the raw-6064 panel shows the seam crossing as a clean wrap from near 0 down through 0/RM to near RM).
+
+- Analyzer verdict caveat noted:
+  - When `analyze-rtcore` is run on the FULL 206-second session (including the earlier 100-RPM preposition from 0 deg -> +175 deg), cum/|net| = 1.225 which trips WHIP because the preposition's per-cycle jitter inflates cumulative relative to the single-motion net. This is a FALSE POSITIVE caused by analyzing a multi-phase session as one window. The correct use of the tool is to isolate one motion segment at a time via t_ns filter (as done here). Documented for future sessions.
+
+- Implication per plan Phase 4 decision tree:
+  - Phase 3 slow (max_motor_rpm=1) is CLEAN at Move B+ direction (+175 -> +185). Next is re-run at max_motor_rpm=10 to see if the operator-observed whip at 10 RPM reproduces under the 1 kHz trace. If also clean, earn back the retracted Move B+ PASS. If NOT clean at 10 RPM, the issue is speed-dependent (drive position-loop gain bandwidth or host per-cycle step clamp interaction) and Phase 5 investigation opens.
+  - Move B- (negative seam cross, -175 -> -185) at slow speed is also a required data point before re-earning the retraction marks, to prove symmetric behavior.
+
+- Validation performed:
+  - `make` and `pytest` not re-run (no code logic change in this pass beyond the runner script which doesn't have unit tests yet).
+  - `ReadLints` on `scripts/j6_seam_whip_phase3_runner.py` -> clean.
+  - Live analyze-rtcore output verified on both the full session and the isolated seam-cross window.
+  - Stack hard-stopped cleanly after the run; autosave hook fired as expected.
+
+- Follow-up / risk:
+  - DO NOT claim Move B+ PASS yet. This is one direction, one slow speed. Plan's Phase 6 requires re-running at 10 motor RPM AND both directions before retracted PASS marks are re-earned.
+  - The runner script assumes --skip-home-power-up can be set when already armed, but on a fresh stack it correctly homes and powers up. Keep --skip-home-power-up explicit when chaining multiple runs to avoid accidental re-home mid-session.
+  - The whole `logs/j6-multiturn-fast/` directory is ~570 MB now from this one session. Future runs will add more. Consider pruning older snapshots or moving to a separate test-artefacts dir when the proof matrix completes.
+  - `absolute_home_anchor_stale` is still firing on every motion (known issue, deferred cleanup per earlier scratchpad). The runner script works around it by caching the pre-motion joint state. Do NOT loosen the diagnostic's 8-count tolerance until the full proof matrix completes.
+  - analyze-rtcore's 1.2x WHIP threshold will give false positives on multi-phase sessions. For clean verdicts, always isolate a single motion window first (cheap python filter on t_ns as done here). Consider adding `--from-t-ns` / `--to-t-ns` flags to analyze-rtcore in a future pass to make this easier.
+
+## 2026-04-19 09:02 +0000 - Phase 3 Move B+ at 10 motor RPM also CLEAN
+
+- Context:
+  - Per plan Phase 4 decision tree, if the slow (1 RPM) seam cross is clean, re-run at 10 motor RPM — the speed at which the operator originally observed the whip that led to retracting Move B+. If also clean, start earning back the retraction.
+
+- What happened:
+  - `./start-stack.sh` fresh after the slow run. J6 at +185 deg physical from the prior test; absolute encoder retention held (`0x9650`, pos=1,292,557 ≈ canonical +185) across the restart.
+  - Initial runner attempt failed because `arm_rad[1], arm_rad[2], arm_rad[5]` were all blanked by `absolute_home_anchor_stale` for seconds after the fresh home+power-up. Added `fetch_joint_state_with_all_joints_ready` (polls `/info/joints` until all 6 joints have non-None values, 15 s timeout).
+  - Second attempt failed at the seam-cross step: controller rejected `APPLY_JOINT_SETPOINT` with `Canonical joint truth unavailable ... reasons=['multi_turn_anchor_inconsistent_with_live_6064']`. Root cause: the 16-count `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` gate in `backend.py:125` trips after the ~630k-count 175 deg preposition moves the live 0x6064 far from the anchor-implied expected value. 1 s settle wasn't enough; bumped to 5 s.
+  - Third attempt (with `--skip-home-power-up`, J6 already at +175 from the failed 2nd attempt) completed: preposition = no-op; seam cross to +185 at max_motor_rpm=10 accepted as trajectory_id=3. `wait-for-idle` returned `state=completed` after **1.9 s** (analytic expected = 10 deg * 10 gear / (10 motor RPM * 6) = 1.67 s).
+
+- Runner fixes landed in `scripts/j6_seam_whip_phase3_runner.py`:
+  - New `fetch_joint_state_with_all_joints_ready(timeout_s=10, poll_interval_s=0.25)` survives the anchor_stale blanking window post-home.
+  - Post-preposition settle bumped from 1 s to 5 s so the `multi_turn_anchor_inconsistent_with_live_6064` gate passes before the next motion.
+  - Added CLI flags `--preposition-deg`, `--seam-target-deg`, `--preposition-max-motor-rpm`, `--seam-max-motor-rpm`, `--label-suffix`, `--seam-idle-timeout-s`.
+  - Fixed expected-duration formula: was `(delta_deg / gear_ratio) / (rpm / 60)` -> produced 6.0 s for 10 RPM case (actual 1.9 s). Corrected to `delta_deg * gear_ratio / (motor_rpm * 6)`.
+
+- Analysis (isolated 2.31 s window via t_ns filter, `phase3-seam-cross-10rpm-positive-isolated.jsonl`, 2,312 samples at effective_hz 1000.43):
+  - 0x6064 first = 18,205 (+175 deg canonical), last = 1,292,425 = `RM - 18,295` (+185 deg canonical after wrapping through 0/RM seam).
+  - cumulative_travel = 37,024 motor counts = 10.17 deg output.
+  - net_displacement = -36,500 motor counts = -10.025 deg output (matches commanded with J6 sign=-1).
+  - max_abs_wire_step = 126 counts/ms = 0.035 deg/ms = ~5.8 motor RPM sustained peak (matches commanded 10 RPM within velocity-planner overhead).
+  - cum / |net| = 1.014.
+  - **VERDICT = CLEAN**, wire_monotonic = True, fault_seen = False.
+  - U40.20/U40.22 cross-check: net = -34,334 motor counts = -9.43 deg output. Only 2 distinct mt values captured in the 2.31 s window at the 5 Hz SDO poll rate; the wire-frame verdict is the primary evidence.
+  - Whip-impossibility gate: a 360 deg whip in ANY sub-interval of the 2.31 s window would produce max_abs_wire_step >= 565 counts/ms (for the slowest possible 360-deg-per-2.3s whip). Measured 126 is well below that floor.
+
+- Validation performed:
+  - `make`/`pytest` not re-run (no unit-testable change; runner wiring only).
+  - `ReadLints` on the runner script -> clean.
+  - Live analyze-rtcore on the isolated window -> CLEAN; on the full session -> WHIP false positive (multi-phase quirk, documented).
+  - Stack hard-stopped cleanly; autosave hook fired, `autosave-20260419T090220Z.jsonl` (157 MB) preserved.
+
+- Runtime outcome:
+  - Move B+ is proven CLEAN at BOTH max_motor_rpm=1 AND max_motor_rpm=10 by 1 kHz telemetry with identical code (drop-in + host fold + RTCore interpolation-wrap gating, no changes between runs).
+  - The earlier "operator observed 360 deg whip at 10 RPM" retraction is NOT reproducing. The telemetry is ground truth. Possible explanations: transient drive-side behavior that has cleared, visual misinterpretation of wrist motion, or uncharacterized state dependence. Not speculating further without more data.
+
+- Follow-up / risk:
+  - Phase 6 re-earn still requires Move B- (negative direction) at BOTH max_motor_rpm=1 AND max_motor_rpm=10 before the retraction is closed. Do NOT declare Move B+ PASS until the full 2x2 matrix is confirmed clean.
+  - The `multi_turn_anchor_inconsistent_with_live_6064` gate (16-count tolerance) is operationally awkward: it rejects the next motion command until the anchor refreshes (takes ~5 s after a large preposition). Works but forces explicit settle. Consider raising the tolerance to something like RM/4 = 327,680 counts (= 90 deg physical) after the proof matrix completes; it still catches real frame-inconsistency bugs without forcing artificial settles.
+  - The runner does not auto-retry on `multi_turn_anchor_inconsistent_with_live_6064`; it exits with a useful message. Consider adding a retry-with-extra-settle path in a future session.
+  - Snapshot artefacts from this run (all in `logs/j6-multiturn-fast/`): `phase3-after-powerup-10rpm-positive-*.jsonl` (121 MB), `phase3-pre-seam-10rpm-positive-*.jsonl` (124 MB), `phase3-post-seam-10rpm-positive-*.jsonl` (125 MB), `autosave-20260419T090220Z.jsonl` (157 MB), `phase3-seam-cross-10rpm-positive-isolated.{jsonl,png}` (1.4 MB + 100 KB).
+
+## 2026-04-19 18:30 +0000 - Phase 6 COMPLETE: full B+ / B- at slow/fast matrix is CLEAN
+
+- Context:
+  - Plan's Phase 6 gate: "Re-run the 10-motor-RPM seam-crossing matrix (Move B+, Move B-) with the fast capture active for every motion. Confirm the trace is clean at the faster speed too." This entry closes that gate by completing the Move B- direction that was blocked earlier on a physical EtherCAT disconnect.
+  - Prior state: Move B+ slow and Move B+ 10 RPM both CLEAN under 1 kHz trace (DEVLOG 2026-04-19 08:44 and 09:02). Move B- blocked (DEVLOG 2026-04-19 after the stop --hard following the 10 RPM B+ run).
+  - EtherCAT physical link was restored by the operator before this session (eth0 `carrier=1, operstate=up`, sudo ethercat master shows Slaves: 6 again).
+
+- Motion runs (two separate stack sessions, home + power-up + preposition + seam cross, autosave hook captures full session on stop):
+  - Session 1 -- Move B- at 1 motor RPM (`--preposition-deg -175 --seam-target-deg -185 --seam-max-motor-rpm 1 --label-suffix 1rpm-negative`):
+    - Home, power-up, joint state settled after ~2.75 s (anchor-stale diagnostic).
+    - Preposition 0 deg -> -175 deg at 100 motor RPM (no seam crossing) completed in ~3 s.
+    - 5 s settle for anchor consistency gate.
+    - Seam cross -175 deg -> -185 deg at 1 motor RPM completed in 17.1 s. wait-for-idle reported `state=completed`.
+    - Stack hard-stop; autosave `autosave-20260419T182834Z.jsonl` (54 MB) produced.
+  - Session 2 -- Move B- at 10 motor RPM (`--seam-max-motor-rpm 10 --label-suffix 10rpm-negative`):
+    - Fresh stack, home, power-up, settle.
+    - Preposition 0 deg -> -175 deg at 100 motor RPM completed cleanly.
+    - Seam cross -175 deg -> -185 deg at 10 motor RPM completed in 1.8 s (matches analytic 1.67 s).
+    - Stack hard-stop; autosave `autosave-20260419T183025Z.jsonl` (47 MB).
+
+- Analysis (both isolated via t_ns filter, same pattern as prior runs):
+  - Move B- at 1 RPM, `phase3-seam-cross-1rpm-negative-isolated.jsonl` (17,352 samples, effective_hz 1000.06):
+    - first_p (0x6064) = 1,292,515 (-175 deg canonical wire frame), last_p = 18,238 (-185 deg canonical AFTER wrap through RM/0 seam).
+    - cumulative_travel = 38,655 motor counts = 10.62 deg output.
+    - net_displacement = +36,443 motor counts = +10.009 deg output (commanded +10 deg exactly, sign=+1 in this direction since canonical -175 -> -185 with J6 sign=-1 inverts to wire going UP through RM).
+    - max_abs_wire_step = 18 counts/ms (0.005 deg/ms), mean = +2.22 counts/ms (matches 1 motor RPM).
+    - cum / |net| = 1.061.
+    - wire_monotonic = True, fault_seen = False. **VERDICT = CLEAN.**
+    - U40.20/U40.22 cross-check: net = +36,420 motor counts = +10.003 deg output (matches wire frame within encoder resolution; 11 distinct mt values captured in 17.35 s at the 5 Hz SDO poll rate).
+  - Move B- at 10 RPM, `phase3-seam-cross-10rpm-negative-isolated.jsonl` (2,017 samples, effective_hz 1000.50):
+    - first_p = 1,292,515 (-175 deg), last_p = 18,365 (-185 deg through seam).
+    - cumulative_travel = 36,908 motor counts = 10.137 deg.
+    - net_displacement = +36,570 motor counts = +10.044 deg.
+    - max_abs_wire_step = 150 counts/ms (0.041 deg/ms, matches commanded 10 motor RPM peak + velocity-planner overhead).
+    - cum / |net| = 1.009 (nearly perfect).
+    - wire_monotonic = True, fault_seen = False. **VERDICT = CLEAN.**
+    - U40.20/U40.22 cross-check: net = +35,797 motor counts = +9.832 deg output (3 distinct mt values in 2.02 s).
+
+- Full Phase 6 re-earn matrix is now CLEAN in all four cells:
+  | direction                  | 1 motor RPM              | 10 motor RPM             |
+  |----------------------------|--------------------------|--------------------------|
+  | Move B+ (+175 -> +185)     | CLEAN +10.01 deg output  | CLEAN +10.03 deg output  |
+  | Move B- (-175 -> -185)     | CLEAN +10.01 deg output  | CLEAN +10.04 deg output  |
+  (net displacement, sign-adjusted for sign=-1; every cell within 0.05 deg of commanded 10 deg)
+
+- Retraction audit trail: the DEVLOG entry at `## 2026-04-19 05:30 +0000 - RETRACTION: Phase 6 "PASS" verdicts were endpoint-only and path-blind` is the baseline for this reearn. That retraction was correctly applied at the time because the only evidence was endpoint-only multi-turn reads that cannot distinguish a clean 10 deg motion from a 360 deg whip netting 10 deg. This 2026-04-19 18:30 entry supersedes the claim of "retracted" for Move B+ and Move B- specifically, backed by dense 1 kHz telemetry covering the entire motion window in both directions at both speeds. **Move B+ and Move B- seam-crossing PASS marks are re-earned.** The retraction entry stays in place; do not edit it, the audit trail depends on it.
+
+- Explicitly still retracted (not earned back in this session):
+  - Chained multi-turn (0 deg -> +175 -> +350 deg) from the 2026-04-19 05:30 retraction entry. That scenario needs its own 1 kHz capture pass. Recommended next test before any canonical multi-turn is exposed to downstream consumers.
+
+- Image subfolder for all Phase 6 evidence: `logs/j6-multiturn-fast/images/` now holds:
+  - `phase3-seam-cross-slow-MOTION-EVIDENCE.png` (Move B+ 1 RPM, 276 KB)
+  - `phase3-seam-cross-10rpm-positive-MOTION-EVIDENCE.png` (Move B+ 10 RPM, 255 KB)
+  - `phase3-seam-cross-1rpm-negative-MOTION-EVIDENCE.png` (Move B- 1 RPM, 242 KB)
+  - `phase3-seam-cross-10rpm-negative-MOTION-EVIDENCE.png` (Move B- 10 RPM, 257 KB)
+  - Four matching `...-isolated.png` auto-generated by analyze-rtcore (100 KB each)
+  - `phase3-post-seam-slow-20260419T084219Z.png` (historical, first full-session analysis from 08:44)
+  - Each MOTION-EVIDENCE PNG has 4 stacked panels: unwrapped-6064 displacement (deg output) with U40.20/.22 overlay, raw 6064 + 607A wire values with RM wrap line, per-cycle wire velocity (counts/ms) with commanded-velocity reference line, 0x6041 statusword + 0x603F error code strip. Purple vertical line marks the seam-crossing timestamp on all panels.
+  - JSONL traces (cumulative + isolated) stay in `logs/j6-multiturn-fast/` root to keep the subfolder focused on visual evidence.
+
+- Validation performed:
+  - No code changes in this pass; runner script was already landed in prior entries.
+  - `ReadLints` on touched memory files -> clean.
+  - Live analyze-rtcore verdicts printed for both negative-direction isolated windows.
+  - Stack hard-stopped cleanly after each run; autosave hook fired as expected.
+
+- Follow-up / risk:
+  - The whole `logs/j6-multiturn-fast/` is now ~1.1 GB across 18 JSONL files. `images/` is ~1.5 MB. Consider deleting pre-phase3/ and the intermediate autosaves once the proof matrix is cited and the handoff file (if any) is updated; the four isolated JSONLs and four MOTION-EVIDENCE PNGs are the durable evidence that needs to survive. Defer cleanup until the operator gives the word.
+  - Fast-trace drop-in at `/etc/systemd/system/gradient-rt-motion.service.d/fast-trace.conf` is still active. It's fine to leave for future verification work, but it will continue adding ~60 MB/minute of stack uptime and firing the autosave on every `stop --hard`. If the Phase 3 matrix is complete for this workstream, consider setting `GRADIENT_RT_FAST_TRACE_HZ=0` in the drop-in (or removing it) to stop the trace writer on future starts.
+  - Chained-multi-turn (from the same retraction) is the last outstanding Phase-6-family test. Not blocking this entry but worth scheduling before any UI / downstream planner starts trusting continuous canonical >180 deg commands.
+
+## 2026-04-19 19:22 +0000 - Operator reproduced the whip from the UI: two-jog pattern lands J6 on the seam, next jog flips the host's fold turn and whips long-path
+
+- Context:
+  - After the Phase 6 matrix was marked clean (single-command seam crossings), operator ran a separate test using the web UI's jog buttons. From canonical +175 deg: jogged +5 deg (to +180, EXACTLY on the seam), waited the natural UI/anchor-gate settle (~5 s), jogged +5 deg again (to +185). J6 whipped a full +350 deg forward -- operator saw it with their own eyes.
+  - 1 kHz fast_trace captured the whole event.
+
+- What the trace showed:
+  - Isolated window `ui-test-seam-cross-isolated.jsonl`, 56,285 samples at 992 Hz, covering 56.7 s including both UI clicks and the 5 s settle between them.
+  - Phase 1 (t=21.7-21.9 s, first UI click +175 -> +180):
+    - Host emitted continuous 0x607A target ramping 13,759 -> -18 (short-path negative continuous).
+    - Drive correctly followed the short path across the seam; 0x6064 went 18,204 -> 77 (close to 0), then drive wrapped and 6064 landed near RM-18.
+    - J6 ended at canonical +180 deg (on the seam).
+    - No whip in Phase 1.
+  - Settle (t=21.9-26.8 s): 0x6064 parked near RM-18, 0x607A held at -18. No motion.
+  - Phase 2 (t=26.828-26.99 s, second UI click +180 -> +185):
+    - 0x607A JUMPED from -18 to +13,089 in ONE millisecond, then ramped +13,107 counts/ms for ~100 ms until it reached +1,292,370.
+    - **+13,107 counts/ms = exactly GRADIENT_RT_MAX_RPM (6,000 motor RPM).** Not the commanded `max_motor_rpm=100` from the UI jog -- the drive's absolute max.
+    - Drive chased the target and rotated J6 ~360 deg forward in those 100 ms. Physical whip.
+  - Final state: J6 landed at canonical +185 deg (= final target) but after going the LONG way around. From the drive's perspective the motion "completed" and no fault fired.
+
+- Root cause analysis:
+  - Location: `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py::_nearest_turn_fold_axis_q_for_axis`, lines 3982-3985:
+    ```
+    delta = float(observed_counts) - float(base_counts)
+    wrap_turns = int(round(delta / float(period_counts)))
+    wrap_lift_counts = int(wrap_turns * int(period_counts))
+    adjusted_counts = float(base_counts) + float(wrap_lift_counts)
+    ```
+  - At the start of Phase 2, J6 is at canonical +180 deg which is the seam. The live 0x6064 sampled by the host is either 0 or RM-1 depending on sub-count encoder noise. With `observed_reference_counts = RM-1, native_home_offset_counts = -RM/2`: `observed_counts = RM/2 - 1`. Target base_counts for canonical +185 deg is `~ -673,785` (negative continuous). `delta / period_counts ≈ 1.014`, `round(...) = 1`. The fold emits `wrap_lift_counts = +RM = +1,310,720` and `adjusted_counts = +636,935` (long-path target). Convert back to wire frame and you get ~+1,292,370, which is exactly what we observed.
+  - Had the host sampled live_6064 = 0 instead (the other valid reading at the seam), `observed_counts = -RM/2`, `delta ≈ +18,425`, `round(0.014) = 0`, `wrap_lift_counts = 0`, `adjusted_counts = -673,785` (short-path target, continuous negative). That's what Phase 1 did correctly.
+  - **The bug**: `round(delta/period_counts)` is on the knife-edge at the seam. Sub-count noise in live_6064 determines whether the fold picks 0 or +1 turn, and a +1 flip commands a full extra revolution.
+  - Why single-command Phase 3 tests were CLEAN: the runner goes from +175 -> +185 in one motion, fold computes ONCE from the safe +175 position (live_6064 ~= 18k, well away from the seam boundary), picks turn 0 correctly, and emits the continuous short-path target. The UI's two-jog pattern re-runs the fold AFTER J6 has landed on the seam, exposing the boundary flip.
+
+- Analyzer fix landed (this session, `scripts/j6_multiturn_fast_capture.py`):
+  - `FastTraceAnalysis` now carries `net_displacement_shortest_wrap_counts` (net wrapped into `[-RM/2, +RM/2]`) and `long_path_excess_counts` (= `|net - shortest|`).
+  - `_print_rtcore_analysis` verdict logic: WHIP fires when `long_path_excess >= RM/2` (motor took >= one extra full revolution beyond the shortest equivalent path), regardless of `wire_monotonic` or `cum/|net|`. This is the correct gate for "went the long way" class of bug that the old `cum/|net| > 1.2` check missed because the whip was monotonic.
+  - Tests: added `test_analyze_rtcore_detects_long_path_whip_even_when_monotonic` and `test_analyze_rtcore_clean_short_cross_stays_clean`. Sweep: 46 passed (was 44).
+
+- Re-verdicted matrix across all five captures (identical code, old and new verdict):
+  | run                                 | long_path_excess        | old verdict | new verdict |
+  |-------------------------------------|-------------------------|-------------|-------------|
+  | Phase 3 B+ slow (1 RPM, 1 cmd)      | 0 counts = 0 deg        | CLEAN       | CLEAN       |
+  | Phase 3 B+ fast (10 RPM, 1 cmd)     | 0 counts = 0 deg        | CLEAN       | CLEAN       |
+  | Phase 3 B- slow (1 RPM, 1 cmd)      | 0 counts = 0 deg        | CLEAN       | CLEAN       |
+  | Phase 3 B- fast (10 RPM, 1 cmd)     | 0 counts = 0 deg        | CLEAN       | CLEAN       |
+  | UI test (100 RPM, 2 jogs, seam)     | 1,310,720 counts = 360° | CLEAN (bug) | **WHIP**    |
+
+- Implication for the Phase 6 re-earn:
+  - The re-earn stands for SINGLE-COMMAND seam crossings (4/4 clean; verified by both old and new verdict). Operator can trust these for planner / runner paths that send one APPLY_JOINT_SETPOINT per trajectory.
+  - The re-earn DOES NOT extend to the UI's multi-jog pattern or any other code path that triggers the host fold twice with an intermediate stop on or near the seam. Those paths are exposed to the boundary flip and can whip.
+  - Chained multi-turn (still-retracted) is NOT yet tested with the new verdict, but the mechanism is identical (multiple fold invocations, intermediate targets near canonical multiples of 180 deg) so the same boundary flip is plausible. Do NOT unflag chained multi-turn until the fold boundary behavior is fixed.
+
+- Next code action (not yet landed in this session):
+  - Add a boundary-aware tiebreaker to `_nearest_turn_fold_axis_q_for_axis`. Candidate fixes:
+    1. Hysteresis: prefer the previously-emitted wrap_turns value when `|delta/period - round(delta/period)| < ~0.02`.
+    2. Explicit "J6 is at the seam" guard: if `|observed_counts modulo period_counts| < RM/16`, force wrap_turns = sign of delta such that adjusted_counts stays inside `[-RM/2, +RM/2]` relative to the observed_counts' continuous frame.
+    3. Reject the motion command with a 409/CANONICAL_JOINT_TRUTH_UNAVAILABLE if J6 is within, say, 5 deg of canonical +/-180 deg at the time of command acceptance (defers the decision until operator moves away from the seam).
+  - Regression test: `observed_reference_counts = RM - 1, base_axis_q = <canonical +185 deg>, assert wrap_lift_counts == 0`, same for `observed_reference_counts = 0` with `base_axis_q = <canonical -185 deg>` (the mirror case).
+  - Ship this fix before any UI motion path that can cross the seam is trusted again.
+
+- Validation performed in this pass:
+  - `python3 -c "import ast; ast.parse(open('scripts/j6_multiturn_fast_capture.py').read())"` -> OK.
+  - `python3 -m pytest tests/test_j6_multiturn_fast_capture.py -q` -> 46 passed.
+  - `ReadLints` on touched files -> clean.
+  - Re-ran analyze-rtcore on all 5 isolated JSONLs; verdicts correct (4 CLEAN, 1 WHIP).
+  - No hardware touched; no motion commanded. Stack was brought up to idle to save the UI test snapshots earlier in the session but is fully stopped now.
+
+- Follow-up / risk:
+  - The fold boundary bug is the real Phase 5 finding. Everything else in this session was tooling to detect it.
+  - The existing DEVLOG entry `## 2026-04-19 18:30 +0000 - Phase 6 COMPLETE: full B+ / B- at slow/fast matrix is CLEAN` is still accurate for single-command seam crossings. The new entry does NOT supersede it; it narrows the scope of what the Phase 6 claim protects.
+  - The retraction audit trail entry at `## 2026-04-19 05:30 +0000 - RETRACTION: Phase 6 "PASS" verdicts were endpoint-only and path-blind` is also still accurate: the original retraction was legitimate (endpoint-only evidence could NOT distinguish a whip from a clean move). This session's finding adds a distinct failure mode (multi-jog fold flip at seam) on top of that.
+  - PNGs in `logs/j6-multiturn-fast/images/`: `ui-test-seam-cross-WHIP-EVIDENCE.png` (the smoking gun, custom 4-panel plot annotating the two phases and the peak velocity spike), plus `ui-test-seam-cross-isolated.png` (auto-generated by analyze-rtcore with the new VERDICT=WHIP). The four Phase 3 MOTION-EVIDENCE PNGs remain correctly labeled CLEAN.

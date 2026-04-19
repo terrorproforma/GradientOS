@@ -22,18 +22,42 @@ STARTUP_RATIO_NUMERATOR_OBJECT = "C10.18 / 0x2010:19"
 STARTUP_RATIO_DENOMINATOR_KEY = "a6ec_rotation_mode_gear_ratio_denominator"
 STARTUP_RATIO_DENOMINATOR_LABEL = "A6-EC rotation-mode gear ratio denominator"
 STARTUP_RATIO_DENOMINATOR_OBJECT = "C10.19 / 0x2010:1A"
+STARTUP_REFERENCE_DIRECTION_KEY = "a6ec_rotation_mode_reference_running_direction"
+STARTUP_REFERENCE_DIRECTION_LABEL = "A6-EC rotation-mode reference running direction"
+STARTUP_REFERENCE_DIRECTION_OBJECT = "C10.16 / 0x2010:17"
 STARTUP_SETTING_ENV_VAR = "GRADIENT_RT_DRIVE_STARTUP_SDO_CONFIG"
 NATIVE_HOME_CONFIG_ENV_VAR = "GRADIENT_RT_NATIVE_HOME_CONFIG"
 ABSOLUTE_FEEDBACK_CONFIG_ENV_VAR = "GRADIENT_RT_ABSOLUTE_FEEDBACK_CONFIG"
 MOTION_FEEDBACK_CONFIG = {
     "profile_id": PROFILE_ID,
+    # Feedback (0x6064) is a sawtooth in [0, RM-1] for C00.07=4. The host
+    # compares feedback and completes trajectories modulo-RM against this
+    # representation.
     "feedback_counts_wrap": True,
+    # Command (0x607A) is emitted as a continuous linear value so the drive
+    # can absorb seam crossings via its own internal modulus +
+    # C10.16=0 shortest-path handling. This matches the vendor's Chapter 5
+    # §5.3 Figure 5-1 where the target is drawn as a continuous ramp while
+    # feedback is a sawtooth. RTCore plumbs this via
+    # GRADIENT_RT_COMMAND_WRAP_AXIS_MASK separate from the feedback mask.
+    "command_counts_wrap": False,
 }
 POSITION_SEMANTICS_CONFIG = {
     "profile_id": PROFILE_ID,
     "drive_native_ratio_enabled": True,
     "position_semantics_source": "drive_output_shaft",
     "canonical_truth_source": "encoder_multi_turn_counts",
+    # Seam-crossing trajectories are accepted by the host safety guard
+    # because RTCore now emits continuous (unwrapped) 0x607A values per
+    # C00.07=4 Chapter 5 Figure 5-1. The drive handles the wrap internally
+    # via its rotation-mode position loop (modulus + C10.16=0 shortest
+    # path), so a move whose wire representation crosses 0/RM no longer
+    # produces a synthetic near-one-revolution step between consecutive
+    # cycles. Historical note: this flag was True through 2026-04-18
+    # during the Er87.1 investigation; flipping it to False is paired
+    # with the RTCore command-wrap change plumbed via
+    # `MOTION_FEEDBACK_CONFIG["command_counts_wrap"]`.
+    "command_frame_seam_crossing_unsafe": False,
     # On restart, the vendor says a retained coordinate system should be
     # trusted from 6041 bit 15 even if the HM-complete bit is not reasserted.
     # In practice this A6-EC firmware clears bit 15 on every drive power
@@ -71,6 +95,13 @@ STARTUP_SETTING_VALUE_LABELS = {
     4: "Absolute position rotation mode",
     5: "Absolute-position mode 5 (verify against vendor manual)",
 }
+STARTUP_REFERENCE_DIRECTION_VALUE_LABELS = {
+    0: "Nearest (shortest path)",
+    1: "Always forward",
+    2: "Always reverse",
+    3: "Keep current direction",
+    4: "Not specified",
+}
 NATIVE_HOME_TRUTH_SOURCE = {
     "kind": "sdo",
     "index": 0x607C,
@@ -85,7 +116,18 @@ NATIVE_HOME_CONFIG = {
     "transaction": [
         {"op": "set_mode", "value": 6},
         {"op": "write_sdo", "index": 0x60E6, "subindex": 0x00, "type": "u8", "value": 0},
-        {"op": "write_sdo", "index": 0x607C, "subindex": 0x00, "type": "i32", "value": 0},
+        # Bias the drive's single-turn command/reference frame to the midpoint
+        # of its wrap period so ordinary home-adjacent moves do not live on the
+        # raw 0/RM seam. Canonical zero remains host-owned via the absolute
+        # anchor captured after HM35.
+        {
+            "op": "write_sdo_wrap_fraction",
+            "index": 0x607C,
+            "subindex": 0x00,
+            "type": "i32",
+            "fraction_numerator": 1,
+            "fraction_denominator": 2,
+        },
         {"op": "write_sdo", "index": 0x6098, "subindex": 0x00, "type": "i8", "value": 35},
         {"op": "controlword_sequence", "values": [6, 7, 15]},
         {"op": "wait_statusword", "all_set_mask": 0x0227, "all_clear_mask": 0x2048},
@@ -94,10 +136,6 @@ NATIVE_HOME_CONFIG = {
         {"op": "refresh_truth"},
         {"op": "restore_mode", "value": 8},
         {"op": "release_service_override"},
-        {"op": "write_sdo", "index": 0x2031, "subindex": 0x11, "type": "u16", "value": 1},
-        {"op": "wait_sdo", "index": 0x2031, "subindex": 0x11, "type": "u16", "value": 0},
-        {"op": "write_sdo", "index": 0x2031, "subindex": 0x11, "type": "u16", "value": 2},
-        {"op": "wait_sdo", "index": 0x2031, "subindex": 0x11, "type": "u16", "value": 0},
     ],
 }
 ENCODER_DATA_RESET_OPERATION = {
@@ -211,6 +249,7 @@ _STARTUP_SETTING_ORDER = (
     STARTUP_SETTING_KEY,
     STARTUP_RATIO_NUMERATOR_KEY,
     STARTUP_RATIO_DENOMINATOR_KEY,
+    STARTUP_REFERENCE_DIRECTION_KEY,
 )
 _STARTUP_SETTING_METADATA = {
     STARTUP_SETTING_KEY: {
@@ -224,6 +263,10 @@ _STARTUP_SETTING_METADATA = {
     STARTUP_RATIO_DENOMINATOR_KEY: {
         "label": STARTUP_RATIO_DENOMINATOR_LABEL,
         "object": STARTUP_RATIO_DENOMINATOR_OBJECT,
+    },
+    STARTUP_REFERENCE_DIRECTION_KEY: {
+        "label": STARTUP_REFERENCE_DIRECTION_LABEL,
+        "object": STARTUP_REFERENCE_DIRECTION_OBJECT,
     },
 }
 
@@ -492,6 +535,13 @@ ENCODER_RETENTION_FAULT_CODES: frozenset[str] = frozenset(
         "Er20.7",  # Encoder model not supported
         "Er20.8",  # Encoder battery failure
         "Er20.9",  # Encoder multi-turn error
+        # Multi-turn overflow family (0x203F -> 0XA01). Vendor email 4 Q2(a)
+        # explicitly lists ErA0.1 as a primary signal that U40.20/U40.22 is
+        # no longer reliable (alongside Er20.8, Er20.9, ALF9.0). Bus-level
+        # 0x603F resolves to the same 0X7305 "Encoder error" class as the
+        # rest of this family, so the persisted-home-anchor restart-trust
+        # path must also short-circuit when ErA0.1 is live.
+        "ErA0.1",  # Multi-turn overflow fault
         # Battery family (0x203F -> 0XF90, alarm)
         "ALF9.0",  # Encoder battery voltage low
     }
@@ -578,6 +628,14 @@ def _startup_mode_value_label(raw_value: object) -> str | None:
     return STARTUP_SETTING_VALUE_LABELS.get(mode_value)
 
 
+def _startup_reference_direction_value_label(raw_value: object) -> str | None:
+    try:
+        direction_value = int(raw_value)
+    except Exception:
+        return None
+    return STARTUP_REFERENCE_DIRECTION_VALUE_LABELS.get(direction_value)
+
+
 def _render_native_home_config_spec(config: Mapping[str, Any]) -> str:
     parts = [
         f"steady_state_mode|{int(config.get('steady_state_mode', 0))}",
@@ -604,6 +662,16 @@ def _render_native_home_config_spec(config: Mapping[str, Any]) -> str:
                 f"0x{int(step.get('subindex', 0)) & 0xFF:02X}|"
                 f"{str(step.get('type', 'u16')).strip().lower()}|"
                 f"{int(step.get('value', 0))}"
+            )
+            continue
+        if op == "write_sdo_wrap_fraction":
+            parts.append(
+                "op|write_sdo_wrap_fraction|"
+                f"0x{int(step.get('index', 0)) & 0xFFFF:04X}|"
+                f"0x{int(step.get('subindex', 0)) & 0xFF:02X}|"
+                f"{str(step.get('type', 'u16')).strip().lower()}|"
+                f"{int(step.get('fraction_numerator', 0))}|"
+                f"{int(step.get('fraction_denominator', 1))}"
             )
             continue
         if op == "wait_sdo":
@@ -755,8 +823,11 @@ def build_startup_config(
 
 
 def _startup_setting_value_label(setting_key: str, raw_value: object) -> str | None:
-    if str(setting_key).strip() == STARTUP_SETTING_KEY:
+    normalized_key = str(setting_key).strip()
+    if normalized_key == STARTUP_SETTING_KEY:
         return _startup_mode_value_label(raw_value)
+    if normalized_key == STARTUP_REFERENCE_DIRECTION_KEY:
+        return _startup_reference_direction_value_label(raw_value)
     return None
 
 

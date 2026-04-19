@@ -12,10 +12,10 @@
           "updated_at": "2026-04-16T07:46:15+00:00",
           "updated_by": "ethercat_rtcore:joint1:native_home",
           "last_seen": {
-            "absolute_counts": -82704,
-            "reference_counts": 12908891,
-            "observed_at": "2026-04-17T07:40:38+00:00",
-            "observed_at_monotonic_ns": 209480239213473,
+            "absolute_counts": 543145,
+            "reference_counts": 427544,
+            "observed_at": "2026-04-19T19:43:33+00:00",
+            "observed_at_monotonic_ns": 210085825531607,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
@@ -28,10 +28,10 @@
           "updated_at": "2026-04-16T07:45:44+00:00",
           "updated_by": "ethercat_rtcore:joint2:native_home",
           "last_seen": {
-            "absolute_counts": -57649,
-            "reference_counts": 12927028,
-            "observed_at": "2026-04-17T07:40:38+00:00",
-            "observed_at_monotonic_ns": 209480266553233,
+            "absolute_counts": -30443,
+            "reference_counts": 12954230,
+            "observed_at": "2026-04-19T19:43:34+00:00",
+            "observed_at_monotonic_ns": 210087548985926,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
@@ -44,10 +44,10 @@
           "updated_at": "2026-04-16T07:45:16+00:00",
           "updated_by": "ethercat_rtcore:joint3:native_home",
           "last_seen": {
-            "absolute_counts": 46893,
-            "reference_counts": 13106119,
-            "observed_at": "2026-04-17T07:40:34+00:00",
-            "observed_at_monotonic_ns": 209476002010771,
+            "absolute_counts": 1095845,
+            "reference_counts": 1047865,
+            "observed_at": "2026-04-19T19:43:34+00:00",
+            "observed_at_monotonic_ns": 210087551805552,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
@@ -60,10 +60,10 @@
           "updated_at": "2026-04-16T07:43:45+00:00",
           "updated_by": "ethercat_rtcore:joint4:native_home",
           "last_seen": {
-            "absolute_counts": 118015,
-            "reference_counts": 43,
-            "observed_at": "2026-04-17T07:40:34+00:00",
-            "observed_at_monotonic_ns": 209476083050532,
+            "absolute_counts": 1947,
+            "reference_counts": 2243276,
+            "observed_at": "2026-04-19T19:43:31+00:00",
+            "observed_at_monotonic_ns": 210083854082953,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
@@ -76,31 +76,31 @@
           "updated_at": "2026-04-16T07:33:43+00:00",
           "updated_by": "ethercat_rtcore:joint5:native_home",
           "last_seen": {
-            "absolute_counts": 65548,
-            "reference_counts": 144,
-            "observed_at": "2026-04-17T07:40:35+00:00",
-            "observed_at_monotonic_ns": 209476931558822,
+            "absolute_counts": 1825,
+            "reference_counts": 4032420,
+            "observed_at": "2026-04-19T19:43:31+00:00",
+            "observed_at_monotonic_ns": 210083855144211,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
         {
-          "home_anchor_rad": -0.5761008659603389,
+          "home_anchor_rad": -0.32081290702643367,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             5
           ],
-          "updated_at": "2026-04-16T21:47:10+00:00",
+          "updated_at": "2026-04-19T18:53:05+00:00",
           "updated_by": "ethercat_rtcore:joint6:native_home",
           "last_seen": {
-            "absolute_counts": 120186,
-            "reference_counts": 4,
-            "observed_at": "2026-04-17T07:40:36+00:00",
-            "observed_at_monotonic_ns": 209477665676511,
+            "absolute_counts": 704063,
+            "reference_counts": 1292502,
+            "observed_at": "2026-04-19T19:43:31+00:00",
+            "observed_at_monotonic_ns": 210083979756501,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         }
       ],
-      "updated_at": "2026-04-17T07:40:38+00:00",
+      "updated_at": "2026-04-19T19:43:34+00:00",
       "updated_by": "ethercat_rtcore:restart-trust"
     }
   }
