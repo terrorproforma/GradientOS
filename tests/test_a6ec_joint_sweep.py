@@ -421,8 +421,13 @@ def test_a6ec_joint_full_range_sweep_fresh_hm_keeps_truth_continuous(
             f"joint={joint_index} q={q:.6f} recovered={recovered_q:.6f} per_count={per_count_rad:.6f}"
         )
 
-        # Nearest-turn 607A round-trip: the wire target should land on the
-        # live 6064 exactly (to within rounding).
+        # Nearest-turn 607A round-trip: the wire target must land on
+        # the live 6064 MODULO RM (drive's internal comparison is
+        # modular per Chapter 5 Fig 5-1). Under the 2026-04-19 multi-
+        # turn-aware fold, at seam-adjacent q values the emitted wire
+        # value can legitimately be an integer multiple of RM above or
+        # below live 6064 (multi-turn representation). The drive sees
+        # both as equivalent, and the physical motion is identical.
         target_axis_q = backend._command_axis_q_for_joint_value(
             axis_i=joint_index,
             logical_joint_idx=joint_index,
@@ -430,8 +435,12 @@ def test_a6ec_joint_full_range_sweep_fresh_hm_keeps_truth_continuous(
         )
         wire_counts = int(round(target_axis_q * float(sign) * float(cpu)))
         live_6064 = int(backend._axis_counts[joint_index])
-        assert abs(wire_counts - live_6064) <= 1, (
-            f"joint={joint_index} q={q:.6f} wire_counts={wire_counts} live_6064={live_6064}"
+        modular_delta = (wire_counts - live_6064) % rm
+        if modular_delta > rm // 2:
+            modular_delta -= rm
+        assert abs(modular_delta) <= 1, (
+            f"joint={joint_index} q={q:.6f} wire_counts={wire_counts} "
+            f"live_6064={live_6064} modular_delta={modular_delta} rm={rm}"
         )
 
         # Continuity vs the previous sample (no wrap-class jumps).

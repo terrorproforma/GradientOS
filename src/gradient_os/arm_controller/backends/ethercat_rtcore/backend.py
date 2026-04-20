@@ -72,6 +72,22 @@ _GRADIENT_MAX_AXES = 16
 # hammer the disk.
 _LAST_SEEN_PERSIST_INTERVAL_S = 5.0
 
+# Standard profile-contract key for the drive's unambiguous multi-turn
+# encoder counter, emitted as a signed i64 in MOTOR-frame counts (i.e.,
+# counts_per_motor_rev per motor revolution, never wrapping at the
+# rotation-mode period). A drive profile opts into the multi-turn-aware
+# nearest-turn fold by emitting a mapping under this key from its
+# `normalize_absolute_feedback()` with `{"valid": bool, "value": int}`.
+#
+# Only the A6-EC profile emits this today (by combining U40.20 +
+# U40.22 via `signed_i64_pair`; see `ABSOLUTE_FEEDBACK_SOURCES` in
+# `profiles/drive/a6ec_ds402.py`), but the contract is profile-agnostic.
+# Controllers MUST NOT assume A6-EC-specific semantics from the value
+# beyond "signed i64 motor-frame counts, monotonic with physical motor
+# rotation, seam-free"; any profile that exposes an equivalent multi-
+# turn register gets the multi-turn fold for free.
+_PROFILE_MULTI_TURN_COUNTS_KEY = "encoder_multi_turn_counts"
+
 # A6-EC motor-encoder multi-turn counter is 32767 turns wide; anything
 # past that without commanded motion during the off-window is considered
 # physically impossible and therefore evidence of lost retention rather
@@ -2200,7 +2216,9 @@ class EthercatRTCoreBackend(ActuatorBackend):
             persisted_home_anchor_present = anchor_entry is not None
             multi_turn_feedback_valid = False
             if isinstance(normalized_absolute_feedback, Mapping):
-                mt_source_payload = normalized_absolute_feedback.get("encoder_multi_turn_counts")
+                mt_source_payload = normalized_absolute_feedback.get(
+                    _PROFILE_MULTI_TURN_COUNTS_KEY
+                )
                 if isinstance(mt_source_payload, Mapping):
                     multi_turn_feedback_valid = bool(mt_source_payload.get("valid"))
             # W1 last-seen U40.20/.22 sidecar: compute a pre-gate
@@ -3571,14 +3589,79 @@ class EthercatRTCoreBackend(ActuatorBackend):
         return ((int(raw_counts) + half_turn) % period_counts) - half_turn
 
     def _display_feedback_counts_for_axis(self, axis_i: int, raw_counts: int) -> int:
+        # Preferred path: derive the unwrapped display counts from the drive's
+        # unambiguous multi-turn register (profile contract:
+        # `encoder_multi_turn_counts`; A6-EC populates via U40.20 + U40.22).
+        # This is the SAME ground truth the seam-aware fold and anchor-
+        # consistency gates use, eliminating a class of drift bugs that the
+        # host-accumulated unwrap below is susceptible to:
+        #   * pre-OP PDO zero-reads at drive startup can seed the cache at 0,
+        #     permanently offsetting by one turn when the drive later reports
+        #     a near-seam position (round((0 - ~RM)/RM) = -1).
+        #   * HM35 rewrites 0x607C which causes 0x6064 to jump by up to RM/2
+        #     with zero physical motion; nearest-turn unwrap interprets that
+        #     jump as "same turn" and propagates a stale pre-home turn count
+        #     through the home procedure indefinitely.
+        # Requires BOTH a valid multi-turn reading AND a captured home anchor;
+        # falls back cleanly when either is missing. Only engaged for drives
+        # running in native-ratio mode so the legacy single-motor-turn
+        # semantics (counts_per_rev wrap) are not disturbed.
         normalized_counts = self._normalize_feedback_counts_for_axis(axis_i, raw_counts)
         period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
         if period_counts <= 0:
             return int(normalized_counts)
+        if self._drive_native_ratio_enabled():
+            multi_turn_axis_q_counts = (
+                self._multi_turn_reference_counts_for_axis_when_anchored(axis_i)
+            )
+            if multi_turn_axis_q_counts is not None:
+                native_home_offset_counts = int(
+                    self._native_home_offset_counts_for_axis(axis_i)
+                )
+                # multi_turn_axis_q is in the canonical axis-q frame (home
+                # subtracted); the display path is contracted to return the
+                # WIRE-frame unwrapped counts. Forward conversion is
+                # wire + native_home_offset_counts = axis_q_counts, so
+                # reverse is wire = axis_q_counts - native_home_offset_counts.
+                wire_unwrapped_counts = int(multi_turn_axis_q_counts) - int(
+                    native_home_offset_counts
+                )
+                with self._status_lock:
+                    if (
+                        axis_i < len(self._feedback_unwrapped_counts)
+                        and axis_i < len(self._feedback_unwrapped_valid)
+                    ):
+                        # Keep the fallback cache in lockstep with ground truth
+                        # so any transient loss of multi-turn data (first cycles
+                        # after boot, SDO poll glitch) continues from a correct
+                        # value, not a stale one.
+                        self._feedback_unwrapped_counts[axis_i] = int(
+                            wire_unwrapped_counts
+                        )
+                        self._feedback_unwrapped_valid[axis_i] = True
+                return int(wire_unwrapped_counts)
+        # Fallback: accumulated-turn unwrap. Used when the profile does not
+        # expose a multi-turn register, the drive has not yet published a
+        # valid multi-turn reading, no home anchor has been captured, or the
+        # axis is running in legacy single-motor-turn mode.
         with self._status_lock:
             if axis_i >= len(self._feedback_unwrapped_counts) or axis_i >= len(self._feedback_unwrapped_valid):
                 return int(normalized_counts)
             if not self._feedback_unwrapped_valid[axis_i]:
+                # Guard against the pre-OP PDO zero-read pattern: during the
+                # first few seconds after stack start the drive publishes
+                # `pos_counts = 0, statusword = 0x0000` until PDO mapping
+                # latches. Seeding the unwrap cache from that bogus zero
+                # permanently offsets the cache by one turn when the drive
+                # later reports a near-seam position. Treat "both the
+                # normalized count and the live statusword are zero" as the
+                # pre-OP signature and defer seeding until at least one of
+                # them becomes non-zero.
+                live_statusword = 0
+                if 0 <= axis_i < len(self._axis_statusword):
+                    live_statusword = int(self._axis_statusword[axis_i])
+                if int(normalized_counts) == 0 and live_statusword == 0:
+                    return int(normalized_counts)
                 self._feedback_unwrapped_counts[axis_i] = int(normalized_counts)
                 self._feedback_unwrapped_valid[axis_i] = True
                 return int(normalized_counts)
@@ -3672,6 +3755,25 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 axis.get("absolute_feedback")
             )
         with self._status_lock:
+            # HM35 writes a new 0x607C value, which the drive reports as an
+            # updated native_home_position_offset. The live 0x6064 reading
+            # jumps by up to RM/2 with NO physical motion the moment the new
+            # 607C latches. The fallback accumulated-unwrap path treats that
+            # jump like ordinary motion (nearest-turn unwrap) and propagates
+            # any pre-home turn state through the home procedure. Invalidate
+            # the affected axis's unwrap cache so the next display query
+            # re-seeds from the post-HM35 wire value. Defense-in-depth: the
+            # primary display path derives from the anchor-relative multi-
+            # turn register which self-corrects via the re-captured anchor,
+            # but the fallback path needs this hook.
+            for invalidate_axis_i in range(
+                min(_GRADIENT_MAX_AXES, len(self._native_home_offset_counts))
+            ):
+                if offsets[invalidate_axis_i] != int(
+                    self._native_home_offset_counts[invalidate_axis_i]
+                ):
+                    if invalidate_axis_i < len(self._feedback_unwrapped_valid):
+                        self._feedback_unwrapped_valid[invalidate_axis_i] = False
             self._native_home_offset_counts = offsets
             self._absolute_feedback_by_axis = absolute_feedback
             self._native_home_metrics_mtime_ns = stat.st_mtime_ns
@@ -3902,6 +4004,137 @@ class EthercatRTCoreBackend(ActuatorBackend):
             resolved_counts += int(self._native_home_offset_counts_for_axis(axis_i))
         return int(resolved_counts)
 
+    def _multi_turn_reference_counts_for_axis(self, axis_i: int) -> int | None:
+        """Return the drive's live multi-turn position for `axis_i` as an
+        unambiguous continuous counts value in the SAME frame as the
+        fold's `base_counts` (axis-q-counts, canonical-relative).
+
+        Uses the profile's standard `encoder_multi_turn_counts` entry
+        (see `_PROFILE_MULTI_TURN_COUNTS_KEY`) which any drive profile
+        can populate via its `normalize_absolute_feedback()`; the A6-EC
+        profile does this today by combining U40.20 + U40.22 into a
+        signed i64. No A6-EC-specific code runs on this path.
+
+        Frame conversion note: the drive's multi-turn register counts
+        in encoder-internal frame (motor counts since encoder-internal
+        zero). To put that in the fold's canonical-axis-q-counts frame
+        we subtract the home-anchor value, which is
+        `motor_counts_at_home_time` recorded when the operator
+        commissioned the joint. At canonical 0 (home), the result is 0;
+        at canonical X, the result is `X * sign * counts_per_unit`,
+        which is exactly what `base_counts = base_axis_q * sign *
+        counts_per_unit` expects.
+
+        The gear ratio that distinguishes motor-frame from reference-
+        frame is ALREADY baked into `counts_per_unit = RM / (2π)`, so
+        motor_counts minus anchor (both in motor frame) equals the
+        axis-q-counts equivalent of the current canonical angle (see
+        `_axis_q_from_counts` for the same identity).
+
+        Returns None when:
+          * no axis config is attached yet, or
+          * the encoder's counts-per-motor-rev is not known (sanity
+            guard; exists because tests occasionally build _AxisConfig
+            without counts_per_rev), or
+          * the drive has not yet reported a valid multi-turn value
+            (e.g., first cycles after boot before the metrics-thread SDO
+            poll has fired).
+
+        When the home anchor is not available (e.g., fresh boot before
+        any anchor was commissioned), a zero anchor is used and the
+        returned value is motor-encoder-internal. That is OK for the
+        fold's seam-disambiguation purpose because the disambiguation
+        code only cares about the SHIFT (modulo period_counts), which
+        is unaffected by an absolute offset. A zero anchor biases the
+        shift by a fixed amount per axis that cancels out inside the
+        `round(delta/period)` call at non-seam positions; at the seam
+        the shift correctly picks the side matching current motor
+        position regardless of the anchor's absolute value.
+
+        Callers that receive None fall back to their legacy single-turn
+        `0x6064` logic; this method never raises.
+        """
+        cfg = self._axis_config
+        if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
+            return None
+        counts_per_motor_rev = (
+            int(cfg.counts_per_rev[axis_i])
+            if axis_i < len(cfg.counts_per_rev)
+            else 0
+        )
+        if counts_per_motor_rev <= 0:
+            return None
+        metrics = self._absolute_feedback_metrics_for_axis(axis_i)
+        if not metrics.has_any_valid():
+            return None
+        normalized = self._normalize_absolute_feedback_metrics(metrics)
+        if not isinstance(normalized, Mapping):
+            return None
+        mt_payload = normalized.get(_PROFILE_MULTI_TURN_COUNTS_KEY)
+        if not isinstance(mt_payload, Mapping) or not bool(mt_payload.get("valid")):
+            return None
+        try:
+            motor_counts = int(mt_payload.get("value"))
+        except Exception:
+            return None
+        # Translate from encoder-internal frame to canonical-axis-q
+        # frame by subtracting the home-anchor (= motor_counts at home
+        # commissioning time). Anchor is stored as `home_anchor_rad`;
+        # convert to counts via sign * counts_per_unit.
+        sign = int(cfg.sign[axis_i]) if axis_i < len(cfg.sign) else 0
+        counts_per_unit = (
+            float(cfg.counts_per_unit[axis_i]) if axis_i < len(cfg.counts_per_unit) else 0.0
+        )
+        anchor_counts = 0
+        if sign in (-1, 1) and counts_per_unit > 0.0:
+            with self._status_lock:
+                joint_i = (
+                    int(self._axis_to_joint[axis_i])
+                    if 0 <= axis_i < len(self._axis_to_joint)
+                    else -1
+                )
+                anchor_entry = None
+                if 0 <= joint_i < len(self._absolute_encoder_home_anchors):
+                    anchor_entry = self._absolute_encoder_home_anchors[joint_i]
+            if isinstance(anchor_entry, dict):
+                try:
+                    anchor_rad = float(anchor_entry.get("home_anchor_rad"))
+                except Exception:
+                    anchor_rad = 0.0
+                anchor_counts = int(round(anchor_rad * float(sign) * float(counts_per_unit)))
+        return int(motor_counts - anchor_counts)
+
+    def _multi_turn_reference_counts_for_axis_when_anchored(
+        self, axis_i: int
+    ) -> int | None:
+        """Stricter variant of `_multi_turn_reference_counts_for_axis` for the
+        operator-facing display path.
+
+        The permissive sibling substitutes a zero anchor when none has been
+        commissioned, which is fine for the seam-disambiguation fold (it only
+        cares about the modulo-period shift) but WRONG for the display path:
+        with a zero anchor the returned value is in motor-encoder-internal
+        frame (large absolute offset per axis) and leaks into the operator
+        view as bogus positions. Gate on anchor presence so the display
+        caller can fall back to the legacy accumulated-unwrap path when the
+        axis has not yet been commissioned.
+        """
+        cfg = self._axis_config
+        if cfg is None or axis_i < 0 or axis_i >= int(cfg.num_axes):
+            return None
+        with self._status_lock:
+            joint_i = (
+                int(self._axis_to_joint[axis_i])
+                if 0 <= axis_i < len(self._axis_to_joint)
+                else -1
+            )
+            anchor_entry = None
+            if 0 <= joint_i < len(self._absolute_encoder_home_anchors):
+                anchor_entry = self._absolute_encoder_home_anchors[joint_i]
+        if not isinstance(anchor_entry, dict):
+            return None
+        return self._multi_turn_reference_counts_for_axis(axis_i)
+
     def _nearest_turn_fold_axis_q_for_axis(
         self,
         axis_i: int,
@@ -3909,6 +4142,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         *,
         observed_reference_counts: int | None = None,
         observed_reference_q: float | None = None,
+        observed_multi_turn_reference_counts: int | None = None,
         wrap_to_single_turn: bool = False,
     ) -> tuple[float, int]:
         # Stateless per-write nearest-turn fold. Takes the desired axis-space
@@ -3964,18 +4198,115 @@ class EthercatRTCoreBackend(ActuatorBackend):
         # correction; the live-counts fallback below also comes from
         # `_live_reference_counts_for_axis` which returns raw wire
         # counts and therefore needs the same correction applied.
+        #
+        # 2026-04-19 UI-whip fix (SEAM-ONLY DISAMBIGUATION): even with
+        # the frame correction above, live 0x6064 is still AMBIGUOUS
+        # right on the seam boundary. When J6 sits at canonical +/-180
+        # deg, the drive reports 0x6064 = 0 or RM-1 depending on sub-
+        # count encoder noise; these two readings are ONE FULL TURN
+        # APART in the continuous frame, which flips
+        # `round(delta/period)` between 0 and +/-1 and emits a target
+        # one full revolution off. The two-jog UI case (jog +5 deg to
+        # +180, wait, jog +5 deg to +185) triggered the whip this way.
+        #
+        # The fix uses the drive's UNAMBIGUOUS multi-turn register
+        # (see `_multi_turn_reference_counts_for_axis`) to pick the
+        # RIGHT side of the seam. This disambiguation ONLY fires when
+        # the live wire reading is within a small tolerance of the
+        # seam (< RM/16 ~= 22 deg); outside that band, single-turn
+        # observed is unambiguous and the fold runs its original math
+        # exactly as before. Wire emission is therefore IDENTICAL to
+        # the pre-fix behavior everywhere except at the seam.
+        #
+        # PREFERENCE ORDER for observed_counts:
+        #   1. Explicit `observed_reference_counts` (single-turn 0x6064).
+        #      If `observed_multi_turn_reference_counts` is ALSO
+        #      provided AND the wire value is seam-adjacent, pick the
+        #      turn of live_6064 that is closest to the multi-turn
+        #      reference (resolves the +/-RM jump at the seam). This is
+        #      the primary path for live motion writes.
+        #   2. Explicit `observed_reference_q` (axis-q space; used by
+        #      the roundtrip diagnostic only).
+        #   3. Auto-fetched live 0x6064 + auto-fetched multi-turn via
+        #      the helpers. Same seam-adjacent disambiguation applies.
+        #   4. Final fallback: auto-fetched live 0x6064 alone.
         native_home_offset_counts = int(self._native_home_offset_counts_for_axis(axis_i))
+
+        def _disambiguate_seam_with_multi_turn(
+            single_turn_wire_counts: int,
+            ref_counts_axis_q: float,
+            multi_turn_axis_q: float,
+            period: int,
+        ) -> float:
+            # Inner helper: given the SINGLE-TURN wire counts reading
+            # (which is what the drive reports in 0x6064, wrapped into
+            # [0, period)), the axis-q-frame equivalent of that reading
+            # (ref_counts_axis_q = wire + native_home_offset), the
+            # unambiguous multi-turn reference in axis-q frame, and the
+            # wrap period:
+            #
+            #   * detect whether the wire reading sits within a narrow
+            #     seam-adjacent band (< period/16 ~= 22 deg from the
+            #     0/RM boundary)
+            #   * if at the seam AND the multi-turn indicates the OTHER
+            #     side, shift ref_counts_axis_q by +/-period to move it
+            #     onto the correct side
+            #   * if NOT at the seam, return ref_counts_axis_q unchanged
+            #     (preserves the pre-fix wire-emission behavior exactly)
+            #
+            # Returns the (possibly shifted) axis-q counts to use as
+            # observed_counts in the fold's round(delta/period).
+            seam_tolerance = int(period) // 16
+            if seam_tolerance <= 0:
+                return ref_counts_axis_q
+            wire_mod = int(single_turn_wire_counts) % int(period)
+            if wire_mod < 0:
+                wire_mod += int(period)
+            # Distance from wire to the nearest seam boundary (0 or
+            # period). The seam is a single physical point so both
+            # halves count as "at the seam" -- encoder noise can
+            # sample on either side.
+            distance_to_seam = min(wire_mod, int(period) - wire_mod)
+            if distance_to_seam >= seam_tolerance:
+                return ref_counts_axis_q
+            # At the seam: pick the turn-shifted ref value that is
+            # closest to the multi-turn reference. Modulo-N closeness:
+            # the shift we apply is the one that minimises the
+            # absolute continuous distance.
+            shift = int(round((multi_turn_axis_q - ref_counts_axis_q) / float(period)))
+            return ref_counts_axis_q + float(shift) * float(period)
+
         if observed_reference_counts is not None:
-            observed_counts = (
+            ref_axis_q = (
                 float(observed_reference_counts) + float(native_home_offset_counts)
             )
+            if observed_multi_turn_reference_counts is not None:
+                mt_axis_q = float(observed_multi_turn_reference_counts)
+                observed_counts = _disambiguate_seam_with_multi_turn(
+                    int(observed_reference_counts),
+                    ref_axis_q,
+                    mt_axis_q,
+                    int(period_counts),
+                )
+            else:
+                observed_counts = ref_axis_q
         elif observed_reference_q is not None:
             observed_counts = float(observed_reference_q) * float(sign) * float(counts_per_unit)
         else:
             live_counts = self._live_reference_counts_for_axis(axis_i)
             if live_counts is None:
                 return float(base_axis_q), 0
-            observed_counts = float(live_counts) + float(native_home_offset_counts)
+            ref_axis_q = float(live_counts) + float(native_home_offset_counts)
+            auto_multi_turn = self._multi_turn_reference_counts_for_axis(axis_i)
+            if auto_multi_turn is not None:
+                observed_counts = _disambiguate_seam_with_multi_turn(
+                    int(live_counts),
+                    ref_axis_q,
+                    float(auto_multi_turn),
+                    int(period_counts),
+                )
+            else:
+                observed_counts = ref_axis_q
         # Step 1: classical nearest-turn fold so adjusted_counts lands
         # within RM/2 of the live reference (the diagnostic "wrap_lift"
         # we still expose for downstream roundtrip telemetry).
@@ -4010,17 +4341,69 @@ class EthercatRTCoreBackend(ActuatorBackend):
         canonical_q: float,
         *,
         live_reference_counts: int | None = None,
+        live_multi_turn_reference_counts: int | None = None,
     ) -> float:
         base_axis_q = self._base_command_axis_q_for_joint_value(logical_joint_idx, canonical_q)
         wrap_to_single_turn = not self._experimental_continuous_607a_enabled_for_joint(
             logical_joint_idx
         )
-        adjusted_axis_q, lift_counts = self._nearest_turn_fold_axis_q_for_axis(
-            axis_i,
-            base_axis_q,
-            observed_reference_counts=live_reference_counts,
-            wrap_to_single_turn=wrap_to_single_turn,
-        )
+        # 2026-04-20 direction-preserving command path: when the drive is in
+        # continuous-607A rotation mode AND we have a valid anchored multi-turn
+        # register reading, the caller's `canonical_q` is already multi-turn-
+        # aware (see `_canonical_joint_positions_from_raw_feedback` which
+        # builds canonical from `absolute_axis_q - anchor - master_offset` using
+        # U40.20/.22 as the truth source). In that regime the fold's nearest-
+        # turn `round(delta/period)` shift is actively HARMFUL: it anchors on
+        # live 0x6064 (single-turn modular) and can flip the commanded turn
+        # between adjacent trajectory waypoints, producing a non-monotonic
+        # wire-frame target path that RTCore chases at MAX RPM. The Phase 5
+        # (canonical +365° → +180°) whip on 2026-04-20 was exactly this mode:
+        # an s-curve trajectory in canonical space crossed the round() boundary
+        # mid-trajectory, the per-waypoint folds disagreed on which turn, and
+        # the motor oscillated through a full revolution at 6000 RPM before
+        # settling at the correct net position. The operator's principled
+        # insight: "the move is positive or negative - must rotate in a
+        # specific direction" is literally satisfied by emitting axis_q =
+        # base_axis_q without any turn-shift — axis-q counts are linearly
+        # proportional to canonical, so a signed canonical delta maps to a
+        # signed wire delta of the same sign, preserving direction.
+        #
+        # Gate on the stricter `_when_anchored` variant so a joint without a
+        # captured home anchor (fresh boot, legacy profile) still falls
+        # through to the fold path as before. Legacy single-turn drives
+        # (wrap_to_single_turn=True) continue to use the fold unconditionally
+        # because they require the [0, RM) wrap for drive-parse safety.
+        use_direction_preserving = False
+        if not wrap_to_single_turn and live_multi_turn_reference_counts is None:
+            anchored_multi_turn = (
+                self._multi_turn_reference_counts_for_axis_when_anchored(axis_i)
+            )
+            use_direction_preserving = anchored_multi_turn is not None
+        if use_direction_preserving:
+            # Direction-preserving path: trust the multi-turn-aware canonical
+            # input. Skip the fold's turn-shift (Step 1 of
+            # `_nearest_turn_fold_axis_q_for_axis`). The
+            # `command_frame_oversized_delta` safety gate below still fires
+            # if the emitted target would be modularly more than half a
+            # period from the live wire — that catches real frame bugs
+            # without inducing the whip.
+            adjusted_axis_q = float(base_axis_q)
+            lift_counts = 0
+        else:
+            # Legacy fold path: used when no anchor is captured OR the drive
+            # is in legacy single-turn-wrap mode. Keep the permissive multi-
+            # turn reference so the seam-only disambiguation still fires at
+            # the 0/RM boundary (2026-04-19 UI-whip regression coverage).
+            resolved_multi_turn = live_multi_turn_reference_counts
+            if resolved_multi_turn is None:
+                resolved_multi_turn = self._multi_turn_reference_counts_for_axis(axis_i)
+            adjusted_axis_q, lift_counts = self._nearest_turn_fold_axis_q_for_axis(
+                axis_i,
+                base_axis_q,
+                observed_reference_counts=live_reference_counts,
+                observed_multi_turn_reference_counts=resolved_multi_turn,
+                wrap_to_single_turn=wrap_to_single_turn,
+            )
         period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
         if period_counts > 0:
             # After folding, the signed SHORTEST-ANGULAR delta against the

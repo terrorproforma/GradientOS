@@ -1,46 +1,85 @@
 {
-  "description": "Planned on 2026-03-22 18:47:05 via PLAN_WELD",
+  "description": "Planned on 2026-04-20 00:15:51 via PLAN_WELD",
   "loop": false,
   "orientation_euler_angles_deg": null,
   "moves": [
     {
       "command": "move_absolute",
       "vector": [
-        0.7337,
-        0.146,
-        0.4484
+        0.9644,
+        -0.018,
+        0.6915
       ],
       "orientation_euler_deg": [
         -135.0,
-        0.0,
-        -0.0
+        -0.0,
+        -120.81
       ]
     },
     {
       "command": "move_absolute",
       "vector": [
-        0.8457,
-        0.1097,
-        0.4479
+        1.0356,
+        -0.0179,
+        0.6915
       ],
       "orientation_euler_deg": [
-        -135.09,
-        -0.02,
-        -88.49
+        -135.0,
+        0.0,
+        -120.81
       ],
       "is_weld": true,
       "weld_type": "fillet"
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        1.0356,
+        -0.0179,
+        0.7265
+      ],
+      "orientation_euler_deg": [
+        -135.0,
+        0.0,
+        -120.81
+      ]
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.8066,
+        0.0009,
+        0.7265
+      ],
+      "orientation_euler_deg": [
+        -135.0,
+        0.0,
+        -120.81
+      ]
+    },
+    {
+      "command": "move_absolute",
+      "vector": [
+        0.8066,
+        0.0009,
+        0.6887
+      ],
+      "orientation_euler_deg": [
+        -135.0,
+        0.0,
+        -120.81
+      ]
     }
   ],
   "planning_warnings": [
-    "Post-action transition skipped (return_to_start:1) target=[0.8457, 0.1097, 1.3729]"
+    "Torch-angle orientations failed for weld section #1; tool=tool-1774284997294; retrying with orientation lock."
   ],
   "weld": {
     "type": "fillet",
     "name": "fillet weld",
-    "model_id": "step-6a86eadda8abf942",
-    "edge_id": "part_0:edge_00031",
-    "start_s": 0.653,
+    "model_id": "step-58e30e1330e84782",
+    "edge_id": "part_0:edge_00029",
+    "start_s": 0.0,
     "end_s": 1.0,
     "options": {
       "work_angle_deg": 45,

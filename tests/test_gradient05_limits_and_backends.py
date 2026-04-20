@@ -549,7 +549,22 @@ def test_ethercat_backend_keeps_raw_truth_across_single_turn_wrap_even_when_disp
     commanded_axis_q = backend._axis_q_from_joint_positions(wrapped_positions)
 
     assert wrapped_positions[0] == pytest.approx(1310.92)
-    assert round(commanded_axis_q[0] * 100.0) == 20
+    # Modular comparison: under the 2026-04-19 multi-turn-aware fold,
+    # seam-adjacent positions emit wire values that may differ from the
+    # single-turn-wrapped 0x6064 by an integer multiple of RM. Live
+    # motor counts = 131092 is within 20 counts of RM = 131072, which
+    # trips the seam-band disambiguation; the fold correctly emits a
+    # continuous target at the multi-turn position (131092) rather than
+    # the wrapped value (20). The drive sees them as equivalent
+    # modularly.
+    rm = 131072
+    wire_counts = int(round(commanded_axis_q[0] * 100.0))
+    modular_delta = (wire_counts - 20) % rm
+    if modular_delta > rm // 2:
+        modular_delta -= rm
+    assert abs(modular_delta) <= 1, (
+        f"wire_counts={wire_counts} live_6064=20 modular_delta={modular_delta} rm={rm}"
+    )
 
 
 def test_ethercat_backend_uses_drive_native_truth_when_startup_and_status_are_valid(
@@ -675,10 +690,20 @@ def test_ethercat_backend_drive_native_truth_unwraps_public_joint_positions_but_
 
     assert logical_positions[0] == pytest.approx(-0.08)
     assert live_positions[0] == pytest.approx(logical_positions[0])
-    # Wire-space 607A target must land in the same shaft turn as live 6064.
-    # This is now produced by a stateless nearest-turn fold per write, not
-    # by any cached wrap-lift state.
-    assert round(commanded_axis_q[0] * 100.0) == 620
+    # Wire-space 607A target must land on live 6064 MODULO RM. Under the
+    # 2026-04-19 multi-turn-aware fold, seam-adjacent positions (here,
+    # live_6064=620 is within 8 counts of RM=628) use multi-turn to
+    # disambiguate and may emit a target an integer multiple of RM away
+    # from live_6064. Physical motion is identical (drive does modular
+    # comparison per Chapter 5 Fig 5-1).
+    rm = 628
+    wire_counts = int(round(commanded_axis_q[0] * 100.0))
+    modular_delta = (wire_counts - 620) % rm
+    if modular_delta > rm // 2:
+        modular_delta -= rm
+    assert abs(modular_delta) <= 1, (
+        f"wire_counts={wire_counts} live_6064=620 modular_delta={modular_delta} rm={rm}"
+    )
 
 
 def test_ethercat_backend_drive_native_truth_requires_absolute_home_anchor(monkeypatch, tmp_path):
@@ -4431,6 +4456,625 @@ def test_a6ec_continuous_607a_fold_does_not_flip_turn_at_midpoint_home(
     assert wire_distance_from_live < half_rm, (
         f"wire_counts={wire_counts} too far from live_counts={live_counts}: "
         f"distance={wire_distance_from_live} > RM/2={half_rm}"
+    )
+
+
+# --------------------------------------------------------------------------
+# 2026-04-19 UI whip regression: nearest-turn fold must use the multi-turn
+# encoder reference (`encoder_multi_turn_counts`) at the seam boundary,
+# not live 0x6064 alone.
+#
+# Scenario: J6 is parked exactly on the seam at canonical +180 deg after a
+# prior jog. The drive's live 0x6064 can read EITHER 0 OR RM-1 depending
+# on sub-count encoder noise. With the old fold (single-turn reference),
+# round(delta/period) flipped turn count between 0 and +1 based on which
+# reading came in, which caused the 2026-04-19 UI-driven whip (operator
+# jogged +5 deg -> +180, waited, jogged +5 deg -> +185; second jog whipped
+# +360 deg the long way because the fold picked turn=+1). With the fix,
+# the fold reads U40.20/.22 combined signed i64 via the profile's
+# standard `encoder_multi_turn_counts` key, which is unambiguous, and
+# picks the correct turn regardless of sub-count noise on 0x6064.
+# --------------------------------------------------------------------------
+def _setup_midpoint_home_fold_backend(
+    monkeypatch, tmp_path, *, u40_20_motor_counts: int
+) -> tuple["EthercatRTCoreBackend", int, int, float]:
+    """Build an A6-EC-like backend at midpoint home with a supplied U40.20
+    motor-frame multi-turn reading. Returns (backend, rm, half_rm,
+    counts_per_unit).
+    """
+    monkeypatch.setenv(
+        "GRADIENT_JOINT_ZERO_OFFSETS_PATH",
+        str(tmp_path / "joint_zero_offsets.json"),
+    )
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    counts_per_rev = 131072
+    gear_ratio = 10.0  # A6-EC C10.18/C10.19 = 10/1 for J6
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    rm = int(round(counts_per_unit * 2.0 * math.pi))
+    half_rm = rm // 2
+    # Split the 64-bit motor counts across the low/high 32-bit fields.
+    mt_u64 = int(u40_20_motor_counts) & ((1 << 64) - 1)
+    low_signed = mt_u64 & 0xFFFFFFFF
+    if low_signed >= (1 << 31):
+        low_signed -= 1 << 32
+    high_signed = (mt_u64 >> 32) & 0xFFFFFFFF
+    if high_signed >= (1 << 31):
+        high_signed -= 1 << 32
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": -half_rm,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": int(low_signed)},
+                    "encoder_multi_turn_high": {"valid": 1, "value": int(high_signed)},
+                },
+            }
+        ],
+    )
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    return backend, rm, half_rm, counts_per_unit
+
+
+def test_a6ec_fold_uses_multi_turn_reference_at_seam_low_side(
+    monkeypatch, tmp_path
+):
+    """J6 at canonical +180 deg with live 0x6064 = 0 (the low-side ambiguous
+    reading at the seam). Commanding canonical +185 deg from here MUST emit
+    a target near axis-q +185 deg -- short path, turn 0 -- not +185+360 deg
+    (long path, turn +1 whip).
+
+    In motor-frame counts, canonical +180 deg for J6 (sign=-1, gear=10):
+      output_rev = 180 / 360 = 0.5
+      motor_rev  = output_rev * gear = 5
+      motor_cts  = motor_rev * counts_per_motor_rev * sign(=-1) = -655,360
+    """
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=-655_360
+    )
+    # Live 0x6064 at the seam low side (wire = 0). Without the fix, the
+    # legacy path sees observed_counts = 0 + (-RM/2) = -RM/2 and base_counts
+    # = +185*-1*counts_per_unit ~= -673,785. delta/period = (-655,360 -
+    # -673,785)/RM = +0.014 -> round() = 0. Correct by luck. But the
+    # high-side test below (wire = RM-1) would flip to +1 without U40.20/.22.
+    target_axis_q = backend._command_axis_q_for_joint_value(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=math.radians(185.0),
+        live_reference_counts=0,
+    )
+    # Expected short-path target: axis-q = +185 deg = +3.228... rad
+    assert math.isclose(
+        target_axis_q, math.radians(185.0), abs_tol=1e-6
+    ), (
+        f"fold snapped to wrong turn: got {target_axis_q!r} rad "
+        f"({math.degrees(target_axis_q):.3f} deg), expected +185.000 deg"
+    )
+
+
+def test_a6ec_fold_uses_multi_turn_reference_at_seam_high_side(
+    monkeypatch, tmp_path
+):
+    """Mirror of the low-side test: J6 at canonical +180 deg with live
+    0x6064 = RM-1 (the high-side ambiguous reading at the seam). Without
+    the multi-turn fix this is EXACTLY the case that whipped on 2026-04-19:
+    the old fold computes delta/period ~= +1.014, rounds to +1, emits a
+    target RM above where it should be, and the drive goes the long way.
+
+    With the multi-turn fix, U40.20/.22 unambiguously says we're at motor
+    count -655,360 (canonical +180 deg, turn 0), and the fold picks
+    wrap_turns = 0 regardless of which ambiguous 0x6064 reading came in.
+    """
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=-655_360
+    )
+    # Same motor-frame multi-turn position (-655,360 motor counts =
+    # canonical +180 deg), but 0x6064 happens to read RM-1 this time.
+    # This is the reading that TRIGGERED the whip on 2026-04-19.
+    target_axis_q = backend._command_axis_q_for_joint_value(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=math.radians(185.0),
+        live_reference_counts=rm - 1,
+    )
+    # Must still produce short-path target, not one turn above.
+    assert math.isclose(
+        target_axis_q, math.radians(185.0), abs_tol=1e-6
+    ), (
+        f"fold took the long path at the seam high side: got "
+        f"{target_axis_q!r} rad ({math.degrees(target_axis_q):.3f} deg), "
+        f"expected +185.000 deg. This is the 2026-04-19 UI whip regression."
+    )
+
+
+def test_a6ec_fold_away_from_seam_preserves_single_turn_emission(
+    monkeypatch, tmp_path
+):
+    """Path-B regression: when J6 is NOT near the seam (i.e., live
+    0x6064 is well away from the 0/RM boundary), the multi-turn data
+    must NOT shift observed_counts. The fold's wire emission must stay
+    identical to the pre-fix single-turn-aware behavior everywhere
+    outside the +/- ~22 deg seam-adjacent band. This regression guards
+    against the multi-turn disambiguation leaking outside its intended
+    scope (see Phase 6 matrix in DEVLOG 2026-04-19 18:30: verified-safe
+    wire semantics only apply within +/-RM/2 of live 0x6064).
+    """
+    # J6 at canonical +90 deg (wire 6064 at RM/4 = 327,680) -- mid-band,
+    # nowhere near the seam. The multi-turn register unambiguously
+    # says we're at canonical +90 deg motor-frame. Commanding +91 deg
+    # should produce axis-q = +91 deg and a wire target close to live
+    # 0x6064 (not one turn above, which would be the failure mode if
+    # multi-turn disambiguation fired outside the seam band).
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=int(math.radians(90.0) * (-1) * (131072.0 * 10.0 / (2.0 * math.pi)))
+    )
+    # Live 0x6064 at canonical +90 deg for J6 (sign=-1, midpoint home):
+    #   wire = home_offset (+RM/2) - canonical * RM/(2pi) * |sign|
+    #        = RM/2 - (RM/4) = RM/4 = 327,680
+    live_counts = rm // 4
+    target_axis_q = backend._command_axis_q_for_joint_value(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=math.radians(91.0),
+        live_reference_counts=live_counts,
+    )
+    # target canonical +91 deg -> axis-q +91 deg (fold didn't flip turn)
+    assert math.isclose(
+        target_axis_q, math.radians(91.0), abs_tol=1e-6
+    ), (
+        f"away-from-seam emission changed: got {target_axis_q!r} rad "
+        f"({math.degrees(target_axis_q):.3f} deg), expected +91.000 deg. "
+        f"Multi-turn disambiguation must not fire outside the seam-adjacent band."
+    )
+    # Compute the actual wire value emitted on the wire. Following the
+    # existing midpoint-home fold regression test pattern:
+    wire_counts = int(round(target_axis_q * (-1) * counts_per_unit)) - (-half_rm)
+    # Wire should be within one period of live (single-turn emission
+    # preserved; pre-fix behavior equals post-fix behavior here).
+    assert abs(wire_counts - live_counts) < rm // 2, (
+        f"wire_counts={wire_counts} drifted more than RM/2 from live_counts={live_counts}; "
+        f"multi-turn disambiguation leaked outside the seam band."
+    )
+
+
+def test_a6ec_multi_turn_reference_falls_back_when_profile_omits_key(
+    monkeypatch, tmp_path
+):
+    """Vendor-agnostic safety net: when the profile's absolute_feedback
+    does NOT include `encoder_multi_turn_counts` (e.g., a drive profile
+    that does not expose a multi-turn register), the helper must return
+    None so the fold cleanly falls back to the legacy single-turn path.
+    """
+    monkeypatch.setenv(
+        "GRADIENT_JOINT_ZERO_OFFSETS_PATH",
+        str(tmp_path / "joint_zero_offsets.json"),
+    )
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    counts_per_rev = 131072
+    counts_per_unit = (float(counts_per_rev) * 10.0) / (2.0 * math.pi)
+    half_rm = int(round(counts_per_unit * math.pi))
+    # Write metrics with EMPTY absolute_feedback -- profile cannot derive a
+    # signed_i64_pair source and the helper must return None.
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": -half_rm,
+                "absolute_feedback": {},
+            }
+        ],
+    )
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[-1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    result = backend._multi_turn_reference_counts_for_axis(0)
+    assert result is None, (
+        f"helper must return None when the profile does not expose "
+        f"encoder_multi_turn_counts, got {result!r}"
+    )
+
+
+# --------------------------------------------------------------------------
+# 2026-04-20 `_display_feedback_counts_for_axis` multi-turn preference.
+#
+# Scenario: at startup the drive publishes `pos_counts = 0, statusword = 0`
+# for several seconds while the PDO mapping latches (pre-OP). Any caller that
+# invokes the display-unwrap path during that window used to seed the cache
+# from the bogus zero; when the drive subsequently reported a near-seam
+# position (~RM/2 counts away from 0), the nearest-turn unwrap picked the
+# -1 turn and propagated that stale frame indefinitely, leaving the display
+# frame permanently offset by one full revolution. The user-visible symptom
+# was `/info/joints-detailed` reporting `command_roundtrip_consistent=False`
+# with `error_counts = ±RM`, which surfaced through
+# `truth_reason=absolute_home_anchor_stale` and caused the
+# `/control/joint-jog` endpoint to reject with
+# `CANONICAL_JOINT_TRUTH_UNAVAILABLE`.
+#
+# The durable fix delegates the display-unwrap path to the drive's multi-turn
+# register (profile contract `encoder_multi_turn_counts`) when both the
+# multi-turn reading AND a captured home anchor are available. That ground-
+# truth path has no dependency on pre-OP PDO reads or HM35 reference rewrites.
+# The fallback accumulated-unwrap path gains a pre-OP seed gate and an HM35-
+# invalidation hook for drives that don't expose multi-turn.
+# --------------------------------------------------------------------------
+def test_a6ec_display_feedback_prefers_multi_turn_when_anchored(
+    monkeypatch, tmp_path
+):
+    """J6 at canonical 0 deg (home) with live 0x6064 = RM/2 and multi-turn
+    reading at the anchor counts. The display unwrap must return RM/2 (the
+    wire-frame representation of axis-q = 0), NOT -RM/2 (which would yield
+    reference_q = 2*pi = +360 deg in the canonical frame and falsely flag
+    the axis as stale-anchor).
+    """
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=0
+    )
+    # Install an anchor at home (motor_counts in the metrics is also 0 via
+    # u40_20_motor_counts=0; with anchor at 0 rad they are consistent).
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [
+            {"home_anchor_rad": 0.0, "source": "encoder_multi_turn_counts"}
+        ]
+    # Verify the helper returns the correct axis-q motor counts (= 0 at home).
+    multi_turn_axis_q = backend._multi_turn_reference_counts_for_axis_when_anchored(0)
+    assert multi_turn_axis_q == 0, (
+        f"multi-turn axis-q at home must be 0, got {multi_turn_axis_q}"
+    )
+    # The key invariant: display_counts at home wire (RM/2) must equal RM/2.
+    # This yields physical_q = -pi, and + native_home_offset_q = +pi produces
+    # reference_q = 0 (canonical at home), not 2*pi (= canonical one-turn-off).
+    display_counts = backend._display_feedback_counts_for_axis(0, half_rm)
+    assert display_counts == half_rm, (
+        f"display_feedback_counts at home wire must equal RM/2 = {half_rm}, "
+        f"got {display_counts}. A -RM/2 return would make reference_q = 2*pi "
+        f"and falsely flag the axis as stale-anchor (the 2026-04-20 UI "
+        f"jog-rejection regression)."
+    )
+
+
+def test_a6ec_display_feedback_multi_turn_path_survives_pre_op_zero_reads(
+    monkeypatch, tmp_path
+):
+    """Directly reproduces the 2026-04-20 UI-jog rejection: at startup the
+    backend received several cycles of `pos_counts=0, statusword=0` before
+    the drive latched a near-seam absolute position. With the pre-fix code,
+    those zero-reads permanently offset the display unwrap cache by -1 turn.
+    With the multi-turn-preferred path, the display unwrap ignores the
+    host-accumulated cache entirely when multi-turn + anchor are available.
+    """
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=0
+    )
+    # Install an anchor at home so the multi-turn-preferred path engages.
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [
+            {"home_anchor_rad": 0.0, "source": "encoder_multi_turn_counts"}
+        ]
+    # Simulate the pre-OP zero-read path: invoke display-unwrap with
+    # raw_counts = 0 and statusword = 0 (the pattern observed at sessions 0-8s).
+    # This used to poison the cache with 0; with the fix, the multi-turn path
+    # takes over and returns the anchor-relative wire frame (= half_rm at home).
+    with backend._status_lock:
+        backend._axis_statusword[0] = 0
+    first_call = backend._display_feedback_counts_for_axis(0, 0)
+    assert first_call == half_rm, (
+        f"multi-turn-preferred path must return the anchor-relative wire "
+        f"frame at home ({half_rm}), NOT 0 (pre-OP cache). got {first_call}"
+    )
+    # Drive comes up. Sample near-seam like the 2026-04-20 startup trace.
+    near_seam_wire = rm - 18_253
+    with backend._status_lock:
+        backend._axis_statusword[0] = 0x9650
+    second_call = backend._display_feedback_counts_for_axis(0, near_seam_wire)
+    # multi-turn is STILL 0 (joint physically hasn't moved from anchor);
+    # wire_unwrapped = 0 - native_home_offset = 0 - (-half_rm) = half_rm.
+    # Pre-fix this would have returned -18_253 (near-seam representation
+    # with stale -1 turn cache), yielding reference_q = 2*pi offset.
+    assert second_call == half_rm, (
+        f"multi-turn path must continue returning half_rm={half_rm} as long "
+        f"as physical motor_counts haven't changed. got {second_call} "
+        f"(pre-fix behavior yielded -18_253)."
+    )
+
+
+def test_a6ec_display_feedback_fallback_gates_seed_on_pre_op_zero(
+    monkeypatch, tmp_path
+):
+    """Profile without a captured anchor must fall back to accumulated-unwrap.
+    In that fallback, the pre-OP `(raw=0, sw=0)` pattern must NOT seed the
+    cache, otherwise a subsequent near-seam report poisons the cache by -1
+    turn. The seed is deferred until either raw or statusword becomes
+    non-zero.
+    """
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=0
+    )
+    # No anchor installed: multi-turn-preferred path declines, fallback runs.
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [None]
+        backend._axis_statusword[0] = 0
+    # Pre-OP: raw=0, sw=0. Seed MUST be deferred.
+    assert backend._display_feedback_counts_for_axis(0, 0) == 0
+    with backend._status_lock:
+        assert not backend._feedback_unwrapped_valid[0], (
+            "fallback must refuse to seed from the (raw=0, sw=0) pre-OP "
+            "pattern; otherwise the subsequent drive-latch sample poisons "
+            "the unwrap cache by -1 turn for the rest of the session."
+        )
+    # Drive comes up, reports near-seam. With the gate in place, THIS is the
+    # first seed (not the earlier zero), and nearest-turn unwrap correctly
+    # tracks from here.
+    near_seam_wire = rm - 18_253
+    with backend._status_lock:
+        backend._axis_statusword[0] = 0x9650
+    result = backend._display_feedback_counts_for_axis(0, near_seam_wire)
+    # Seeded from normalized_counts which for near_seam_wire = rm - 18_253
+    # gives ((rm - 18_253 + half_rm) % rm) - half_rm = (-18_253 + half_rm) -
+    # half_rm = ... Just compute directly.
+    expected_normalized = ((near_seam_wire + half_rm) % rm) - half_rm
+    assert result == expected_normalized, (
+        f"first post-pre-OP seed must be the normalized near-seam value "
+        f"({expected_normalized}), got {result}"
+    )
+    with backend._status_lock:
+        assert backend._feedback_unwrapped_valid[0]
+
+
+def test_a6ec_display_feedback_fallback_invalidates_cache_on_hm35(
+    monkeypatch, tmp_path
+):
+    """When the drive rewrites 0x607C (HM35 completes), the
+    `_refresh_native_home_offsets_from_metrics` hook must invalidate the
+    affected axis's fallback unwrap cache so the next display query re-seeds
+    from the post-HM35 wire value. Without this invalidation, a pre-HM35
+    stale turn count propagates through the home procedure indefinitely
+    (because the HM35-induced 6064 jump is ~half_rm, which rounds to 0 turns
+    in nearest-turn unwrap and just keeps the stale count).
+    """
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=0
+    )
+    # Seed the fallback cache with a pre-HM35 value: imagine the axis was at
+    # canonical +175 deg before HM35 (wire near seam, unwrapped to a slightly
+    # negative value under the pre-HM35 reference frame).
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [None]  # force fallback
+        backend._feedback_unwrapped_counts[0] = -18_253
+        backend._feedback_unwrapped_valid[0] = True
+        # Simulate a prior native_home_offset value that is about to change.
+        backend._native_home_offset_counts[0] = 0
+    # Now HM35 writes 607C = RM/2, so native_home_position_offset changes to
+    # -RM/2. Re-write the metrics file with the new offset and force the
+    # refresh (mtime_ns reset so `_refresh_native_home_offsets_from_metrics`
+    # doesn't short-circuit on unchanged mtime).
+    metrics_path = rtcore_backend_module._RTCORE_METRICS_PATH
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": -half_rm,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 0},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    with backend._status_lock:
+        backend._native_home_metrics_mtime_ns = -1  # force re-read
+    backend._refresh_native_home_offsets_from_metrics()
+    with backend._status_lock:
+        assert not backend._feedback_unwrapped_valid[0], (
+            "HM35-induced native_home_position_offset change MUST invalidate "
+            "the fallback unwrap cache; otherwise the pre-HM35 stale turn "
+            "count propagates through the home procedure indefinitely."
+        )
+
+
+# --------------------------------------------------------------------------
+# 2026-04-20 Phase 5 whip regression: when the host has multi-turn state and
+# a captured home anchor, the command path must preserve the commanded
+# direction. The operator's observed failure mode was: J6 at canonical +365°
+# (one full rev forward in the multi-turn register), user commands delta
+# -185° to reach canonical +180°. Pre-fix, the fold's round(delta/period)
+# used live_6064 (short-form +5°) as the anchor and produced a trajectory
+# where adjacent waypoints picked DIFFERENT wrap_turns, creating a non-
+# monotonic wire-frame target path that RTCore's velocity planner chased at
+# the drive's max RPM (6000 motor RPM) — even though the commanded speed
+# was 100 motor RPM. Post-fix, with an anchored multi-turn register, the
+# command path skips the fold's turn-shift and emits base_axis_q directly
+# (= canonical + master_offset), which is monotonic across the trajectory
+# by construction because canonical is already multi-turn-continuous.
+# --------------------------------------------------------------------------
+def test_a6ec_command_axis_q_preserves_direction_with_multi_turn_anchor(
+    monkeypatch, tmp_path
+):
+    """J6 physically at canonical +365° (one forward rev + 5°). Multi-turn
+    register at motor_counts corresponding to +365° axis-q. Anchor captured
+    at home. When user commands canonical +365° (= no motion from current),
+    the emitted axis_q must equal +365° rad EXACTLY, not +5° (collapsed
+    modular form).
+    """
+    # Motor at canonical +365° with sign=-1: motor_counts = +365° * -1 * cpu
+    # ~= -1,329,115 counts (one full rev forward in motor frame).
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=-1_329_115
+    )
+    # Install home anchor captured at motor zero (canonical 0°).
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [
+            {"home_anchor_rad": 0.0, "source": "encoder_multi_turn_counts"}
+        ]
+    # Live wire reads canonical +5° (modular short-form) — this is what the
+    # fold's pre-fix logic would use as the anchor and where it would COLLAPSE
+    # the command to. We want the command path to IGNORE this and honor the
+    # multi-turn-aware canonical input instead.
+    live_wire = half_rm + int(round(math.radians(5.0) * (-1.0) * counts_per_unit))
+    target_axis_q = backend._command_axis_q_for_joint_value(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=math.radians(365.0),
+        live_reference_counts=live_wire,
+    )
+    assert math.isclose(
+        target_axis_q, math.radians(365.0), abs_tol=1e-6
+    ), (
+        f"direction-preserving command path must honor multi-turn-aware "
+        f"canonical, got {target_axis_q!r} rad ({math.degrees(target_axis_q):.3f}°), "
+        f"expected +365.000° exactly. A result near +5° would be the Phase 5 "
+        f"whip pre-fix behavior."
+    )
+
+
+def test_a6ec_command_axis_q_trajectory_waypoints_monotonic_with_multi_turn(
+    monkeypatch, tmp_path
+):
+    """Simulate the Phase 5 trajectory: J6 at canonical +365° (multi-turn
+    register), user commands delta -185° via an s-curve trajectory through
+    canonical {+365°, +272.5°, +180°}. Every emitted axis_q must be
+    monotonic (no mid-trajectory turn-flip). Pre-fix, the middle waypoint
+    at +272.5° picked turn +1 while the start (+365°) and end (+180°)
+    picked turn 0, producing a non-monotonic wire-frame path that caused
+    the observed whip.
+    """
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=-1_329_115
+    )
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [
+            {"home_anchor_rad": 0.0, "source": "encoder_multi_turn_counts"}
+        ]
+    # Motor at canonical +365° modularly = +5° (wire counts for +5°):
+    live_wire = half_rm + int(round(math.radians(5.0) * (-1.0) * counts_per_unit))
+    waypoints_canonical_deg = [365.0, 340.0, 310.0, 272.5, 225.0, 200.0, 180.0]
+    emitted_axis_q = []
+    for canonical_deg in waypoints_canonical_deg:
+        axis_q = backend._command_axis_q_for_joint_value(
+            axis_i=0,
+            logical_joint_idx=0,
+            canonical_q=math.radians(canonical_deg),
+            live_reference_counts=live_wire,
+        )
+        emitted_axis_q.append(axis_q)
+    # Assert monotonic decrease (canonical values decrease, so axis_q with
+    # sign=-1 increases toward zero, i.e. emitted values monotonically
+    # DECREASE in magnitude for decreasing canonical).
+    for prev, curr, prev_deg, curr_deg in zip(
+        emitted_axis_q[:-1], emitted_axis_q[1:],
+        waypoints_canonical_deg[:-1], waypoints_canonical_deg[1:],
+    ):
+        # Since canonical decreases and sign=-1, each axis_q should decrease too.
+        assert curr < prev, (
+            f"non-monotonic axis_q between waypoints "
+            f"{prev_deg}° (axis_q={prev:.4f}) and {curr_deg}° (axis_q={curr:.4f}): "
+            f"the Phase 5 whip pre-fix signature. Expected monotonic decrease."
+        )
+    # Also: each emitted axis_q must equal base_axis_q exactly (no turn-shift).
+    for canonical_deg, axis_q in zip(waypoints_canonical_deg, emitted_axis_q):
+        assert math.isclose(
+            axis_q, math.radians(canonical_deg), abs_tol=1e-6
+        ), (
+            f"waypoint at canonical {canonical_deg}° emitted axis_q "
+            f"{axis_q!r} (= {math.degrees(axis_q):.3f}°) instead of "
+            f"{canonical_deg}° exactly. The fold introduced a turn-shift "
+            f"when it should have passed canonical through directly."
+        )
+
+
+def test_a6ec_command_axis_q_falls_back_to_fold_without_anchor(
+    monkeypatch, tmp_path
+):
+    """When no home anchor is captured (e.g., fresh boot, never homed), the
+    direction-preserving path must NOT fire. The existing fold path
+    (including its seam-only multi-turn disambiguation) remains the
+    behavior. This preserves the 2026-04-19 UI-whip seam-crossing
+    regression coverage for pre-commissioning joints.
+    """
+    # Set motor at canonical +180° (seam); multi-turn axis_q = -RM/2.
+    # RM = counts_per_motor_rev(131072) * gear(10) = 1,310,720; half_rm = 655,360.
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=-655_360
+    )
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [None]  # NO anchor captured
+    # Live at the high-side seam ambiguity (wire=RM-1, canonical ≈ ±180°).
+    # The fold's seam disambiguation MUST still fire here because this is
+    # the exact 2026-04-19 UI-whip reproduction.
+    target_axis_q = backend._command_axis_q_for_joint_value(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=math.radians(185.0),
+        live_reference_counts=rm - 1,
+    )
+    # Fold with seam disambiguation picks the short-path target (no +RM whip).
+    assert math.isclose(
+        target_axis_q, math.radians(185.0), abs_tol=1e-6
+    ), (
+        f"fold fallback must still do seam disambiguation at the high-side "
+        f"ambiguous reading even without an anchor (2026-04-19 regression). "
+        f"got {target_axis_q!r} rad ({math.degrees(target_axis_q):.3f}°), "
+        f"expected +185.000°."
+    )
+
+
+def test_a6ec_multi_turn_reference_when_anchored_returns_none_without_anchor(
+    monkeypatch, tmp_path
+):
+    """The stricter `_when_anchored` variant must return None when no home
+    anchor has been captured, so the display path can cleanly fall back to
+    the accumulated-unwrap semantics. (The permissive sibling would return
+    motor-encoder-internal counts which are useless for operator display.)
+    """
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch, tmp_path, u40_20_motor_counts=123_456
+    )
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [None]
+    assert (
+        backend._multi_turn_reference_counts_for_axis_when_anchored(0) is None
+    ), (
+        "_multi_turn_reference_counts_for_axis_when_anchored must return "
+        "None when no anchor is captured; the permissive sibling "
+        "_multi_turn_reference_counts_for_axis would return "
+        "motor-encoder-internal counts here."
+    )
+    # Install an anchor and verify the helper now returns a value.
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [
+            {"home_anchor_rad": 0.0, "source": "encoder_multi_turn_counts"}
+        ]
+    result = backend._multi_turn_reference_counts_for_axis_when_anchored(0)
+    assert result == 123_456, (
+        f"with anchor at 0 rad, helper must return motor_counts unchanged, "
+        f"got {result}"
     )
 
 
