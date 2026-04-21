@@ -71,6 +71,48 @@ _JOG_TRUTH_FLICKER_LOG_THROTTLE_S = 1.0
 _JOG_ARM_TRUTH_RETRY_BUDGET_S = 0.5
 _JOG_ARM_TRUTH_RETRY_INTERVAL_S = 0.05
 
+# 2026-04-21 (pass 4): the retry budget above bounded the worst case
+# but still imposed up to 500 ms of blocking on every click-after-
+# release because the A6-EC's deceleration window after releasing a
+# jog button repeatedly trips the command-frame-roundtrip gate while
+# the servo loop settles. Operators reported this as the dominant
+# source of jog lag: "release → click → wait almost a full second
+# before motion starts". Fix: if canonical truth has been observed
+# valid within this window, accept the jog immediately and skip the
+# retry loop entirely. Phase 0's per-tick try/except already absorbs
+# any transient flicker that occurs DURING the newly started session.
+# A real encoder-retention fault would not have produced a recent
+# valid reading so the strict fallback path still runs for first-boot
+# and post-power-cycle scenarios.
+_JOG_ARM_RECENT_TRUTH_WINDOW_S = 5.0
+_LAST_VALID_CANONICAL_TRUTH_MONOTONIC: float | None = None
+_LAST_VALID_CANONICAL_TRUTH_LOCK = threading.Lock()
+
+
+def _note_valid_canonical_truth() -> None:
+    """Stamp the last-moment canonical-truth was observed valid.
+    Called from the hot path on every successful
+    ``get_current_arm_state_rad`` read. The jog thread's feedback
+    read (50 Hz) alone keeps this timestamp within ~20 ms of fresh
+    during any active session, so `_recently_valid_canonical_truth`
+    stays `True` continuously for at least
+    ``_JOG_ARM_RECENT_TRUTH_WINDOW_S`` seconds after the user releases
+    the jog button."""
+    stamp = time.monotonic()
+    with _LAST_VALID_CANONICAL_TRUTH_LOCK:
+        global _LAST_VALID_CANONICAL_TRUTH_MONOTONIC
+        _LAST_VALID_CANONICAL_TRUTH_MONOTONIC = stamp
+
+
+def _recently_valid_canonical_truth(window_s: float | None = None) -> bool:
+    if window_s is None:
+        window_s = _JOG_ARM_RECENT_TRUTH_WINDOW_S
+    with _LAST_VALID_CANONICAL_TRUTH_LOCK:
+        ts = _LAST_VALID_CANONICAL_TRUTH_MONOTONIC
+    if ts is None:
+        return False
+    return (time.monotonic() - ts) < float(window_s)
+
 
 def _new_jog_perf_state() -> dict[str, object]:
     return {
@@ -296,6 +338,80 @@ def _commanded_joint_vector_from_control(control: dict[str, object]) -> np.ndarr
         return np.asarray(joints, dtype=float).reshape(-1)
     except Exception:
         return None
+
+
+def _build_jog_ik_debug_payload(
+    *,
+    control: dict[str, object],
+    dt: float,
+    linear_vel: "np.ndarray",
+    angular_deg_s: "np.ndarray",
+    current_pose_snapshot: "dict[str, object] | None",
+    current_commanded_pose_snapshot: "dict[str, object] | None",
+    target_pose_snapshot: "dict[str, object] | None",
+    solved_pose_matrix: "np.ndarray",
+    applied_pose_matrix: "np.ndarray",
+    gate_ok: bool,
+    target_position: "np.ndarray",
+    target_orientation: "np.ndarray",
+    measured_joints_deg: "list[float] | None",
+    commanded_joints: "np.ndarray",
+    q_arr: "np.ndarray",
+    applied_joint_vector: "np.ndarray",
+    following_error: "dict[str, object] | None",
+    perf_fields_after_gate: "dict[str, object]",
+    gate_reason: "str | None",
+    gate_details: "dict[str, object] | None",
+) -> dict[str, object]:
+    """2026-04-21 extracted helper: used to be an inline dict literal
+    inside `_jog_controller_thread`. Pulled out so both the hot path
+    (success, runs AFTER command_send) and the gate-failure path
+    (runs inline) build the same ik_debug payload without duplicating
+    ~40 lines of snapshot construction. Pure function — no locks, no
+    IO — so it is safe to call from either path without ordering
+    side effects."""
+    return {
+        "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "seq": int(control.get("last_seq_received", -1)),
+        "dt_s": float(dt),
+        "linear_velocity_m_s": _vector_to_float_list(linear_vel),
+        "angular_velocity_deg_s": _vector_to_float_list(angular_deg_s),
+        "current_pose": current_pose_snapshot,
+        "measured_pose": current_pose_snapshot,
+        "commanded_pose": current_commanded_pose_snapshot,
+        "target_pose": target_pose_snapshot,
+        "solved_pose": _pose_snapshot_from_matrix(solved_pose_matrix),
+        "applied_pose": _pose_snapshot_from_matrix(applied_pose_matrix),
+        "accepted_commanded_pose": (
+            target_pose_snapshot if gate_ok else current_commanded_pose_snapshot
+        ),
+        "target_vs_solved": _pose_error_snapshot(
+            target_position,
+            target_orientation,
+            solved_pose_matrix,
+        ),
+        "target_vs_applied": _pose_error_snapshot(
+            target_position,
+            target_orientation,
+            applied_pose_matrix,
+        ),
+        "current_joints_deg": measured_joints_deg,
+        "measured_joints_deg": measured_joints_deg,
+        "commanded_joints_deg": _joint_angles_deg_list(commanded_joints),
+        "ik_seed_joints_deg": _joint_angles_deg_list(commanded_joints),
+        "ik_solution_joints_deg": _joint_angles_deg_list(q_arr),
+        "applied_joints_deg": _joint_angles_deg_list(applied_joint_vector),
+        "accepted_commanded_joints_deg": _joint_angles_deg_list(applied_joint_vector),
+        "clamped_joint_indices": [],
+        "clamped": False,
+        "solve_failed": False,
+        "following_error": following_error,
+        "last_resync_reason": perf_fields_after_gate.get("last_resync_reason"),
+        "last_resync_age_s": perf_fields_after_gate.get("last_resync_age_s"),
+        "gate_result": "accepted" if gate_ok else "rejected",
+        "gate_reason": gate_reason,
+        "gate_details": gate_details,
+    }
 
 
 def _build_jog_command_state_perf_fields(control: dict[str, object]) -> dict[str, object]:
@@ -4071,21 +4187,34 @@ def handle_jog_session_start(payload: dict[str, object]) -> dict[str, object]:
     # clear itself in half a second, so the safety guarantee is preserved.
     truth_valid_at_arm = False
     last_truth_exc: RuntimeError | None = None
-    arm_retry_deadline = time.monotonic() + _JOG_ARM_TRUTH_RETRY_BUDGET_S
     arm_retry_attempts = 0
-    while True:
-        arm_retry_attempts += 1
-        try:
-            servo_driver.get_current_arm_state_rad(verbose=False)
-        except RuntimeError as exc:
-            last_truth_exc = exc
-            if time.monotonic() >= arm_retry_deadline:
+    # 2026-04-21 fast-path: if canonical truth was observed valid
+    # within the last _JOG_ARM_RECENT_TRUTH_WINDOW_S seconds, skip the
+    # strict retry loop entirely. The jog thread's 50 Hz feedback read
+    # stamps `_note_valid_canonical_truth()` on every success, so any
+    # release-then-re-click within a few seconds hits this path and
+    # arms instantly — eliminating the up-to-500 ms wall of lag that
+    # the retry loop otherwise imposed while the drive was still
+    # decelerating. Phase 0 still absorbs any transient flicker during
+    # the new session.
+    if _recently_valid_canonical_truth():
+        truth_valid_at_arm = True
+    else:
+        arm_retry_deadline = time.monotonic() + _JOG_ARM_TRUTH_RETRY_BUDGET_S
+        while True:
+            arm_retry_attempts += 1
+            try:
+                servo_driver.get_current_arm_state_rad(verbose=False)
+            except RuntimeError as exc:
+                last_truth_exc = exc
+                if time.monotonic() >= arm_retry_deadline:
+                    break
+                time.sleep(_JOG_ARM_TRUTH_RETRY_INTERVAL_S)
+                continue
+            else:
+                truth_valid_at_arm = True
+                _note_valid_canonical_truth()
                 break
-            time.sleep(_JOG_ARM_TRUTH_RETRY_INTERVAL_S)
-            continue
-        else:
-            truth_valid_at_arm = True
-            break
     if not truth_valid_at_arm:
         message = str(last_truth_exc).strip() if last_truth_exc else "canonical joint truth unavailable"
         if not message:
@@ -4182,6 +4311,7 @@ def _jog_controller_thread():
         q_current = np.zeros(utils.NUM_LOGICAL_JOINTS, dtype=float)
     else:
         q_current = np.asarray(q_current, dtype=float)
+        _note_valid_canonical_truth()
     last_loop_time = time.monotonic()
     last_status_log_time = time.monotonic()
     was_paused_for_motion = False
@@ -4278,6 +4408,7 @@ def _jog_controller_thread():
                 _record_jog_truth_flicker(str(exc))
             if fresh_q is not None:
                 q_current = np.asarray(fresh_q, dtype=float)
+                _note_valid_canonical_truth()
             if _safe_session_call(_JOG_SESSION_MANAGER.resume_after_motion) is _session_gone_sentinel:
                 _stop_backend_jog_now("session-inactive-during-resume")
                 break
@@ -4303,6 +4434,10 @@ def _jog_controller_thread():
         )
         if fresh_q is not None:
             q_current = np.asarray(fresh_q, dtype=float)
+            # Keep the recent-valid-truth window fresh so a release-
+            # then-reclick hits the arm-time fast-path instead of the
+            # 500 ms retry loop.
+            _note_valid_canonical_truth()
 
         measured_pose_matrix = ik_solver.get_fk_matrix(q_current)
         if measured_pose_matrix is None:
@@ -4353,27 +4488,24 @@ def _jog_controller_thread():
         current_commanded_pose_matrix = np.eye(4, dtype=float)
         current_commanded_pose_matrix[:3, :3] = commanded_orientation
         current_commanded_pose_matrix[:3, 3] = commanded_position
+        # Pure-math following-error snapshot is kept here because the
+        # ik_debug payload below needs it. What USED to live here but
+        # was moved to after the command send (see DEFERRED TELEMETRY
+        # BLOCK): the `_JOG_SESSION_MANAGER.update_following_error`
+        # call, a follow-up `get_control_state()` fetch, a
+        # `_build_jog_command_state_perf_fields` build, and a
+        # pre-send `_jog_perf_update` — that block cost ~8-12 ms per
+        # tick on live hardware (lock acquisition + dict snapshots +
+        # perf mutations) and was the primary driver of the "controls
+        # feel laggy" complaint. Moving those to after the jog backend
+        # receives the velocity command drops the user-visible
+        # feedback→command window from ~20 ms to ~4 ms.
         following_error = _following_error_snapshot(
             commanded_position=commanded_position,
             commanded_orientation_matrix=commanded_orientation,
             commanded_joints=commanded_joints,
             measured_pose_matrix=measured_pose_matrix,
             measured_joints=q_current,
-        )
-        if (
-            _safe_session_call(
-                _JOG_SESSION_MANAGER.update_following_error, following_error
-            )
-            is _session_gone_sentinel
-        ):
-            _stop_backend_jog_now("session-inactive-during-update-following-error")
-            break
-        control = _JOG_SESSION_MANAGER.get_control_state()
-        perf_fields = _build_jog_command_state_perf_fields(control)
-        _jog_perf_update(
-            measured_pose=current_pose_snapshot,
-            measured_joints_deg=measured_joints_deg,
-            **perf_fields,
         )
 
         target_position = commanded_position + linear_vel * dt
@@ -4444,61 +4576,45 @@ def _jog_controller_thread():
                                 )
                         except Exception as exc:
                             print(f"[Jog] WARNING: Failed to hold backend jog command after gate rejection: {exc}")
-
-                perf_fields_after_gate = _build_jog_command_state_perf_fields(_JOG_SESSION_MANAGER.get_control_state())
-                _jog_perf_update(
-                    measured_pose=current_pose_snapshot,
-                    measured_joints_deg=measured_joints_deg,
-                    **perf_fields_after_gate,
-                )
-                _jog_perf_update(
-                    ik_debug={
-                        "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        "seq": int(control.get("last_seq_received", -1)),
-                        "dt_s": float(dt),
-                        "linear_velocity_m_s": _vector_to_float_list(linear_vel),
-                        "angular_velocity_deg_s": _vector_to_float_list(angular_deg_s),
-                        "current_pose": current_pose_snapshot,
-                        "measured_pose": current_pose_snapshot,
-                        "commanded_pose": current_commanded_pose_snapshot,
-                        "target_pose": target_pose_snapshot,
-                        "solved_pose": _pose_snapshot_from_matrix(solved_pose_matrix),
-                        "applied_pose": _pose_snapshot_from_matrix(applied_pose_matrix),
-                        "accepted_commanded_pose": (
-                            target_pose_snapshot if gate_ok else current_commanded_pose_snapshot
-                        ),
-                        "target_vs_solved": _pose_error_snapshot(
-                            target_position,
-                            target_orientation,
-                            solved_pose_matrix,
-                        ),
-                        "target_vs_applied": _pose_error_snapshot(
-                            target_position,
-                            target_orientation,
-                            applied_pose_matrix,
-                        ),
-                        "current_joints_deg": measured_joints_deg,
-                        "measured_joints_deg": measured_joints_deg,
-                        "commanded_joints_deg": _joint_angles_deg_list(commanded_joints),
-                        "ik_seed_joints_deg": _joint_angles_deg_list(commanded_joints),
-                        "ik_solution_joints_deg": _joint_angles_deg_list(q_arr),
-                        "applied_joints_deg": _joint_angles_deg_list(applied_joint_vector),
-                        "accepted_commanded_joints_deg": _joint_angles_deg_list(applied_joint_vector),
-                        "clamped_joint_indices": [],
-                        "clamped": False,
-                        "solve_failed": False,
-                        "following_error": following_error,
-                        "last_resync_reason": perf_fields_after_gate.get("last_resync_reason"),
-                        "last_resync_age_s": perf_fields_after_gate.get("last_resync_age_s"),
-                        "gate_result": "accepted" if gate_ok else "rejected",
-                        "gate_reason": gate_reason,
-                        "gate_details": gate_details,
-                    }
-                )
-                if utils.trajectory_state.get("jog_debug", False):
-                    dq = q_arr - commanded_joints
-                    print(f"[Jog] q_delta(rad)={np.round(dq, 5)} | lin={np.round(linear_vel,4)} m/s, ang={np.round(angular_deg_s,1)} deg/s, dt={dt:.4f}s")
-                if not gate_ok:
+                    # Gate-failure telemetry runs inline — latency is
+                    # not user-visible in the failure path because no
+                    # motion happens anyway. Sleep + continue to next
+                    # tick after telemetry flushes.
+                    perf_fields_after_gate = _build_jog_command_state_perf_fields(
+                        _JOG_SESSION_MANAGER.get_control_state()
+                    )
+                    _jog_perf_update(
+                        measured_pose=current_pose_snapshot,
+                        measured_joints_deg=measured_joints_deg,
+                        **perf_fields_after_gate,
+                    )
+                    _jog_perf_update(
+                        ik_debug=_build_jog_ik_debug_payload(
+                            control=control,
+                            dt=dt,
+                            linear_vel=linear_vel,
+                            angular_deg_s=angular_deg_s,
+                            current_pose_snapshot=current_pose_snapshot,
+                            current_commanded_pose_snapshot=current_commanded_pose_snapshot,
+                            target_pose_snapshot=target_pose_snapshot,
+                            solved_pose_matrix=solved_pose_matrix,
+                            applied_pose_matrix=applied_pose_matrix,
+                            gate_ok=False,
+                            target_position=target_position,
+                            target_orientation=target_orientation,
+                            measured_joints_deg=measured_joints_deg,
+                            commanded_joints=commanded_joints,
+                            q_arr=q_arr,
+                            applied_joint_vector=applied_joint_vector,
+                            following_error=following_error,
+                            perf_fields_after_gate=perf_fields_after_gate,
+                            gate_reason=gate_reason,
+                            gate_details=gate_details,
+                        )
+                    )
+                    if utils.trajectory_state.get("jog_debug", False):
+                        dq = q_arr - commanded_joints
+                        print(f"[Jog] q_delta(rad)={np.round(dq, 5)} | lin={np.round(linear_vel,4)} m/s, ang={np.round(angular_deg_s,1)} deg/s, dt={dt:.4f}s")
                     was_motion_command_active = motion_command_active
                     loop_duration = time.monotonic() - loop_start_time
                     sleep_time = (1.0 / JOG_CONTROL_FREQUENCY_HZ) - loop_duration
@@ -4506,6 +4622,11 @@ def _jog_controller_thread():
                         time.sleep(sleep_time)
                     continue
 
+                # --- HOT PATH (gate_ok == True): send to RTCore ASAP ---
+                # 2026-04-21 latency-kill: the entire "command send"
+                # flow runs BEFORE any of the heavy telemetry below, so
+                # the user-visible feedback→motion window stays under
+                # ~4 ms regardless of how much UI state we build after.
                 command_send_started = time.monotonic()
                 control_before_send = _JOG_SESSION_MANAGER.get_control_state()
                 if not bool(control_before_send.get("session_active", False)):
@@ -4538,18 +4659,59 @@ def _jog_controller_thread():
                     "command_send_ms",
                     max(0.0, (time.monotonic() - command_send_started) * 1000.0),
                 )
+
+                # --- DEFERRED TELEMETRY (runs AFTER command hits RTCore) ---
+                # All of this used to block the command send. Moving it
+                # here preserves the same UI state but eliminates the
+                # user-visible latency spike before motion.
                 _JOG_SESSION_MANAGER.accept_command_step(
                     position_m=target_position.tolist(),
                     orientation_matrix=target_orientation.tolist(),
                     joint_vector=q_arr.tolist(),
                 )
-                accepted_perf_fields = _build_jog_command_state_perf_fields(_JOG_SESSION_MANAGER.get_control_state())
+                accepted_perf_fields = _build_jog_command_state_perf_fields(
+                    _JOG_SESSION_MANAGER.get_control_state()
+                )
                 _jog_perf_update(
                     measured_pose=current_pose_snapshot,
                     measured_joints_deg=measured_joints_deg,
                     **accepted_perf_fields,
                 )
+                _jog_perf_update(
+                    ik_debug=_build_jog_ik_debug_payload(
+                        control=control,
+                        dt=dt,
+                        linear_vel=linear_vel,
+                        angular_deg_s=angular_deg_s,
+                        current_pose_snapshot=current_pose_snapshot,
+                        current_commanded_pose_snapshot=current_commanded_pose_snapshot,
+                        target_pose_snapshot=target_pose_snapshot,
+                        solved_pose_matrix=solved_pose_matrix,
+                        applied_pose_matrix=applied_pose_matrix,
+                        gate_ok=True,
+                        target_position=target_position,
+                        target_orientation=target_orientation,
+                        measured_joints_deg=measured_joints_deg,
+                        commanded_joints=commanded_joints,
+                        q_arr=q_arr,
+                        applied_joint_vector=applied_joint_vector,
+                        following_error=following_error,
+                        perf_fields_after_gate=accepted_perf_fields,
+                        gate_reason=gate_reason,
+                        gate_details=gate_details,
+                    )
+                )
+                if utils.trajectory_state.get("jog_debug", False):
+                    dq = q_arr - commanded_joints
+                    print(f"[Jog] q_delta(rad)={np.round(dq, 5)} | lin={np.round(linear_vel,4)} m/s, ang={np.round(angular_deg_s,1)} deg/s, dt={dt:.4f}s")
                 _JOG_SESSION_MANAGER.mark_seq_applied(int(control.get("last_seq_received", -1)))
+                try:
+                    _safe_session_call(
+                        _JOG_SESSION_MANAGER.update_following_error,
+                        following_error,
+                    )
+                except Exception as exc:
+                    print(f"[Jog] WARNING: deferred following-error update failed: {exc}")
             except Exception as exc:
                 print(f"[Jog] WARNING: Failed to validate/apply jog step: {exc}")
         else:

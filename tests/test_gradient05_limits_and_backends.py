@@ -1324,11 +1324,20 @@ def test_a6ec_truth_unavailable_when_anchor_and_6064_disagree_modulo_rm(
     metrics_path = tmp_path / "metrics.json"
     monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
 
-    counts_per_unit = 100.0
-    counts_per_rev = 628  # small RM to keep the math easy
+    # 2026-04-21: bumped counts_per_rev from 628 to a realistic G05
+    # value (131072) so RM/3 ≈ 43,690 counts comfortably exceeds the
+    # widened base shaft-frame tolerance (512 counts). The prior 628
+    # value produced a ~209-count disagreement that used to trip the
+    # 16-count tolerance but would silently pass the widened one —
+    # making the test a no-op on today's config.
+    counts_per_rev = 131072
+    counts_per_unit = counts_per_rev / (2.0 * math.pi)
     rm = counts_per_rev
     absolute_counts = 100  # anchored multi-turn counts
-    # Disagree by RM/3 on the shaft frame.
+    # Disagree by RM/3 on the shaft frame. On the real G05 encoder this
+    # is a full-scale third-of-a-revolution mismatch — i.e., the drive
+    # lost track of which third of its rotation it's on. That's the
+    # class of encoder-retention failure the gate is meant to catch.
     live_reference_counts = absolute_counts + rm // 3
 
     _write_rtcore_metrics_snapshot(
@@ -1371,7 +1380,11 @@ def test_a6ec_truth_unavailable_when_anchor_and_6064_disagree_modulo_rm(
     axis_detail = snapshot["axis_absolute_feedback"][0]
     assert axis_detail["truth_reason"] == "multi_turn_anchor_inconsistent_with_live_6064"
     assert axis_detail["shaft_frame_consistent"] is False
-    assert abs(float(axis_detail["shaft_frame_mod_rm_delta_counts"])) > 16.0
+    # Delta must exceed the effective tolerance — compare against the
+    # gate's own reported tolerance rather than a hard-coded value so
+    # future base-tolerance tuning doesn't silently break this test.
+    effective_tol = float(axis_detail["shaft_frame_tolerance_counts"])
+    assert abs(float(axis_detail["shaft_frame_mod_rm_delta_counts"])) > effective_tol
 
 
 def test_a6ec_command_frame_rejects_oversized_trajectory_step(monkeypatch, tmp_path):

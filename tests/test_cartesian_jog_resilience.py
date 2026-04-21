@@ -223,8 +223,20 @@ def _force_session_idle() -> None:
 def _fresh_jog_session() -> None:
     _force_session_idle()
     _reset_trajectory_state()
+    _reset_canonical_truth_cache()
     yield
     _force_session_idle()
+    _reset_canonical_truth_cache()
+
+
+def _reset_canonical_truth_cache() -> None:
+    """2026-04-21: `handle_jog_session_start` now skips the strict
+    retry loop when `_recently_valid_canonical_truth()` is True. Tests
+    that exercise the strict path (including ones that started a
+    successful session earlier in the run) must reset the timestamp
+    so they don't accidentally hit the fast-path cache."""
+    with command_api._LAST_VALID_CANONICAL_TRUTH_LOCK:
+        command_api._LAST_VALID_CANONICAL_TRUTH_MONOTONIC = None
 
 
 def test_handle_jog_session_start_records_truth_valid_at_arm(
@@ -339,6 +351,93 @@ def test_handle_jog_session_start_retries_and_succeeds_on_later_attempt(
     )
 
 
+def test_handle_jog_session_start_uses_fast_path_when_truth_was_recently_valid(
+    monkeypatch: pytest.MonkeyPatch, _fresh_jog_session: None
+) -> None:
+    """2026-04-21 (pass 4): the arm-time strict check was the dominant
+    user-perceived jog lag source — every click-after-release blocked
+    up to 500 ms while the drive's deceleration window transiently
+    tripped the roundtrip / shaft-frame gates. The fast-path skips
+    the retry loop entirely when canonical truth has been stamped
+    valid within `_JOG_ARM_RECENT_TRUTH_WINDOW_S`. This test pins
+    that behaviour so a future refactor doesn't silently reintroduce
+    the lag regression."""
+    # Pretend the jog thread just stamped a valid truth reading.
+    command_api._note_valid_canonical_truth()
+
+    call_count = {"value": 0}
+
+    def _raising_strict_read(verbose: bool = False):
+        call_count["value"] += 1
+        raise RuntimeError(
+            "Canonical joint truth unavailable (drive still settling)"
+        )
+
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        _raising_strict_read,
+    )
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: None)
+    monkeypatch.setattr(command_api, "_ensure_jog_thread_running", lambda: None)
+
+    snapshot = command_api.handle_jog_session_start(
+        {"owner_id": "test-ui", "seq": 0, "deadman": True}
+    )
+
+    # Fast path must not call the strict read AT ALL.
+    assert call_count["value"] == 0, (
+        f"Fast-path was supposed to skip the strict read; it ran "
+        f"{call_count['value']} times."
+    )
+    assert snapshot.get("truth_valid_at_arm") is True
+
+
+def test_handle_jog_session_start_fast_path_expires_after_window(
+    monkeypatch: pytest.MonkeyPatch, _fresh_jog_session: None
+) -> None:
+    """If the recent-valid-truth timestamp is older than the window,
+    the fast-path must NOT trigger and the strict retry loop runs
+    normally. This keeps the safety intent of the original Phase 3
+    check for first-boot / post-power-cycle jogs where canonical
+    truth has not been observed valid recently."""
+    # Stamp a "very old" valid-truth moment by setting the timestamp
+    # far enough in the past to exceed the window.
+    import time as _t
+
+    with command_api._LAST_VALID_CANONICAL_TRUTH_LOCK:
+        command_api._LAST_VALID_CANONICAL_TRUTH_MONOTONIC = (
+            _t.monotonic() - command_api._JOG_ARM_RECENT_TRUTH_WINDOW_S - 1.0
+        )
+
+    # Short retry budget for test speed.
+    monkeypatch.setattr(command_api, "_JOG_ARM_TRUTH_RETRY_BUDGET_S", 0.05)
+    monkeypatch.setattr(command_api, "_JOG_ARM_TRUTH_RETRY_INTERVAL_S", 0.005)
+
+    call_count = {"value": 0}
+
+    def _succeeding_strict_read(verbose: bool = False):
+        call_count["value"] += 1
+        return [0.0] * 6
+
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        _succeeding_strict_read,
+    )
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: None)
+    monkeypatch.setattr(command_api, "_ensure_jog_thread_running", lambda: None)
+
+    snapshot = command_api.handle_jog_session_start(
+        {"owner_id": "test-ui", "seq": 0, "deadman": True}
+    )
+
+    # Stale timestamp MUST force the strict path; at least one
+    # get_current_arm_state_rad call must have run.
+    assert call_count["value"] >= 1
+    assert snapshot.get("truth_valid_at_arm") is True
+
+
 def test_handle_jog_session_start_propagates_non_runtime_exceptions_unchanged(
     monkeypatch: pytest.MonkeyPatch, _fresh_jog_session: None
 ) -> None:
@@ -392,26 +491,41 @@ def test_jog_thread_source_contains_session_inactive_race_guard() -> None:
     # The four known raise-prone callsites must each be wrapped with
     # _safe_session_call. If any of these moves or is renamed, this
     # assert surfaces the gap immediately.
+    import re
+
     for callsite in (
         "_JOG_SESSION_MANAGER.update_following_error",
         "_JOG_SESSION_MANAGER.resync_command_state",
         "_JOG_SESSION_MANAGER.record_gate_failure",
     ):
-        # Each of these names should appear INSIDE a _safe_session_call
-        # invocation, never as a bare call that could raise on a race.
-        bare_pattern = f"            {callsite}("
-        wrapped_pattern = f"_safe_session_call(\n                {callsite}"
-        wrapped_pattern_short = f"_safe_session_call(\n                    {callsite}"
-        assert (
-            wrapped_pattern in source or wrapped_pattern_short in source
-        ), (
+        # Each of these names must appear INSIDE a `_safe_session_call`
+        # invocation (any indentation depth), never as a bare call that
+        # could raise on a stop-race. The regex below tolerates
+        # arbitrary whitespace between `_safe_session_call(` and the
+        # method reference so the test keeps passing across reorderings
+        # and indentation changes.
+        wrapped_re = re.compile(
+            r"_safe_session_call\s*\(\s*" + re.escape(callsite)
+        )
+        bare_re = re.compile(
+            r"^\s+" + re.escape(callsite) + r"\s*\(",
+            re.MULTILINE,
+        )
+        assert wrapped_re.search(source), (
             f"Expected {callsite} to be wrapped in _safe_session_call — "
             f"a bare call can crash the thread on a stop-race."
         )
-        assert bare_pattern not in source, (
-            f"Found bare {callsite} call in jog thread — MUST be "
-            f"wrapped in _safe_session_call to absorb SESSION_INACTIVE."
-        )
+        for m in bare_re.finditer(source):
+            # A bare match is only suspicious when it isn't the FIRST
+            # arg of a `_safe_session_call` wrapper directly above it.
+            preceding = source[max(0, m.start() - 60) : m.start()]
+            if "_safe_session_call" in preceding:
+                continue
+            raise AssertionError(
+                f"Found bare {callsite} call in jog thread at offset "
+                f"{m.start()} — MUST be wrapped in _safe_session_call "
+                f"to absorb SESSION_INACTIVE."
+            )
 
 
 def test_try_except_is_present_at_jog_loop_call_sites() -> None:

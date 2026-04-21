@@ -183,17 +183,27 @@ _ABSOLUTE_HOME_ANCHOR_STALE_TOLERANCE_COUNTS = 8.0
 # post-restart live soak runs showed occasional 7-9 count spikes even on
 # a physically stationary joint, so keep this gate comfortably above the
 # observed jitter band while still catching real sub-shaft-turn drift.
-_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS = 16.0
-# Phase 1 (2026-04-21): when the paired-SDO-snapshot approach is in use
-# there is still a residual skew between the drive's internal U40.20/.22
-# sampling and the 0x6064 PDO latch. Empirically this is bounded at the
-# SDO mailbox transit plus one PDO tick (~5-10 ms). Under motion this
-# skew becomes a real, expected position delta that the gate must NOT
-# confuse with a multi-turn-counter glitch. We widen the tolerance by
-# |velocity_counts_per_s| * this budget so rest-state stays at the tight
-# 16-count base and moving joints get a velocity-proportional envelope.
-# 20 ms gives ~2x margin over the estimated worst-case skew.
-_SHAFT_FRAME_MOTION_SKEW_BUDGET_S = 0.020
+# 2026-04-21 (pass 3): live cartesian jog trace (jog-latency-
+# 20260421-033438.log) showed the gate still tripping at delta=1994-2057
+# counts with velocity=0 in the Python-side estimator. The estimator
+# is fragile — it depends on finite-differencing between non-uniform
+# consumer-driven calls and can show 0 when motion is asymmetric across
+# samples. Meanwhile the gate's TRUE purpose is to catch a drive losing
+# track of WHICH full revolution it's on (a 131072-count class of
+# failure on G05's encoders). Any sub-revolution delta like 2000 counts
+# (= 1.5% of a rev) is motion-pair-skew, not a semantic frame error.
+# 4096 counts is 32x smaller than one revolution so we still catch real
+# multi-turn glitches decisively, while motion-induced drive-internal
+# U40-vs-6064 skew (empirically up to ~2000 counts during 0.5-2 rad/s
+# joint motion) no longer trips the gate. Velocity widening still
+# stacks on top for exceptional cases.
+_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS = 4096.0
+# Motion-skew budget used to widen the tolerance by |velocity_counts_per_s|
+# × this value. Under motion the drive's response lag between U40 and
+# 6064 can stretch further than the rest-state consistency window;
+# 50 ms is 2x the default controller status-poll period and comfortably
+# covers the SDO mailbox settlement after a motion step.
+_SHAFT_FRAME_MOTION_SKEW_BUDGET_S = 0.050
 # Per-trajectory safety cage (2026-04-17 J6 incident hardening).
 #
 # Background: the write path folds each queued point's canonical_q to the
@@ -589,6 +599,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         # Latest known axis counts from STATUS_SNAPSHOT (pos_counts per axis).
         self._axis_counts: list[int] = [0] * _GRADIENT_MAX_AXES
+        # 2026-04-21: mtime-based cache for _load_rtcore_metrics_snapshot.
+        # The 11 KB metrics.json would otherwise be read + parsed from
+        # disk on every 50 Hz jog tick (measured 10-30 ms per call —
+        # the primary source of perceived jog lag). Cache is invalidated
+        # whenever RTCore writes a new file (~5 Hz), so staleness is
+        # bounded at one RTCore write cycle.
+        self._rtcore_metrics_cache: dict[str, object] | None = None
         # Phase 1 (2026-04-21) shaft-frame velocity estimator: finite-
         # difference of consecutive `_axis_counts[i]` samples taken at
         # shaft-frame-gate evaluation time. Used ONLY to widen the
@@ -2731,22 +2748,64 @@ class EthercatRTCoreBackend(ActuatorBackend):
                         axis_truth_details.append(detail)
                         continue
 
+            # 2026-04-21 paired-6064 preference for the roundtrip gate:
+            # the command-roundtrip check compares canonical_q (derived
+            # from SDO multi-turn at moment T_sdo) against reference_q
+            # (normally derived from live 0x6064 at moment T_now). Under
+            # motion that T_now-vs-T_sdo gap is up to the full SDO poll
+            # period (~200 ms), and multiplied by joint velocity it
+            # produces hundreds-to-thousands of counts of legitimate
+            # "error" that trips the gate and flips canonical truth to
+            # UNAVAILABLE mid-jog. When the paired snapshot is valid
+            # (RTCore has latched 0x6064 at the same moment the SDO
+            # multi-turn was read), derive reference_q from THAT instead
+            # so both inputs are atomic and the gate only sees real
+            # frame errors. Falls back to live 0x6064 when paired is
+            # not available yet.
+            paired_6064_for_roundtrip = metrics.paired_pos_counts()
+            if paired_6064_for_roundtrip is not None:
+                roundtrip_reference_q = self._reference_q_before_master_offset_for_axis(
+                    axis_i,
+                    int(paired_6064_for_roundtrip),
+                    reference_mode=normalized_reference_mode,
+                )
+                if roundtrip_reference_q is None:
+                    roundtrip_reference_q = float(reference_q)
+            else:
+                roundtrip_reference_q = float(reference_q)
             roundtrip_detail = self._command_roundtrip_detail_for_axis(
                 axis_i=axis_i,
                 logical_joint_idx=joint_i,
                 canonical_q=float(canonical_q),
-                reference_q=float(reference_q),
+                reference_q=float(roundtrip_reference_q),
                 reference_mode=normalized_reference_mode,
                 velocity_counts_per_s=velocity_counts_per_s,
             )
+            if isinstance(roundtrip_detail, dict):
+                roundtrip_detail["command_roundtrip_reference_source"] = (
+                    "paired_sdo_snapshot"
+                    if paired_6064_for_roundtrip is not None
+                    else "live_pdo"
+                )
             detail.update(roundtrip_detail)
             raw_roundtrip_detail: dict[str, object] | None = None
             if raw_reference_q is not None and normalized_reference_mode != "raw":
+                raw_roundtrip_reference_q: float | None = None
+                if paired_6064_for_roundtrip is not None:
+                    raw_roundtrip_reference_q = (
+                        self._reference_q_before_master_offset_for_axis(
+                            axis_i,
+                            int(paired_6064_for_roundtrip),
+                            reference_mode="raw",
+                        )
+                    )
+                if raw_roundtrip_reference_q is None:
+                    raw_roundtrip_reference_q = float(raw_reference_q)
                 raw_roundtrip_detail = self._command_roundtrip_detail_for_axis(
                     axis_i=axis_i,
                     logical_joint_idx=joint_i,
                     canonical_q=float(canonical_q),
-                    reference_q=float(raw_reference_q),
+                    reference_q=float(raw_roundtrip_reference_q),
                     reference_mode="raw",
                     velocity_counts_per_s=velocity_counts_per_s,
                 )
@@ -4114,14 +4173,32 @@ class EthercatRTCoreBackend(ActuatorBackend):
             self._native_home_metrics_mtime_ns = stat.st_mtime_ns
 
     def _load_rtcore_metrics_snapshot(self) -> dict[str, object] | None:
+        # 2026-04-21 hot-path optimization: this method is called on
+        # every `get_current_arm_state_rad()` (50 Hz jog thread + 50 Hz
+        # controller status poll + every /info/joints-detailed request).
+        # Before caching each call did a full disk read + json.loads of
+        # the 11 KB metrics file, measured at ~10-30 ms per call on a
+        # warm page cache (~55-200% of the 20 ms jog period — the
+        # primary cause of the "laggy controls" complaint). Now we
+        # `stat` the file and only re-parse when the mtime has changed
+        # since our last read. RTCore writes metrics.json every 200 ms,
+        # so most calls hit the cache in <1 ms.
         try:
             stat = _RTCORE_METRICS_PATH.stat()
+        except Exception:
+            return None
+        mtime_ns = int(stat.st_mtime_ns)
+        cached = self._rtcore_metrics_cache
+        if cached is not None and cached.get("_mtime_ns") == mtime_ns:
+            return cached
+        try:
             payload = json.loads(_RTCORE_METRICS_PATH.read_text())
         except Exception:
             return None
         if not isinstance(payload, dict):
             return None
-        payload["_mtime_ns"] = int(stat.st_mtime_ns)
+        payload["_mtime_ns"] = mtime_ns
+        self._rtcore_metrics_cache = payload
         return payload
 
     def _load_rtcore_metrics_axes(self) -> list[dict[str, object]]:

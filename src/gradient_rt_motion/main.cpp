@@ -4954,10 +4954,44 @@ int main(int argc, char** argv) {
 
       for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
         AbsoluteFeedbackAxis axis_feedback{};
+        // 2026-04-21 (pass 2): latch paired_pos_counts AS CLOSE IN TIME
+        // AS POSSIBLE to the multi-turn U40.20/U40.22 reads, not after
+        // all 8 fields are polled. SDO uploads take ~5-20 ms each, so
+        // polling 8 fields sequentially spans ~40-160 ms. If we latch
+        // 6064 only at the END of that window, the paired value lags
+        // U40.20/U40.22 by ~100 ms under motion — at 0.1 rad/s that's
+        // ~1000 counts of skew and the shaft-frame gate trips. Instead
+        // we latch once just BEFORE the U40.20/U40.22 read (best case
+        // skew ~1-2 ms) whenever the field config includes multi-turn
+        // entries. Fallback: if neither multi-turn subindex is present
+        // in the config, latch at end-of-loop as before (skew is then
+        // bounded only by the full field-list duration).
+        bool paired_latched = false;
+        auto latch_paired = [&]() {
+          if (paired_latched) return;
+          axis_feedback.paired_pos_counts = latest_feedback.pos_counts[i];
+          axis_feedback.paired_valid = 1;
+          axis_feedback.paired_sample_time_ns = now_monotonic_ns();
+          paired_latched = true;
+        };
         for (uint32_t field_i = 0; field_i < absolute_feedback_cfg.field_count; ++field_i) {
           const auto& field_cfg = absolute_feedback_cfg.fields[field_i];
           if (!field_cfg.valid || !field_cfg.object.valid) {
             continue;
+          }
+          // Latch the paired 6064 snapshot just before the FIRST
+          // multi-turn subindex read (U40.20 / U40.22 / U40.2B / U40.2D
+          // on the A6-EC). This puts paired_pos_counts within ~1-2 ms
+          // of the multi-turn value Python will consume for the shaft-
+          // frame gate.
+          const bool is_multi_turn_field = (
+              field_cfg.object.index == 0x2040 &&
+              (field_cfg.object.subindex == 0x21 ||
+               field_cfg.object.subindex == 0x23 ||
+               field_cfg.object.subindex == 0x2B ||
+               field_cfg.object.subindex == 0x2D));
+          if (is_multi_turn_field) {
+            latch_paired();
           }
           (void)read_absolute_feedback_field_axis(
               i,
@@ -4966,15 +5000,12 @@ int main(int argc, char** argv) {
               field_cfg.object.type,
               &axis_feedback.fields[field_i]);
         }
-        // Phase 1 (2026-04-21): latch live 0x6064 at the moment the
-        // SDO uploads for this axis have just completed. This is the
-        // atomic-paired-snapshot that lets Python's shaft-frame gate
-        // compare two values from the SAME instant (bounded by the
-        // mailbox transit, ~1-5 ms) instead of the stale 200 ms poll
-        // skew that drove the canonical-truth flicker under motion.
-        axis_feedback.paired_pos_counts = latest_feedback.pos_counts[i];
-        axis_feedback.paired_valid = 1;
-        axis_feedback.paired_sample_time_ns = now_monotonic_ns();
+        // Fallback latch: if the field config does not include any
+        // multi-turn subindex, still publish a paired snapshot at the
+        // end of the loop so downstream Python can detect "paired is
+        // valid" even though it carries the full-loop skew. This keeps
+        // the rest-state behavior identical to the original design.
+        latch_paired();
         latest_feedback.absolute_feedback[i] = axis_feedback;
       }
 #else
