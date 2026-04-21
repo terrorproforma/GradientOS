@@ -27,15 +27,64 @@ ETHERCAT_DRIVE_CATALOG: dict[str, dict[str, Any]] = {
                 {"semantic": "max_profile_vel", "index": 0x607F, "subindex": 0x00, "bits": 32},
             ],
             "tx_pdo_layout": [
+                # Phase 1 final layout (2026-04-21): 6 entries / 17 bytes.
+                #
+                # The path to atomic multi-turn via TxPDO is blocked by
+                # A6-EC firmware: although the ESI declares the 0x2040
+                # subitems as `<PdoMapping>t</PdoMapping>`, the drive
+                # ACCEPTS the PDO assignment (0x1B02 shows 18 entries in
+                # `ethercat pdos`) but REFUSES to populate the U40.20/
+                # U40.22 bytes cyclically — SDO reads correctly return
+                # the multi-turn value while the PDO bytes stay at 0.
+                # Verified live 2026-04-21 with an 8-entry / 23 B custom
+                # mapping: statusword transmitted at 0x1650, multi-turn
+                # bytes at 0x00000000.
+                #
+                # The Phase 1 goal (eliminate the 200 ms shaft-frame
+                # skew flicker) is now delivered by a different path:
+                # RTCore atomically latches `axis_pos_counts[i]` at the
+                # moment of the SDO upload of U40.20/U40.22 into the
+                # `paired_pos_counts` field of `AbsoluteFeedbackAxis`.
+                # The canonical-truth shaft-frame gate compares two
+                # values from the SAME moment (see `perform_absolute_
+                # feedback_refresh` in main.cpp), bounded by the
+                # mailbox transit (~1-5 ms) instead of the 200 ms poll
+                # period.
+                #
+                # The touch-probe TxPDO feedback entries
+                # (tp_status/tp_pos1/tp_pos2 at 0x60B9/0x60BA/0x60BC)
+                # stay removed because RTCore declared but never read
+                # them — dead weight that only taxed SM3 capacity.
                 {"semantic": "err", "index": 0x603F, "subindex": 0x00, "bits": 16},
                 {"semantic": "sw", "index": 0x6041, "subindex": 0x00, "bits": 16},
                 {"semantic": "pos", "index": 0x6064, "subindex": 0x00, "bits": 32},
                 {"semantic": "torque", "index": 0x6077, "subindex": 0x00, "bits": 16},
                 {"semantic": "mode_disp", "index": 0x6061, "subindex": 0x00, "bits": 8},
-                {"semantic": "tp_status", "index": 0x60B9, "subindex": 0x00, "bits": 16},
-                {"semantic": "tp_pos1", "index": 0x60BA, "subindex": 0x00, "bits": 32},
-                {"semantic": "tp_pos2", "index": 0x60BC, "subindex": 0x00, "bits": 32},
                 {"semantic": "di", "index": 0x60FD, "subindex": 0x00, "bits": 32},
+                # Symptom: the A6-EC drive's SM3 sync manager is sized
+                # for the original ~25-byte TxPDO. Appending the 9
+                # extended entries (22 more bytes) made the TxPDO too
+                # large; `ethercat pdos` listed all 17 accepted
+                # declarations but the live domain buffer transmitted
+                # 0x0000 for every TxPDO byte. SDO upload of 0x6041
+                # returned the correct 0x1650 in parallel, so the drive
+                # itself was fine but the cyclic frame was blown.
+                #
+                # Atomic multi-turn and extended telemetry need to land
+                # via a different mechanism: either a second TxPDO slot
+                # (e.g. map `multi_turn_lo/hi` into a spare 0x1A0X /
+                # 0x1B0X slot that SM3 can still fit) or bump SM3 size
+                # via an explicit 0x1C13 re-assign. Tracked as a
+                # follow-up under the canonical-truth stability
+                # workstream; Phase 0 and Phase 3 arm-time strict check
+                # still work without extended PDO (they fall back to the
+                # SDO 5 Hz poll for multi-turn).
+                #
+                # Re-introducing entries here MUST be preceded by a live
+                # check that `cat /run/gradient-rt-motion/metrics.json`
+                # reports non-zero statusword on every axis at bus
+                # power-up, and `ethercat data` shows real bytes in the
+                # TxPDO region of each axis stride.
             ],
         },
         "startup_defaults": {

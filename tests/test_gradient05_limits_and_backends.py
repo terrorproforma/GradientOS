@@ -264,6 +264,86 @@ def test_ethercat_axis_mapping_defaults_to_direct_order(monkeypatch):
     assert backend._resolve_axis_to_joint_map(num_axes=2, num_joints=6) == [0, 1]
 
 
+def test_tx_pdo_layout_fits_a6ec_sm3_capacity_and_preserves_classic_entries():
+    """Phase 1 (2026-04-20 post-revert) regression. On 2026-04-20 bring-up
+    the A6-EC drives accepted our 18-entry extended TxPDO mapping via
+    SDO but could not transmit the 47-byte frame; `ethercat data`
+    showed zeros across every TxPDO byte while the exact same SDO
+    upload returned the correct statusword. The extended entries
+    have been removed until we can land them via a second TxPDO slot
+    or an explicit 0x1C13 sync-manager re-assign. This test pins
+    both halves of the invariant: the classic 9 entries must stay,
+    and the total layout must fit the observed SM3 capacity (~28
+    bytes) so nobody accidentally re-blanks the frame."""
+    from gradient_os.arm_controller.ethercat_drive_catalog import ETHERCAT_DRIVE_CATALOG
+
+    layout = ETHERCAT_DRIVE_CATALOG["a6ec_ds402"]["rtcore"]["tx_pdo_layout"]
+    by_semantic = {entry["semantic"]: entry for entry in layout}
+    # Phase 1 final (2026-04-21): after two live probes (47 B and 33 B
+    # both silently blanked the A6-EC TxPDO frame), characterising the
+    # drive revealed the real issue isn't SM3 capacity per se — it's
+    # that U40.20/U40.22 are declared PDO-mappable in the ESI but the
+    # firmware does NOT actually populate the bytes cyclically. The
+    # drive accepts the PDO assignment but sends zeros for those
+    # subitems while 0x6064 in the same frame populates correctly.
+    #
+    # Phase 1 now delivers atomic multi-turn via a different path:
+    # RTCore latches 0x6064 at the moment of the SDO absolute-feedback
+    # upload and publishes it as `paired_pos_counts` inside the
+    # absolute_feedback JSON payload. The Python shaft-frame gate
+    # reads that paired value instead of live-now 0x6064, so the two
+    # values it compares come from the same moment (bounded at
+    # mailbox transit ~1-5 ms) instead of the 200 ms SDO-poll skew.
+    #
+    # The TxPDO stays at 6 essential entries (17 bytes): err, sw, pos,
+    # torque, mode_disp, di. Touch-probe feedback entries (tp_status/
+    # tp_pos1/tp_pos2) were dropped because RTCore never read them
+    # from process data — only `tp_func` on the RxPDO side is
+    # exercised and it stays in place.
+    required_entries = {
+        ("err", 0x603F, 0x00, 16),
+        ("sw", 0x6041, 0x00, 16),
+        ("pos", 0x6064, 0x00, 32),
+        ("torque", 0x6077, 0x00, 16),
+        ("mode_disp", 0x6061, 0x00, 8),
+        ("di", 0x60FD, 0x00, 32),
+    }
+    for semantic, index, subindex, bits in required_entries:
+        entry = by_semantic.get(semantic)
+        assert entry is not None, f"missing tx_pdo entry: {semantic}"
+        assert int(entry["index"]) == index, f"wrong index for {semantic}"
+        assert int(entry["subindex"]) == subindex, f"wrong subindex for {semantic}"
+        assert int(entry["bits"]) == bits, f"wrong bits for {semantic}"
+
+    # Regression guards: entries deliberately kept OUT of the TxPDO.
+    assert "multi_turn_lo" not in by_semantic, (
+        "multi_turn_lo removed 2026-04-21 — A6-EC firmware does not "
+        "populate U40.20 in custom TxPDO despite ESI claiming it is "
+        "PDO-mappable. Canonical-truth atomicity is now delivered by "
+        "the `paired_pos_counts` snapshot in the absolute_feedback JSON."
+    )
+    assert "multi_turn_hi" not in by_semantic, "multi_turn_hi removed 2026-04-21"
+    assert "tp_status" not in by_semantic, (
+        "tp_status removed 2026-04-21 — RTCore never read it from process data"
+    )
+    assert "tp_pos1" not in by_semantic, "tp_pos1 removed 2026-04-21"
+    assert "tp_pos2" not in by_semantic, "tp_pos2 removed 2026-04-21"
+
+    # Guardrail: A6-EC live bring-up (2026-04-20 / 2026-04-21) showed
+    # the firmware silently blanks the TxPDO frame when the custom
+    # mapping pushes past the drive's tolerance. The 6-entry / 17-byte
+    # layout is the known-safe steady state; anything larger must be
+    # accompanied by live-hardware verification that `statusword`
+    # continues to read non-zero via PDO on every axis. The 28 B cap
+    # below bakes in a safety margin vs the 33 B probe that broke it.
+    total_bits = sum(int(entry["bits"]) for entry in layout)
+    assert total_bits <= 28 * 8, (
+        f"tx_pdo_layout total {total_bits} bits exceeds the A6-EC SM3 "
+        f"known-safe capacity (28 B). A 33 B mapping silently blanked "
+        f"the TxPDO frame on hardware. See 2026-04-21 scratchpad."
+    )
+
+
 def test_ethercat_axis_mapping_honors_env_override(monkeypatch):
     monkeypatch.setenv("GRADIENT_RTCORE_CONTROL_JOINTS", "3,4")
     backend = _force_legacy_truth_fallback(
@@ -1949,6 +2029,14 @@ def test_ethercat_backend_prefers_robot_defined_axis_scaling(monkeypatch, tmp_pa
 def test_ethercat_backend_zero_capture_persists_joint_offsets(monkeypatch, tmp_path):
     offsets_path = tmp_path / "joint_zero_offsets.json"
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(offsets_path))
+    # Isolate the RTCore metrics path so a live stack's metrics.json
+    # (at /run/gradient-rt-motion/metrics.json) cannot leak a non-zero
+    # `native_home_position_offset` into the zero-capture math. Without
+    # this, running pytest while the stack is up pollutes the expected
+    # `physical_q = raw / cpu` with the drive's live native-home offset.
+    monkeypatch.setattr(
+        rtcore_backend_module, "_RTCORE_METRICS_PATH", tmp_path / "metrics.json"
+    )
     backend = _force_legacy_truth_fallback(
         EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
     )
@@ -3552,6 +3640,113 @@ def test_a6ec_shaft_frame_consistency_uses_logicalized_live_reference_counts(mon
     assert detail["shaft_frame_consistent"] is True
     assert detail["shaft_frame_mod_rm_delta_counts"] == pytest.approx(0.0)
     assert detail["shaft_frame_live_reference_logical_counts"] == pytest.approx(0.0)
+
+
+def test_command_roundtrip_tolerance_widens_with_velocity(monkeypatch, tmp_path):
+    """2026-04-21 velocity-aware command-roundtrip tolerance: at rest the
+    tolerance stays at the tight 15-count base, but under motion it
+    widens proportionally to |velocity_counts_per_s| × the motion skew
+    budget so the drive's servo-loop following error (PLUS the
+    canonical_q-vs-reference_q sample-moment skew) no longer trips
+    `drive_native_command_frame_roundtrip_mismatch` on every motion
+    start. Pinning the relationship here keeps future tuning explicit
+    and prevents silently reverting the widening."""
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    _write_rtcore_metrics_snapshot(metrics_path, [{}])
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
+    backend._axis_to_joint = [0]
+    backend._rt_num_axes = 1
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+
+    # At rest the tolerance equals the tight 15-count base (plus the
+    # fixed 1e-9 rad safety pad that `_counts_tolerance_rad_for_axis`
+    # always adds so zero-counts tolerances never underflow).
+    tol_rest_rad = backend._command_roundtrip_tolerance_rad_for_axis(
+        0, velocity_counts_per_s=0.0
+    )
+    base_counts_rad = (
+        float(rtcore_backend_module._COMMAND_ROUNDTRIP_TOLERANCE_COUNTS)
+        / float(counts_per_unit)
+    ) + 1e-9
+    assert tol_rest_rad == pytest.approx(base_counts_rad, abs=1e-15)
+
+    # With a velocity estimate, widen by |v| * skew_budget (counts-frame).
+    vel_counts_per_s = 20000.0
+    skew_budget = float(rtcore_backend_module._COMMAND_ROUNDTRIP_MOTION_SKEW_BUDGET_S)
+    tol_motion_rad = backend._command_roundtrip_tolerance_rad_for_axis(
+        0, velocity_counts_per_s=vel_counts_per_s
+    )
+    expected_total_counts = (
+        float(rtcore_backend_module._COMMAND_ROUNDTRIP_TOLERANCE_COUNTS)
+        + abs(vel_counts_per_s) * skew_budget
+    )
+    expected_rad = (expected_total_counts / float(counts_per_unit)) + 1e-9
+    assert tol_motion_rad == pytest.approx(expected_rad, rel=1e-9)
+    # Widened tolerance must be DECISIVELY larger than rest tolerance —
+    # a handful of counts would just be noise. Require at least 10x.
+    assert tol_motion_rad > 10.0 * tol_rest_rad, (
+        "Motion-widened tolerance MUST be substantially larger than "
+        "rest-state tolerance, else the widening is ineffective and "
+        "jog sessions will still trip the roundtrip gate on every "
+        "acceleration."
+    )
+
+    # Sign of velocity does not matter — widening is always absolute.
+    tol_negative_vel_rad = backend._command_roundtrip_tolerance_rad_for_axis(
+        0, velocity_counts_per_s=-vel_counts_per_s
+    )
+    assert tol_negative_vel_rad == pytest.approx(tol_motion_rad, rel=1e-9)
+
+
+def test_command_roundtrip_detail_includes_velocity_field(monkeypatch, tmp_path):
+    """The velocity estimate must surface on the diagnostic detail dict
+    so operators can confirm from `/info/joints-detailed` whether the
+    widening is active during a live jog. If the field disappears,
+    debugging a future flicker regression becomes much harder."""
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    counts_per_rev = 131072
+    gear_ratio = 10.0
+    counts_per_unit = (float(counts_per_rev) * gear_ratio) / (2.0 * math.pi)
+    _write_rtcore_metrics_snapshot(metrics_path, [{}])
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
+    backend._axis_to_joint = [0]
+    backend._rt_num_axes = 1
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[counts_per_unit] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[counts_per_rev] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+
+    detail = backend._command_roundtrip_detail_for_axis(
+        axis_i=0,
+        logical_joint_idx=0,
+        canonical_q=0.0,
+        reference_q=0.0,
+        reference_mode="raw",
+        velocity_counts_per_s=12345.0,
+    )
+
+    assert "command_roundtrip_velocity_counts_per_s" in detail
+    assert detail["command_roundtrip_velocity_counts_per_s"] == pytest.approx(12345.0)
+    assert detail["command_roundtrip_consistent"] is True
 
 
 def test_ethercat_backend_enqueue_trajectory_points_keeps_controller_logical_frame_with_native_home_offset(

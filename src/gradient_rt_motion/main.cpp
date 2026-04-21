@@ -394,6 +394,23 @@ struct AbsoluteFeedbackFieldSample {
 
 struct AbsoluteFeedbackAxis {
   std::array<AbsoluteFeedbackFieldSample, kMaxAbsoluteFeedbackFields> fields{};
+  // Phase 1 (2026-04-21): the A6-EC does not cyclically populate
+  // U40.20/U40.22 in its TxPDO even though the ESI declares them
+  // PDO-mappable (vendor firmware quirk). To still give the canonical-
+  // truth shaft-frame gate an apples-to-apples comparison we latch
+  // `axis_pos_counts[i]` (the live 0x6064 from the cyclic TxPDO)
+  // immediately after each per-axis SDO upload completes and
+  // publish it as the "paired" reference. The gate then compares the
+  // SDO-sourced multi-turn against this 6064 snapshot (bounded at
+  // the mailbox transit, typically 1-5 ms) instead of a 200 ms-skewed
+  // live-now 6064.
+  //
+  // `paired_valid = 0` means the pairing has not yet been established
+  // (e.g., before the first SDO poll completes or when the SDO poll is
+  // disabled). Python consumers fall back to live-now 6064 in that case.
+  uint8_t paired_valid = 0;
+  int32_t paired_pos_counts = 0;
+  uint64_t paired_sample_time_ns = 0;
 };
 
 struct DrivePdoConfig {
@@ -2182,6 +2199,26 @@ int main(int argc, char** argv) {
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_al_state{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_online{};
     std::array<uint8_t, gradient::ipc::v1::GRADIENT_MAX_AXES> slave_operational{};
+
+    // Phase 1 (2026-04-20): extended A6-EC 0x2040 PDO telemetry,
+    // populated in the feedback cycle below. ext_valid_axis_mask has
+    // bit i set iff axes[i] carries a live PDO read this cycle (the
+    // underlying offset was registered by register_axis_offsets_explicit).
+    // If the extended PDO registration is missing for a given axis, the
+    // corresponding bit stays cleared and the StatusExtendedSnapshotV1
+    // emitter leaves that axis as zero so Python consumers see the axis
+    // as "not present" rather than "zero-valid".
+    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ext_position_error_counts{};
+    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ext_multi_turn_lo{};
+    std::array<int32_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ext_multi_turn_hi{};
+    std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ext_bus_voltage_raw{};
+    std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ext_load_rate_raw{};
+    std::array<int16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ext_igbt_temp_raw{};
+    std::array<int16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ext_motor_temp_raw{};
+    std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ext_drive_not_ready_bits{};
+    std::array<uint16_t, gradient::ipc::v1::GRADIENT_MAX_AXES> ext_motor_not_rotating_code{};
+    std::atomic<uint32_t> ext_valid_axis_mask{0};
+    std::atomic<uint64_t> ext_sample_time_ns{0};
   };
 
   struct LatestJogDebug {
@@ -2570,6 +2607,19 @@ int main(int argc, char** argv) {
       unsigned int tp_pos1 = kInvalidOffset;
       unsigned int tp_pos2 = kInvalidOffset;
       unsigned int di = kInvalidOffset;
+
+      // Phase 1 (2026-04-20): extended A6-EC 0x2040 PDO subitems. Left
+      // kInvalidOffset until the drive profile's tx_pdo_layout registers
+      // them; per-axis feedback reads below skip anything still invalid.
+      unsigned int ext_bus_voltage = kInvalidOffset;         // 0x2040:0x07
+      unsigned int ext_load_rate = kInvalidOffset;           // 0x2040:0x08
+      unsigned int ext_position_error = kInvalidOffset;      // 0x2040:0x11
+      unsigned int ext_multi_turn_lo = kInvalidOffset;       // 0x2040:0x21
+      unsigned int ext_multi_turn_hi = kInvalidOffset;       // 0x2040:0x23
+      unsigned int ext_igbt_temp = kInvalidOffset;           // 0x2040:0x31
+      unsigned int ext_motor_temp = kInvalidOffset;          // 0x2040:0x32
+      unsigned int ext_drive_not_ready = kInvalidOffset;     // 0x2040:0x43
+      unsigned int ext_motor_not_rotating = kInvalidOffset;  // 0x2040:0x44
     };
 
     std::array<ec_slave_config_t*, gradient::ipc::v1::GRADIENT_MAX_AXES> sc{};
@@ -2790,6 +2840,23 @@ int main(int argc, char** argv) {
              off[i].err,
              off[i].manufacturer_err,
              off[i].di);
+        // Phase 1 (2026-04-20): log the extended-PDO offsets separately
+        // so operators can tell from RTCore boot log which drives accepted
+        // the extended 0x2040 mapping. Any value of kInvalidOffset means
+        // the catalog did not request that subitem or the drive rejected
+        // its registration; Python side falls back to the SDO poll for
+        // such axes.
+        logf("EtherCAT phase=pdo_register axis=%u ext offsets pe=%u mt_lo=%u mt_hi=%u vbus=%u load=%u igbt=%u motor=%u dnr=%u mnr=%u",
+             i,
+             off[i].ext_position_error,
+             off[i].ext_multi_turn_lo,
+             off[i].ext_multi_turn_hi,
+             off[i].ext_bus_voltage,
+             off[i].ext_load_rate,
+             off[i].ext_igbt_temp,
+             off[i].ext_motor_temp,
+             off[i].ext_drive_not_ready,
+             off[i].ext_motor_not_rotating);
       }
     };
 
@@ -2849,6 +2916,34 @@ int main(int argc, char** argv) {
       }
       if (semantic == "di") {
         return &axis_offsets.di;
+      }
+      // Phase 1 (2026-04-20) extended A6-EC diagnostics PDO entries.
+      if (semantic == "bus_voltage") {
+        return &axis_offsets.ext_bus_voltage;
+      }
+      if (semantic == "load_rate") {
+        return &axis_offsets.ext_load_rate;
+      }
+      if (semantic == "position_error") {
+        return &axis_offsets.ext_position_error;
+      }
+      if (semantic == "multi_turn_lo") {
+        return &axis_offsets.ext_multi_turn_lo;
+      }
+      if (semantic == "multi_turn_hi") {
+        return &axis_offsets.ext_multi_turn_hi;
+      }
+      if (semantic == "igbt_temp") {
+        return &axis_offsets.ext_igbt_temp;
+      }
+      if (semantic == "motor_temp") {
+        return &axis_offsets.ext_motor_temp;
+      }
+      if (semantic == "drive_not_ready") {
+        return &axis_offsets.ext_drive_not_ready;
+      }
+      if (semantic == "motor_not_rotating") {
+        return &axis_offsets.ext_motor_not_rotating;
       }
       return nullptr;
     };
@@ -3955,6 +4050,63 @@ int main(int argc, char** argv) {
           // Mirror the wire-frame 0x607A we just emitted so the fast-trace
           // thread can observe the command stream at cycle rate.
           latest_feedback.target_pos_counts[i] = target_pos_out;
+
+          // Phase 1 (2026-04-20): extended A6-EC 0x2040 PDO diagnostics.
+          // Each read is guarded on a successful offset registration so
+          // drives that did not accept the extended mapping do not silently
+          // return zeros in the extended snapshot.
+          bool ext_valid_any = false;
+          if (off[i].ext_position_error != kInvalidOffset) {
+            latest_feedback.ext_position_error_counts[i] =
+                EC_READ_S32(axis_pd + off[i].ext_position_error);
+            ext_valid_any = true;
+          }
+          if (off[i].ext_multi_turn_lo != kInvalidOffset) {
+            latest_feedback.ext_multi_turn_lo[i] =
+                EC_READ_S32(axis_pd + off[i].ext_multi_turn_lo);
+            ext_valid_any = true;
+          }
+          if (off[i].ext_multi_turn_hi != kInvalidOffset) {
+            latest_feedback.ext_multi_turn_hi[i] =
+                EC_READ_S32(axis_pd + off[i].ext_multi_turn_hi);
+            ext_valid_any = true;
+          }
+          if (off[i].ext_bus_voltage != kInvalidOffset) {
+            latest_feedback.ext_bus_voltage_raw[i] =
+                EC_READ_U16(axis_pd + off[i].ext_bus_voltage);
+            ext_valid_any = true;
+          }
+          if (off[i].ext_load_rate != kInvalidOffset) {
+            latest_feedback.ext_load_rate_raw[i] =
+                EC_READ_U16(axis_pd + off[i].ext_load_rate);
+            ext_valid_any = true;
+          }
+          if (off[i].ext_igbt_temp != kInvalidOffset) {
+            latest_feedback.ext_igbt_temp_raw[i] =
+                static_cast<int16_t>(EC_READ_S16(axis_pd + off[i].ext_igbt_temp));
+            ext_valid_any = true;
+          }
+          if (off[i].ext_motor_temp != kInvalidOffset) {
+            latest_feedback.ext_motor_temp_raw[i] =
+                static_cast<int16_t>(EC_READ_S16(axis_pd + off[i].ext_motor_temp));
+            ext_valid_any = true;
+          }
+          if (off[i].ext_drive_not_ready != kInvalidOffset) {
+            latest_feedback.ext_drive_not_ready_bits[i] =
+                EC_READ_U16(axis_pd + off[i].ext_drive_not_ready);
+            ext_valid_any = true;
+          }
+          if (off[i].ext_motor_not_rotating != kInvalidOffset) {
+            latest_feedback.ext_motor_not_rotating_code[i] =
+                EC_READ_U16(axis_pd + off[i].ext_motor_not_rotating);
+            ext_valid_any = true;
+          }
+          if (ext_valid_any) {
+            const uint32_t prev_mask =
+                latest_feedback.ext_valid_axis_mask.load(std::memory_order_relaxed);
+            latest_feedback.ext_valid_axis_mask.store(
+                prev_mask | (1u << i), std::memory_order_relaxed);
+          }
         }
 
         latest_jog_debug.num_axes = opt.num_axes;
@@ -4325,6 +4477,10 @@ int main(int argc, char** argv) {
         latest_feedback.startup_reset_count = startup_reset_count;
         // Wakeup jitter relative to the requested absolute schedule.
         latest_feedback.cycle_jitter_ns = jitter_ns;
+        // Phase 1 (2026-04-20): stamp the wall-monotonic sample time for
+        // the extended PDO snapshot so Python can reason about freshness
+        // (Phase 3 uses it to decide PDO-vs-SDO fallback).
+        latest_feedback.ext_sample_time_ns.store(now_monotonic_ns(), std::memory_order_relaxed);
         static uint64_t fb_seq = 1;
         latest_feedback.seq.store(fb_seq++, std::memory_order_release);
       }
@@ -4551,6 +4707,13 @@ int main(int argc, char** argv) {
     uint32_t last_startup_reset_count = 0;
     constexpr uint64_t kStartupReadbackDelayNs = 500000000ULL; // 500ms after startup_ready
     constexpr uint64_t kAbsoluteFeedbackPollIntervalNs = 200000000ULL; // 200ms
+    // Phase 1 (2026-04-20): when the extended PDO snapshot has published
+    // a sample this recently, the SDO absolute_feedback poll is skipped.
+    // The PDO path already carries the same multi-turn data atomically
+    // with 0x6064, so the SDO mailbox cost is pure overhead in that
+    // regime. If the extended PDO mapping was rejected by the drive, the
+    // ext_sample_time_ns stays at 0 and the SDO fallback remains active.
+    constexpr uint64_t kAbsoluteFeedbackSkipWhenPdoFreshNs = 50000000ULL; // 50ms
 
     auto reset_startup_drive_config_feedback = [&](auto& feedback_store) {
       feedback_store.fill(StartupSdoFeedback{});
@@ -4772,6 +4935,21 @@ int main(int argc, char** argv) {
           now_ns - absolute_feedback_last_poll_ns < kAbsoluteFeedbackPollIntervalNs) {
         return;
       }
+      // Phase 1 (2026-04-20): skip the SDO poll entirely when the
+      // extended PDO snapshot already carries fresh multi-turn samples.
+      // Saves mailbox bandwidth for other service SDO traffic (startup
+      // config readback, native home config). If the PDO timestamp is
+      // 0 (never sampled) or older than the threshold, fall through to
+      // the SDO upload so the fallback stays live.
+      const uint64_t ext_sample_ns =
+          latest_feedback.ext_sample_time_ns.load(std::memory_order_relaxed);
+      const uint32_t ext_valid_mask =
+          latest_feedback.ext_valid_axis_mask.load(std::memory_order_relaxed);
+      if (ext_sample_ns != 0 && ext_valid_mask != 0 &&
+          now_ns - ext_sample_ns < kAbsoluteFeedbackSkipWhenPdoFreshNs) {
+        absolute_feedback_last_poll_ns = now_ns;
+        return;
+      }
       absolute_feedback_last_poll_ns = now_ns;
 
       for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
@@ -4788,6 +4966,15 @@ int main(int argc, char** argv) {
               field_cfg.object.type,
               &axis_feedback.fields[field_i]);
         }
+        // Phase 1 (2026-04-21): latch live 0x6064 at the moment the
+        // SDO uploads for this axis have just completed. This is the
+        // atomic-paired-snapshot that lets Python's shaft-frame gate
+        // compare two values from the SAME instant (bounded by the
+        // mailbox transit, ~1-5 ms) instead of the stale 200 ms poll
+        // skew that drove the canonical-truth flicker under motion.
+        axis_feedback.paired_pos_counts = latest_feedback.pos_counts[i];
+        axis_feedback.paired_valid = 1;
+        axis_feedback.paired_sample_time_ns = now_monotonic_ns();
         latest_feedback.absolute_feedback[i] = axis_feedback;
       }
 #else
@@ -5000,6 +5187,22 @@ int main(int argc, char** argv) {
           oss << "\"value\":" << field.value;
           oss << "}";
         }
+        // Phase 1 (2026-04-21) atomic-paired 0x6064 snapshot: the live
+        // position counts as they read AT THE MOMENT the SDO uploads
+        // above completed. Python's canonical-truth shaft-frame gate
+        // reads `paired_pos_counts` instead of the live-now 6064 to
+        // avoid the 200 ms poll-skew flicker during motion.
+        if (!first) {
+          oss << ",";
+        }
+        oss << "\"paired_pos_counts\":{";
+        oss << "\"valid\":" << static_cast<unsigned int>(axis_feedback.paired_valid) << ",";
+        oss << "\"value\":" << axis_feedback.paired_pos_counts;
+        oss << "},";
+        oss << "\"paired_sample_time_ns\":{";
+        oss << "\"valid\":" << static_cast<unsigned int>(axis_feedback.paired_valid) << ",";
+        oss << "\"value\":" << axis_feedback.paired_sample_time_ns;
+        oss << "}";
         oss << "},";
       };
       auto append_startup_drive_config_json = [&](const StartupSdoConfig& descriptor,
@@ -6540,6 +6743,39 @@ int main(int argc, char** argv) {
                      &status_seq,
                      now);
           eventfd_write_one(status_eventfd);
+
+          // Phase 1 (2026-04-20): publish the extended A6-EC PDO
+          // diagnostics snapshot alongside the classic StatusSnapshotV1.
+          // valid_axis_mask tracks which axes had an extended-PDO read
+          // registered on this run; unmapped axes stay at zeroed defaults
+          // so Python consumers can treat them as "not present" rather
+          // than "zero-valid".
+          if (fb_seq != 0) {
+            gradient::ipc::v1::StatusExtendedSnapshotV1 ext_snap{};
+            ext_snap.num_axes = opt.num_axes;
+            ext_snap.valid_axis_mask =
+                latest_feedback.ext_valid_axis_mask.load(std::memory_order_relaxed);
+            ext_snap.sample_time_ns =
+                latest_feedback.ext_sample_time_ns.load(std::memory_order_relaxed);
+            for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+              ext_snap.axes[i].position_error_counts = latest_feedback.ext_position_error_counts[i];
+              ext_snap.axes[i].multi_turn_lo = latest_feedback.ext_multi_turn_lo[i];
+              ext_snap.axes[i].multi_turn_hi = latest_feedback.ext_multi_turn_hi[i];
+              ext_snap.axes[i].bus_voltage_raw = latest_feedback.ext_bus_voltage_raw[i];
+              ext_snap.axes[i].load_rate_raw = latest_feedback.ext_load_rate_raw[i];
+              ext_snap.axes[i].igbt_temp_raw = latest_feedback.ext_igbt_temp_raw[i];
+              ext_snap.axes[i].motor_temp_raw = latest_feedback.ext_motor_temp_raw[i];
+              ext_snap.axes[i].drive_not_ready_bits = latest_feedback.ext_drive_not_ready_bits[i];
+              ext_snap.axes[i].motor_not_rotating_code = latest_feedback.ext_motor_not_rotating_code[i];
+            }
+            ring_write(status_ring,
+                       gradient::ipc::v1::MSG_STATUS_EXTENDED_SNAPSHOT,
+                       &ext_snap,
+                       sizeof(ext_snap),
+                       &status_seq,
+                       now);
+            eventfd_write_one(status_eventfd);
+          }
         }
 
         if (now >= next_jog_debug_ns) {

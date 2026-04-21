@@ -59,7 +59,7 @@ _MAGIC_GSHM = _fourcc("G", "S", "H", "M")
 _MAGIC_RING = _fourcc("R", "I", "N", "G")
 
 _VER_MAJOR = 1
-_VER_MINOR = 0
+_VER_MINOR = 1  # Phase 1 (2026-04-20): adds MSG_STATUS_EXTENDED_SNAPSHOT (0x0206).
 
 _ROLE_CONTROLLER = 1
 
@@ -71,6 +71,20 @@ _GRADIENT_MAX_AXES = 16
 # fresh sample, and long enough that routine feedback cycles do not
 # hammer the disk.
 _LAST_SEEN_PERSIST_INTERVAL_S = 5.0
+
+# Phase 3 (2026-04-20): freshness window for the atomic PDO multi-turn
+# branch of _absolute_axis_q_from_metrics. Samples older than this (e.g.
+# PDO stream dropped mid-session, drive rejected the extended mapping
+# at bring-up) fall back to the legacy SDO absolute-feedback poll so
+# the canonical-truth pipeline stays alive.
+_PDO_MULTI_TURN_FRESH_NS = 50_000_000  # 50 ms
+
+# Tag placed on canonical-truth diagnostic entries when the axis was
+# read from the atomic cyclic PDO multi-turn (U40.20/.22 mapped into
+# the TxPDO per Phase 1) rather than the 5 Hz SDO poll. Operators use
+# this in /info/joints-detailed to verify the shaft-frame gate is now
+# comparing atomically-sampled values instead of racing a 200 ms skew.
+_ABSOLUTE_SOURCE_PDO_MULTI_TURN = "pdo_multi_turn_atomic"
 
 # Standard profile-contract key for the drive's unambiguous multi-turn
 # encoder counter, emitted as a signed i64 in MOTOR-frame counts (i.e.,
@@ -99,6 +113,9 @@ _MSG_STATUS_SNAPSHOT = 0x0202
 _MSG_STATUS_AXIS_CONFIG = 0x0203
 _MSG_STATUS_MOTION_STATE = 0x0204
 _MSG_STATUS_JOG_DEBUG = 0x0205
+# Phase 1 (2026-04-20) ipc v1.1: extended A6-EC 0x2040 PDO diagnostics
+# published alongside the classic status snapshot.
+_MSG_STATUS_EXTENDED_SNAPSHOT = 0x0206
 
 # Command ring message types (v1)
 _MSG_CMD_ARM = 0x0101
@@ -130,6 +147,34 @@ _NATIVE_HOME_WAIT_TIMEOUT_S = 20.0
 _NATIVE_HOME_POST_SETTLE_TIMEOUT_S = 3.0
 _NATIVE_HOME_FAILED_STABILIZATION_SNAPSHOTS = 2
 _COMMAND_ROUNDTRIP_TOLERANCE_COUNTS = 15.0
+# 2026-04-21: command-roundtrip gate (canonical_q derived from SDO
+# multi-turn vs reference_q derived from live 0x6064) has the same
+# asymmetric-sample-moment problem as the shaft-frame gate, plus an
+# extra servo-loop term (the drive's position following error under
+# motion). Under motion the legitimate mismatch between these two
+# views is NOT a semantic frame error — it is purely the drive's
+# response lag. We widen the tolerance by |velocity_counts_per_s| *
+# this budget so rest-state stays at the tight base and moving axes
+# get a velocity-proportional envelope. 30 ms is intentionally
+# LARGER than the shaft-frame motion budget (20 ms) because this
+# gate also sees the servo-loop following error on top of the
+# mailbox+PDO skew.
+_COMMAND_ROUNDTRIP_MOTION_SKEW_BUDGET_S = 0.030
+# 2026-04-21 sanity cap on the velocity finite-difference estimator. A
+# real G05 jog tops out around 1-2 rad/s at the joint level, which is
+# at most ~500_000 counts/s on our highest-ratio joints. Values above
+# 5 M counts/s (~25 rad/s on J1-J3, much higher on J4-J6) cannot be
+# physical — they come from the 0x6064 cyclic wrapping across a single-
+# turn boundary between two consecutive samples (e.g., 131060 → 20 at
+# the end of a revolution). When the estimator produces such a spike,
+# both gates would be widened by absurd amounts and would accept real
+# frame errors. Above the cap we DROP the estimate and fall back to
+# the tight rest-state tolerance — this is the conservative choice
+# because a dropped widening during a genuine high-speed move will
+# cause a transient gate trip (recovered next cycle via Phase 0 safety
+# net), while accepting a wrap-artifact velocity would let real
+# semantic frame errors slip through.
+_VELOCITY_ESTIMATE_MAX_COUNTS_PER_S = 5_000_000.0
 _ABSOLUTE_HOME_ANCHOR_STALE_TOLERANCE_COUNTS = 8.0
 # Per the plan: a live 6064 disagreement with anchored canonical truth,
 # taken modulo RM, above this tolerance fails closed with the explicit
@@ -139,6 +184,16 @@ _ABSOLUTE_HOME_ANCHOR_STALE_TOLERANCE_COUNTS = 8.0
 # a physically stationary joint, so keep this gate comfortably above the
 # observed jitter band while still catching real sub-shaft-turn drift.
 _SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS = 16.0
+# Phase 1 (2026-04-21): when the paired-SDO-snapshot approach is in use
+# there is still a residual skew between the drive's internal U40.20/.22
+# sampling and the 0x6064 PDO latch. Empirically this is bounded at the
+# SDO mailbox transit plus one PDO tick (~5-10 ms). Under motion this
+# skew becomes a real, expected position delta that the gate must NOT
+# confuse with a multi-turn-counter glitch. We widen the tolerance by
+# |velocity_counts_per_s| * this budget so rest-state stays at the tight
+# 16-count base and moving joints get a velocity-proportional envelope.
+# 20 ms gives ~2x margin over the estimated worst-case skew.
+_SHAFT_FRAME_MOTION_SKEW_BUDGET_S = 0.020
 # Per-trajectory safety cage (2026-04-17 J6 incident hardening).
 #
 # Background: the write path folds each queued point's canonical_q to the
@@ -211,6 +266,27 @@ _AXIS_CONFIG_STRUCT = struct.Struct("<II16I16d16i16B16x16d")  # 424 bytes
 _STATUS_SNAPSHOT_HEADER_STRUCT = struct.Struct("<IIIIqqQ")
 _STATUS_MOTION_STATE_STRUCT = struct.Struct("<IIQIIIIIIIIQQ")  # 64 bytes
 _STATUS_JOG_DEBUG_STRUCT = struct.Struct("<12I7Q16i16i16i16i")  # 360 bytes
+
+# Phase 1 (2026-04-20) ipc v1.1. Mirrors AxisStatusExtV1 and
+# StatusExtendedSnapshotV1 in src/gradient_rt_motion/ipc_v1.hpp.
+# AxisStatusExtV1 (24 bytes per axis):
+#   i   position_error_counts
+#   i   multi_turn_lo
+#   i   multi_turn_hi
+#   H   bus_voltage_raw
+#   H   load_rate_raw
+#   h   igbt_temp_raw
+#   h   motor_temp_raw
+#   H   drive_not_ready_bits
+#   H   motor_not_rotating_code
+_AXIS_STATUS_EXT_STRUCT = struct.Struct("<iiiHHhhHH")
+assert _AXIS_STATUS_EXT_STRUCT.size == 24, _AXIS_STATUS_EXT_STRUCT.size
+# StatusExtendedSnapshotV1 header: num_axes (u32) + valid_axis_mask (u32)
+# + sample_time_ns (u64). Axes follow as GRADIENT_MAX_AXES * 24 bytes.
+_STATUS_EXTENDED_SNAPSHOT_HEADER_STRUCT = struct.Struct("<IIQ")
+assert _STATUS_EXTENDED_SNAPSHOT_HEADER_STRUCT.size == 16, (
+    _STATUS_EXTENDED_SNAPSHOT_HEADER_STRUCT.size
+)
 
 _TRAJECTORY_WAIT_SETTLE_MARGIN_S = 5.0
 _CMD_RING_WRITE_WAIT_S = 0.5
@@ -358,6 +434,23 @@ class _AbsoluteFeedbackAxisMetrics:
     def has_any_valid(self) -> bool:
         return any(field.valid for field in self.fields.values())
 
+    def paired_pos_counts(self) -> int | None:
+        """Phase 1 (2026-04-21) atomic-paired-snapshot: return the
+        live-0x6064 value RTCore latched at the moment this axis's
+        SDO absolute-feedback upload completed. Used by the canonical-
+        truth shaft-frame gate so it compares two values from the
+        same moment (bounded by mailbox transit) rather than the
+        200 ms SDO-poll skew vs a live-now PDO read.
+
+        Returns None when RTCore has not yet latched a pairing (e.g.,
+        before the first SDO poll or when absolute-feedback poll is
+        disabled) so callers can fall back to the live PDO reference.
+        """
+        entry = self.fields.get("paired_pos_counts")
+        if entry is None or not entry.valid:
+            return None
+        return int(entry.value)
+
 
 @dataclass(frozen=True)
 class RTCoreExecutionStatus:
@@ -496,6 +589,17 @@ class EthercatRTCoreBackend(ActuatorBackend):
 
         # Latest known axis counts from STATUS_SNAPSHOT (pos_counts per axis).
         self._axis_counts: list[int] = [0] * _GRADIENT_MAX_AXES
+        # Phase 1 (2026-04-21) shaft-frame velocity estimator: finite-
+        # difference of consecutive `_axis_counts[i]` samples taken at
+        # shaft-frame-gate evaluation time. Used ONLY to widen the
+        # tolerance on the consistency check when the joint is in
+        # motion, because the paired_pos_counts/SDO-U40 pair is bounded
+        # at ~5-10 ms of mailbox+PDO-tick skew and that skew × velocity
+        # produces a real motion-induced delta that is NOT a shaft-frame
+        # bug. `None`/`0` here means "no prior sample yet" → gate
+        # behaves as before (tight 16-count tolerance).
+        self._shaft_frame_prev_raw_counts: list[int | None] = [None] * _GRADIENT_MAX_AXES
+        self._shaft_frame_prev_raw_time_ns: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_torque_raw: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_statusword: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_error_code: list[int] = [0] * _GRADIENT_MAX_AXES
@@ -505,6 +609,28 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._axis_di_bits: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_fault_flags: list[int] = [0] * _GRADIENT_MAX_AXES
         self._axis_brake_state: list[int] = [0] * _GRADIENT_MAX_AXES
+        # Phase 1 (2026-04-20): extended A6-EC 0x2040 PDO diagnostics.
+        # Populated from StatusExtendedSnapshotV1 (new message type
+        # _MSG_STATUS_EXTENDED_SNAPSHOT) in the same ring-consumer loop
+        # that handles the classic snapshot. Each field stays at zero
+        # and _axis_extended_updated_ns stays at zero until the first
+        # valid extended-snapshot payload arrives for that axis, so
+        # Phase 2/3 consumers can distinguish "never seen" from
+        # "zero-valid".
+        self._axis_position_error_counts: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_multi_turn_lo: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_multi_turn_hi: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_bus_voltage_raw: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_load_rate_raw: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_igbt_temp_raw: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_motor_temp_raw: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_drive_not_ready_bits: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_motor_not_rotating_code: list[int] = [0] * _GRADIENT_MAX_AXES
+        self._axis_extended_updated_ns: list[int] = [0] * _GRADIENT_MAX_AXES
+        # Last sample_time_ns observed from the extended snapshot;
+        # Phase 3 uses it for PDO-vs-SDO freshness gating.
+        self._axis_extended_latest_sample_ns: int = 0
+        self._axis_extended_valid_mask_last: int = 0
         self._native_home_offset_counts: list[int] = [0] * _GRADIENT_MAX_AXES
         self._absolute_feedback_by_axis: list[_AbsoluteFeedbackAxisMetrics] = [
             _AbsoluteFeedbackAxisMetrics() for _ in range(_GRADIENT_MAX_AXES)
@@ -2256,6 +2382,50 @@ class EthercatRTCoreBackend(ActuatorBackend):
                             last_seen_delta_physically_possible = bool(
                                 abs(int(last_seen_delta_counts)) <= int(max_off_motor_delta_counts)
                             )
+            # 2026-04-21 velocity-aware tolerance: finite-difference
+            # consecutive live-0x6064 samples to estimate how fast this
+            # axis is moving in counts/s. Used to widen BOTH the shaft-
+            # frame gate (mod-RM multi-turn vs paired 6064) AND the
+            # command-roundtrip gate (canonical_q from SDO vs reference_q
+            # from live 0x6064) so that neither trips on motion-induced
+            # skew during normal jog. Hoisted above both gates so they
+            # share the same estimate, and computed unconditionally per
+            # axis per cycle so `_shaft_frame_prev_*` advances every
+            # tick even if a gate happens to be disabled for that axis.
+            # At rest (velocity ~0) the tolerances stay at their tight
+            # base values.
+            #
+            # Wrap-safety: when the cyclic 0x6064 reading wraps across a
+            # single-turn boundary (e.g., 131060 → 20 near the end of a
+            # revolution) the naive finite-difference yields a spike
+            # orders of magnitude larger than any physical joint velocity
+            # and WIDELY distorts the tolerances. Clamp the estimate to
+            # a physically-plausible bound so the widening stays bounded
+            # during legitimate wraps. `_VELOCITY_ESTIMATE_MAX_COUNTS_PER_S`
+            # is 5 M counts/s, which exceeds any realistic jog speed on
+            # any G05 joint by > 10x; anything above that is treated as
+            # a wrap artifact and the widening is skipped (velocity set
+            # to None so the tolerance falls back to the tight base).
+            velocity_counts_per_s: float | None = None
+            if raw is not None:
+                now_ns_for_velocity = int(time.monotonic_ns())
+                prev_raw = self._shaft_frame_prev_raw_counts[axis_i]
+                prev_ts = self._shaft_frame_prev_raw_time_ns[axis_i]
+                if (
+                    prev_raw is not None
+                    and prev_ts > 0
+                    and now_ns_for_velocity > prev_ts
+                ):
+                    dt_s = float(now_ns_for_velocity - prev_ts) * 1e-9
+                    if dt_s > 1e-4:
+                        raw_velocity = (
+                            float(int(raw) - int(prev_raw)) / float(dt_s)
+                        )
+                        if abs(raw_velocity) <= _VELOCITY_ESTIMATE_MAX_COUNTS_PER_S:
+                            velocity_counts_per_s = raw_velocity
+                self._shaft_frame_prev_raw_counts[axis_i] = int(raw)
+                self._shaft_frame_prev_raw_time_ns[axis_i] = now_ns_for_velocity
+
             persisted_home_anchor_consistent: bool | None = None
             anchor_consistency_detail: dict[str, object] | None = None
             if (
@@ -2273,13 +2443,34 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     - float(anchor_entry["home_anchor_rad"])
                     - self._master_offset_for_joint(joint_i)
                 )
+                # Phase 1 (2026-04-21) atomic-paired-snapshot: prefer
+                # the 0x6064 value RTCore latched at the moment this
+                # axis's SDO absolute-feedback upload completed over
+                # the live-now PDO read. Both `absolute_result` (SDO
+                # multi-turn) and `paired_6064` come from the SAME
+                # moment (bounded at the mailbox transit, typically
+                # 1-5 ms) so the shaft-frame mod-RM comparison stops
+                # racing the 200 ms poll-skew window that drove the
+                # canonical-truth flicker during motion. Falls back to
+                # the live PDO reference when RTCore has not yet
+                # published a pairing (first cycles after boot,
+                # absolute-feedback poll disabled) so the gate stays
+                # alive in the pre-paired window.
+                paired_6064 = metrics.paired_pos_counts()
+                shaft_frame_reference_counts = (
+                    int(paired_6064) if paired_6064 is not None else int(raw)
+                )
                 anchor_consistency_detail = self._shaft_frame_consistency_detail(
                     axis_i=axis_i,
                     canonical_q=float(trial_canonical_q),
                     logical_joint_idx=joint_i,
-                    live_reference_counts=int(raw),
+                    live_reference_counts=shaft_frame_reference_counts,
+                    velocity_counts_per_s=velocity_counts_per_s,
                 )
                 if isinstance(anchor_consistency_detail, dict):
+                    anchor_consistency_detail["shaft_frame_reference_source"] = (
+                        "paired_sdo_snapshot" if paired_6064 is not None else "live_pdo"
+                    )
                     persisted_home_anchor_consistent = bool(
                         anchor_consistency_detail.get("shaft_frame_consistent", False)
                     )
@@ -2546,6 +2737,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 canonical_q=float(canonical_q),
                 reference_q=float(reference_q),
                 reference_mode=normalized_reference_mode,
+                velocity_counts_per_s=velocity_counts_per_s,
             )
             detail.update(roundtrip_detail)
             raw_roundtrip_detail: dict[str, object] | None = None
@@ -2556,6 +2748,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     canonical_q=float(canonical_q),
                     reference_q=float(raw_reference_q),
                     reference_mode="raw",
+                    velocity_counts_per_s=velocity_counts_per_s,
                 )
                 detail.update(
                     {
@@ -3411,6 +3604,148 @@ class EthercatRTCoreBackend(ActuatorBackend):
             output_target_velocity_counts_per_s=output_target_velocity_counts_per_s,
         )
 
+    def _ingest_extended_snapshot_payload(self, payload: bytes) -> None:
+        """Parse a StatusExtendedSnapshotV1 ring entry and update per-axis state.
+
+        Phase 1 (2026-04-20): plumbing only. Phase 2 surfaces the new
+        fields via _build_joint_state_snapshot. Phase 3 consumes
+        _axis_multi_turn_lo/hi for canonical truth.
+
+        Only axes flagged in ``valid_axis_mask`` are written; untouched
+        axes keep their previous values (so a transient RT-cycle drop
+        cannot stale-zero the panel).
+        """
+        if len(payload) < _STATUS_EXTENDED_SNAPSHOT_HEADER_STRUCT.size:
+            return
+        num_axes, valid_mask, sample_time_ns = (
+            _STATUS_EXTENDED_SNAPSHOT_HEADER_STRUCT.unpack_from(payload, 0)
+        )
+        num_axes = int(num_axes)
+        valid_mask = int(valid_mask)
+        sample_time_ns = int(sample_time_ns)
+        if num_axes > _GRADIENT_MAX_AXES:
+            num_axes = _GRADIENT_MAX_AXES
+        base = _STATUS_EXTENDED_SNAPSHOT_HEADER_STRUCT.size
+        stride = _AXIS_STATUS_EXT_STRUCT.size
+        with self._status_lock:
+            self._axis_extended_latest_sample_ns = sample_time_ns
+            self._axis_extended_valid_mask_last = valid_mask
+            for axis_i in range(num_axes):
+                if not (valid_mask & (1 << axis_i)):
+                    continue
+                axis_off = base + axis_i * stride
+                if axis_off + stride > len(payload):
+                    break
+                (
+                    pe,
+                    mt_lo,
+                    mt_hi,
+                    vbus,
+                    load,
+                    igbt_t,
+                    motor_t,
+                    dnr,
+                    mnr,
+                ) = _AXIS_STATUS_EXT_STRUCT.unpack_from(payload, axis_off)
+                self._axis_position_error_counts[axis_i] = int(pe)
+                self._axis_multi_turn_lo[axis_i] = int(mt_lo)
+                self._axis_multi_turn_hi[axis_i] = int(mt_hi)
+                self._axis_bus_voltage_raw[axis_i] = int(vbus)
+                self._axis_load_rate_raw[axis_i] = int(load)
+                self._axis_igbt_temp_raw[axis_i] = int(igbt_t)
+                self._axis_motor_temp_raw[axis_i] = int(motor_t)
+                self._axis_drive_not_ready_bits[axis_i] = int(dnr)
+                self._axis_motor_not_rotating_code[axis_i] = int(mnr)
+                self._axis_extended_updated_ns[axis_i] = sample_time_ns
+
+    # --- Phase 1 scaled accessors ------------------------------------
+    #
+    # A6-EC operation-monitoring unit reference (from the manual):
+    #   0x2040:0x07 bus voltage         UINT  units=0.1 V
+    #   0x2040:0x08 average load rate   UINT  units=0.1 %
+    #   0x2040:0x31 IGBT temperature    INT   units=1 deg C
+    #   0x2040:0x32 motor temperature   INT   units=1 deg C
+    #
+    # All accessors return None when the axis has never received a
+    # valid extended snapshot so downstream consumers can distinguish
+    # "not present" (e.g. drive rejected extended PDO mapping) from
+    # "zero-valid" (drive says bus is at exactly 0.0 V).
+
+    def _axis_bus_voltage_v(self, axis_i: int) -> float | None:
+        if not (0 <= axis_i < len(self._axis_bus_voltage_raw)):
+            return None
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return float(self._axis_bus_voltage_raw[axis_i]) * 0.1
+
+    def _axis_load_rate_pct(self, axis_i: int) -> float | None:
+        if not (0 <= axis_i < len(self._axis_load_rate_raw)):
+            return None
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return float(self._axis_load_rate_raw[axis_i]) * 0.1
+
+    def _axis_igbt_temp_c(self, axis_i: int) -> int | None:
+        if not (0 <= axis_i < len(self._axis_igbt_temp_raw)):
+            return None
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_igbt_temp_raw[axis_i])
+
+    def _axis_motor_temp_c(self, axis_i: int) -> int | None:
+        if not (0 <= axis_i < len(self._axis_motor_temp_raw)):
+            return None
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_motor_temp_raw[axis_i])
+
+    def _axis_position_error_counts_or_none(self, axis_i: int) -> int | None:
+        if not (0 <= axis_i < len(self._axis_position_error_counts)):
+            return None
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_position_error_counts[axis_i])
+
+    def _axis_drive_not_ready_bits_or_none(self, axis_i: int) -> int | None:
+        if not (0 <= axis_i < len(self._axis_drive_not_ready_bits)):
+            return None
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_drive_not_ready_bits[axis_i])
+
+    def _axis_motor_not_rotating_code_or_none(self, axis_i: int) -> int | None:
+        if not (0 <= axis_i < len(self._axis_motor_not_rotating_code)):
+            return None
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_motor_not_rotating_code[axis_i])
+
+    def _axis_multi_turn_counts_from_pdo(self, axis_i: int) -> int | None:
+        """Combined signed i64 from 0x2040:0x21 (lo) + 0x2040:0x23 (hi).
+
+        Matches the existing SDO-path sign-extension semantics in
+        ``combine_signed_i64_pair`` from the a6ec_joint_motion math
+        module. The SDO path (``_absolute_feedback_metrics_for_axis``)
+        reads the same two 32-bit words and combines them identically,
+        so switching a consumer to this accessor yields the same
+        integer counts when both paths have data.
+        """
+        if not (0 <= axis_i < len(self._axis_multi_turn_lo)):
+            return None
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        lo = int(self._axis_multi_turn_lo[axis_i]) & 0xFFFFFFFF
+        hi = int(self._axis_multi_turn_hi[axis_i])
+        # sign-extended i64 from (hi << 32) | lo, matching
+        # combine_signed_i64_pair(low=lo_signed, high=hi_signed) in
+        # arm_controller.math.a6ec_joint_motion.
+        combined = (hi << 32) | lo
+        # Python ints are already arbitrary-precision signed, but the
+        # (hi << 32) | lo construction above treats `lo` as unsigned
+        # 32-bit per the mask. `hi` is already a signed Python int, so
+        # the result is the correct signed i64.
+        return combined
+
     def _build_axis_config_from_robot_config(self, robot_config: dict) -> Optional[_AxisConfig]:
         counts_per_rev = list(robot_config.get("actuator_encoder_counts_per_rev", []))
         counts_per_radian = [float(value) for value in list(robot_config.get("actuator_counts_per_radian", []))]
@@ -3842,6 +4177,20 @@ class EthercatRTCoreBackend(ActuatorBackend):
         axis_i: int,
         metrics: _AbsoluteFeedbackAxisMetrics,
     ) -> tuple[float, str, int] | None:
+        """Return (axis_q_rad, source_label, counts) for the axis's
+        multi-turn position.
+
+        Phase 3 (2026-04-20): prefer the atomic PDO multi-turn (Phase 1's
+        extended snapshot) when the sample is recent. The PDO-sourced
+        counts are sampled in the same EtherCAT cycle as ``0x6064``, so
+        the shaft-frame gate downstream no longer races the 200 ms skew
+        window that caused mid-jog flickers. Falls back to the legacy
+        SDO-polled absolute_feedback metrics when PDO data is absent
+        (drive never accepted extended mapping) or stale (PDO stream
+        dropped)."""
+        pdo_result = self._absolute_axis_q_from_pdo(axis_i)
+        if pdo_result is not None:
+            return pdo_result
         counts_and_source = self._absolute_axis_counts_from_metrics(axis_i, metrics)
         if counts_and_source is None:
             return None
@@ -3850,6 +4199,50 @@ class EthercatRTCoreBackend(ActuatorBackend):
         if axis_q is None:
             return None
         return float(axis_q), str(source), int(absolute_counts)
+
+    def _absolute_axis_q_from_pdo(self, axis_i: int) -> tuple[float, str, int] | None:
+        """Fast path reading the atomic PDO multi-turn when fresh.
+
+        Returns None when any of the following hold, which punts the
+        caller to the SDO fallback:
+
+        * The axis never received an extended snapshot
+          (``_axis_extended_updated_ns == 0``), e.g. drive rejected the
+          extended PDO mapping at bring-up.
+        * The last extended snapshot is older than
+          ``_PDO_MULTI_TURN_FRESH_NS``, e.g. RT cycle stalled or
+          intermediate processing dropped the message.
+        * The combined multi-turn value is not decodable
+          (``_axis_multi_turn_counts_from_pdo`` returns None).
+        * The axis config has not yet resolved the per-axis sign/scale.
+        """
+        try:
+            updated_ns = int(self._axis_extended_updated_ns[axis_i])
+        except (IndexError, TypeError, ValueError):
+            return None
+        if updated_ns == 0:
+            return None
+        now_ns = time.monotonic_ns()
+        # Clamp against monotonic going backwards (should be impossible
+        # but the guard keeps unit tests that monkeypatch time.monotonic_ns
+        # deterministic if they set the sample older than now_ns).
+        if now_ns - updated_ns > _PDO_MULTI_TURN_FRESH_NS:
+            return None
+        mt_counts = self._axis_multi_turn_counts_from_pdo(axis_i)
+        if mt_counts is None:
+            return None
+        axis_cfg = self._axis_config
+        if axis_cfg is None:
+            return None
+        try:
+            sign = int(axis_cfg.sign[axis_i])
+            cpu = float(axis_cfg.counts_per_unit[axis_i])
+        except (IndexError, AttributeError, TypeError, ValueError):
+            return None
+        if cpu == 0.0 or sign == 0:
+            return None
+        axis_q = float(mt_counts) / (float(sign) * cpu)
+        return axis_q, _ABSOLUTE_SOURCE_PDO_MULTI_TURN, int(mt_counts)
 
     def _absolute_home_anchor_for_joint(self, logical_joint_idx: int) -> dict[str, Any] | None:
         with self._status_lock:
@@ -4487,7 +4880,12 @@ class EthercatRTCoreBackend(ActuatorBackend):
             return 1e-9
         return (float(counts) / counts_per_unit) + 1e-9
 
-    def _command_roundtrip_tolerance_rad_for_axis(self, axis_i: int) -> float:
+    def _command_roundtrip_tolerance_rad_for_axis(
+        self,
+        axis_i: int,
+        *,
+        velocity_counts_per_s: float | None = None,
+    ) -> float:
         # Live raw/absolute reads are sequential rather than simultaneous, and the
         # A6-EC probe work established that stationary bridges can wander by several
         # counts without indicating a semantic frame shift. Post-restart live soak
@@ -4495,7 +4893,23 @@ class EthercatRTCoreBackend(ActuatorBackend):
         # while the robot remains physically stationary, so keep the command-frame
         # guard above that observed jitter band while still rejecting larger
         # mismatches.
-        return self._counts_tolerance_rad_for_axis(axis_i, _COMMAND_ROUNDTRIP_TOLERANCE_COUNTS)
+        # 2026-04-21 velocity-aware widening: under motion the drive's
+        # servo loop has a natural position-following-error that scales
+        # with velocity, PLUS the canonical_q vs reference_q pair come
+        # from different moments (SDO multi-turn vs live 0x6064). Both
+        # effects add a motion-dependent residual that the tight
+        # 15-count base tolerance mis-classifies as a frame bug and
+        # trips `drive_native_command_frame_roundtrip_mismatch`. Widen
+        # proportionally to |velocity| so rest-state stays tight.
+        base_counts = float(_COMMAND_ROUNDTRIP_TOLERANCE_COUNTS)
+        motion_widen_counts = 0.0
+        if velocity_counts_per_s is not None:
+            motion_widen_counts = abs(float(velocity_counts_per_s)) * float(
+                _COMMAND_ROUNDTRIP_MOTION_SKEW_BUDGET_S
+            )
+        return self._counts_tolerance_rad_for_axis(
+            axis_i, base_counts + motion_widen_counts
+        )
 
     def _command_roundtrip_detail_for_axis(
         self,
@@ -4505,6 +4919,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         canonical_q: float,
         reference_q: float,
         reference_mode: str = "raw",
+        velocity_counts_per_s: float | None = None,
     ) -> dict[str, object]:
         normalized_reference_mode = str(reference_mode).strip().lower()
         base_roundtrip_reference_q = self._base_command_axis_q_for_joint_value(logical_joint_idx, canonical_q)
@@ -4521,12 +4936,17 @@ class EthercatRTCoreBackend(ActuatorBackend):
         else:
             roundtrip_reference_q = float(base_roundtrip_reference_q)
         error_rad = float(roundtrip_reference_q) - float(reference_q)
-        tolerance_rad = self._command_roundtrip_tolerance_rad_for_axis(axis_i)
+        tolerance_rad = self._command_roundtrip_tolerance_rad_for_axis(
+            axis_i, velocity_counts_per_s=velocity_counts_per_s
+        )
         detail: dict[str, object] = {
             "command_roundtrip_reference_rad": float(roundtrip_reference_q),
             "command_roundtrip_reference_error_rad": float(error_rad),
             "command_roundtrip_tolerance_rad": float(tolerance_rad),
             "command_roundtrip_consistent": abs(float(error_rad)) <= float(tolerance_rad),
+            "command_roundtrip_velocity_counts_per_s": float(
+                velocity_counts_per_s or 0.0
+            ),
         }
         if normalized_reference_mode == "raw":
             period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
@@ -4556,6 +4976,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         canonical_q: float,
         logical_joint_idx: int,
         live_reference_counts: int,
+        velocity_counts_per_s: float | None = None,
     ) -> dict[str, object] | None:
         # Compute the mod-RM distance between the anchored canonical_q view
         # (expressed in 607A/6064 wire counts) and the live 6064 reading.
@@ -4589,17 +5010,27 @@ class EthercatRTCoreBackend(ActuatorBackend):
         wrap_turns = int(round(delta_counts / period))
         mod_rm_delta_counts = delta_counts - float(wrap_turns) * period
         mod_rm_delta_rad = mod_rm_delta_counts / (float(sign) * float(counts_per_unit))
+        base_tolerance_counts = float(_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS)
+        motion_widen_counts = 0.0
+        if velocity_counts_per_s is not None:
+            motion_widen_counts = abs(float(velocity_counts_per_s)) * float(
+                _SHAFT_FRAME_MOTION_SKEW_BUDGET_S
+            )
+        effective_tolerance_counts = base_tolerance_counts + motion_widen_counts
         tolerance_rad = self._counts_tolerance_rad_for_axis(
             axis_i,
-            _SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS,
+            effective_tolerance_counts,
         )
         consistent = abs(float(mod_rm_delta_rad)) <= float(tolerance_rad)
         return {
             "shaft_frame_consistent": bool(consistent),
             "shaft_frame_mod_rm_delta_counts": float(mod_rm_delta_counts),
             "shaft_frame_mod_rm_delta_rad": float(mod_rm_delta_rad),
-            "shaft_frame_tolerance_counts": float(_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS),
+            "shaft_frame_tolerance_counts": float(effective_tolerance_counts),
+            "shaft_frame_tolerance_base_counts": float(base_tolerance_counts),
+            "shaft_frame_tolerance_motion_widen_counts": float(motion_widen_counts),
             "shaft_frame_tolerance_rad": float(tolerance_rad),
+            "shaft_frame_velocity_counts_per_s": float(velocity_counts_per_s or 0.0),
             "shaft_frame_period_counts": int(period_counts),
             "shaft_frame_wrap_turns": int(wrap_turns),
             "shaft_frame_expected_reference_counts": float(expected_counts),
@@ -5676,6 +6107,19 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     parsed_state = self._parse_jog_debug_state(payload)
                     with self._status_lock:
                         self._jog_debug_status = parsed_state
+                except Exception:
+                    pass
+
+            # Phase 1 (2026-04-20): extended A6-EC PDO diagnostics. Same
+            # cadence as the classic snapshot; only the axes flagged in
+            # `valid_axis_mask` get their per-axis fields overwritten so
+            # an RT-cycle drop cannot stale-zero previously valid data.
+            if (
+                mtype == _MSG_STATUS_EXTENDED_SNAPSHOT
+                and len(payload) >= _STATUS_EXTENDED_SNAPSHOT_HEADER_STRUCT.size
+            ):
+                try:
+                    self._ingest_extended_snapshot_payload(payload)
                 except Exception:
                     pass
 

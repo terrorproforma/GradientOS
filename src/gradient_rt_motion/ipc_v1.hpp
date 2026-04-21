@@ -27,7 +27,7 @@ constexpr uint32_t kMagicGshm = fourcc('G', 'S', 'H', 'M');
 constexpr uint32_t kMagicRing = fourcc('R', 'I', 'N', 'G');
 
 constexpr uint16_t kVerMajor = 1;
-constexpr uint16_t kVerMinor = 0;
+constexpr uint16_t kVerMinor = 1;  // 2026-04-20: adds StatusExtendedSnapshotV1
 
 constexpr uint32_t kRoleController = 1;
 constexpr uint32_t kRoleObserver = 2; // reserved (future)
@@ -261,6 +261,41 @@ struct StatusJogDebugV1 {
 };
 static_assert(sizeof(StatusJogDebugV1) == 360, "StatusJogDebugV1 size must match spec");
 
+// Per-axis extended PDO telemetry, populated from 0x2040 subindices
+// every EtherCAT cycle. Introduced in ipc v1.1 (2026-04-20) to carry
+// the atomically-sampled multi-turn register and drive-native
+// diagnostics alongside the existing StatusSnapshotV1. AxisStatusV1
+// stays ABI-stable on purpose.
+//
+// All fields are RAW drive units; the Python backend applies unit
+// scaling per the A6-EC manual. See
+// docs/resources/ethercat/esi/stepperonline/A6-EC/STEPPERONLINE_A6_Servo_V0.02.xml
+// DataType DT2040 for the authoritative PDO-mappability declaration.
+struct AxisStatusExtV1 {
+  int32_t position_error_counts;    // 0x2040:0x11 (DINT, signed)
+  int32_t multi_turn_lo;            // 0x2040:0x21 (DINT, lower 32 bits of multi-turn pair)
+  int32_t multi_turn_hi;            // 0x2040:0x23 (DINT, upper 32 bits of multi-turn pair)
+  uint16_t bus_voltage_raw;         // 0x2040:0x07 (UINT, 0.1 V units per manual)
+  uint16_t load_rate_raw;           // 0x2040:0x08 (UINT, 0.1 % units per manual)
+  int16_t igbt_temp_raw;            // 0x2040:0x31 (INT, 1 deg C units)
+  int16_t motor_temp_raw;           // 0x2040:0x32 (INT, 1 deg C units)
+  uint16_t drive_not_ready_bits;    // 0x2040:0x43 (UINT, bitfield; A6-EC specific)
+  uint16_t motor_not_rotating_code; // 0x2040:0x44 (UINT, enum;     A6-EC specific)
+};
+static_assert(sizeof(AxisStatusExtV1) == 24, "AxisStatusExtV1 size must match spec");
+
+// Extended snapshot: published at the same cadence as StatusSnapshotV1.
+// valid_axis_mask has bit i set iff axes[i] was populated from live PDO
+// data this cycle (an axis drops out of the mask when PDO registration
+// never resolved its offsets or the EtherCAT master is not yet in OP).
+struct StatusExtendedSnapshotV1 {
+  uint32_t num_axes;            // <= GRADIENT_MAX_AXES
+  uint32_t valid_axis_mask;     // bit i=1 means axes[i] has live PDO data this cycle
+  uint64_t sample_time_ns;      // CLOCK_MONOTONIC at snapshot creation
+  AxisStatusExtV1 axes[GRADIENT_MAX_AXES];
+};
+static_assert(sizeof(StatusExtendedSnapshotV1) == 400, "StatusExtendedSnapshotV1 size must match spec");
+
 // ----- Command payloads -----
 
 struct CmdArmV1 {
@@ -437,6 +472,7 @@ enum : uint16_t {
   MSG_STATUS_SNAPSHOT = 0x0202,
   MSG_STATUS_MOTION_STATE = 0x0204,
   MSG_STATUS_JOG_DEBUG = 0x0205,
+  MSG_STATUS_EXTENDED_SNAPSHOT = 0x0206,  // ipc v1.1 (2026-04-20)
   MSG_STATUS_IO_SNAPSHOT = 0x0210,
   MSG_EVENT = 0x02FF,
 };

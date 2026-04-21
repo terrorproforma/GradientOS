@@ -137,6 +137,197 @@ def test_attach_monitor_joint_feedback_omits_display_when_truth_unavailable():
     assert msg["axis_absolute_feedback"] == [{"logical_joint": 1, "truth_available": False}]
 
 
+class _FakeExtendedBackend:
+    """Minimal backend stub exposing the Phase 1 extended-telemetry
+    accessors. Used by the Phase 2 regression tests below to verify
+    that ``_build_joint_state_snapshot`` enriches the per-axis entries
+    and emits the new top-level arrays."""
+
+    def __init__(self) -> None:
+        # Simulate extended telemetry received for axes 0 and 2 only;
+        # axes 1, 3, 4, 5 have never been sampled (updated_ns == 0).
+        self._axis_extended_updated_ns = [
+            1_700_000_000,  # axis 0
+            0,              # axis 1
+            1_700_000_000,  # axis 2
+            0,              # axis 3
+            0,              # axis 4
+            0,              # axis 5
+        ]
+        # Raw PDO fields populate both the enrichment path and the
+        # top-level array path.
+        self._axis_bus_voltage_raw = [4800, 0, 4810, 0, 0, 0]
+        self._axis_load_rate_raw = [235, 0, 189, 0, 0, 0]
+        self._axis_igbt_temp_raw = [42, 0, 47, 0, 0, 0]
+        self._axis_motor_temp_raw = [55, 0, 58, 0, 0, 0]
+        self._axis_position_error_counts = [12, 0, -7, 0, 0, 0]
+        self._axis_drive_not_ready_bits = [0x02, 0, 0x00, 0, 0, 0]
+        self._axis_motor_not_rotating_code = [3, 0, 0, 0, 0, 0]
+
+    def _axis_bus_voltage_v(self, axis_i: int) -> float | None:
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return float(self._axis_bus_voltage_raw[axis_i]) * 0.1
+
+    def _axis_load_rate_pct(self, axis_i: int) -> float | None:
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return float(self._axis_load_rate_raw[axis_i]) * 0.1
+
+    def _axis_igbt_temp_c(self, axis_i: int) -> int | None:
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_igbt_temp_raw[axis_i])
+
+    def _axis_motor_temp_c(self, axis_i: int) -> int | None:
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_motor_temp_raw[axis_i])
+
+    def _axis_position_error_counts_or_none(self, axis_i: int) -> int | None:
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_position_error_counts[axis_i])
+
+    def _axis_drive_not_ready_bits_or_none(self, axis_i: int) -> int | None:
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_drive_not_ready_bits[axis_i])
+
+    def _axis_motor_not_rotating_code_or_none(self, axis_i: int) -> int | None:
+        if self._axis_extended_updated_ns[axis_i] == 0:
+            return None
+        return int(self._axis_motor_not_rotating_code[axis_i])
+
+
+def test_build_joint_state_snapshot_enriches_axis_absolute_feedback_with_extended_pdo(monkeypatch):
+    """Phase 2 (2026-04-20) — ``_build_joint_state_snapshot`` must fold
+    the Phase 1 extended A6-EC 0x2040 PDO diagnostics onto each
+    ``axis_absolute_feedback`` entry. Only axes with a non-zero
+    ``_axis_extended_updated_ns`` get enriched; the rest stay minimal so
+    the UI can tell "drive rejected extended PDO mapping" apart from
+    "drive reports 0.0 V"."""
+    canonical_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    backend = _FakeExtendedBackend()
+
+    monkeypatch.setattr(
+        run_controller.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: canonical_positions,
+    )
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend", lambda: backend)
+    monkeypatch.setattr(
+        run_controller.backend_registry, "get_active_backend_name", lambda: "ethercat_rtcore"
+    )
+    monkeypatch.setattr(run_controller, "_sync_backend_raw_positions", lambda _backend: {0: 0})
+    monkeypatch.setattr(
+        run_controller,
+        "_backend_display_feedback_snapshot",
+        lambda _backend, _raw_positions: {
+            "truth_available": True,
+            "joint_positions_rad": canonical_positions,
+            "truth_unavailable_axes": [],
+            "truth_unavailable_joints": [],
+            "axis_absolute_feedback": [
+                {"axis": idx, "logical_joint": idx + 1, "truth_available": True}
+                for idx in range(6)
+            ],
+        },
+    )
+    monkeypatch.setattr(run_controller.utils, "gripper_present", False, raising=False)
+
+    snapshot = run_controller._build_joint_state_snapshot()
+
+    entries = snapshot["axis_absolute_feedback"]
+    # Axis 0: fresh sample — every extended key present with A6-EC scaling.
+    axis0 = entries[0]
+    assert axis0["bus_voltage_v"] == pytest.approx(480.0)
+    assert axis0["load_rate_pct"] == pytest.approx(23.5)
+    assert axis0["igbt_temp_c"] == 42
+    assert axis0["motor_temp_c"] == 55
+    assert axis0["position_error_counts"] == 12
+    assert axis0["drive_not_ready_bits"] == 0x02
+    # 0x02 is the "servo_off" bit in the seed skeleton — verify the text
+    # decoder runs rather than asserting the specific label (the label
+    # map is documented as a work in progress pending manual review).
+    assert isinstance(axis0["drive_not_ready_text"], str)
+    assert axis0["drive_not_ready_text"] != "ready"
+    assert axis0["motor_not_rotating_code"] == 3
+    assert isinstance(axis0["motor_not_rotating_text"], str)
+
+    # Axis 1: never sampled — no extended keys added. "truth_available"
+    # stays from the display snapshot.
+    axis1 = entries[1]
+    assert "bus_voltage_v" not in axis1
+    assert "igbt_temp_c" not in axis1
+    assert "motor_not_rotating_text" not in axis1
+
+    # Axis 2: fresh sample.
+    assert entries[2]["bus_voltage_v"] == pytest.approx(481.0)
+    assert entries[2]["drive_not_ready_text"] == "ready"  # bits=0 => ready
+    assert entries[2]["motor_not_rotating_text"] == "ok"  # code=0 => ok
+
+    # Top-level arrays: present, with None for never-sampled axes so
+    # the UI can index them directly.
+    assert snapshot["axis_bus_voltage_v"] == [
+        pytest.approx(480.0),
+        None,
+        pytest.approx(481.0),
+        None,
+        None,
+        None,
+    ]
+    assert snapshot["axis_igbt_temp_c"] == [42, None, 47, None, None, None]
+    assert snapshot["axis_motor_temp_c"] == [55, None, 58, None, None, None]
+    assert snapshot["axis_position_error_counts"] == [12, None, -7, None, None, None]
+    assert snapshot["axis_drive_not_ready_bits"] == [0x02, None, 0x00, None, None, None]
+    assert snapshot["axis_drive_not_ready_text"][0] != "ready"
+    assert snapshot["axis_drive_not_ready_text"][1] is None
+    assert snapshot["axis_drive_not_ready_text"][2] == "ready"
+    assert snapshot["axis_motor_not_rotating_code"] == [3, None, 0, None, None, None]
+    assert snapshot["axis_motor_not_rotating_text"][2] == "ok"
+
+
+def test_build_joint_state_snapshot_skips_enrichment_for_bare_backend(monkeypatch):
+    """If the active backend does not expose the Phase 1 extended
+    accessors (e.g. simulation backend), ``_build_joint_state_snapshot``
+    must NOT crash and must NOT emit any top-level extended arrays."""
+    canonical_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+    backend = object()  # no extended accessors at all
+
+    monkeypatch.setattr(
+        run_controller.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: canonical_positions,
+    )
+    monkeypatch.setattr(run_controller.backend_registry, "get_active_backend", lambda: backend)
+    monkeypatch.setattr(
+        run_controller.backend_registry, "get_active_backend_name", lambda: "simulation"
+    )
+    monkeypatch.setattr(run_controller, "_sync_backend_raw_positions", lambda _backend: {0: 0})
+    monkeypatch.setattr(
+        run_controller,
+        "_backend_display_feedback_snapshot",
+        lambda _backend, _raw_positions: {
+            "truth_available": True,
+            "joint_positions_rad": canonical_positions,
+            "truth_unavailable_axes": [],
+            "truth_unavailable_joints": [],
+            "axis_absolute_feedback": [{"axis": 0, "logical_joint": 1, "truth_available": True}],
+        },
+    )
+    monkeypatch.setattr(run_controller.utils, "gripper_present", False, raising=False)
+
+    snapshot = run_controller._build_joint_state_snapshot()
+
+    # No extended fields on any axis entry.
+    assert "bus_voltage_v" not in snapshot["axis_absolute_feedback"][0]
+    # No top-level extended arrays either.
+    assert "axis_bus_voltage_v" not in snapshot
+    assert "axis_igbt_temp_c" not in snapshot
+    assert "axis_motor_not_rotating_text" not in snapshot
+
+
 def test_build_joint_state_snapshot_uses_backend_display_feedback(monkeypatch):
     display_positions = [0.11, 0.21, 0.31, 0.41, 0.51, 0.61]
     canonical_positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]

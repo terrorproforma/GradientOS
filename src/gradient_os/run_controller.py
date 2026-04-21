@@ -95,6 +95,15 @@ _CANONICAL_TRUTH_MONITOR_STATE: dict[str, object] = {
     "read_source": None,
 }
 
+# Phase 4 (2026-04-20): collision watchdog lifecycle. The singleton
+# handle lets the controller start the watchdog whenever the live
+# ethercat_rtcore backend activates and stop it cleanly on runtime
+# re-activation or controller shutdown. None when no watchdog is
+# running (sim mode, non-RTCore backend, or the backend lacks the
+# Phase 1 extended-telemetry arrays required to feed it).
+_COLLISION_WATCHDOG: object | None = None
+_COLLISION_WATCHDOG_LOCK = threading.Lock()
+
 
 def _update_rolling_metric(metric: dict[str, object], value_ms: float) -> None:
     count = int(metric.get("count", 0)) + 1
@@ -103,6 +112,123 @@ def _update_rolling_metric(metric: dict[str, object], value_ms: float) -> None:
     metric["last_ms"] = float(value_ms)
     metric["avg_ms"] = avg_ms + ((float(value_ms) - avg_ms) / float(count))
     metric["max_ms"] = max(float(metric.get("max_ms", 0.0)), float(value_ms))
+
+
+def _stop_collision_watchdog() -> None:
+    """Phase 4 (2026-04-20): stop the running collision watchdog if any.
+
+    Safe to call multiple times and from any state (helper does nothing
+    if no watchdog has been started). Called from ``_activate_runtime``
+    before starting a fresh watchdog and from the controller shutdown
+    path."""
+    global _COLLISION_WATCHDOG
+    with _COLLISION_WATCHDOG_LOCK:
+        watchdog = _COLLISION_WATCHDOG
+        _COLLISION_WATCHDOG = None
+    if watchdog is None:
+        return
+    try:
+        watchdog.stop()
+    except Exception as exc:
+        print(f"[Collision] WARNING: watchdog stop raised: {exc}", flush=True)
+
+
+def _start_collision_watchdog(
+    *,
+    backend_instance: object | None,
+    robot_config_obj: object | None,
+    servo_backend: str,
+    sim_mode: bool,
+) -> None:
+    """Phase 4 (2026-04-20): start the collision watchdog for the live
+    ethercat_rtcore backend when the robot config exposes thresholds
+    and the backend publishes the Phase 1 extended-PDO arrays.
+
+    Falls back to a no-op when any precondition is missing; the
+    controller continues without collision detection in that case (for
+    example: sim mode, non-RTCore backend, backend missing the
+    ``_axis_extended_updated_ns`` array). No exception is raised — the
+    watchdog is a safety overlay, not a startup gate.
+    """
+    global _COLLISION_WATCHDOG
+    _stop_collision_watchdog()  # idempotent teardown of any prior instance.
+    if sim_mode or servo_backend != "ethercat_rtcore":
+        return
+    if backend_instance is None or robot_config_obj is None:
+        return
+    thresholds_getter = getattr(robot_config_obj, "collision_watchdog_thresholds", None)
+    if thresholds_getter is None:
+        return
+    try:
+        thresholds = list(thresholds_getter)
+    except TypeError:
+        try:
+            thresholds = list(thresholds_getter())
+        except Exception as exc:
+            print(
+                f"[Collision] WARNING: failed to read thresholds from robot config: {exc}",
+                flush=True,
+            )
+            return
+    except Exception as exc:
+        print(
+            f"[Collision] WARNING: failed to read thresholds from robot config: {exc}",
+            flush=True,
+        )
+        return
+    if not thresholds:
+        return
+    # Backend must expose the Phase 1 extended-PDO state arrays used by
+    # the watchdog's check_once loop. A backend without them is either
+    # simulation or pre-Phase-1 legacy; either way the watchdog would
+    # have no signal to trip on.
+    required_attrs = (
+        "_axis_torque_raw",
+        "_axis_position_error_counts",
+        "_axis_extended_updated_ns",
+    )
+    missing = [name for name in required_attrs if getattr(backend_instance, name, None) is None]
+    if missing:
+        print(
+            f"[Collision] Skipping watchdog: backend missing extended-PDO state ({missing})",
+            flush=True,
+        )
+        return
+
+    from .arm_controller.collision_watchdog import CollisionEvent, CollisionWatchdog
+
+    def _on_collision(event: CollisionEvent) -> None:
+        axis_i = int(event.axis_i)
+        print(
+            f"[Collision] DETECTED axis={axis_i} reason={event.reason} "
+            f"value={event.observed_value} threshold={event.threshold}",
+            flush=True,
+        )
+        try:
+            safe_power_down = getattr(backend_instance, "_best_effort_safe_power_down", None)
+            if callable(safe_power_down):
+                try:
+                    safe_power_down(wait_for_idle=False, timeout_s=0.5, quick_stop=True)
+                except TypeError:
+                    # Older backends may not support the quick_stop kwarg; try
+                    # without it so the watchdog still brakes motion.
+                    safe_power_down(wait_for_idle=False, timeout_s=0.5)
+        except Exception as exc:
+            print(f"[Collision] WARNING: safe power-down raised: {exc}", flush=True)
+
+    watchdog = CollisionWatchdog(
+        backend=backend_instance,
+        thresholds=thresholds,
+        on_collision=_on_collision,
+    )
+    watchdog.start()
+    with _COLLISION_WATCHDOG_LOCK:
+        _COLLISION_WATCHDOG = watchdog
+    print(
+        f"[Collision] Watchdog started "
+        f"(axes={len(thresholds)}, backend={servo_backend})",
+        flush=True,
+    )
 
 
 def _encode_controller_payload_b64(payload: dict[str, object]) -> str:
@@ -532,6 +658,75 @@ def _build_joint_state_snapshot() -> dict[str, object]:
                     snapshot["display_joint_truth_unavailable_joints"] = list(unavailable_joints)
                 axis_absolute_feedback = display_snapshot.get("axis_absolute_feedback")
                 if isinstance(axis_absolute_feedback, list):
+                    # Phase 2 (2026-04-20): enrich each per-axis entry
+                    # with the extended A6-EC 0x2040 PDO diagnostics
+                    # plumbed through Phase 1. Fields are populated only
+                    # when the backend has actually received a valid
+                    # extended snapshot for that axis so operators can
+                    # tell "drive rejected extended PDO mapping" (absent
+                    # keys) from "drive reports 0.0 V" (bus_voltage_v=0.0).
+                    # Backends that lack the extended accessors (simulation,
+                    # test fakes) are skipped silently.
+                    _bus_v_getter = getattr(backend, "_axis_bus_voltage_v", None)
+                    _load_getter = getattr(backend, "_axis_load_rate_pct", None)
+                    _igbt_getter = getattr(backend, "_axis_igbt_temp_c", None)
+                    _motor_getter = getattr(backend, "_axis_motor_temp_c", None)
+                    _pe_getter = getattr(backend, "_axis_position_error_counts_or_none", None)
+                    _dnr_getter = getattr(backend, "_axis_drive_not_ready_bits_or_none", None)
+                    _mnr_getter = getattr(backend, "_axis_motor_not_rotating_code_or_none", None)
+                    _enrichment_available = any(
+                        callable(g)
+                        for g in (
+                            _bus_v_getter,
+                            _load_getter,
+                            _igbt_getter,
+                            _motor_getter,
+                            _pe_getter,
+                            _dnr_getter,
+                            _mnr_getter,
+                        )
+                    )
+                    if _enrichment_available:
+                        for entry in axis_absolute_feedback:
+                            if not isinstance(entry, dict):
+                                continue
+                            axis_i_value = entry.get("axis")
+                            try:
+                                axis_i_int = int(axis_i_value) if axis_i_value is not None else None
+                            except (TypeError, ValueError):
+                                axis_i_int = None
+                            if axis_i_int is None:
+                                continue
+                            if callable(_bus_v_getter):
+                                bus_v = _bus_v_getter(axis_i_int)
+                                if bus_v is not None:
+                                    entry["bus_voltage_v"] = round(float(bus_v), 2)
+                            if callable(_load_getter):
+                                load = _load_getter(axis_i_int)
+                                if load is not None:
+                                    entry["load_rate_pct"] = round(float(load), 1)
+                            if callable(_igbt_getter):
+                                igbt = _igbt_getter(axis_i_int)
+                                if igbt is not None:
+                                    entry["igbt_temp_c"] = int(igbt)
+                            if callable(_motor_getter):
+                                motor_t = _motor_getter(axis_i_int)
+                                if motor_t is not None:
+                                    entry["motor_temp_c"] = int(motor_t)
+                            if callable(_pe_getter):
+                                pe = _pe_getter(axis_i_int)
+                                if pe is not None:
+                                    entry["position_error_counts"] = int(pe)
+                            if callable(_dnr_getter):
+                                dnr = _dnr_getter(axis_i_int)
+                                if dnr is not None:
+                                    entry["drive_not_ready_bits"] = int(dnr)
+                                    entry["drive_not_ready_text"] = _decode_drive_not_ready_bits(dnr)
+                            if callable(_mnr_getter):
+                                mnr = _mnr_getter(axis_i_int)
+                                if mnr is not None:
+                                    entry["motor_not_rotating_code"] = int(mnr)
+                                    entry["motor_not_rotating_text"] = _decode_motor_not_rotating_code(mnr)
                     snapshot["axis_absolute_feedback"] = axis_absolute_feedback
                     truth_reasons = sorted(
                         {
@@ -592,6 +787,65 @@ def _build_joint_state_snapshot() -> dict[str, object]:
         if isinstance(axis_brake_state, list) and axis_brake_state:
             snapshot["axis_brake_state"] = [int(value) for value in axis_brake_state[: len(axis_brake_state)]]
 
+        # Phase 2 (2026-04-20): top-level per-axis arrays for the new
+        # extended diagnostic PDO entries. Emitted as float/int/str lists
+        # (None for axes that have never received a valid extended
+        # snapshot) so the UI can index by axis without having to walk
+        # into `axis_absolute_feedback[i]`.
+        extended_updated = getattr(backend, "_axis_extended_updated_ns", None)
+        if isinstance(extended_updated, list) and extended_updated:
+            axis_extent = len(extended_updated)
+            bus_v_arr = getattr(backend, "_axis_bus_voltage_raw", None)
+            load_arr = getattr(backend, "_axis_load_rate_raw", None)
+            igbt_arr = getattr(backend, "_axis_igbt_temp_raw", None)
+            motor_t_arr = getattr(backend, "_axis_motor_temp_raw", None)
+            pe_arr = getattr(backend, "_axis_position_error_counts", None)
+            dnr_arr = getattr(backend, "_axis_drive_not_ready_bits", None)
+            mnr_arr = getattr(backend, "_axis_motor_not_rotating_code", None)
+            if isinstance(bus_v_arr, list) and len(bus_v_arr) >= axis_extent:
+                snapshot["axis_bus_voltage_v"] = [
+                    round(float(bus_v_arr[i]) * 0.1, 2) if extended_updated[i] != 0 else None
+                    for i in range(axis_extent)
+                ]
+            if isinstance(load_arr, list) and len(load_arr) >= axis_extent:
+                snapshot["axis_load_rate_pct"] = [
+                    round(float(load_arr[i]) * 0.1, 1) if extended_updated[i] != 0 else None
+                    for i in range(axis_extent)
+                ]
+            if isinstance(igbt_arr, list) and len(igbt_arr) >= axis_extent:
+                snapshot["axis_igbt_temp_c"] = [
+                    int(igbt_arr[i]) if extended_updated[i] != 0 else None
+                    for i in range(axis_extent)
+                ]
+            if isinstance(motor_t_arr, list) and len(motor_t_arr) >= axis_extent:
+                snapshot["axis_motor_temp_c"] = [
+                    int(motor_t_arr[i]) if extended_updated[i] != 0 else None
+                    for i in range(axis_extent)
+                ]
+            if isinstance(pe_arr, list) and len(pe_arr) >= axis_extent:
+                snapshot["axis_position_error_counts"] = [
+                    int(pe_arr[i]) if extended_updated[i] != 0 else None
+                    for i in range(axis_extent)
+                ]
+            if isinstance(dnr_arr, list) and len(dnr_arr) >= axis_extent:
+                snapshot["axis_drive_not_ready_bits"] = [
+                    int(dnr_arr[i]) if extended_updated[i] != 0 else None
+                    for i in range(axis_extent)
+                ]
+                snapshot["axis_drive_not_ready_text"] = [
+                    _decode_drive_not_ready_bits(dnr_arr[i]) if extended_updated[i] != 0 else None
+                    for i in range(axis_extent)
+                ]
+            if isinstance(mnr_arr, list) and len(mnr_arr) >= axis_extent:
+                snapshot["axis_motor_not_rotating_code"] = [
+                    int(mnr_arr[i]) if extended_updated[i] != 0 else None
+                    for i in range(axis_extent)
+                ]
+                snapshot["axis_motor_not_rotating_text"] = [
+                    _decode_motor_not_rotating_code(mnr_arr[i]) if extended_updated[i] != 0 else None
+                    for i in range(axis_extent)
+                ]
+
     if "canonical_joint_truth_reason" not in snapshot and truth_error:
         if "Canonical joint truth unavailable" in truth_error:
             snapshot["canonical_joint_truth_reason"] = "canonical_truth_unavailable"
@@ -630,6 +884,64 @@ def _mode_display_name(value: object) -> str:
         10: "cyclic_sync_torque",
     }
     return labels.get(mode_id, f"mode_{mode_id}")
+
+
+# Phase 2 (2026-04-20): decoders for the A6-EC extended diagnostic PDO
+# enums added in Phase 1. The maps below are OPERATOR-FACING skeletons
+# and are deliberately conservative: any bit or code not in the map is
+# surfaced as a raw hex/decimal so the UI will never silently mistranslate
+# a vendor-specific enum value. The authoritative A6-EC bit/enum
+# catalogue lives in docs/resources/a6ec_manual_codes.md; extend the
+# maps below as vendor reference is confirmed.
+_A6EC_DRIVE_NOT_READY_BIT_LABELS: dict[int, str] = {
+    # Starting seed of commonly-observed bits. Cross-reference with the
+    # manual PDF before trusting as a complete catalogue.
+    0: "main_circuit_off",
+    1: "servo_off",
+    2: "fault_present",
+    3: "limit_switch_active",
+    4: "homing_required",
+    5: "mode_not_enabled",
+    6: "safety_signal_off",
+}
+
+_A6EC_MOTOR_NOT_ROTATING_CODES: dict[int, str] = {
+    0: "ok",
+    1: "servo_disabled",
+    2: "target_equals_actual",
+    3: "position_clamped_by_limits",
+    4: "commanded_velocity_zero",
+    5: "awaiting_homing",
+    6: "torque_saturated",
+}
+
+
+def _decode_drive_not_ready_bits(bits: object) -> str:
+    """Decode a 0x2040:0x43 drive-not-ready bitfield into a comma-
+    separated human label. Unmapped bits surface as ``unknown_bits=0xNN``
+    so operators can look them up in the vendor manual."""
+    value = _coerce_int(bits, 0) & 0xFFFF
+    if value == 0:
+        return "ready"
+    labels = [
+        label
+        for bit, label in _A6EC_DRIVE_NOT_READY_BIT_LABELS.items()
+        if value & (1 << bit)
+    ]
+    if labels:
+        return ",".join(labels)
+    return f"unknown_bits=0x{value:04X}"
+
+
+def _decode_motor_not_rotating_code(code: object) -> str:
+    """Decode a 0x2040:0x44 "reason motor is not rotating" enum value
+    into a human label. Unknown codes surface verbatim so they can be
+    cross-referenced against the vendor manual."""
+    value = _coerce_int(code, 0) & 0xFFFF
+    label = _A6EC_MOTOR_NOT_ROTATING_CODES.get(value)
+    if label is not None:
+        return label
+    return f"unknown_code={value}"
 
 
 def _build_rtcore_axis_telemetry_samples(backend: object | None) -> dict[str, dict[str, object]]:
@@ -818,6 +1130,73 @@ def _build_drive_fault_snapshot(
                     }
                 if collected:
                     axis_drive_native_truth_context = collected
+
+    # Phase 2 (2026-04-20): pull the extended A6-EC 0x2040 PDO
+    # diagnostics from the backend's live state arrays so /monitor
+    # SSE and the commissioning panel both see the new fields. The
+    # scaled accessors return None for axes that have never received
+    # a valid extended snapshot; those axes are intentionally omitted
+    # from the context so the UI can show "not present" vs "0.0 V".
+    axis_extended_telemetry_context: dict[int, dict[str, object]] | None = None
+    if backend_instance is not None:
+        extended_updated = getattr(backend_instance, "_axis_extended_updated_ns", None)
+        if isinstance(extended_updated, list) and extended_updated:
+            collected_ext: dict[int, dict[str, object]] = {}
+            for axis_index in range(len(extended_updated)):
+                if int(extended_updated[axis_index]) == 0:
+                    continue
+                axis_ext: dict[str, object] = {}
+                getters = (
+                    ("bus_voltage_v", "_axis_bus_voltage_v", 2, "float"),
+                    ("load_rate_pct", "_axis_load_rate_pct", 1, "float"),
+                    ("igbt_temp_c", "_axis_igbt_temp_c", None, "int"),
+                    ("motor_temp_c", "_axis_motor_temp_c", None, "int"),
+                    (
+                        "position_error_counts",
+                        "_axis_position_error_counts_or_none",
+                        None,
+                        "int",
+                    ),
+                    (
+                        "drive_not_ready_bits",
+                        "_axis_drive_not_ready_bits_or_none",
+                        None,
+                        "int",
+                    ),
+                    (
+                        "motor_not_rotating_code",
+                        "_axis_motor_not_rotating_code_or_none",
+                        None,
+                        "int",
+                    ),
+                )
+                for key, method_name, precision, kind in getters:
+                    method = getattr(backend_instance, method_name, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        value = method(axis_index)
+                    except Exception:
+                        value = None
+                    if value is None:
+                        continue
+                    if kind == "float":
+                        axis_ext[key] = round(float(value), precision) if precision is not None else float(value)
+                    else:
+                        axis_ext[key] = int(value)
+                dnr_bits = axis_ext.get("drive_not_ready_bits")
+                if isinstance(dnr_bits, int):
+                    axis_ext["drive_not_ready_text"] = _decode_drive_not_ready_bits(dnr_bits)
+                mnr_code = axis_ext.get("motor_not_rotating_code")
+                if isinstance(mnr_code, int):
+                    axis_ext["motor_not_rotating_text"] = _decode_motor_not_rotating_code(
+                        mnr_code
+                    )
+                if axis_ext:
+                    collected_ext[axis_index] = axis_ext
+            if collected_ext:
+                axis_extended_telemetry_context = collected_ext
+
     snapshot = _build_normalized_drive_fault_snapshot(
         metrics=metrics,
         servo_backend=servo_backend,
@@ -828,6 +1207,7 @@ def _build_drive_fault_snapshot(
         axis_to_joint=axis_to_joint,
         socket_present=os.path.exists(os.path.join(os.path.dirname(_rtcore_metrics_path()), "ipc.sock")),
         axis_drive_native_truth_context=axis_drive_native_truth_context,
+        axis_extended_telemetry_context=axis_extended_telemetry_context,
     )
     snapshot["metrics_path"] = _rtcore_metrics_path()
     return snapshot
@@ -1447,6 +1827,22 @@ Examples:
         backend_ready = backend_ready_local
         servo_backend = servo_backend_local
         controller_sim_mode = target_sim_mode
+
+        # Phase 4 (2026-04-20): start the collision watchdog after the
+        # backend has been accepted as ready. Silently skipped on
+        # non-ethercat_rtcore backends, sim mode, or when the robot
+        # config does not provide thresholds. Any prior watchdog is
+        # stopped before the new one starts so runtime-mode switches
+        # (sim <-> live) hand off cleanly.
+        if backend_ready_local:
+            _start_collision_watchdog(
+                backend_instance=active_backend_local,
+                robot_config_obj=selected_robot_local,
+                servo_backend=servo_backend_local,
+                sim_mode=target_sim_mode,
+            )
+        else:
+            _stop_collision_watchdog()
 
     try:
         _activate_runtime(_build_startup_runtime_request(), reason="startup")
@@ -2918,6 +3314,14 @@ Examples:
         exit_code = 0
     finally:
         print("[Controller] Shutting down.")
+        # Phase 4 (2026-04-20): stop the collision watchdog BEFORE the
+        # backend goes away so the watchdog thread does not see
+        # half-torn-down per-axis state. Safe no-op when no watchdog
+        # was running.
+        try:
+            _stop_collision_watchdog()
+        except Exception as exc:
+            print(f"[Controller] Collision watchdog shutdown error: {exc}")
         sock.close()
         
         # Shutdown the backend instance (closes serial port, releases resources)

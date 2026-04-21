@@ -349,6 +349,19 @@ type DriveFaultAxis = {
 	native_home_verification_source?: string;
 	fault?: DriveFaultDetail | null;
 	manufacturer_fault?: DriveFaultDetail | null;
+	// Phase 2 (2026-04-20): extended A6-EC 0x2040 PDO diagnostics.
+	// Fields are optional and null-safe: if the drive rejected the
+	// extended PDO mapping, none of them are set, so absence means
+	// "not present" rather than "zero-valid".
+	bus_voltage_v?: number | null;
+	load_rate_pct?: number | null;
+	igbt_temp_c?: number | null;
+	motor_temp_c?: number | null;
+	position_error_counts?: number | null;
+	drive_not_ready_bits?: number | null;
+	drive_not_ready_text?: string | null;
+	motor_not_rotating_code?: number | null;
+	motor_not_rotating_text?: string | null;
 };
 
 type DriveFaultReference = {
@@ -562,6 +575,88 @@ function formatDriveNativeTruthStatus(axis: DriveFaultAxis | undefined): DriveNa
 		};
 	}
 	return null;
+}
+
+// Phase 2 (2026-04-20): per-axis health chips rendered under the
+// canonical-truth trust line. Chips are colour-coded so the operator
+// can scan the panel at a glance and spot a hot IGBT or a high-load
+// joint without reading raw numbers. Thresholds here are operator-
+// facing warning bands, NOT control-loop limits; actual drive
+// protection still lives in the firmware's Er codes.
+type AxisHealthChipTone = "ok" | "warn" | "error" | "info";
+
+type AxisHealthChip = {
+	key: string;
+	label: string;
+	tone: AxisHealthChipTone;
+};
+
+const AXIS_HEALTH_CHIP_TONE_CLASSES: Record<AxisHealthChipTone, string> = {
+	ok: "bg-emerald-900/60 text-emerald-200 border border-emerald-500/30",
+	warn: "bg-amber-900/60 text-amber-200 border border-amber-500/30",
+	error: "bg-rose-900/60 text-rose-100 border border-rose-500/40",
+	info: "bg-slate-800/80 text-slate-200 border border-slate-600/40",
+};
+
+function buildAxisHealthChips(axis: DriveFaultAxis | undefined): AxisHealthChip[] {
+	if (!axis) {
+		return [];
+	}
+	const chips: AxisHealthChip[] = [];
+	if (typeof axis.bus_voltage_v === "number" && Number.isFinite(axis.bus_voltage_v)) {
+		const v = axis.bus_voltage_v;
+		const tone: AxisHealthChipTone = v < 18 || v > 60 ? "warn" : "ok";
+		chips.push({ key: "vbus", label: `${v.toFixed(1)} V`, tone });
+	}
+	if (typeof axis.igbt_temp_c === "number" && Number.isFinite(axis.igbt_temp_c)) {
+		const t = axis.igbt_temp_c;
+		const tone: AxisHealthChipTone = t > 85 ? "error" : t > 70 ? "warn" : "ok";
+		chips.push({ key: "igbt", label: `IGBT ${t}°C`, tone });
+	}
+	if (typeof axis.motor_temp_c === "number" && Number.isFinite(axis.motor_temp_c)) {
+		const t = axis.motor_temp_c;
+		const tone: AxisHealthChipTone = t > 100 ? "error" : t > 70 ? "warn" : "ok";
+		chips.push({ key: "motor", label: `Motor ${t}°C`, tone });
+	}
+	if (typeof axis.load_rate_pct === "number" && Number.isFinite(axis.load_rate_pct)) {
+		const l = axis.load_rate_pct;
+		const tone: AxisHealthChipTone = l > 80 ? "warn" : "ok";
+		chips.push({ key: "load", label: `Load ${l.toFixed(0)}%`, tone });
+	}
+	if (
+		typeof axis.position_error_counts === "number" &&
+		Number.isFinite(axis.position_error_counts) &&
+		Math.abs(axis.position_error_counts) > 100
+	) {
+		chips.push({
+			key: "pe",
+			label: `PE ${axis.position_error_counts}`,
+			tone: "warn",
+		});
+	}
+	if (
+		typeof axis.motor_not_rotating_text === "string" &&
+		axis.motor_not_rotating_text.trim().length > 0 &&
+		axis.motor_not_rotating_text !== "ok"
+	) {
+		chips.push({
+			key: "mnr",
+			label: axis.motor_not_rotating_text,
+			tone: "info",
+		});
+	}
+	if (
+		typeof axis.drive_not_ready_text === "string" &&
+		axis.drive_not_ready_text.trim().length > 0 &&
+		axis.drive_not_ready_text !== "ready"
+	) {
+		chips.push({
+			key: "dnr",
+			label: axis.drive_not_ready_text,
+			tone: "warn",
+		});
+	}
+	return chips;
 }
 
 function expSliderToMultiplier(v: number): number {
@@ -3163,6 +3258,27 @@ export function ControlPanel({
 													{driveNativeTruthStatus.message}
 												</div>
 											) : null}
+											{(() => {
+												const chips = buildAxisHealthChips(driveAxis);
+												if (chips.length === 0) {
+													return null;
+												}
+												return (
+													<div
+														className="mt-1 flex max-w-[14rem] flex-wrap gap-1"
+														data-testid={`axis-health-chips-j${jointNumber}`}
+													>
+														{chips.map((chip) => (
+															<span
+																key={chip.key}
+																className={`rounded px-1.5 py-0.5 text-[10px] leading-none ${AXIS_HEALTH_CHIP_TONE_CLASSES[chip.tone]}`}
+															>
+																{chip.label}
+															</span>
+														))}
+													</div>
+												);
+											})()}
 										</div>
 										<div className="ml-auto grid grid-cols-3 gap-1">
 											<button

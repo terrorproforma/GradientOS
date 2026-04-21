@@ -1,6 +1,7 @@
 # Contains the high-level command handlers that parse and react to UDP messages.
 import os
 import json
+import sys
 import time
 from scipy.spatial.transform import Slerp  # needed for reset/initial path slerp interpolation
 import numpy as np
@@ -43,6 +44,32 @@ _RTCORE_TERMINAL_EXECUTION_STATES = {"idle", "completed", "aborted", "faulted", 
 _PROGRAM_TERMINAL_STATES = {"completed", "aborted", "faulted", "timeout", "interrupted"}
 _PROGRAM_ACTIVE_STATES = {"planning", "accepted", "executing"}
 _JOG_PERF_LOCK = threading.Lock()
+
+# Phase 0 (2026-04-20 canonical-truth stability): the 50 Hz jog feedback
+# read used to be able to raise a RuntimeError (canonical joint truth
+# unavailable) on any transient flicker from the shaft-frame gate, which
+# would kill the daemon jog thread silently and halt motion. The handler
+# below records the event so operators can measure the flicker rate and
+# tells the loop to reuse cached q_current instead of crashing. The log
+# emission is throttled to at most once per second so a pathological
+# flicker burst cannot flood the controller log.
+_JOG_TRUTH_FLICKER_LOG_THROTTLE_S = 1.0
+
+# 2026-04-21 canonical-truth settling tolerance at jog arm time. The
+# A6-EC's servo loop takes 0.5-2 s after SAFE_POWER_UP (or a fresh
+# SAFE_POWER_DOWN→SAFE_POWER_UP cycle) before the command-frame
+# roundtrip gate stops tripping on transient drive-settling mismatches.
+# `_JOG_ARM_TRUTH_RETRY_BUDGET_S` is the hard ceiling for how long we
+# will wait for canonical truth to become available before rejecting
+# a jog session start. `_JOG_ARM_TRUTH_RETRY_INTERVAL_S` is the per-
+# attempt sleep so we don't spin the CPU. A real encoder-retention
+# fault will NOT clear inside this window, so the safety intent of
+# the original strict check is preserved: we still refuse to arm if
+# the drive legitimately cannot prove its position, but we don't
+# reject the user's first jog attempt 200 ms after power-up just
+# because the drive is still decelerating.
+_JOG_ARM_TRUTH_RETRY_BUDGET_S = 0.5
+_JOG_ARM_TRUTH_RETRY_INTERVAL_S = 0.05
 
 
 def _new_jog_perf_state() -> dict[str, object]:
@@ -87,7 +114,43 @@ def _new_jog_perf_state() -> dict[str, object]:
         "last_gate_failure_reason": None,
         "last_gate_failure_details": None,
         "ik_debug": None,
+        "truth_flicker_total": 0,
+        "truth_flicker_last_reason": "",
+        "truth_flicker_last_wall_s": 0.0,
+        "truth_flicker_last_log_wall_s": 0.0,
     }
+
+
+def _record_jog_truth_flicker(reason: str) -> None:
+    """Record a transient canonical-truth failure in the cartesian jog loop.
+
+    Motion continues from cached q_current; this helper exists so that a
+    RuntimeError raised by ``servo_driver.get_current_arm_state_rad`` (via
+    the backend shaft-frame gate) is counted and surfaced rather than
+    killing the jog thread. The counter is exposed on GET_PERFORMANCE_STATE
+    so operators can tell apart "fix is working; flickers absorbed" from
+    "truth actually broke; needs investigation".
+
+    Log emission is throttled to at most one entry per
+    ``_JOG_TRUTH_FLICKER_LOG_THROTTLE_S`` seconds so sustained flicker
+    bursts cannot flood stderr.
+    """
+    now = time.time()
+    reason_text = str(reason)[:200]
+    with _JOG_PERF_LOCK:
+        _JOG_PERF["truth_flicker_total"] = int(_JOG_PERF.get("truth_flicker_total", 0)) + 1
+        _JOG_PERF["truth_flicker_last_reason"] = reason_text
+        _JOG_PERF["truth_flicker_last_wall_s"] = now
+        last_log = float(_JOG_PERF.get("truth_flicker_last_log_wall_s", 0.0))
+        should_log = now - last_log >= _JOG_TRUTH_FLICKER_LOG_THROTTLE_S
+        if should_log:
+            _JOG_PERF["truth_flicker_last_log_wall_s"] = now
+    if should_log:
+        print(
+            f"[Jog] truth flicker ({reason_text[:120]}) — using cached feedback",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 _JOG_PERF: dict[str, object] = _new_jog_perf_state()
@@ -465,6 +528,13 @@ def _record_jog_velocity_update(velocity_vector: np.ndarray) -> None:
 def get_jog_performance_snapshot() -> dict[str, object]:
     with _JOG_PERF_LOCK:
         snapshot = json.loads(json.dumps(_JOG_PERF))
+    # Back-fill the truth-flicker metrics so downstream consumers always see a
+    # stable shape even if _JOG_PERF was constructed before these fields
+    # existed (the live perf state normally carries them via
+    # _new_jog_perf_state(), so this is defensive).
+    snapshot.setdefault("truth_flicker_total", 0)
+    snapshot.setdefault("truth_flicker_last_reason", "")
+    snapshot.setdefault("truth_flicker_last_wall_s", 0.0)
     session_snapshot = {}
     control_state = {}
     try:
@@ -3980,6 +4050,57 @@ def handle_get_jog_session_state() -> dict[str, object]:
 def handle_jog_session_start(payload: dict[str, object]) -> dict[str, object]:
     if bool(utils.trajectory_state_get("is_running", False)):
         raise JogSessionError("MOTION_ACTIVE", "Cannot start jog while another motion is running.")
+
+    # Phase 3 (2026-04-20) risk mitigation: run the strict canonical-truth
+    # read at arm time so the session cannot start on a stale anchor or
+    # a transient truth outage. The Phase 0 per-tick try/except absorbs
+    # transient flickers during motion but would also swallow a real
+    # encoder-retention fault that happened between sessions.
+    #
+    # 2026-04-21 update: the original single-shot check was too brittle
+    # in practice — the A6-EC's servo loop takes 0.5-2 s to settle after
+    # SAFE_POWER_UP, during which the command-frame-roundtrip gate
+    # transiently trips (`drive_native_command_frame_roundtrip_mismatch`)
+    # even though nothing is physically wrong. See terminal 29.txt:270-281
+    # for the live rejection sequence: the operator pressed jog 4 times
+    # over ~1 s and every attempt was 503'd while the drive was still
+    # decelerating / settling. A short retry loop (500 ms / 50 ms cadence
+    # = 10 attempts) gives the drive time to settle without silently
+    # accepting a permanently-bad anchor. If truth is STILL unavailable
+    # after the retry window, we reject — a real encoder fault will not
+    # clear itself in half a second, so the safety guarantee is preserved.
+    truth_valid_at_arm = False
+    last_truth_exc: RuntimeError | None = None
+    arm_retry_deadline = time.monotonic() + _JOG_ARM_TRUTH_RETRY_BUDGET_S
+    arm_retry_attempts = 0
+    while True:
+        arm_retry_attempts += 1
+        try:
+            servo_driver.get_current_arm_state_rad(verbose=False)
+        except RuntimeError as exc:
+            last_truth_exc = exc
+            if time.monotonic() >= arm_retry_deadline:
+                break
+            time.sleep(_JOG_ARM_TRUTH_RETRY_INTERVAL_S)
+            continue
+        else:
+            truth_valid_at_arm = True
+            break
+    if not truth_valid_at_arm:
+        message = str(last_truth_exc).strip() if last_truth_exc else "canonical joint truth unavailable"
+        if not message:
+            message = "canonical joint truth unavailable"
+        print(
+            f"[Jog] Rejecting jog session start after {arm_retry_attempts} attempt(s) "
+            f"over {_JOG_ARM_TRUTH_RETRY_BUDGET_S * 1000.0:.0f} ms: {message}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise JogSessionError(
+            "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
+            f"Cannot start jog: canonical joint truth is unavailable. {message}",
+        ) from last_truth_exc
+
     jog_backend = _get_rtcore_jog_backend()
     execution_policy = _jog_execution_policy(jog_backend)
     snapshot = _JOG_SESSION_MANAGER.start_session(
@@ -3993,7 +4114,14 @@ def handle_jog_session_start(payload: dict[str, object]) -> dict[str, object]:
         backend_timeout_s=_jog_backend_timeout_s(jog_backend),
         session_id=str(payload.get("session_id", "") or "") or None,
     )
-    print(f"[Jog] Starting jog session {snapshot.get('session_id')} ({execution_policy})")
+    # Expose the arm-time truth verdict on the session snapshot so the
+    # frontend (via GET /control/jog/session/state) and operators
+    # can see that the session started with a verified anchor.
+    snapshot["truth_valid_at_arm"] = bool(truth_valid_at_arm)
+    print(
+        f"[Jog] Starting jog session {snapshot.get('session_id')} "
+        f"({execution_policy}, truth_valid_at_arm={truth_valid_at_arm})"
+    )
     _reset_jog_perf(execution_policy, jog_backend is not None)
     _sync_jog_trajectory_state(touch_last_command=True)
     _ensure_jog_thread_running()
@@ -4045,7 +4173,11 @@ def _jog_controller_thread():
     jog_backend = _get_rtcore_jog_backend()
     jog_backend_timeout_s = _jog_backend_timeout_s(jog_backend)
     jog_backend_active = False
-    q_current = servo_driver.get_current_arm_state_rad(verbose=False)
+    try:
+        q_current = servo_driver.get_current_arm_state_rad(verbose=False)
+    except RuntimeError as exc:
+        q_current = None
+        _record_jog_truth_flicker(str(exc))
     if q_current is None:
         q_current = np.zeros(utils.NUM_LOGICAL_JOINTS, dtype=float)
     else:
@@ -4081,6 +4213,31 @@ def _jog_controller_thread():
         finally:
             jog_backend_active = False
 
+    # 2026-04-21 thread-race guard: a JOG_SESSION_STOP / lease expiry /
+    # controller-stop can mutate the session state to `stopping` or
+    # `stopped` AFTER the top-of-loop `session_active` check but BEFORE
+    # the later session-manager mutations on the same tick
+    # (update_following_error, resync_command_state, pause_for_motion,
+    # resume_after_motion). Those mutations raise
+    # `JogSessionError("SESSION_INACTIVE")` and previously propagated
+    # out of the thread entrypoint, killing the thread with an
+    # uncaught-exception traceback (see terminal 29.txt:253 — crash
+    # observed during live cartesian jog). `_safe_call_session` wraps
+    # any such mutation so SESSION_INACTIVE returns a sentinel and the
+    # caller can fall through to the top-of-loop break path instead of
+    # crashing. Non-SESSION_INACTIVE JogSessionErrors still propagate
+    # because they indicate a real bug.
+    _session_gone_sentinel = object()
+
+    def _safe_session_call(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except JogSessionError as exc:
+            code = str(getattr(exc, "code", "") or "").upper()
+            if code != "SESSION_INACTIVE":
+                raise
+            return _session_gone_sentinel
+
     while True:
         session_snapshot = _JOG_SESSION_MANAGER.expire_if_needed()
         if not bool(session_snapshot.get("session_active", False)):
@@ -4100,7 +4257,9 @@ def _jog_controller_thread():
         last_loop_time = loop_start_time
 
         if bool(utils.trajectory_state_get("is_running", False)):
-            _JOG_SESSION_MANAGER.pause_for_motion()
+            if _safe_session_call(_JOG_SESSION_MANAGER.pause_for_motion) is _session_gone_sentinel:
+                _stop_backend_jog_now("session-inactive-during-pause")
+                break
             _sync_jog_trajectory_state()
             _stop_backend_jog_now("pause-for-motion")
             was_paused_for_motion = True
@@ -4112,10 +4271,16 @@ def _jog_controller_thread():
             continue
 
         if was_paused_for_motion:
-            fresh_q = servo_driver.get_current_arm_state_rad(verbose=False)
+            try:
+                fresh_q = servo_driver.get_current_arm_state_rad(verbose=False)
+            except RuntimeError as exc:
+                fresh_q = None
+                _record_jog_truth_flicker(str(exc))
             if fresh_q is not None:
                 q_current = np.asarray(fresh_q, dtype=float)
-            _JOG_SESSION_MANAGER.resume_after_motion()
+            if _safe_session_call(_JOG_SESSION_MANAGER.resume_after_motion) is _session_gone_sentinel:
+                _stop_backend_jog_now("session-inactive-during-resume")
+                break
             _sync_jog_trajectory_state()
             last_loop_time = time.monotonic()
             was_paused_for_motion = False
@@ -4127,7 +4292,11 @@ def _jog_controller_thread():
             break
 
         feedback_read_started = time.monotonic()
-        fresh_q = servo_driver.get_current_arm_state_rad(verbose=False)
+        try:
+            fresh_q = servo_driver.get_current_arm_state_rad(verbose=False)
+        except RuntimeError as exc:
+            fresh_q = None
+            _record_jog_truth_flicker(str(exc))
         _record_jog_stage_metric(
             "feedback_read_ms",
             max(0.0, (time.monotonic() - feedback_read_started) * 1000.0),
@@ -4162,12 +4331,18 @@ def _jog_controller_thread():
             pending_resync_reason = "idle-resume"
 
         if pending_resync_reason is not None or not bool(control.get("command_state_valid", False)):
-            _JOG_SESSION_MANAGER.resync_command_state(
-                position_m=current_position.tolist(),
-                orientation_matrix=current_orientation.tolist(),
-                joint_vector=q_current.tolist(),
-                reason=pending_resync_reason or "boundary-resync",
-            )
+            if (
+                _safe_session_call(
+                    _JOG_SESSION_MANAGER.resync_command_state,
+                    position_m=current_position.tolist(),
+                    orientation_matrix=current_orientation.tolist(),
+                    joint_vector=q_current.tolist(),
+                    reason=pending_resync_reason or "boundary-resync",
+                )
+                is _session_gone_sentinel
+            ):
+                _stop_backend_jog_now("session-inactive-during-resync")
+                break
             control = _JOG_SESSION_MANAGER.get_control_state()
             pending_resync_reason = None
 
@@ -4185,7 +4360,14 @@ def _jog_controller_thread():
             measured_pose_matrix=measured_pose_matrix,
             measured_joints=q_current,
         )
-        _JOG_SESSION_MANAGER.update_following_error(following_error)
+        if (
+            _safe_session_call(
+                _JOG_SESSION_MANAGER.update_following_error, following_error
+            )
+            is _session_gone_sentinel
+        ):
+            _stop_backend_jog_now("session-inactive-during-update-following-error")
+            break
         control = _JOG_SESSION_MANAGER.get_control_state()
         perf_fields = _build_jog_command_state_perf_fields(control)
         _jog_perf_update(
@@ -4246,7 +4428,11 @@ def _jog_controller_thread():
                                 maxs,
                                 source="jog",
                             )
-                    _JOG_SESSION_MANAGER.record_gate_failure(reason=gate_reason, details=gate_details)
+                    _safe_session_call(
+                        _JOG_SESSION_MANAGER.record_gate_failure,
+                        reason=gate_reason,
+                        details=gate_details,
+                    )
                     _emit_jog_gate_alert(gate_reason, gate_details)
                     if jog_backend is not None and jog_backend_active:
                         try:
@@ -4375,7 +4561,11 @@ def _jog_controller_thread():
                 "orientation_residual_deg": None,
                 "violating_joint_indices": [],
             }
-            _JOG_SESSION_MANAGER.record_gate_failure(reason=gate_reason, details=gate_details)
+            _safe_session_call(
+                _JOG_SESSION_MANAGER.record_gate_failure,
+                reason=gate_reason,
+                details=gate_details,
+            )
             perf_fields_after_gate = _build_jog_command_state_perf_fields(_JOG_SESSION_MANAGER.get_control_state())
             _jog_perf_update(
                 measured_pose=current_pose_snapshot,

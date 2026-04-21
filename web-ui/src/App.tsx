@@ -179,6 +179,16 @@ type DriveFaultAxis = {
   native_home_last_abort_code_hex?: string;
   fault?: DriveFaultDetail | null;
   manufacturer_fault?: DriveFaultDetail | null;
+  // Phase 2 (2026-04-20): extended A6-EC 0x2040 PDO diagnostics.
+  bus_voltage_v?: number | null;
+  load_rate_pct?: number | null;
+  igbt_temp_c?: number | null;
+  motor_temp_c?: number | null;
+  position_error_counts?: number | null;
+  drive_not_ready_bits?: number | null;
+  drive_not_ready_text?: string | null;
+  motor_not_rotating_code?: number | null;
+  motor_not_rotating_text?: string | null;
 };
 
 type DriveFaultSnapshot = {
@@ -5012,6 +5022,18 @@ export function synthesizeDriveFaultSnapshotFromAxes(
     if (nativeHomeActive) {
       nativeHomeActiveAxisMask |= (1 << axis);
     }
+    // Phase 2 (2026-04-20): carry the extended A6-EC 0x2040 PDO
+    // diagnostics from axis_absolute_feedback into the synthesized
+    // DriveFaultAxis so the commissioning panel health chips keep
+    // rendering even when the backend monitor event temporarily
+    // drops the aggregate drive_faults block (see the 2026-04-17
+    // commissioning-banner-stale regression for the pattern).
+    const extendedEntry = entry as Record<string, unknown>;
+    const numberOrNull = (value: unknown): number | undefined =>
+      typeof value === "number" && Number.isFinite(value) ? value : undefined;
+    const stringOrNull = (value: unknown): string | undefined =>
+      typeof value === "string" && value.length > 0 ? value : undefined;
+
     axes.push({
       axis,
       logical_joint: typeof logical_joint === "number" ? logical_joint : null,
@@ -5030,6 +5052,15 @@ export function synthesizeDriveFaultSnapshotFromAxes(
       native_home_state: nativeHomeStateRaw,
       native_home_state_name: nativeHomeStateNameRaw,
       native_home_active: nativeHomeActive,
+      bus_voltage_v: numberOrNull(extendedEntry.bus_voltage_v),
+      load_rate_pct: numberOrNull(extendedEntry.load_rate_pct),
+      igbt_temp_c: numberOrNull(extendedEntry.igbt_temp_c),
+      motor_temp_c: numberOrNull(extendedEntry.motor_temp_c),
+      position_error_counts: numberOrNull(extendedEntry.position_error_counts),
+      drive_not_ready_bits: numberOrNull(extendedEntry.drive_not_ready_bits),
+      drive_not_ready_text: stringOrNull(extendedEntry.drive_not_ready_text),
+      motor_not_rotating_code: numberOrNull(extendedEntry.motor_not_rotating_code),
+      motor_not_rotating_text: stringOrNull(extendedEntry.motor_not_rotating_text),
     });
   }
   if (axes.length === 0) {

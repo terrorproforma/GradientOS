@@ -186,3 +186,83 @@ class Gradient05Config(RobotConfig):
         """
         return (0, 0, 0)
 
+    @property
+    def collision_watchdog_thresholds(self) -> list:
+        """
+        Phase 4 (2026-04-20) — per-axis collision detection bounds.
+
+        CONSERVATIVE PLACEHOLDERS. These numbers MUST be calibrated on
+        hardware during Phase 4.5:
+
+          1. Run normal motion sweeps and jog for 5 minutes.
+          2. Record peak |torque_raw| and peak |position_error_counts|
+             per axis from ``GET /info/joints-detailed``.
+          3. Set ``torque_abs_max_raw`` and ``position_error_counts_max``
+             to ~1.5x the observed peak per axis.
+          4. Controlled soft-obstacle test: intentionally push the end
+             effector into foam during a slow jog. Verify the watchdog
+             fires within 30 ms, no false positives during normal
+             motion.
+
+        Unit reference (A6-EC manual):
+          * torque_abs_max_raw  — 0x6077 units of 0.1 % rated torque.
+            2000 ~= 200 % rated; good default for soft-stop.
+          * position_error_counts_max  — drive counts at the motor
+            encoder resolution; on the gradient-05 17-bit encoder,
+            5000 counts ~= 3.8 deg motor-shaft tracking error.
+
+        The ``CollisionThresholds`` dataclass lives in
+        ``gradient_os.arm_controller.collision_watchdog``. We return a
+        plain list of objects so run_controller can import the module
+        once and use the instances directly.
+        """
+        from ...collision_watchdog import CollisionThresholds
+
+        return [
+            # J1 — base joint, largest mass loading, widest swings.
+            CollisionThresholds(
+                torque_abs_max_raw=2500,
+                position_error_counts_max=8000,
+                sustained_samples=3,
+                sample_period_s=0.01,
+            ),
+            # J2 — shoulder, high gravity torque under load.
+            CollisionThresholds(
+                torque_abs_max_raw=2500,
+                position_error_counts_max=8000,
+                sustained_samples=3,
+                sample_period_s=0.01,
+            ),
+            # J3 — elbow, similar gravity profile to J2.
+            CollisionThresholds(
+                torque_abs_max_raw=2200,
+                position_error_counts_max=7000,
+                sustained_samples=3,
+                sample_period_s=0.01,
+            ),
+            # J4 — wrist rotation, low static torque.
+            CollisionThresholds(
+                torque_abs_max_raw=1800,
+                position_error_counts_max=5000,
+                sustained_samples=3,
+                sample_period_s=0.01,
+            ),
+            # J5 — wrist pitch, low static torque.
+            CollisionThresholds(
+                torque_abs_max_raw=1800,
+                position_error_counts_max=5000,
+                sustained_samples=3,
+                sample_period_s=0.01,
+            ),
+            # J6 — tool flange, 10:1 gearing + single-turn wrap concerns.
+            # Tighter PE threshold: J6 is the seam-crossing axis from
+            # the 2026-04-17 incident and any position-error growth
+            # there deserves quicker attention.
+            CollisionThresholds(
+                torque_abs_max_raw=1800,
+                position_error_counts_max=4000,
+                sustained_samples=3,
+                sample_period_s=0.01,
+            ),
+        ]
+

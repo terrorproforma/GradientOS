@@ -129,6 +129,7 @@ def build_drive_fault_snapshot(
     axis_to_joint: Sequence[int] | None = None,
     socket_present: bool | None = None,
     axis_drive_native_truth_context: Mapping[int, Mapping[str, Any]] | None = None,
+    axis_extended_telemetry_context: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the monitor/telemetry drive-fault snapshot.
 
@@ -148,6 +149,17 @@ def build_drive_fault_snapshot(
     ``coordinate_system_invalid`` for axes whose bit 15 is clear even
     though the backend may have upgraded them to
     ``persisted_home_anchor_agreement``.
+
+    Phase 2 (2026-04-20): when ``axis_extended_telemetry_context`` is
+    supplied (also by ``run_controller._build_drive_fault_snapshot``
+    from the backend's extended PDO state), the new A6-EC 0x2040
+    diagnostic fields (``bus_voltage_v``, ``load_rate_pct``,
+    ``igbt_temp_c``, ``motor_temp_c``, ``position_error_counts``,
+    ``drive_not_ready_bits``/``_text``, ``motor_not_rotating_code``/
+    ``_text``) are merged into each per-axis payload entry. The UI
+    commissioning panel reads these to render the per-axis health
+    strip. Unsupplied entries leave the fields absent so the UI can
+    tell "drive rejected extended PDO mapping" from "drive reports 0.0".
     """
     num_axes = coerce_int(metrics.get("num_axes"), 0)
     armed = coerce_int(metrics.get("armed"), 0)
@@ -395,6 +407,29 @@ def build_drive_fault_snapshot(
             slave_al_state,
             fieldbus_profile_id=resolved_fieldbus_profile,
         )
+        # Phase 2 (2026-04-20): merge the extended A6-EC diagnostic
+        # PDO fields from the per-axis context if provided. Fields that
+        # are absent from the context stay absent from the payload so
+        # consumers can distinguish "extended PDO not present" from
+        # "extended PDO reports zero".
+        extended_axis_extras: dict[str, Any] = {}
+        if axis_extended_telemetry_context is not None:
+            extended_override = axis_extended_telemetry_context.get(axis_index)
+            if isinstance(extended_override, Mapping):
+                for key in (
+                    "bus_voltage_v",
+                    "load_rate_pct",
+                    "igbt_temp_c",
+                    "motor_temp_c",
+                    "position_error_counts",
+                    "drive_not_ready_bits",
+                    "drive_not_ready_text",
+                    "motor_not_rotating_code",
+                    "motor_not_rotating_text",
+                ):
+                    if key in extended_override:
+                        extended_axis_extras[key] = extended_override[key]
+
         axes_payload.append(
             {
                 "axis": axis_index,
@@ -411,6 +446,7 @@ def build_drive_fault_snapshot(
                 "slave_online": slave_online,
                 "slave_operational": slave_operational,
                 "slave_al_state": slave_al_state,
+                **extended_axis_extras,
                 "slave_al_state_name": (
                     str(slave_al_detail.get("name", "UNKNOWN"))
                     if isinstance(slave_al_detail, dict)

@@ -1011,6 +1011,167 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(screen.queryByText(/verification conflicted/i)).toBeNull();
 	});
 
+	it("renders per-axis health chips with A6-EC extended PDO telemetry", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [
+						{
+							axis: 0,
+							logical_joint: 1,
+							ds402_state: "OperationEnabled",
+							statusword: 0x1650,
+							error_code: 0,
+							bus_voltage_v: 47.8,
+							igbt_temp_c: 42,
+							motor_temp_c: 55,
+							load_rate_pct: 23.5,
+							position_error_counts: 12,
+							motor_not_rotating_text: "ok",
+							drive_not_ready_text: "ready",
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		const chipRow = screen.getByTestId("axis-health-chips-j1");
+		expect(chipRow).toBeTruthy();
+		// Voltage chip rounds to one decimal.
+		expect(chipRow.textContent).toContain("47.8 V");
+		expect(chipRow.textContent).toContain("IGBT 42°C");
+		expect(chipRow.textContent).toContain("Motor 55°C");
+		// Load is rounded to zero decimals.
+		expect(chipRow.textContent).toContain("Load 24%");
+		// Small position error stays below the chip threshold.
+		expect(chipRow.textContent).not.toContain("PE ");
+		// "ok"/"ready" decorations are hidden to avoid visual noise.
+		expect(chipRow.textContent).not.toContain("ok");
+		expect(chipRow.textContent).not.toContain("ready");
+	});
+
+	it("shows a warn-tone chip when IGBT temperature exceeds 70°C", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "ACTIVE",
+					axes: [
+						{
+							axis: 2,
+							logical_joint: 3,
+							ds402_state: "OperationEnabled",
+							statusword: 0x1650,
+							error_code: 0,
+							igbt_temp_c: 75,
+							bus_voltage_v: 48,
+							load_rate_pct: 30,
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		const chipRow = screen.getByTestId("axis-health-chips-j3");
+		const igbtChip = Array.from(chipRow.querySelectorAll("span")).find((span) =>
+			span.textContent?.includes("IGBT 75°C"),
+		);
+		expect(igbtChip).toBeTruthy();
+		expect(igbtChip?.className).toContain("amber");
+	});
+
+	it("shows error-tone chip when IGBT temperature exceeds 85°C", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "ACTIVE",
+					axes: [
+						{
+							axis: 3,
+							logical_joint: 4,
+							ds402_state: "OperationEnabled",
+							statusword: 0x1650,
+							error_code: 0,
+							igbt_temp_c: 92,
+							bus_voltage_v: 48,
+							load_rate_pct: 40,
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		const chipRow = screen.getByTestId("axis-health-chips-j4");
+		const igbtChip = Array.from(chipRow.querySelectorAll("span")).find((span) =>
+			span.textContent?.includes("IGBT 92°C"),
+		);
+		expect(igbtChip).toBeTruthy();
+		expect(igbtChip?.className).toContain("rose");
+	});
+
+	it("surfaces motor_not_rotating reason as an info chip when drive explains why motion is blocked", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [
+						{
+							axis: 4,
+							logical_joint: 5,
+							ds402_state: "SwitchOnDisabled",
+							statusword: 0x0250,
+							error_code: 0,
+							motor_not_rotating_text: "awaiting_homing",
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		const chipRow = screen.getByTestId("axis-health-chips-j5");
+		expect(chipRow.textContent).toContain("awaiting_homing");
+	});
+
+	it("omits the health-chip row when no extended PDO telemetry is present", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "DISARMED",
+					axes: [
+						{
+							axis: 5,
+							logical_joint: 6,
+							ds402_state: "SwitchOnDisabled",
+							statusword: 0x1650,
+							error_code: 0,
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+		expect(screen.queryByTestId("axis-health-chips-j6")).toBeNull();
+	});
+
 	it("shows canonical truth trust source and unavailable reason in joint commissioning", async () => {
 		render(
 			<ControlPanel
