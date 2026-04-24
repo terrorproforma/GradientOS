@@ -303,8 +303,12 @@ class TestShaftFrameConsistency:
         assert abs(result.mod_rm_delta_counts) < 1.5
 
     def test_inconsistent_when_sub_shaft_turn_drift_exceeds_tolerance(self) -> None:
-        # Inject 50 counts of sub-shaft-turn drift. Default tolerance
-        # is 16 counts -> gate must fail closed.
+        # Inject 50 counts of sub-shaft-turn drift. Explicit
+        # tolerance=16 is passed below (historical pin), so 50 > 16
+        # forces the gate closed regardless of the production
+        # `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` default (currently
+        # 4096). The test uses a tight explicit tolerance to exercise
+        # the closed-gate path with a small drift.
         k = _j6_kinematics()
         canonical_q = 0.2
         live_counts = int(
@@ -323,7 +327,9 @@ class TestShaftFrameConsistency:
     def test_jitter_within_tolerance_stays_consistent(self) -> None:
         # A6-EC probe work: stationary bridges wander by 0..3 counts
         # (occasionally 7-9 post-restart). A 10-count drift must NOT
-        # fail closed under the default 16-count gate.
+        # fail closed under a 16-count explicit tolerance; the
+        # production default is larger (4096 counts, sized for the
+        # full-revolution failure class) so this is also safe there.
         k = _j6_kinematics()
         canonical_q = 0.0
         live_counts = int(

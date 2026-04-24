@@ -33,6 +33,26 @@ def build_startup_fault_reset_plan(probe: Mapping[str, object]) -> dict[str, Any
 
     faulted_axes: list[dict[str, Any]] = []
     faulted_axis_mask = 0
+    # Per-axis classification of the preflight reset action. Encoder-
+    # retention axes are the only bucket that REQUIRES an additional
+    # preceding step (F31.10 SDO write); every faulted axis still
+    # ends with a DS402 control-word fault-reset pulse to transition
+    # the drive state machine out of Fault. We surface the buckets as
+    # three orthogonal masks so callers can see what the preflight
+    # will do, but they all converge on the same pulse step at the
+    # end.
+    #
+    # Key rule (2026-04-23, found live): F31.10 alone is NOT enough
+    # to leave DS402 Fault state. The drive's encoder-side state
+    # clears but 0x6041 bit 3 / 0x603F stay latched until a
+    # controlword 0x80 pulse re-runs the DS402 fault-reset edge, so
+    # encoder-reset axes MUST also appear in the DS402 pulse mask
+    # (otherwise the preflight waits for BUS_UP_DISARMED forever
+    # even though the SDO write succeeded).
+    ds402_pulse_axis_mask = 0
+    encoder_reset_axis_mask = 0
+    unresettable_axis_mask = 0
+    encoder_reset_logical_joints: list[int] = []
     for axis in probe.get("axes", []) if isinstance(probe.get("axes"), list) else []:
         if not isinstance(axis, Mapping):
             continue
@@ -49,9 +69,37 @@ def build_startup_fault_reset_plan(probe: Mapping[str, object]) -> dict[str, Any
             else None
         )
         fault = axis.get("fault") if isinstance(axis.get("fault"), Mapping) else {}
+        encoder_retention_fault_present = bool(axis.get("encoder_retention_fault_present", False))
+        encoder_retention_fault_raw = axis.get("encoder_retention_fault")
+        encoder_retention_fault = (
+            dict(encoder_retention_fault_raw)
+            if isinstance(encoder_retention_fault_raw, Mapping)
+            else None
+        )
         label = f"axis{axis_index}"
         if isinstance(logical_joint, int) and logical_joint > 0:
             label = f"J{logical_joint}/axis{axis_index}"
+        resettable_flag = fault.get("resettable") is True
+        if encoder_retention_fault_present:
+            reset_action = "encoder_data_reset_then_ds402_pulse"
+            encoder_reset_axis_mask |= 1 << axis_index
+            ds402_pulse_axis_mask |= 1 << axis_index
+            if isinstance(logical_joint, int) and logical_joint > 0:
+                # The anchor store is 0-indexed; the probe uses 1-indexed
+                # logical joints, so translate for caller convenience.
+                encoder_reset_logical_joints.append(logical_joint - 1)
+        elif resettable_flag:
+            reset_action = "ds402_fault_pulse"
+            ds402_pulse_axis_mask |= 1 << axis_index
+        else:
+            # Unknown / non-resettable vendor code: preserve legacy
+            # behaviour of trying the DS402 pulse anyway. If the drive
+            # refuses to leave Fault after the pulse the preflight
+            # timeout path will catch it with the existing "faults
+            # still present after reset" message.
+            reset_action = "ds402_fault_pulse"
+            unresettable_axis_mask |= 1 << axis_index
+            ds402_pulse_axis_mask |= 1 << axis_index
         faulted_axes.append(
             {
                 "axis": axis_index,
@@ -63,18 +111,36 @@ def build_startup_fault_reset_plan(probe: Mapping[str, object]) -> dict[str, Any
                 "ds402_state": str(axis.get("ds402_state", axis.get("drive_state", "UNKNOWN"))).strip() or "UNKNOWN",
                 "fault_code": str(fault.get("code", "")).strip() or None,
                 "fault_name": str(fault.get("name", "")).strip() or None,
-                "resettable": fault.get("resettable") is True,
+                "resettable": resettable_flag,
+                "encoder_retention_fault_present": encoder_retention_fault_present,
+                "encoder_retention_fault": encoder_retention_fault,
+                "reset_action": reset_action,
             }
         )
 
     summaries: list[str] = []
     for axis in faulted_axes:
         parts = [str(axis["label"]), str(axis["error_code_hex"])]
+        if axis.get("encoder_retention_fault_present"):
+            parts.append("[encoder-retention]")
         if axis.get("fault_code"):
             parts.append(str(axis["fault_code"]))
         if axis.get("fault_name"):
             parts.append(str(axis["fault_name"]))
         summaries.append(" ".join(parts))
+
+    # Deduplicate the logical-joint list while preserving axis order so
+    # the first axis to land in the probe payload decides ordering in
+    # operator-facing messages. Python 3.7+ preserves dict insertion
+    # order which we rely on here.
+    encoder_reset_logical_joints = list(dict.fromkeys(encoder_reset_logical_joints))
+    encoder_reset_required = encoder_reset_axis_mask != 0
+    ds402_pulse_required = ds402_pulse_axis_mask != 0
+    # `ds402_pulse_axis_mask` always INCLUDES `encoder_reset_axis_mask`
+    # because encoder-reset axes need the follow-up pulse to leave
+    # DS402 Fault state. The "mixed" reason should only fire when
+    # there are ALSO non-retention resettable axes in the pulse mask.
+    ds402_pulse_non_retention_mask = ds402_pulse_axis_mask & ~encoder_reset_axis_mask
 
     disarmed_safe = armed == 0 and enable_mask == 0 and op_enabled_axes == 0
     should_auto_reset = (
@@ -97,6 +163,10 @@ def build_startup_fault_reset_plan(probe: Mapping[str, object]) -> dict[str, Any
         )
     elif rtcore_state != "UP":
         reason = f"rtcore_state={rtcore_state}"
+    elif encoder_reset_required and ds402_pulse_non_retention_mask != 0:
+        reason = "encoder_retention_and_ds402_resets_required"
+    elif encoder_reset_required:
+        reason = "encoder_retention_reset_required"
     else:
         reason = "faulted_disarmed_axes_ready_for_reset"
 
@@ -112,6 +182,15 @@ def build_startup_fault_reset_plan(probe: Mapping[str, object]) -> dict[str, Any
         "faulted_axis_mask_hex": f"0x{faulted_axis_mask:x}",
         "faulted_axes": faulted_axes,
         "faulted_summary": ", ".join(summaries),
+        "ds402_pulse_axis_mask": ds402_pulse_axis_mask,
+        "ds402_pulse_axis_mask_hex": f"0x{ds402_pulse_axis_mask:x}",
+        "ds402_pulse_required": ds402_pulse_required,
+        "encoder_reset_axis_mask": encoder_reset_axis_mask,
+        "encoder_reset_axis_mask_hex": f"0x{encoder_reset_axis_mask:x}",
+        "encoder_reset_required": encoder_reset_required,
+        "encoder_reset_logical_joints": encoder_reset_logical_joints,
+        "unresettable_axis_mask": unresettable_axis_mask,
+        "unresettable_axis_mask_hex": f"0x{unresettable_axis_mask:x}",
         "should_auto_reset": should_auto_reset,
         "blocks_startup": blocks_startup,
         "reason": reason,

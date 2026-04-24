@@ -56,6 +56,13 @@ Read the file that matches the task:
   Use for the A6-EC frame-semantics and native-home workstream note: probe rationale, raw vs reference vs rotation frame separation, anchor math, persistence lessons, UI trust implications, and remaining open questions.
   Durable project doc; the settled rules from this workstream are promoted into the master principles doc under `§9.4`-`§9.7` and into [commissioning-safety.md](./commissioning-safety.md).
 
+### Settled 2026-04-21 (promoted)
+
+- Atomic paired-snapshot architecture for asymmetric-rate PDO/SDO comparisons (master principles `§9.5A`, also [rtcore-ethercat.md](./rtcore-ethercat.md) "Asymmetric-Rate Atomic Snapshots").
+- Shaft-frame tolerance sizing: gate the "full-revolution drift" failure class, not drive-internal motion-pair-skew. Currently `4096` counts (master principles `§9.5`, [commissioning-safety.md](./commissioning-safety.md) "Multi-Turn Truth and Shaft-Frame Consistency").
+- Jog control loop hot-path vs deferred-telemetry split, `_JOG_ARM_RECENT_TRUTH_WINDOW_S` fast-path, `_safe_session_call` race guard ([controller-runtime.md](./controller-runtime.md) "Jog Control Loop").
+- `./start-stack.sh stop --hard` is the only safe RTCore teardown; `kill -9 gradient-rt-motion` orphans the EtherCAT master kernel module and requires a reboot ([validation-and-debugging.md](./validation-and-debugging.md) "RTCore Teardown").
+
 ## Non-Negotiable Rules
 
 - Do not duplicate comms or telemetry pathways if an existing payload can carry the new data.

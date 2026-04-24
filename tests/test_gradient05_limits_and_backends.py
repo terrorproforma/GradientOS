@@ -129,7 +129,7 @@ def test_gradient05_config_defaults_and_mapping_shape():
         5: [5],
     }
     assert cfg.actuator_encoder_counts_per_rev == [131072] * 6
-    assert cfg.actuator_gear_ratios == [100.0, 100.0, 100.0, 18.0, 31.25, 10.0]
+    assert cfg.actuator_gear_ratios == [100.0, 100.0, 100.0, 18.0, 11.0, 10.0]
     assert cfg.actuator_position_signs == [-1, 1, -1, -1, -1, -1]
     assert cfg.logical_joint_limits_rad == [
         (-6.3, 6.3),
@@ -3916,7 +3916,7 @@ def test_ethercat_backend_a6ec_reference_wrap_period_uses_per_axis_gear_ratios(
             robot_cfg["actuator_gear_ratios"][:6],
         )
     ]
-    assert expected_period_counts[4] == 4_096_000
+    assert expected_period_counts[4] == 1_441_792  # J5: 131072 counts/rev * 11 gear ratio
 
     for axis_i, expected_period in enumerate(expected_period_counts):
         counts_per_unit = float(backend._axis_config.counts_per_unit[axis_i])

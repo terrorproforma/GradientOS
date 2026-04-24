@@ -59,9 +59,14 @@ Vendor Q2 requires the motor to be "stationary AND inactive" before HM35. The ho
 Vendor Q4/Q10 says "host only needs `6064`". That claim applies to single-turn-bounded axes. It is NOT sufficient for joints whose software limits exceed one shaft revolution (Gradient-05 J1/J4/J5/J6). `6064` wraps at `RM` in absolute rotation mode and cannot carry multi-turn continuity. Contract:
 
 - Canonical planner/controller truth is `canonical_q = absolute_axis_q − absolute_home_anchor − master_offset` where `absolute_axis_q` is derived from the multi-turn `U40.20 / U40.22` pair and the anchor lives in `.gradient_absolute_encoder_anchors.json`.
-- Before publishing canonical truth, verify that `(canonical_q + master_offset) * sign * counts_per_unit` agrees with live `6064` modulo `RM` within `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (16 counts).
-- Whole-shaft-turn offsets between the anchored view and live `6064` are legitimate (that is what the anchor encodes). Sub-shaft-turn drift is a frame bug; truth fails closed with reason `multi_turn_anchor_inconsistent_with_live_6064` (or the drive-native-prefixed equivalent) and the stale-anchor diagnostic fields are attached.
+- Before publishing canonical truth, verify that `(canonical_q + master_offset) * sign * counts_per_unit` agrees with the paired `6064` snapshot modulo `RM` within `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (currently `4096` counts).
+- The tolerance is intentionally sized for the "drive lost track of WHICH full revolution" failure mode (`131072` counts on G05 encoders). Sub-revolution deltas up to `~2000` counts are motion-pair-skew between the drive's internal `U40.20 / U40.22` and `0x6064` sampling and should not trip the gate. `4096` is `32×` smaller than a full revolution, so real retention failures remain detectable. Do NOT tighten back toward `16` unless the paired-snapshot and pair-skew physics fundamentally change.
+- Whole-shaft-turn offsets between the anchored view and the paired `6064` are legitimate (that is what the anchor encodes). Sub-shaft-turn drift above tolerance is a frame bug; truth fails closed with reason `multi_turn_anchor_inconsistent_with_live_6064` (or the drive-native-prefixed equivalent) and the stale-anchor diagnostic fields are attached.
 - Do not demote `U40.20/.22` to diagnostics-only for this drive family; multi-turn-capable joints require it.
+
+### Paired-Snapshot Reference for the Gate (A6-EC)
+
+The shaft-frame gate must compare values from the SAME moment. The A6-EC advertises `U40.20 / U40.22` as PDO-mappable but firmware does NOT populate them cyclically, so multi-turn is SDO-only and asymmetric with the `0x6064` PDO cycle. RTCore latches `0x6064` just before issuing each axis's `U40.20 / U40.22` SDO upload and publishes it as `paired_pos_counts` inside the `absolute_feedback` JSON payload. Python's gate reads the paired value via `_AbsoluteFeedbackAxisMetrics.paired_pos_counts()` and passes it in as the shaft-frame reference, NOT the live-now PDO value. Fallback to live `0x6064` only when `paired_valid = 0` (pre-paired window). `shaft_frame_reference_source = "paired_sdo_snapshot" | "live_pdo"` on every axis diagnostic confirms which path ran. See `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md §9.5A` for the full rationale.
 
 ## Restart Trust Model (A6-EC)
 

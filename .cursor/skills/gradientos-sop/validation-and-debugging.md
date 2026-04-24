@@ -53,8 +53,24 @@ Choose the narrowest command set that actually proves the change.
 `Er87.1` (excessive position reference increment, > 5x max speed) and `Er47.0` (following error) on seam-adjacent small jogs are almost always a host-side command-frame turn-selection bug, not drive misconfiguration. Diagnostic path:
 
 - Confirm the trajectory upload payload's per-axis `607A` step size (host `command_frame_oversized_step` gate would have refused a genuine whole-turn jump before commit).
-- Confirm live `6064` vs the host's `canonical_q * sign * counts_per_unit + master_offset` agrees modulo `RM` within 16 counts (`shaft_frame_consistent` in axis detail). A large `shaft_frame_mod_rm_delta_counts` signals a frame mismatch, not a drive fault.
+- Confirm the paired `6064` snapshot vs the host's `canonical_q * sign * counts_per_unit + master_offset` agrees modulo `RM` within `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (currently `4096` counts; see `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md §9.5`). A `shaft_frame_mod_rm_delta_counts` clearly larger than tolerance is a frame mismatch, not a drive fault. Sub-`4096` deltas during motion are motion-pair-skew and should not cause alarm.
+- Confirm `shaft_frame_reference_source = paired_sdo_snapshot` on the axis detail. If it reads `live_pdo`, RTCore has not yet published a paired snapshot for that axis (first cycles after boot, or absolute-feedback poll disabled) and the gate is seeing legitimate 200 ms SDO-vs-PDO skew; wait one poll period before blaming drive state.
 - Do not blame vendor scaling (`6091` / `C10.18` / `C10.19`) before confirming the command frame is well-formed; these are already validated by startup readback.
+
+## Jog-Lag Diagnostic Path
+
+When an operator reports "jog is laggy" or "blocked until it settles":
+
+- Read the controller log around the exact sequence the operator described. A release-then-reclick pattern producing `Rejecting jog session start after N attempt(s) over <window>` is the canonical arm-time retry wall — see `controller-runtime.md` "Jog arm-time canonical-truth fast-path".
+- `/debug/performance` exposes `controller.jog.loop` and `controller.jog.stages` (`feedback_read_ms`, `ik_solve_ms`, `command_send_ms`). A jog tick with `loop_ms ≫ sum(stage_ms)` means telemetry/bookkeeping is eating the gap; the hot path should be `feedback + ik + command_send` only, with everything else deferred to after `update_joint_velocity_lease_jog`.
+- `/info/joints-detailed` exposes per-axis `shaft_frame_consistent`, `shaft_frame_tolerance_counts`, `shaft_frame_mod_rm_delta_counts`, `shaft_frame_reference_source`, `command_roundtrip_*` during live motion so gate flips can be correlated with the exact moment the operator felt a stall.
+- `scripts/jog_combined_trace.py` polls both endpoints at 15 Hz and logs every gate flip plus jog-loop stage timings; preferred capture harness for reproducing operator complaints.
+
+## RTCore Teardown (NEVER SIGKILL)
+
+- `./start-stack.sh stop --hard` is the only safe way to tear down a running stack. It stops the launcher, controller, API, and `gradient-rt-motion` cleanly and releases the IgH EtherCAT master in `~100 ms`.
+- NEVER `kill -9` / `pkill -9 gradient-rt-motion`. SIGKILL orphans the EtherCAT master kernel-module references (`ec_master` refcnt stays elevated, `rmmod` fails with `Module is in use`), and the only userspace recovery is a full reboot.
+- If `./start-stack.sh start` refuses with `ec_master module refcnt=3 (expected 1 when idle)`, the module is poisoned — `sudo reboot` is the only way forward.
 
 ## Power-Cycle Persistence Workflow
 

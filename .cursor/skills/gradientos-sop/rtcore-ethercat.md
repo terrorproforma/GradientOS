@@ -31,6 +31,21 @@ Use this file when changing `gradient-rt-motion`, EtherCAT host setup, drive bri
   - the configured PDO assignment (`0x1702/0x1B02` here)
   - the exact ordered layout inside that PDO, not just the PDO index names
 - If manufacturer fault detail is needed but is not in the cyclic PDO, fetch it through a separate non-RT path instead of breaking the PDO layout.
+- ESI `PdoMapping=t` is NOT a promise that the drive populates the subitem cyclically. The A6-EC advertises `U40.20 / U40.22` as PDO-mappable in its DT2040 datatype but empirically the firmware does NOT update those bytes when the subitems are included in a custom TxPDO — the drive accepts the mapping but sends zeros, even when other `0x6064`-family subitems in the same frame populate correctly. Verify wire-level population (not just SDO acceptance of the PDO assignment) before relying on any custom-mapped vendor subitem.
+
+## Asymmetric-Rate Atomic Snapshots
+
+When the controller needs to compare a PDO value (cyclic, fast) with an SDO value (mailbox, slow) — e.g., multi-turn consistency on A6-EC — RTCore owns pairing the two samples because only it has nanosecond access to both at the same moment.
+
+Pattern (applied to the A6-EC `U40.20 / U40.22` vs `0x6064` comparison):
+
+- `AbsoluteFeedbackAxis::paired_pos_counts` (in `src/gradient_rt_motion/main.cpp`) latches live `0x6064` immediately BEFORE each axis's multi-turn SDO read, alongside `paired_valid` and `paired_sample_time_ns`.
+- The latch runs inside the `perform_absolute_feedback_refresh` loop specifically on the first multi-turn subindex encountered (`U40.21 / U40.23 / U40.2B / U40.2D`), not at end-of-loop, to keep skew at `~1-5 ms` instead of `~40-160 ms` of inter-field SDO transit.
+- `append_absolute_feedback_json` publishes `paired_pos_counts` + `paired_sample_time_ns` alongside the other fields so the Python consumer picks them up with the existing `_AbsoluteFeedbackAxisMetrics` parser (no schema break).
+- Python's canonical-truth gate reads `metrics.paired_pos_counts()` and uses that as the reference for the shaft-frame comparison; falls back to live-now `0x6064` only when `paired_valid = 0` (pre-paired window).
+- See `RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md §9.5A` for the full rationale and the diagnostic-surface contract.
+
+When adding a similar cross-fieldbus invariant for a different drive family, do the pairing in RTCore, not in Python. IPC + metrics.json latency blur the sampling moment for any Python-side approach.
 
 ## Startup Verification
 

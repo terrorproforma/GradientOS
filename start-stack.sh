@@ -2252,6 +2252,290 @@ direct_rtcore_fault_reset_mask() {
   return 1
 }
 
+# Drive the vendor-specific encoder-data reset sequence for the axes
+# that showed an encoder-retention-family fault in the startup probe.
+# Runs in the preflight window before the controller is launched so
+# the controller comes up with anchors cleared and the drives already
+# past Fault.
+#
+# Per-slave sequence, proven live 2026-04-23:
+#   1. SDO write F31.10 = 4 (0x2031:0x11, "Reset encoder fault and
+#      multi-turn data"). The vendor documents this as "Effective:
+#      Immediately" but the drive's fault LATCHES (0x603F / 0x203F /
+#      statusword bit 3) stay set until the drive fully re-initialises;
+#      F31.10 alone is therefore necessary but not sufficient for the
+#      latched-fault case the preflight needs to recover from.
+#   2. SDO write F31.01 = 1 (0x2031:0x02, "Software reset"). The
+#      vendor docs describe this as "similar to the program reset
+#      upon power-on, without the need for a power cycle". The drive
+#      drops off the EtherCAT bus for ~5-7 s and re-enumerates. On
+#      return the encoder fault latches are clear and DS402 state
+#      is SwitchOnDisabled. The ethercat CLI write will commonly
+#      fail with "Input/output error" because the slave vanishes
+#      mid-transaction - that is the SUCCESS signal, not a failure,
+#      so we tolerate it.
+#   3. Wait for the slave to re-enumerate on the bus before starting
+#      the next slave in the loop. Parallel writes DO NOT WORK because
+#      the first reset takes the bus through a re-config pass that
+#      leaves subsequent slaves transiently invisible.
+#
+# The collateral of each software reset is a transient 0x8700 ("Sync
+# controller") fault on every OTHER slave on the bus (they see one of
+# their peers disappear). That is a resettable DS402 fault and is
+# cleared by the existing DS402 pulse step that `startup_fault_reset_
+# preflight` runs after this helper returns.
+#
+# Arguments:
+#   $1  encoder_reset_axis_mask_hex (e.g. "0x3c")
+#   $2  space-separated 0-indexed logical joint indices for anchor
+#       invalidation (e.g. "2 3 4 5" for J3..J6). May be empty when
+#       the reset targets axes that have no logical joint mapping.
+direct_rtcore_encoder_data_reset_and_invalidate_anchors() {
+  local axis_mask_hex="$1"
+  local logical_joint_indices_csv="$2"
+  if [[ ! -x "${PROJECT_PYTHON}" ]]; then
+    warn "direct RTCore encoder-data reset unavailable: missing ${PROJECT_PYTHON}"
+    return 1
+  fi
+
+  local detail=""
+  if detail="$(
+    PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}" \
+    GRADIENT_RTCORE_AUTO_ARM=0 \
+    GRADIENT_STARTUP_ENCODER_RESET_AXIS_MASK="${axis_mask_hex}" \
+    GRADIENT_STARTUP_ENCODER_RESET_JOINT_INDICES="${logical_joint_indices_csv}" \
+    "${PROJECT_PYTHON}" - <<'PY' 2>&1
+import os
+import subprocess
+import sys
+import time
+
+from gradient_os import runtime_config
+from gradient_os.absolute_encoder_anchors import invalidate_absolute_encoder_anchors
+from gradient_os.arm_controller.robots import get_robot_config
+
+
+def _parse_mask(raw: str) -> int:
+    token = (raw or "").strip()
+    if not token:
+        return 0
+    return int(token, 0) & 0xFFFFFFFF
+
+
+def _parse_joint_indices(raw: str) -> list[int]:
+    out: list[int] = []
+    for token in (raw or "").split():
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(int(token))
+        except Exception:
+            continue
+    return out
+
+
+def _run_sdo_download(slave_pos: int, index_hex: str, subindex_hex: str, value: int, label: str) -> tuple[int, str]:
+    """Fire-and-forget SDO download via the ethercat CLI.
+
+    Returns (exit_code, captured_output). Never raises so the caller
+    can treat "slave vanished mid-write" as success for the software-
+    reset step.
+    """
+    cmd = [
+        "sudo", "-n", "ethercat", "download",
+        "-p", str(int(slave_pos)),
+        "-t", "uint16",
+        str(index_hex), str(subindex_hex),
+        str(int(value)),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8.0)
+    except Exception as exc:
+        return 99, f"{label} subprocess failure: {exc}"
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def _ethercat_slave_al_states(timeout_s: float = 3.0) -> dict[int, str]:
+    """Return {slave_pos: al_state_name} from `ethercat slaves`.
+
+    This is a master-level query - it does NOT go through the SDO
+    mailbox, so it stays responsive even while a slave is mid-reset
+    and its mailbox is blocked. Slaves missing from the output are
+    absent from the returned dict (caller should treat as offline).
+
+    Output format (whitespace-separated):
+      <pos>  <alias>:<position>  <AL_STATE>  <err_flag>  <name>
+    where AL_STATE is INIT / PREOP / BOOT / SAFEOP / OP.
+    """
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", "ethercat", "slaves"],
+            capture_output=True, text=True, timeout=float(timeout_s),
+        )
+    except Exception:
+        return {}
+    if proc.returncode != 0:
+        return {}
+    out: dict[int, str] = {}
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            pos = int(parts[0])
+        except Exception:
+            continue
+        al = parts[2].upper()
+        if al in {"INIT", "PREOP", "BOOT", "SAFEOP", "OP"}:
+            out[pos] = al
+    return out
+
+
+def _wait_slave_online(slave_pos: int, timeout_s: float = 20.0) -> bool:
+    """Poll `ethercat slaves` until the target slave shows AL=OP.
+
+    Uses the master-level slave list (no SDO mailbox traffic) so it
+    stays responsive even while the slave is mid-reset. Each poll
+    has its own short timeout and any subprocess failure is treated
+    as "not yet online"; only the overall wall-clock budget
+    (``timeout_s``) ends the wait.
+    """
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        states = _ethercat_slave_al_states(timeout_s=2.5)
+        if states.get(int(slave_pos)) == "OP":
+            # Drives take a few hundred ms after the AL state hits OP
+            # to settle in DS402 SwitchOnDisabled; an extra 500 ms
+            # reduces the chance the DS402 pulse in the next preflight
+            # stage hits a transient NotReadyToSwitchOn and gets
+            # ignored.
+            time.sleep(0.5)
+            return True
+        time.sleep(0.25)
+    return False
+
+
+axis_mask = _parse_mask(os.environ.get("GRADIENT_STARTUP_ENCODER_RESET_AXIS_MASK", ""))
+joint_indices = _parse_joint_indices(os.environ.get("GRADIENT_STARTUP_ENCODER_RESET_JOINT_INDICES", ""))
+if axis_mask == 0:
+    print("direct_rtcore_encoder_data_reset_skipped: empty axis mask", flush=True)
+    raise SystemExit(2)
+
+cfg_name = runtime_config.load_runtime_config().get("desired", {}).get("robot")
+robot_cfg = get_robot_config(str(cfg_name or "").strip()).get_config_dict()
+robot_id = str(robot_cfg.get("robot_id") or robot_cfg.get("name") or "").strip() or str(cfg_name or "").strip()
+num_joints = int(robot_cfg.get("num_logical_joints", robot_cfg.get("num_joints", 0)) or 0)
+
+# Enumerate slave positions from the axis mask. Mapping is 1:1 (axis i
+# -> slave pos i) on the current GradientOS bus topology; RTCore's
+# --num-axes + drive profile expose the same index.
+slaves: list[int] = []
+for axis_i in range(32):
+    if (axis_mask >> axis_i) & 1:
+        slaves.append(axis_i)
+print(f"direct_rtcore_encoder_data_reset_begin: axis_mask=0x{axis_mask:x} slaves={slaves}", flush=True)
+
+failed_slaves: list[int] = []
+for slave in slaves:
+    # Step 1: F31.10 = 4 (encoder data reset). This is the vendor-
+    # documented primary operation; accepted immediately but alone
+    # does not clear the latched error in 0x603F / 0x203F.
+    rc_f31_10, out_f31_10 = _run_sdo_download(
+        slave, "0x2031", "0x11", 4, f"slave{slave}.F31.10"
+    )
+    if rc_f31_10 != 0:
+        print(
+            f"direct_rtcore_encoder_data_reset_slave{slave}_f31_10_failed rc={rc_f31_10}: {out_f31_10}",
+            flush=True,
+        )
+        failed_slaves.append(slave)
+        continue
+    # Give the drive a beat to internalise the F31.10 transition
+    # before triggering the software reset. ~100 ms is well above the
+    # kAbsoluteFeedbackPollIntervalNs = 200 ms bound we care about.
+    time.sleep(0.1)
+
+    # Step 2: F31.01 = 1 (software reset). The drive will drop off
+    # the bus mid-transaction; the ethercat CLI reports "Input/output
+    # error" in that case, which is the success signature we want.
+    rc_f31_01, out_f31_01 = _run_sdo_download(
+        slave, "0x2031", "0x02", 1, f"slave{slave}.F31.01"
+    )
+    # A few possible terminal messages from the CLI are harmless:
+    #  - rc=0: write acked before slave dropped; drive will still reset.
+    #  - rc=1 + "Input/output error": slave dropped mid-write; reset fired.
+    #  - rc=1 + "matches 0 slaves": slave already gone (race with a
+    #    previous reset); no further action needed.
+    tolerated_tokens = ("Input/output error", "matches 0 slaves", "No such device")
+    if rc_f31_01 != 0 and not any(tok in out_f31_01 for tok in tolerated_tokens):
+        print(
+            f"direct_rtcore_encoder_data_reset_slave{slave}_f31_01_unexpected"
+            f" rc={rc_f31_01}: {out_f31_01}",
+            flush=True,
+        )
+        failed_slaves.append(slave)
+        continue
+
+    # Step 3: wait for the slave to re-enumerate. Observed ~5-6 s in
+    # practice on this bus; 15 s is a conservative upper bound.
+    if not _wait_slave_online(slave, timeout_s=15.0):
+        print(
+            f"direct_rtcore_encoder_data_reset_slave{slave}_did_not_return"
+            " (timeout waiting for ethercat upload 0x6041 to succeed)",
+            flush=True,
+        )
+        failed_slaves.append(slave)
+        continue
+    print(
+        f"direct_rtcore_encoder_data_reset_slave{slave}_ok:"
+        f" F31.10=4 + F31.01=1 accepted, slave re-enumerated",
+        flush=True,
+    )
+
+print(
+    f"direct_rtcore_encoder_data_reset_done: axis_mask=0x{axis_mask:x}"
+    f" failed_slaves={failed_slaves}",
+    flush=True,
+)
+
+if joint_indices and num_joints > 0 and robot_id:
+    invalidated = invalidate_absolute_encoder_anchors(
+        robot_id,
+        num_joints=num_joints,
+        logical_joint_indices=joint_indices,
+        actor="start-stack.startup_fault_reset_preflight",
+    )
+    entries = (
+        invalidated.get("logical_joint_absolute_home_anchors", [])
+        if isinstance(invalidated, dict)
+        else []
+    )
+    cleared = [i for i, entry in enumerate(entries) if entry is None and i in set(joint_indices)]
+    print(
+        f"absolute_encoder_anchors_invalidated: robot={robot_id!r}"
+        f" logical_joint_indices={joint_indices} cleared={cleared}",
+        flush=True,
+    )
+
+if failed_slaves:
+    raise SystemExit(5)
+PY
+  )"; then
+    log "Issued direct RTCore encoder-data reset: axis_mask=${axis_mask_hex} joints=[${logical_joint_indices_csv}]"
+    if [[ -n "${detail}" ]]; then
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        log "${line}"
+      done <<< "${detail}"
+    fi
+    return 0
+  fi
+
+  warn "Direct RTCore encoder-data reset failed for axis_mask=${axis_mask_hex}: ${detail}"
+  return 1
+}
+
 startup_fault_reset_preflight() {
   if ! wait_for_bus_operational; then
     return 1
@@ -2276,18 +2560,86 @@ startup_fault_reset_preflight() {
   local axis_mask_hex=""
   local fault_summary=""
   local reason=""
+  local ds402_pulse_required=""
+  local ds402_pulse_axis_mask_hex=""
+  local encoder_reset_required=""
+  local encoder_reset_axis_mask_hex=""
+  local encoder_reset_logical_joints_csv=""
   should_auto_reset="$(probe_json_field "${plan}" "should_auto_reset")"
   blocks_startup="$(probe_json_field "${plan}" "blocks_startup")"
   axis_mask_hex="$(probe_json_field "${plan}" "faulted_axis_mask_hex")"
   fault_summary="$(probe_json_field "${plan}" "faulted_summary")"
   reason="$(probe_json_field "${plan}" "reason")"
+  ds402_pulse_required="$(probe_json_field "${plan}" "ds402_pulse_required")"
+  ds402_pulse_axis_mask_hex="$(probe_json_field "${plan}" "ds402_pulse_axis_mask_hex")"
+  encoder_reset_required="$(probe_json_field "${plan}" "encoder_reset_required")"
+  encoder_reset_axis_mask_hex="$(probe_json_field "${plan}" "encoder_reset_axis_mask_hex")"
+  # The plan emits a JSON list; probe_json_field renders it without
+  # the enclosing brackets, but commas still survive. Normalize to a
+  # whitespace-separated token list for the Python helper to parse.
+  encoder_reset_logical_joints_csv="$(probe_json_field "${plan}" "encoder_reset_logical_joints" \
+    | tr -d '[]' \
+    | tr ',' ' ')"
 
   if [[ "${should_auto_reset}" == "1" ]]; then
     log "startup preflight found disarmed drive faults before any drive power-up: ${fault_summary:-axis_mask=${axis_mask_hex}}"
-    if ! direct_rtcore_fault_reset_mask "${axis_mask_hex}"; then
-      error "startup fault-reset preflight failed to send the RTCore reset pulse"
-      return 1
+
+    if [[ "${encoder_reset_required}" == "1" ]]; then
+      warn "startup preflight: encoder-retention fault(s) detected (axis_mask=${encoder_reset_axis_mask_hex})"
+      warn "  Applying drive-profile encoder-data reset (A6-EC F31.10 = 4 + F31.01 = 1"
+      warn "  software reset). Multi-turn data on the affected encoders will be zeroed;"
+      warn "  persisted home anchors will be invalidated for logical joints"
+      warn "  [${encoder_reset_logical_joints_csv}]. A native re-home is required for these"
+      warn "  joints before motion is trusted. Each drive takes ~6 s to re-enumerate; all"
+      warn "  other drives on the bus will see a transient 0x8700 sync-controller fault"
+      warn "  which the DS402 pulse at the end of this preflight step clears."
+      if ! direct_rtcore_encoder_data_reset_and_invalidate_anchors \
+          "${encoder_reset_axis_mask_hex}" \
+          "${encoder_reset_logical_joints_csv}"; then
+        error "startup fault-reset preflight failed to drive the encoder-data reset"
+        return 1
+      fi
+      # After the encoder reset cascade, all drives on the bus have
+      # seen at least one transient sync-loss event (0x8700), so we
+      # re-probe to rebuild the plan; the DS402 pulse below then
+      # fires against the NEW faulted-axis set (which now includes
+      # the sync-loss collaterals) instead of the pre-reset set.
+      log "startup preflight: re-probing after encoder-data reset to classify sync-loss collaterals"
+      sleep 1.0
+      local post_reset_payload=""
+      post_reset_payload="$(capture_probe_json || true)"
+      if [[ -n "${post_reset_payload}" ]]; then
+        local post_reset_plan=""
+        if post_reset_plan="$(probe_startup_fault_reset_plan "${post_reset_payload}" 2>/dev/null)"; then
+          local new_ds402_required=""
+          local new_ds402_mask=""
+          local new_fault_summary=""
+          new_ds402_required="$(probe_json_field "${post_reset_plan}" "ds402_pulse_required")"
+          new_ds402_mask="$(probe_json_field "${post_reset_plan}" "ds402_pulse_axis_mask_hex")"
+          new_fault_summary="$(probe_json_field "${post_reset_plan}" "faulted_summary")"
+          ds402_pulse_required="${new_ds402_required:-${ds402_pulse_required}}"
+          ds402_pulse_axis_mask_hex="${new_ds402_mask:-${ds402_pulse_axis_mask_hex}}"
+          if [[ -n "${new_fault_summary}" ]]; then
+            log "startup preflight: post-reset fault set: ${new_fault_summary}"
+          fi
+        fi
+      fi
     fi
+
+    if [[ "${ds402_pulse_required}" == "1" ]]; then
+      if ! direct_rtcore_fault_reset_mask "${ds402_pulse_axis_mask_hex}"; then
+        error "startup fault-reset preflight failed to send the RTCore reset pulse"
+        return 1
+      fi
+      # Some drives (observed live on A6-EC, slaves 0-3 after a
+      # sync-loss collateral) need a second DS402 pulse cycle to
+      # actually transition out of Fault. Fire a second pulse
+      # after a short settle; no-op if the first pulse already
+      # cleared the state.
+      sleep 0.5
+      direct_rtcore_fault_reset_mask "${ds402_pulse_axis_mask_hex}" || true
+    fi
+
     if ! wait_for_probe_state "BUS_UP_DISARMED" "${STARTUP_FAULT_RESET_TIMEOUT_S}"; then
       local post_reset_probe=""
       post_reset_probe="$(capture_probe_json || true)"
@@ -2307,6 +2659,9 @@ startup_fault_reset_preflight() {
       return 1
     fi
     log "startup fault-reset preflight cleared the disarmed drive faults"
+    if [[ "${encoder_reset_required}" == "1" ]]; then
+      warn "startup preflight: RE-HOME REQUIRED for logical joints [${encoder_reset_logical_joints_csv}] before trusting absolute position on those joints."
+    fi
     return 0
   fi
 

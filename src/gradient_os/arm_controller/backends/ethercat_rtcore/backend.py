@@ -1470,7 +1470,23 @@ class EthercatRTCoreBackend(ActuatorBackend):
         )
         return True
 
-    def reset_encoder_data(self, logical_joint_index: Optional[int] = None) -> bool:
+    def reset_encoder_data(
+        self,
+        logical_joint_index: Optional[int] = None,
+        *,
+        axis_mask: Optional[int] = None,
+    ) -> bool:
+        """Request the drive-profile's encoder-data reset operation.
+
+        - ``logical_joint_index`` (default): resolve to every RTCore
+          axis mapped to that joint; ``None`` means all configured axes.
+        - ``axis_mask`` (keyword only): override with an explicit
+          RTCore axis bitmask. Use when the caller has already
+          classified which axes need the reset (e.g. the startup
+          preflight, which unions encoder-retention-faulted axes into
+          one mask). Takes precedence over ``logical_joint_index``
+          when both are supplied.
+        """
         if not self._connected:
             print("[EtherCAT RTCore] WARNING: cannot reset encoder data while RTCore is disconnected")
             return False
@@ -1497,8 +1513,19 @@ class EthercatRTCoreBackend(ActuatorBackend):
             )
             return False
 
-        if logical_joint_index is None:
-            axis_mask = (1 << self._rt_num_axes) - 1
+        valid_axis_mask = (1 << self._rt_num_axes) - 1
+        if axis_mask is not None:
+            mask_value = int(axis_mask) & valid_axis_mask
+            if mask_value == 0:
+                print(
+                    "[EtherCAT RTCore] WARNING: cannot reset encoder data; explicit axis_mask"
+                    f" 0x{int(axis_mask):x} has no bits in range for {self._rt_num_axes} axes"
+                )
+                return False
+            label = f"axis_mask=0x{mask_value:x}"
+            axis_mask = mask_value
+        elif logical_joint_index is None:
+            axis_mask = valid_axis_mask
             label = "all axes"
         else:
             joint_i = int(logical_joint_index)

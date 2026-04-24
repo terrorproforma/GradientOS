@@ -1223,7 +1223,24 @@ Finalized contract:
 
 - Canonical planner/controller truth for A6-EC is `canonical_q = absolute_axis_q − absolute_home_anchor − master_offset` where `absolute_axis_q` is the i64 combine of `U40.20 / U40.22` and the anchor is persisted in `.gradient_absolute_encoder_anchors.json`.
 - `U40.20 / U40.22` are NOT demoted to diagnostics. They are the authoritative multi-turn source.
-- Vendor "6064 is authoritative" should be interpreted as "authoritative within shaft space". Before publishing canonical truth the controller verifies that `(canonical_q + master_offset) * sign * counts_per_unit` agrees with live `0x6064` modulo `RM` within `16` counts. Whole-shaft-turn offsets are legitimate multi-turn state; sub-shaft-turn drift is a frame bug and fails truth closed with `multi_turn_anchor_inconsistent_with_live_6064`.
+- Vendor "6064 is authoritative" should be interpreted as "authoritative within shaft space". Before publishing canonical truth the controller verifies that `(canonical_q + master_offset) * sign * counts_per_unit` agrees with live `0x6064` modulo `RM` within `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (currently `4096` counts on the A6-EC path). Whole-shaft-turn offsets are legitimate multi-turn state; sub-shaft-turn drift larger than the tolerance is a frame bug and fails truth closed with `multi_turn_anchor_inconsistent_with_live_6064`.
+- Tolerance sizing rationale: the gate catches "drive lost track of WHICH full revolution the shaft is on" — a `131072`-count class of failure on G05's encoders. Any sub-revolution delta up to `~2000` counts is motion-pair-skew between the drive's internal `U40.20 / U40.22` sampling and its `0x6064` register during jog-speed transients and is NOT a semantic frame error. `4096` counts is `32×` smaller than one revolution, so real multi-turn glitches still trip the gate decisively, while normal motion does not. The earlier `16`-count setting was sized for atomic same-moment reads at rest and produced spurious trips under motion.
+
+#### 9.5A RTCore atomic paired-snapshot for U40.20 / U40.22 vs `0x6064`
+
+The A6-EC advertises `U40.20 / U40.22` as `PdoMapping=t` in its ESI DT2040 datatype but the firmware does NOT cyclically populate those subitems in a custom TxPDO: the bytes come through as zeros even when the PDO assignment is accepted and `0x6064` in the same frame populates correctly. Multi-turn truth is therefore read over SDO, which is slower and asynchronous to the PDO 1 kHz cycle.
+
+To keep the shaft-frame consistency gate comparing two values from the SAME moment, RTCore latches the live `0x6064` at the exact point it issues the `U40.20 / U40.22` SDO upload and publishes it as `paired_pos_counts` alongside the multi-turn values inside the `absolute_feedback` JSON payload (see `AbsoluteFeedbackAxis::paired_pos_counts` in `src/gradient_rt_motion/main.cpp` and the matching consumer in `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py::_AbsoluteFeedbackAxisMetrics.paired_pos_counts()`).
+
+Rules:
+
+- Python's shaft-frame gate reads `paired_6064` and compares against the paired multi-turn sample, NOT against the live-now `0x6064`. Using live-now `0x6064` produces up to `~200 ms × velocity` of spurious drift during motion because the SDO poll period lags the PDO refresh.
+- The paired latch happens as close as possible to the `U40.20 / U40.22` read (`just-before` the subindex read, `~1-5 ms` skew worst case) — NOT after all SDO fields complete, which would introduce `40-160 ms` of inter-field skew.
+- The comparison stays available when `paired_valid = 0` (e.g., before the first SDO poll after boot, or when absolute-feedback poll is disabled) by falling back to the live-now `0x6064`, so the gate still runs in the pre-paired window.
+- Diagnostic `shaft_frame_reference_source` reports `paired_sdo_snapshot` vs `live_pdo` on every axis so operators can confirm from `/info/joints-detailed` that the atomic path is active.
+- The `command_roundtrip_reference_source` on the same diagnostic payload mirrors the same choice for the roundtrip gate (which also benefits from the paired reference).
+
+When adding similar asymmetric-rate-fieldbus invariants to other drives, pair the values inside RTCore (nanosecond access to both registers at the same moment) rather than in Python (IPC latency blurs the sampling moment).
 
 ### 9.6 HM35 must wait for a drive-confirmed disarmed statusword
 

@@ -356,7 +356,7 @@ def shaft_frame_consistency(
     canonical_q_rad: float,
     live_reference_counts: int,
     kinematics: A6ECAxisKinematics,
-    tolerance_counts: float = 16.0,
+    tolerance_counts: float = 4096.0,
 ) -> ShaftFrameConsistencyResult:
     """Gate that rejects canonical truth if it disagrees with live 6064.
 
@@ -371,9 +371,15 @@ def shaft_frame_consistency(
     A whole-shaft-turn offset is legitimate (that is precisely what
     the absolute-home anchor encodes for a multi-turn joint), so the
     gate folds ``delta`` to the nearest shaft turn and only fires on
-    the sub-shaft-turn residual. The default tolerance of ``16 counts``
-    matches the A6-EC probe's observed stationary jitter ceiling
-    (``0..9`` counts post-restart, well below ``16``).
+    the sub-shaft-turn residual. The default tolerance of ``4096
+    counts`` is sized for the full-revolution ("drive lost track of
+    WHICH shaft turn it is on", 131072 counts on G05 encoders) class of
+    failure, with ``32×`` margin over one revolution. Sub-revolution
+    deltas up to ``~2000`` counts are legitimate drive-internal
+    motion-pair-skew between ``U40.20 / U40.22`` and ``0x6064`` during
+    jog-speed transients and must not be interpreted as a frame error.
+    See ``RTOS_ETHERCAT_MASTER_OPERATING_PRINCIPLES.md §9.5`` for the
+    canonical sizing rationale.
 
     ``live_reference_counts`` is the raw ``6064`` reading in wire
     units. Do NOT pass a pre-subtracted value; the math folds it

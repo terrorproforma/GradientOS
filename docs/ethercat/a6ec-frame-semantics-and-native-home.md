@@ -121,13 +121,22 @@ respecting the vendor "6064 authoritative within shaft space" claim.
 - Shaft-frame consistency (Workstream 3 gate):
   - Before publishing canonical truth, verify that
     `(canonical_q + master_offset) * sign * counts_per_unit mod RM`
-    agrees with live `6064 mod RM` within a small tolerance
-    (`_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS`, default 16 counts).
+    agrees with the PAIRED `6064` snapshot `mod RM` within
+    `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (currently `4096` counts
+    on the A6-EC path, sized for the full-revolution failure class).
+  - The reference `6064` MUST come from `paired_pos_counts` in the
+    `absolute_feedback` JSON payload — RTCore atomically latches that
+    value at the moment of the `U40.20 / U40.22` SDO read so both sides
+    of the comparison are from the same moment. Using live-now `6064`
+    instead of the paired value produces up to `~200 ms × velocity`
+    of motion-induced skew that spuriously trips the gate during jog.
   - A whole-shaft-turn offset is legitimate (it is what anchors *mean* for a
-    multi-turn axis). A sub-shaft-turn disagreement is a frame bug; truth
-    reads `unavailable` with reason `multi_turn_anchor_inconsistent_with_live_6064`
-    and the stale-anchor diagnostic fields are attached so operators see how
-    far the anchor drifted.
+    multi-turn axis). A sub-shaft-turn disagreement ABOVE tolerance is a
+    frame bug; truth reads `unavailable` with reason
+    `multi_turn_anchor_inconsistent_with_live_6064` and the stale-anchor
+    diagnostic fields are attached. The diagnostic
+    `shaft_frame_reference_source = "paired_sdo_snapshot" | "live_pdo"`
+    reports which reference the gate used on each evaluation.
 - Fail-closed mode:
   - verify the startup posture through the `startup_drive_config` readback channel
   - trust canonical truth only when the drive reports a valid coordinate system
@@ -191,9 +200,10 @@ path; it runs after it in `derive_drive_native_truth_validity`:
    `"statusword_bit15"` (vendor Q9; vestigial on this firmware).
 3. **Else** if the persisted absolute-home anchor exists *and* the live
    `U40.20/.22` multi-turn reading is valid *and* the shaft-frame
-   consistency check (mod-`RM`) agrees with the anchor within
-   `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (16 counts) → trust via
-   `"persisted_home_anchor_agreement"`.
+   consistency check (mod-`RM`, against the paired `6064` snapshot)
+   agrees with the anchor within
+   `_SHAFT_FRAME_CONSISTENCY_TOLERANCE_COUNTS` (currently `4096` counts) →
+   trust via `"persisted_home_anchor_agreement"`.
 4. Else → `coordinate_system_valid = False` with a specific reason:
    `persisted_home_anchor_missing`, `multi_turn_feedback_invalid`, or
    `persisted_home_anchor_inconsistent_with_live_6064`.

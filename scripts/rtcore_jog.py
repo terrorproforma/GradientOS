@@ -49,7 +49,13 @@ _MAGIC_GSHM = _fourcc("G", "S", "H", "M")
 _MAGIC_RING = _fourcc("R", "I", "N", "G")
 
 _VER_MAJOR = 1
-_VER_MINOR = 0
+# Keep in lockstep with `src/gradient_rt_motion/ipc_v1.hpp::kVerMinor` and
+# `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py::_VER_MINOR`.
+# Bumped 2026-04-20 alongside the StatusExtendedSnapshotV1 addition; the RTCore
+# server rejects the HELLO + closes the socket when this drifts behind, which
+# surfaces as `WELCOME size mismatch (got 0 bytes)` to CLI callers and breaks
+# the `start-stack.sh` fault-reset preflight.
+_VER_MINOR = 1
 _ROLE_CONTROLLER = 1
 
 _MAX_AXES = 16

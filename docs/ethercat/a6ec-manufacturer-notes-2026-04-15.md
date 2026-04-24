@@ -547,3 +547,32 @@ Complete Architecture Reference:
 4. Target Writing: Write the target position to 607Ah (in Command Units).
 
 5. Power-off Recovery: After restarting, directly read U40.20/U40.22; no re-homing is required.
+
+EMAIL 4:
+
+Q1. Issue regarding the retention of Bit 15 status after a power restart
+(a) Is Bit 15 always cleared after a power-down and restart?
+Yes, this is the intended behavior of the firmware design, not a fault. In the current firmware version of the A6-EC, Bit 15 is cleared following a power-down and restart. This behavior is determined by the firmware version; currently, there are no configuration parameters available to alter this behavior.
+(b) Is there a specific firmware version or parameter that allows Bit 15 to be retained?
+Not at present. On the drive side, there is currently no supported configuration scheme that allows Bit 15 to remain set to 1 after a power-down and restart. Your host-side verification scheme serves as a correct and valid alternative.
+(c) Is the host-side verification scheme a recommended approach?
+Yes, it is recommended. Your consistency check scheme—verifying the modulo RM consistency between U40.20/.22 and 6064h—is both correct and reliable. Provided the check passes, the current coordinate system data can be accepted as valid, eliminating the need to wait for Bit 15 to become 1. This scheme is robust and capable of correctly identifying valid state data from the pre-power-down condition.
+Q2. Signals that explicitly indicate "U40.20/U40.22 data is no longer reliable"
+(a) Primary signals indicating a data loss fault
+Yes, the following fault codes should be primarily monitored:
+Er20.8 - Encoder battery failure
+Er20.9 - Encoder multi-turn abnormality
+ErA0.1 - Encoder multi-turn overflow
+ALF9.0 - Encoder battery warning
+Additionally, you may monitor 0x603F (Error Code Register) and 0x203F (Extended Error Code). (b) Direct Objects Indicating Unreliable Data
+In addition to fault codes, the following flag bits can also be monitored:
+U41.05 Bit 13 - Multi-turn Fault
+U41.05 Bit 14 - Battery Fault
+U41.05 Bit 15 - Battery Warning
+C10.15 - Multi-turn Overflow Flag
+(c) Recommended Tolerance Range for Plausibility Checks
+The tolerance of 16 count units you have adopted is reasonable. Read jitter in a stationary state typically falls within a few count units; a tolerance of 16 counts is significantly higher than the actual jitter and effectively prevents false positives.
+Q3. Preconditions for HM35
+Your implementation of the two-stage transaction is correct: first, disable the enable signal; wait for the state transition to complete; and then execute HM35.
+Regarding the stabilization waiting time: 500 milliseconds is a reasonable and conservative setting. The drive documentation does not explicitly specify a minimum waiting time; your 500ms strategy ensures state stability and represents a recommended, conservative approach.
+Core Requirements: The motor must be in a stationary state AND have exited the "OperationEnabled" state.

@@ -36,6 +36,133 @@ def test_build_startup_fault_reset_plan_targets_disarmed_faulted_axes():
     assert plan["faulted_axis_mask_hex"] == "0x4"
     assert "J3/axis2" in plan["faulted_summary"]
     assert "0x8700" in plan["faulted_summary"]
+    # Plain resettable DS402 faults route through the pulse path only.
+    assert plan["ds402_pulse_required"] is True
+    assert plan["ds402_pulse_axis_mask"] == 0x4
+    assert plan["ds402_pulse_axis_mask_hex"] == "0x4"
+    assert plan["encoder_reset_required"] is False
+    assert plan["encoder_reset_axis_mask"] == 0x0
+    assert plan["encoder_reset_logical_joints"] == []
+    assert plan["unresettable_axis_mask"] == 0x0
+    assert plan["faulted_axes"][0]["reset_action"] == "ds402_fault_pulse"
+
+
+def test_build_startup_fault_reset_plan_routes_encoder_retention_to_f31_10():
+    """A6-EC encoder-retention fault (Er20.8 = encoder battery failure
+    after the cable was disconnected) must be classified into the
+    encoder-reset bucket and the affected logical joint surfaced for
+    anchor invalidation. DS402-pulse-only axes on the same bus stay
+    in the pulse bucket so the two recovery paths can run
+    side-by-side.
+    """
+    plan = build_startup_fault_reset_plan(
+        {
+            "physical_state": "FAULTED",
+            "driver_state": "FAULTED",
+            "rtcore_state": "UP",
+            "armed": 0,
+            "axis_enable_mask": 0,
+            "op_enabled_axes": 0,
+            "axes": [
+                {"axis": 0, "logical_joint": 1, "ds402_state": "SwitchOnDisabled", "error_code": 0},
+                {
+                    "axis": 2,
+                    "logical_joint": 3,
+                    "ds402_state": "Fault",
+                    "error_code": 0x0208,
+                    "error_code_hex": "0x0208",
+                    "fault": {"code": "Er20.8", "name": "Encoder battery failure", "resettable": False},
+                    "encoder_retention_fault_present": True,
+                    "encoder_retention_fault": {
+                        "present": True,
+                        "codes": ["Er20.8"],
+                        "names": ["Encoder battery failure"],
+                        "matched_sources": ["manufacturer_error_code"],
+                    },
+                },
+                {
+                    "axis": 5,
+                    "logical_joint": 6,
+                    "ds402_state": "Fault",
+                    "error_code": 0x8700,
+                    "error_code_hex": "0x8700",
+                    "fault": {"code": "ErC2.0", "name": "SYNC signal loss", "resettable": True},
+                    "encoder_retention_fault_present": False,
+                },
+            ],
+        }
+    )
+
+    assert plan["should_auto_reset"] is True
+    assert plan["blocks_startup"] is False
+    assert plan["faulted_axis_mask"] == 0x24
+    # Encoder-retention axis (J3) goes through F31.10 + anchor invalidation.
+    assert plan["encoder_reset_required"] is True
+    assert plan["encoder_reset_axis_mask"] == 0x4
+    assert plan["encoder_reset_axis_mask_hex"] == "0x4"
+    # Anchor store is 0-indexed while the probe uses 1-indexed logical
+    # joints; the plan must translate so the caller can pass the list
+    # straight into ``invalidate_absolute_encoder_anchors``.
+    assert plan["encoder_reset_logical_joints"] == [2]
+    # DS402 pulse mask MUST include the encoder-retention axis too -
+    # F31.10 clears the encoder-internal fault but the DS402 state
+    # machine stays latched in Fault until a controlword 0x80 pulse
+    # re-runs the fault-reset edge. Without this the preflight waits
+    # forever for BUS_UP_DISARMED even though the SDO write succeeded
+    # (observed live 2026-04-23).
+    assert plan["ds402_pulse_required"] is True
+    assert plan["ds402_pulse_axis_mask"] == 0x24  # encoder-reset (0x4) + SYNC-loss (0x20)
+    assert plan["ds402_pulse_axis_mask_hex"] == "0x24"
+    assert plan["unresettable_axis_mask"] == 0x0
+    assert plan["reason"] == "encoder_retention_and_ds402_resets_required"
+    # Summary marks the retention axis so operators can see it in logs.
+    assert "[encoder-retention]" in plan["faulted_summary"]
+    # Per-axis reset_action mirrors the bucketing so downstream code
+    # can drive the right tool per axis.
+    actions = {entry["axis"]: entry["reset_action"] for entry in plan["faulted_axes"]}
+    assert actions == {2: "encoder_data_reset_then_ds402_pulse", 5: "ds402_fault_pulse"}
+
+
+def test_build_startup_fault_reset_plan_encoder_retention_only_reason():
+    """When EVERY faulted axis is encoder-retention (the typical case
+    after disconnecting all encoder cables), the plan reason narrows
+    to ``encoder_retention_reset_required`` so the preflight message
+    is precise instead of the generic "ready for reset" label.
+    """
+    plan = build_startup_fault_reset_plan(
+        {
+            "physical_state": "FAULTED",
+            "driver_state": "FAULTED",
+            "rtcore_state": "UP",
+            "armed": 0,
+            "axis_enable_mask": 0,
+            "op_enabled_axes": 0,
+            "axes": [
+                {
+                    "axis": axis_i,
+                    "logical_joint": axis_i + 1,
+                    "ds402_state": "Fault",
+                    "error_code": 0x0208,
+                    "error_code_hex": "0x0208",
+                    "fault": {"code": "Er20.8", "name": "Encoder battery failure", "resettable": False},
+                    "encoder_retention_fault_present": True,
+                }
+                for axis_i in (2, 3, 4, 5)
+            ],
+        }
+    )
+
+    assert plan["should_auto_reset"] is True
+    assert plan["encoder_reset_required"] is True
+    assert plan["encoder_reset_axis_mask"] == 0x3C
+    # DS402 pulse mask tracks the same axes because encoder-reset
+    # requires the follow-up pulse to leave DS402 Fault state. This
+    # is the fix for the "F31.10 sent but drives stayed in Fault"
+    # regression found live on 2026-04-23.
+    assert plan["ds402_pulse_required"] is True
+    assert plan["ds402_pulse_axis_mask"] == 0x3C
+    assert plan["reason"] == "encoder_retention_reset_required"
+    assert plan["encoder_reset_logical_joints"] == [2, 3, 4, 5]
 
 
 def test_drive_faults_and_ethercat_backend_import_without_circular_dependency():
@@ -560,6 +687,78 @@ def test_build_drive_fault_snapshot_carries_native_home_active_mask(monkeypatch)
     assert snapshot["native_home_active_axis_mask_hex"] == "0x2"
     assert snapshot["axes"][0]["native_home_active"] is False
     assert snapshot["axes"][1]["native_home_active"] is True
+
+
+def test_describe_encoder_retention_fault_falls_back_to_bus_code_when_203f_is_zero():
+    """When the drive does not PDO-map 0x203F (observed live on
+    A6-EC), the manufacturer code reads as zero but the firmware
+    publishes the same numeric Er20.8 value (0x0208) on the 0x603F
+    bus code path. The retention classifier must still fire so the
+    startup preflight can run the F31.10 encoder reset instead of
+    walking into the useless DS402-pulse-only recovery.
+    """
+    from gradient_os.arm_controller.profiles.drive.a6ec_ds402 import (
+        describe_encoder_retention_fault,
+    )
+
+    result = describe_encoder_retention_fault(
+        manufacturer_error_code=0,
+        error_code=0x0208,
+    )
+    assert result["present"] is True
+    assert "Er20.8" in result["codes"]
+    assert "Encoder battery failure" in result["names"]
+    assert "error_code_matches_manufacturer_code" in result["matched_sources"]
+    # bus_fault_name falls back to the vendor name when the DS402 bus
+    # table has no entry for that code - which is the production case
+    # for 0x0208 today.
+    assert result["bus_fault_name"] == "Encoder battery failure"
+
+
+def test_describe_encoder_retention_fault_falls_back_to_shared_bus_class_7305():
+    """Bus code 0x7305 is the DS402 ``Encoder`` class and is shared by
+    every Er20.x / ErA0.1 / ALF9.0 on A6-EC. When the preflight only
+    has the bus code (0x203F not PDO-mapped and no specific
+    ``fault_code_203f`` numeric match), the retention classifier must
+    still fire so the affected axis ends up on the F31.10 recovery
+    path instead of the useless DS402-pulse-only path.
+    """
+    from gradient_os.arm_controller.profiles.drive.a6ec_ds402 import (
+        describe_encoder_retention_fault,
+    )
+
+    result = describe_encoder_retention_fault(
+        manufacturer_error_code=0,
+        error_code=0x7305,
+    )
+    assert result["present"] is True
+    # First match in codebook iteration order is Er20.1 (encoder-family
+    # retention). The specific subcode is ambiguous without 0x203F but
+    # the retention verdict is correct.
+    assert result["codes"] == ["Er20.1"]
+    assert "error_code_bus_class_retention_match" in result["matched_sources"]
+    assert "manufacturer_error_code" not in result["matched_sources"]
+    assert "error_code_matches_manufacturer_code" not in result["matched_sources"]
+
+
+def test_describe_encoder_retention_fault_prefers_manufacturer_side_when_available():
+    """When 0x203F IS populated (the vendor-standard path), the
+    retention match source must still be reported as
+    ``manufacturer_error_code`` so operators can tell the two cases
+    apart in logs / monitor output.
+    """
+    from gradient_os.arm_controller.profiles.drive.a6ec_ds402 import (
+        describe_encoder_retention_fault,
+    )
+
+    result = describe_encoder_retention_fault(
+        manufacturer_error_code=0x00000208,
+        error_code=0x7305,
+    )
+    assert result["present"] is True
+    assert result["codes"] == ["Er20.8"]
+    assert "manufacturer_error_code" in result["matched_sources"]
+    assert "error_code_matches_manufacturer_code" not in result["matched_sources"]
 
 
 def test_build_drive_fault_snapshot_carries_encoder_retention_fault(monkeypatch):

@@ -54,9 +54,14 @@ _J6_SIGN = -1  # per Gradient05Config.actuator_position_signs[5]
 # The captured J6 rotation dataset reads 6064 and U40.20/.22 sequentially
 # over ~1 ms per SDO each, and the joint was physically being rotated by
 # hand during capture. Peak-motion cross-SDO skew can reach tens of
-# thousands of motor counts - large enough that the production
-# consistency gates (16 counts for shaft-frame, 15 for roundtrip) reject
-# fast-motion samples purely as a capture artifact, not as a math bug.
+# thousands of motor counts - large enough that even the widened
+# production consistency gates (4096 counts for shaft-frame,
+# velocity-widened for roundtrip) reject fast-motion samples purely as
+# a capture artifact, not as a math bug. The 2026-04-21 RTCore atomic
+# paired-snapshot removed most of this skew in live operation by
+# latching 0x6064 at the SDO-read moment; this replay dataset predates
+# that fix and the comments below describe the original unpaired
+# behaviour.
 #
 # The synthetic per-joint sweep in ``tests/test_a6ec_joint_sweep.py``
 # exercises those gates under controlled inputs. The replay tests here

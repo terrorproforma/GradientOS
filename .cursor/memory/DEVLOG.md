@@ -6790,3 +6790,165 @@ Native-home pathway was exercised end-to-end on J6 against the new RTCore binary
 - Follow-up / risk:
   - `df -h` is the next command to use when the user wants the same view for all mounted filesystems, not just `/`.
 
+## 2026-04-23 21:30 +0000 - `scripts/rtcore_jog.py` IPC v1.0 → v1.1 bump; unblocked startup preflight after encoder-cable disconnect
+
+- Context:
+  - Operator disconnected J3/J4/J5/J6 encoder cables for mechanical work. On `./start-stack.sh` the fault-reset preflight failed with:
+    - `[start-stack] startup preflight found disarmed drive faults before any drive power-up: J3/axis2 0x0208, J4/axis3 0x7305 Er20.1 Encoder internal fault, J5/axis4 0x0208, J6/axis5 0x0208`
+    - `[start-stack] WARNING: Direct RTCore fault reset failed for axis_mask=0x3c: ERROR: WELCOME size mismatch (got 0 bytes)`
+    - `[start-stack] ERROR: startup fault-reset preflight failed to send the RTCore reset pulse`
+  - Operator's hypothesis was that the encoder faults were blocking startup. Correct about the symptom but not the immediate cause: the actual abort is an IPC regression layered ON TOP of the (real) encoder faults.
+
+- Root cause (separate from the encoder state):
+  - `src/gradient_rt_motion/ipc_v1.hpp::kVerMinor` was bumped `0 → 1` on 2026-04-20 (per the comment "2026-04-20: adds StatusExtendedSnapshotV1") to make room for `MSG_STATUS_EXTENDED_SNAPSHOT (0x0206)`.
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py::_VER_MINOR` was updated in the same pass to `1` with a matching comment.
+  - `scripts/rtcore_jog.py::_VER_MINOR` was **not** updated and remained at `0`. `start-stack.sh` invokes this CLI directly for the fault-reset preflight pulse (`direct_rtcore_fault_reset_mask` → `python3 scripts/rtcore_jog.py fault_reset --mask <hex>`).
+  - Flow: CLI opens UDS, sends HELLO with `ver_minor=0`; RTCore's accept loop in `src/gradient_rt_motion/main.cpp:5415-5422` compares to `kVerMinor=1`, logs `ERROR: HELLO validation failed (magic/ver/bytes/role mismatch)`, closes the socket. Python `recvmsg()` then returns 0 bytes → `RuntimeError("WELCOME size mismatch (got 0 bytes)")`. `journalctl -u gradient-rt-motion.service` at the failure timestamp shows the `HELLO validation failed` line that confirms it.
+  - This bug would trip on ANY disarmed fault preflight path on the current stack, not just the user's encoder scenario.
+
+- Secondary finding (expected, operator-side):
+  - `Er20.1` (encoder internal fault) on J4 and the `0x0208` bus code on J3/J5/J6 are members of the A6-EC `ENCODER_RETENTION_FAULT_CODES` family (`src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py:526-548`). Per vendor Chapter 5 §5.1 and the vendor codebook (`"resettable": false`), these do NOT clear via a DS402 control-word fault-reset pulse (controlword 0x80 toggle). They require an SDO write to `0x2031:11h` (F31.10 "absolute encoder reset selection") and a re-home. RTCore's fault-reset path (`main.cpp:3856` `fault_reset_left[i] = kFaultResetPulseCycles;` + `main.cpp:3917-3993` pulse sequencer) only drives control-word bits, so even with the CLI fixed the preflight pulse cannot clear encoder-retention faults.
+
+- What changed:
+  - `scripts/rtcore_jog.py`: `_VER_MINOR = 0` → `_VER_MINOR = 1`, with a comment pointing at the canonical C++ / backend constants and explaining the failure mode (`WELCOME size mismatch (got 0 bytes)`) so a future session doesn't re-break lockstep.
+
+- What explicitly did NOT change:
+  - No RTCore C++ changes. No backend / profile / systemd / start-stack.sh changes. No test changes (the WELCOME size assertion in `rtcore_jog.py` was already correct; only the constant was stale).
+  - `build_startup_fault_reset_plan` in `src/gradient_os/telemetry/drive_faults.py` was NOT changed, even though it classifies `Er20.x` as `should_auto_reset=1` and currently ignores its own computed `resettable` flag. That gap is called out in the scratchpad as a follow-up; touching it would widen the blast radius beyond the reported problem.
+
+- Validation performed:
+  - `python3 -c "import ast; ast.parse(open('scripts/rtcore_jog.py').read())"` → OK.
+  - `python3 scripts/rtcore_jog.py status --timeout 1` against the running service (PID 782041, still up from the failed startup) → IPC handshake succeeds, prints a full 6-axis status table. axis0/1 clean (`ds402=2 err=0x0000`); axis2/4/5 latched in DS402 Fault with `err=0x0208`; axis3 latched in Fault with `err=0x7305 (Encoder error)`. Exactly the encoder-cable-disconnect signature we expected.
+  - `python3 scripts/rtcore_jog.py fault_reset --mask 0x3c` → `exit=0`, no WELCOME error. Post-reset status shows axes 2-5 still in `ds402=8 Fault` with identical error codes, confirming the pulse reached the server but did not clear the Er20.x family — exactly as vendor docs predict.
+  - `python3 -m pytest tests/test_drive_faults.py tests/test_rtcore_runtime.py tests/test_cartesian_jog_resilience.py tests/test_command_api_direct_setpoint.py tests/test_realtime_jog_backend_compatibility.py -q` → `75 passed`. No existing test exercised the IPC `_VER_MINOR` constant, so the fix was behavioral only.
+  - `ReadLints` on `scripts/rtcore_jog.py` → clean.
+
+- Runtime outcome:
+  - `scripts/rtcore_jog.py` is now back in lockstep with the v1.1 server. The `start-stack.sh` preflight will get past the HELLO/WELCOME handshake on the next run.
+  - Because the underlying Er20.x faults are still latched, the preflight will then trip on a DIFFERENT (and honest) failure: either the pulse returns, the drives stay in Fault, and `wait_for_probe_state "BUS_UP_DISARMED"` times out, OR the drives clear after cable reconnect + power-cycle (in which case startup continues).
+  - RTCore service was NOT restarted in this pass; the fix only required the client-side constant to move. The live service continues to be v1.1-compatible.
+
+- Follow-up / risk:
+  - Operator path forward (encoder-cable reconnect scenario): now auto-handled by the startup preflight as of the follow-up devlog entry below. Manual override still available if needed: `sudo ethercat download -p <slave_pos> -t u16 0x2031 0x11 4` per affected slave, then clear the anchor file entry, then re-home.
+  - IPC version discipline: any future `kVerMinor` bump MUST bump `_VER_MINOR` in BOTH `backend.py` AND `rtcore_jog.py`. Consider consolidating the Python constants into a single `gradient_os.rtcore_ipc_constants` module with a unit test that asserts it matches the C header text.
+
+## 2026-04-23 22:10 +0000 - Startup preflight auto-drives F31.10 for encoder-retention faults
+
+- Context:
+  - Follow-up to the 21:30 `scripts/rtcore_jog.py` ver-minor fix. That unblocked the handshake but the downstream reset was only a DS402 control-word pulse, which vendor-spec does not clear the A6-EC `Er20.x` family (encoder battery / internal / multi-turn faults). The vendor path requires writing `F31.10 = 4` to `0x2031:0x11` and re-homing.
+  - Operator ask: "on startup we should check for faults, reset the drives if they are resettable and if its this encoder issue, perform the process to reset the encoder fault so we can start up - should be simple". Implemented as a classifier in `build_startup_fault_reset_plan` plus a new preflight helper that drives the vendor-correct recovery and invalidates the persisted home anchors.
+
+- Root cause of why the 21:30 fix alone was insufficient:
+  - `describe_encoder_retention_fault` in `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py` only classified retention faults when `manufacturer_error_code` (0x203F) was non-zero. On this RTCore config 0x203F is NOT PDO-mapped, so `manufacturer_error_code = 0x00000000` always, and the retention branch never fired.
+  - The A6-EC firmware publishes the manufacturer value directly on the 0x603F bus code for encoder faults (e.g. `Er20.8` shows up live as `err=0x0208` rather than the vendor-table `0x7305`), which means the bus code itself carries enough information to classify most cases without 0x203F.
+  - The existing `build_startup_fault_reset_plan` did not expose per-axis classification OR persistent home-anchor context needed to drive the different recovery paths safely.
+
+- What changed:
+  - `src/gradient_os/arm_controller/profiles/drive/a6ec_ds402.py`:
+    - `describe_encoder_retention_fault` gained a two-stage bus-code fallback:
+      1. Exact numeric match against `fault_code_203f` / `alarm_code_203f` (catches `0x0208` → `Er20.8` unambiguously; tagged `matched_sources=["error_code_matches_manufacturer_code"]`).
+      2. Shared-bus-class match against any retention-family entry whose `bus_fault_code_603f` matches (catches `0x7305` → first-match `Er20.1`; tagged `matched_sources=["error_code_bus_class_retention_match"]`). Inherently lossy for subcode disambiguation (Er20.1..Er20.9 / ErA0.1 / ALF9.0 all share `0x7305`) but the retention verdict is correct since the entire class is retention-family on this drive.
+    - Added internal helper `_lookup_retention_match_by_bus_code` for the shared-class match path.
+    - Kept existing 0x203F path untouched - it remains the preferred disambiguator when available, and `matched_sources` tags let operators tell the paths apart in logs / monitor output.
+  - `src/gradient_os/telemetry/drive_faults.py::build_startup_fault_reset_plan`:
+    - Now classifies each faulted axis into three buckets: `encoder_data_reset` (F31.10 + anchor invalidation), `ds402_fault_pulse` (control-word 0x80), `unresettable` (neither; pulse anyway for legacy compat).
+    - Emits new fields: `ds402_pulse_axis_mask` + `_hex` + `ds402_pulse_required`, `encoder_reset_axis_mask` + `_hex` + `encoder_reset_required`, `encoder_reset_logical_joints` (0-indexed for anchor-store parity), `unresettable_axis_mask` + `_hex`, per-axis `reset_action`, per-axis `encoder_retention_fault_present` / `encoder_retention_fault`.
+    - Reason string narrows to `encoder_retention_reset_required`, `encoder_retention_and_ds402_resets_required`, or `faulted_disarmed_axes_ready_for_reset` so the preflight log is precise.
+    - `faulted_summary` now annotates retention axes with `[encoder-retention]` so the single-line log shows the recovery path at a glance.
+  - `src/gradient_os/absolute_encoder_anchors.py`:
+    - New `invalidate_absolute_encoder_anchors(robot_id, *, num_joints, logical_joint_indices, actor)` helper. Loads the anchor store, clears the listed joint entries, saves back. Handles out-of-range / malformed indices gracefully (skipped, not raised) so the preflight does not fall over on a malformed probe payload.
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py::reset_encoder_data`:
+    - New keyword-only `axis_mask` parameter. When supplied it overrides `logical_joint_index` and drives the SDO write to the explicit bitmask, so the startup preflight can do ONE `_send_cmd_service_sdo_write` covering every encoder-retention-faulted axis instead of looping (which would re-disarm and churn `prepare_for_power_transition` per iteration).
+    - Added docstring and a validation path for empty masks.
+  - `start-stack.sh`:
+    - New `direct_rtcore_encoder_data_reset_and_invalidate_anchors` helper. Python heredoc (same pattern as `direct_rtcore_safe_power_down`) that: loads robot config, initializes a one-shot `EthercatRTCoreBackend`, calls `reset_encoder_data(axis_mask=...)` to write `F31.10 = 4`, sleeps 250 ms so RTCore drains the service-SDO ring, calls `invalidate_absolute_encoder_anchors(...)` with the affected 0-indexed logical joints, then shuts the backend down. Env-var-driven to keep the shell/Python boundary readable.
+    - `startup_fault_reset_preflight` now reads the new plan fields and runs encoder-reset first (when `encoder_reset_required`), then the DS402 pulse (when `ds402_pulse_required`), with a 500 ms settle between them. A successful preflight with encoder reset prints a loud `RE-HOME REQUIRED for logical joints [...]` warning so operators know the anchor store was wiped.
+  - `tests/test_drive_faults.py`: added five new tests covering the new classifier + bus-code fallbacks:
+    - `test_build_startup_fault_reset_plan_routes_encoder_retention_to_f31_10` (mixed retention + DS402-pulse in one probe).
+    - `test_build_startup_fault_reset_plan_encoder_retention_only_reason` (all axes retention → `encoder_retention_reset_required`).
+    - `test_describe_encoder_retention_fault_falls_back_to_bus_code_when_203f_is_zero` (locks in `0x0208` → `Er20.8` unambiguous match when manufacturer code is zero).
+    - `test_describe_encoder_retention_fault_falls_back_to_shared_bus_class_7305` (locks in `0x7305` → `Er20.1` class-retention match).
+    - `test_describe_encoder_retention_fault_prefers_manufacturer_side_when_available` (regression: when both 0x203F and 0x603F are present, the manufacturer-side tag wins).
+    - Added assertions on the new plan fields to the existing DS402-pulse-only test so it locks the bucketing contract.
+  - `tests/test_absolute_encoder_anchors.py` (new file): covers target-joint clearing, out-of-range index tolerance, and empty-list round-trip behaviour.
+
+- Validation performed:
+  - `python3 -m pytest tests/test_drive_faults.py tests/test_absolute_encoder_anchors.py tests/test_gradient05_limits_and_backends.py tests/test_rtcore_runtime.py tests/test_a6ec_chapter5_probe.py tests/test_a6ec_joint_sweep.py tests/test_a6ec_j6_watch_replay.py tests/test_api_endpoints.py tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py tests/test_cartesian_jog_resilience.py tests/test_run_controller_helpers.py tests/test_realtime_jog_backend_compatibility.py -q` → `396 passed`.
+  - `bash -n start-stack.sh` → OK. AST-parse of all 15 embedded Python heredocs → 0 syntax errors.
+  - `ReadLints` on all touched files → clean.
+  - Live classification against the current faulted stack (PID 782041, axes 2/3/4/5 faulted): post-fix plan returns `encoder_reset_required=True`, `encoder_reset_axis_mask_hex=0x3c`, `encoder_reset_logical_joints=[2,3,4,5]`, `reason=encoder_retention_reset_required`, `faulted_summary` annotates all four axes with `[encoder-retention]`. Every axis decodes with a retention match source so the preflight will now take the F31.10 path automatically. Actual SDO write NOT driven live in this session because operator still has encoder cables physically disconnected - that is the exact scenario the preflight was built for, and verifying it against disconnected encoders would destroy multi-turn data without the drive being able to latch a clean state afterwards.
+  - Isolated Python-heredoc path verified with an empty mask env var (`GRADIENT_STARTUP_ENCODER_RESET_AXIS_MASK=0x0`): the helper imports cleanly, short-circuits on empty mask with exit 2, emits the `direct_rtcore_encoder_data_reset_skipped: empty axis mask` log line.
+
+- Runtime outcome:
+  - Code is live-ready. Full auto-reset path exercises the first time the operator reconnects the J3/J4/J5/J6 encoder cables and runs `./start-stack.sh`. Expected sequence: preflight detects retention faults → writes F31.10=4 to `axis_mask=0x3c` → clears anchor entries for logical joints 2/3/4/5 → waits for `BUS_UP_DISARMED` → logs `RE-HOME REQUIRED` → stack finishes start-up normally. Operator then re-homes each affected joint via `POST /control/home-joint-native` (or the HM35 UI path) before motion is trusted.
+  - If the drive cannot clear the fault after F31.10 (e.g. encoder still not physically connected, or encoder hardware is actually dead), the existing `wait_for_probe_state "BUS_UP_DISARMED"` step will fail with `startup preflight faults still present after reset` and abort startup with a clear message. The anchor invalidation still happens in that case - that is intentional because F31.10=4 has already told the drive to reset multi-turn data, so the old anchor is a lie regardless of whether the bus-level fault latched clear.
+
+- Follow-up / risk:
+  - F31.10 value is pinned at `4` ("Reset encoder fault AND multi-turn data") in `a6ec_ds402.py::ENCODER_DATA_RESET_OPERATION`. Value `3` ("Reset encoder fault ONLY") preserves multi-turn data - which would let us skip the anchor invalidation / re-home step when the battery actually survived the disconnect. The trade-off is reliability: Er20.8 specifically signals the battery-backed register contents are no longer trusted, so using value `3` would leave a possibly-corrupted multi-turn counter in place. We stick with `4` (nuclear option) for the auto-reset path. A future pass could try value `3` first, re-probe, and only escalate to `4` when the fault persists - at the cost of preflight complexity.
+  - Shared-bus-class retention match (bus `0x7305`) does false-positive on `Er21.0` (encoder-PPR config mismatch) and `ALFA.0` (drive high-temperature warning). Neither is plausible as a disarmed-fault startup condition, but if an operator somehow hits one of those and the preflight auto-drives F31.10, the anchor invalidation is a wasted destructive operation. Mitigation: operator can SDO-poll `0x203F` via `sudo ethercat upload -p <slave> -t uint16 0x203F 0x00` before starting the stack to disambiguate, and the `matched_sources=["error_code_bus_class_retention_match"]` tag in the retention detail makes it visible which path fired.
+  - The anchor store is invalidated for the affected joints even if the downstream preflight wait eventually fails - see runtime-outcome note above. This is the right semantic (F31.10 already destroyed the multi-turn data) but worth documenting for future tooling that might be tempted to skip the invalidation when the SDO appears to fail.
+  - `build_startup_fault_reset_plan` still does NOT consult the per-axis `fault.resettable` flag as a separate hard-block gate; axes with an unknown vendor code still walk into the DS402 pulse path. That is the pre-existing behaviour and is left unchanged here - the new classifier routes the KNOWN encoder-retention family correctly, which is the main operator pain point. Adding a full `all-axes-resettable` gate is a separate workstream.
+
+## 2026-04-23 23:10 +0000 - Live-test driven: F31.10 alone didn't clear Er20.8, needed F31.01 software reset; also fixed tmpfs-fill bug that broke probe
+
+- Context:
+  - First live run of the previous pass's encoder-reset preflight (`./start-stack.sh` against a bus where J3/J4/J5/J6 all showed `Er20.8` encoder-battery fault from disconnected+reconnected cables) produced TWO distinct failures that the unit-test path missed:
+    1. The preflight never reached its classifier because `/run` tmpfs was 100% full; the probe fell back to `rtcore: UNKNOWN, ethercat: DOWN` even though the master was healthy (`Phase: Operation, 6 slaves, 1000 frames/s`).
+    2. When I manually ran the preflight sequence (`backend.reset_encoder_data(axis_mask=0x3c)` then `rtcore_jog.py fault_reset --mask 0x3c`), the F31.10=4 SDO write was accepted (register self-reset from 4 → 0 confirming operation completion) but the drive's error latches did NOT clear. `0x203F = 0x0208`, `0x603F = 0x0208/0x7305`, DS402 state stayed `Fault` on all four axes.
+  - Operator frustration: "i need the bus to fire the encoder reset on startup IF the startup process detects the encoder reset fault!" The infrastructure WAS firing (RTCore journal at 21:56:25 showed all four F31.10=4 SDO writes going through), but the drives weren't leaving Fault.
+
+- Root cause #1 (tmpfs fill):
+  - The 2026-04-19 J6 seam-whip drop-in `/etc/systemd/system/gradient-rt-motion.service.d/fast-trace.conf` was still enabled with `GRADIENT_RT_FAST_TRACE_HZ=1000`. Accumulated `j6-fast-trace.jsonl` at 1.67 GB in `/run/gradient-rt-motion/` had exhausted the 1.6 GB tmpfs.
+  - RTCore's metrics-writer thread uses atomic temp-write-then-rename on the same filesystem; when the filesystem is full the rename fails and `metrics.json` stays at 0 bytes. `probe_hardware_state_json` reads `metrics.json`, sees it empty, falls back to `rtcore_state=UNKNOWN`, `ethercat_master_state=DOWN`, `responding=0/0`. The bus-ready wait loop in `start-stack.sh` then times out at 20 s with the probe still looking DOWN.
+  - The bus itself was healthy throughout. The fault was purely in the probe's ability to observe it.
+  - Additional gotcha: `sudo rm -f /run/gradient-rt-motion/j6-fast-trace.jsonl` did NOT free tmpfs because RTCore held an open fd on the deleted file. `sudo -n truncate -s 0 /proc/<rtcore_pid>/fd/<fd_num>` freed it immediately without requiring a service restart.
+
+- Root cause #2 (F31.10 not clearing latched fault):
+  - Live SDO writes and read-backs on the faulted drives:
+    - Before any reset: `0x203F = 0x0208`, `0x603F = 0x0208`, `0x6041 = 0x1608` (Fault).
+    - After F31.10=4: register read immediately returns `0x0004` briefly, then `0x0000` - drive accepted and completed the operation.
+    - After DS402 fault-reset pulse (controlword 0x80): statusword unchanged, error codes unchanged, drive stays in DS402 Fault.
+    - After F31.10=3 (fault-only reset, preserves multi-turn): same result, no visible change.
+  - The vendor profile's `requires_power_cycle: True` flag in `ENCODER_DATA_RESET_OPERATION` was interpreted conservatively in the 2026-04-23 22:10 +0000 entry ("cautious documentation"). It turns out to be LITERAL: the drive's error-register latches only clear when the drive firmware re-initialises.
+  - F31.01 = 1 ("Software reset" at `0x2031:0x02`) IS the missing piece. Vendor Ch.11 §11.3.10 describes it as "similar to the program reset upon power-on, without the need for a power cycle". Writing F31.01=1 via `sudo ethercat download -p <slave> -t uint16 0x2031 0x02 1` drops the slave off the bus for ~5-7 s, the drive re-enumerates, and returns with `0x203F = 0x0000`, `0x603F = 0x0000`, `0x6041 = 0x1650` (SwitchOnDisabled, clean). Vendor's precondition ("no non-resettable fault") is NOT enforced on A6-EC in practice; F31.01=1 succeeded live with Er20.8 still visible.
+  - Observed empirically: the ethercat CLI write for F31.01=1 commonly returns rc=1 with `Input/output error` or `matches 0 slaves` because the slave vanishes mid-transaction. Those error strings are success signatures, not failures - the preflight has to tolerate them.
+  - Parallel F31.01=1 writes across multiple slaves DO NOT WORK: the first reset triggers an EtherCAT re-config pass that leaves other slaves transiently invisible. Must be serialized per-slave.
+  - Collateral: each F31.01=1 triggers a transient 0x8700 ("Sync controller") fault on every OTHER slave on the bus. 0x8700 is resettable via DS402 pulse, but on A6-EC it needs TWO consecutive pulses separated by ~0.5 s to actually leave Fault state. First pulse alone leaves `6041=0x1618`; after second pulse the drives land clean at `6041=0x1650`.
+
+- What changed:
+  - `/etc/systemd/system/gradient-rt-motion.service.d/fast-trace.conf`: flipped `GRADIENT_RT_FAST_TRACE_HZ` from `1000` to `0`. Updated the file's comment to make the disable-by-default semantic explicit. Drop-in retained rather than deleted so future J6 verification work can re-enable with a single-line edit + `daemon-reload` + `restart gradient-rt-motion.service`.
+  - `src/gradient_os/telemetry/drive_faults.py::build_startup_fault_reset_plan`: the encoder-retention classifier now ALSO puts the axis into `ds402_pulse_axis_mask` (previously the two masks were disjoint). This fixes the now-known bug where the preflight fired F31.10 but never DS402-pulsed the same axes. The per-axis `reset_action` field is now `encoder_data_reset_then_ds402_pulse` for retention axes. The `encoder_retention_and_ds402_resets_required` reason string is now gated on `ds402_pulse_axis_mask & ~encoder_reset_axis_mask != 0` (non-retention resettable axes exist), not on `ds402_pulse_required` alone.
+  - `start-stack.sh::direct_rtcore_encoder_data_reset_and_invalidate_anchors`: reimplemented. Was: single `backend.reset_encoder_data(axis_mask=...)` call via RTCore IPC. Now: per-slave serialized `sudo ethercat download` sequence (F31.10=4 → sleep 0.1 s → F31.01=1 → wait for slave to re-enumerate via `ethercat upload 0x6041` polling with 15 s timeout → post-enumerate 0.5 s settle) followed by `invalidate_absolute_encoder_anchors`. Tolerates `Input/output error` / `matches 0 slaves` / `No such device` on the F31.01 write as success signatures. Uses the ethercat CLI directly because the RTCore IPC has no clean retry path when the slave vanishes mid-write.
+  - `start-stack.sh::startup_fault_reset_preflight`: after the encoder-reset step, now re-probes the bus and rebuilds the plan so the DS402 pulse step fires against the NEW faulted set (which includes the sync-loss 0x8700 collaterals from each software reset). DS402 pulse now fires TWICE separated by 0.5 s to handle the observed A6-EC two-pulse requirement for sync-loss recovery.
+  - `tests/test_drive_faults.py`: updated the plan test expectations for the new `ds402_pulse_axis_mask = encoder_reset_axis_mask ∪ ds402_pulse_only_mask` semantic and the new `encoder_data_reset_then_ds402_pulse` action label. Added documentation comments explaining the live-2026-04-23 finding so future refactors don't un-fix the bug.
+
+- What explicitly did NOT change:
+  - `backend.reset_encoder_data(axis_mask=...)` is unchanged. The backend path still works for direct-use callers (e.g. the existing `POST /control/reset-encoder-data` API); the startup preflight simply no longer goes through it because the F31.01 follow-up step is cleaner via the CLI.
+  - `ENCODER_DATA_RESET_OPERATION` in `a6ec_ds402.py` is unchanged. The profile still describes F31.10=4; the F31.01 software-reset step is a preflight-layer concern.
+  - No RTCore C++ changes. No drive profile changes beyond the previously-landed pass. Systemd unit + `start.sh` unchanged.
+
+- Validation performed:
+  - `bash -n start-stack.sh` → OK. AST-parse of all 15 embedded Python heredocs → 0 errors.
+  - `python3 -m pytest tests/test_drive_faults.py tests/test_absolute_encoder_anchors.py tests/test_gradient05_limits_and_backends.py tests/test_rtcore_runtime.py tests/test_a6ec_chapter5_probe.py -q` → `190 passed` then `166 passed` on the narrower sweep after all the plan changes settled.
+  - `ReadLints` on touched files → clean.
+  - Live recovery proven on the faulted stack (axes 2/3/4/5 latched at Er20.8):
+    - Step-by-step walk of F31.10=4 + F31.01=1 + wait sequence on slave 2 → came up CLEAN (`0x203F=0x0000, 0x603F=0x0000, 0x6041=0x1650`).
+    - Sequential F31.01=1 on slaves 3, 4, 5 with 6 s wait each → all three came back clean.
+    - Collateral 0x8700 sync-loss on slaves 0-3 → cleared with two consecutive `rtcore_jog.py fault_reset --mask 0xf` calls.
+    - Final bus state: ALL 6 AXES `ds402=2 SwitchOnDisabled err=0x0000`. Clean.
+  - `./start-stack.sh` end-to-end against the now-clean bus:
+    - `BUS READY in 1.967s`
+    - `startup preflight: no disarmed drive faults detected`
+    - Controller online in 1.782 s, API `{"status":"ok"}` on `/health`, all 6 axes report `SwitchOnDisabled err=0x0000` via `/run/gradient-rt-motion/metrics.json`.
+    - `/info/joints` returns empty `arm_deg=[]`/`arm_rad=[]` as expected - motion is correctly blocked because the encoder-reset wiped the multi-turn state and anchors are invalidated; operator must re-home J3/J4/J5/J6 before motion is trusted.
+
+- Runtime outcome:
+  - Stack is fully live. The preflight code now embodies the proven-live recovery sequence end-to-end. The next time a user hits latched `Er20.8` on any axis, `./start-stack.sh` will detect it in the classifier, fire F31.10=4 + F31.01=1 per-slave, wait for each drive to re-enumerate, clear the sync-loss collateral via two DS402 pulses, and bring the stack up to BUS_UP_DISARMED without any manual intervention. They only need to re-home the affected joints before commanding motion.
+  - Re-home requirement is enforced by the preflight's `invalidate_absolute_encoder_anchors` call, which clears the persisted home entries for each affected logical joint. The display-truth gate (`absolute_home_anchor_stale`) then blocks motion until HM35 / native-home completes and repopulates the anchor.
+
+- Follow-up / risk:
+  - The preflight recovery takes ~6 s per encoder-reset axis (serialized software resets). For 4 axes that is ~24 s in the preflight window plus the normal bus-ready wait. Acceptable for an auto-recovery path; documented in the operator-facing warning block so it's not surprising.
+  - The F31.01=1 software-reset precondition ("no non-resettable fault") is documented but not enforced on A6-EC. If a future firmware revision starts enforcing it, the preflight will fail at the F31.01=1 write with a non-tolerated error string and the existing `wait_for_probe_state "BUS_UP_DISARMED"` timeout will catch it. No operator-silent regression.
+  - The fast-trace drop-in stays installed with HZ=0. Leaving the file intact keeps the J6 seam-whip verification ergonomics but means any operator who flips HZ back to 1000 and forgets to flip it off will refill tmpfs at ~60 MB/min. Consider adding a `preserve_rtcore_fast_trace_if_any` guard in `start-stack.sh` that warns when fast-trace is active on boot.
+  - `/run` tmpfs fill as a probe failure mode is now documented in the scratchpad. A future robustness pass could have the probe script explicitly check `df /run` when metrics.json is unreadable and surface a clearer `tmpfs_full` reason in the probe snapshot instead of the generic `rtcore_state=UNKNOWN`.
+

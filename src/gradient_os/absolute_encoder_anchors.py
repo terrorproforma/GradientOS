@@ -222,6 +222,47 @@ def save_absolute_encoder_anchor(
     )
 
 
+def invalidate_absolute_encoder_anchors(
+    robot_id: str,
+    *,
+    num_joints: int,
+    logical_joint_indices: Sequence[int],
+    actor: str = "unknown",
+) -> dict[str, Any]:
+    """Clear the persisted home-anchor entries for the given logical joints.
+
+    Use this when an out-of-band event has made the multi-turn absolute
+    position that anchors the joint's canonical frame unreliable - most
+    notably an F31.10 ("Encoder data reset") SDO write on A6-EC drives,
+    which zeroes the encoder's multi-turn register. After invalidation
+    the affected joints show up as anchor-less on the next backend
+    startup, which in turn forces a native re-home before motion is
+    trusted.
+
+    Non-destructive for any entry whose logical index is not in the
+    provided list; those entries round-trip unchanged. Silently skips
+    out-of-range indices so callers can pass a "best effort" list
+    derived from the startup probe without pre-validating it.
+
+    Returns the stored robot entry (same shape as
+    ``save_absolute_encoder_anchors``).
+    """
+    anchors = load_absolute_encoder_anchors(robot_id, num_joints=num_joints)
+    indices: set[int] = set()
+    for value in logical_joint_indices:
+        try:
+            idx = int(value)
+        except Exception:
+            continue
+        if 0 <= idx < len(anchors):
+            indices.add(idx)
+    if not indices:
+        return save_absolute_encoder_anchors(robot_id, anchors, actor=actor)
+    for idx in indices:
+        anchors[idx] = None
+    return save_absolute_encoder_anchors(robot_id, anchors, actor=actor)
+
+
 def save_last_seen_absolute_counts(
     robot_id: str,
     *,

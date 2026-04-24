@@ -562,6 +562,37 @@ def _lookup_retention_match_by_numeric_code(code_u32: int) -> dict[str, Any] | N
     return None
 
 
+def _lookup_retention_match_by_bus_code(bus_code_u16: int) -> dict[str, Any] | None:
+    """Return the first retention-family ``fault_codes`` / ``alarm_codes``
+    entry whose ``bus_fault_code_603f`` numerically matches the given
+    16-bit 0x603F bus code. The A6-EC collapses every Er20.x / ErA0.x
+    onto the DS402 class 0x7305, so this lookup is inherently lossy
+    for disambiguating the specific Er20.x subcode; callers should
+    only use it as a fallback when 0x203F is unavailable.
+    """
+    if int(bus_code_u16) & 0xFFFF == 0:
+        return None
+    target = f"0X{(int(bus_code_u16) & 0xFFFF):04X}"
+    book = _load_drive_fault_codebook()
+    for candidate in book.get("tables", {}).get("fault_codes", {}).values():
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("bus_fault_code_603f", "")).strip().upper() != target:
+            continue
+        vendor_code = str(candidate.get("code", "")).strip()
+        if vendor_code in ENCODER_RETENTION_FAULT_CODES:
+            return candidate
+    for candidate in book.get("tables", {}).get("alarm_codes", {}).values():
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("bus_fault_code_603f", "")).strip().upper() != target:
+            continue
+        vendor_code = str(candidate.get("code", "")).strip()
+        if vendor_code in ENCODER_RETENTION_FAULT_CODES:
+            return candidate
+    return None
+
+
 def is_encoder_retention_fault(code: int) -> bool:
     """True when the numeric 0x203F-family value maps to an encoder-retention code."""
     code_u32 = int(code) & 0xFFFFFFFF
@@ -578,6 +609,18 @@ def describe_encoder_retention_fault(
     and return whether the live fault/alarm belongs to the encoder-retention
     family, along with the matched vendor labels. The returned dict always
     carries ``present`` so callers can branch without defensive key checks.
+
+    Bus-code fallback (2026-04-23): on this stack the A6-EC firmware
+    publishes the 0x203F manufacturer value directly on 0x603F for the
+    encoder-fault family (e.g. Er20.8 shows up live as bus 0x0208 even
+    though the vendor codebook notes its DS402 class as 0x7305, and
+    0x203F is NOT PDO-mapped so ``manufacturer_error_code`` reads as
+    zero). When the manufacturer-side lookup finds no retention hit
+    but the 16-bit bus value numerically matches a retention-family
+    ``fault_code_203f`` / ``alarm_code_203f`` entry, treat it as a
+    retention hit and tag the match source as
+    ``error_code_matches_manufacturer_code`` so operators can see why
+    it fired.
     """
     codes: list[str] = []
     names: list[str] = []
@@ -593,10 +636,6 @@ def describe_encoder_retention_fault(
             if vendor_name:
                 names.append(vendor_name)
             matched_sources.append("manufacturer_error_code")
-    # Bus fault code (0x603F) does not itself carry a retention-family
-    # identity; the retention decision is driven by 0x203F alone. We still
-    # surface the bus-code label when the manufacturer-side hit it for
-    # operator diagnostics.
     bus_code_u16 = int(error_code) & 0xFFFF
     bus_name: str | None = None
     if bus_code_u16 != 0:
@@ -607,6 +646,48 @@ def describe_encoder_retention_fault(
             bus_name = (
                 str(bus_entry.get("name", "")).strip() or None
             )
+        if not codes:
+            # First bus-code fallback: the A6-EC firmware publishes
+            # manufacturer codes like Er20.8 (= 0x208) directly on the
+            # 0x603F bus when 0x203F is unavailable, so a 16-bit match
+            # against ``fault_code_203f`` / ``alarm_code_203f`` stays
+            # unambiguous.
+            match = _lookup_retention_match_by_numeric_code(bus_code_u16)
+            if isinstance(match, dict):
+                vendor_code = str(match.get("code", "")).strip()
+                vendor_name = str(match.get("name", "")).strip()
+                if vendor_code:
+                    codes.append(vendor_code)
+                if vendor_name:
+                    names.append(vendor_name)
+                matched_sources.append("error_code_matches_manufacturer_code")
+                if not bus_name and isinstance(vendor_name, str) and vendor_name:
+                    bus_name = vendor_name
+        if not codes:
+            # Second bus-code fallback: bus code collapses (e.g. the
+            # DS402 class 0x7305 is shared by Er20.1..Er20.9, ErA0.1,
+            # and ALF9.0 on A6-EC) mean we cannot pin down the exact
+            # Er20.x subcode from 0x603F alone, but we CAN tell that
+            # the active fault is somewhere in the encoder-retention
+            # family since every retention member shares the bus code.
+            # Return the first retention match so the operator still
+            # gets the right treatment path (F31.10 + re-home) even
+            # when 0x203F is unavailable. This path does false-positive
+            # on the rare non-retention faults that share the bus code
+            # (Er21.0 / ALFA.0 on 0x7305), but those are config/thermal
+            # conditions that would not trip the preflight path in
+            # practice.
+            match = _lookup_retention_match_by_bus_code(bus_code_u16)
+            if isinstance(match, dict):
+                vendor_code = str(match.get("code", "")).strip()
+                vendor_name = str(match.get("name", "")).strip()
+                if vendor_code:
+                    codes.append(vendor_code)
+                if vendor_name:
+                    names.append(vendor_name)
+                matched_sources.append("error_code_bus_class_retention_match")
+                if not bus_name and isinstance(vendor_name, str) and vendor_name:
+                    bus_name = vendor_name
     present = bool(codes)
     return {
         "present": bool(present),
