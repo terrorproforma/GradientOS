@@ -316,6 +316,33 @@ def _startup_setting_schema(setting_key: str) -> dict[str, Any]:
 
 
 def _ratio_u16_pair_for_axis(axis_index: int, *, robot_config: Mapping[str, Any] | None) -> tuple[int, int]:
+    """Derive the C10.18 / C10.19 u16 gear-ratio pair for an A6-EC axis.
+
+    The robot config exposes ``actuator_gear_ratios`` as a list of
+    floats. Some physical gearboxes encode as rationals that are not
+    exactly representable in IEEE754 - for example a drivetrain with
+    true mechanical ratio ``100/11`` shows up in Python as
+    ``9.090909090909091``. The naive ``Fraction(str(float))`` path
+    parses that decimal string into
+    ``9090909090909091/1000000000000000``, which overflows the u16
+    SDO registers and would otherwise break startup.
+    
+    The strategy here:
+    1. Accept float inputs via ``Fraction(raw_float)`` which yields the
+       binary-exact IEEE754 value (typically a large power-of-two
+       denominator).
+    2. Call ``.limit_denominator(0xFFFF)`` to snap to the closest
+       u16/u16 rational. For ratios that already fit (e.g. ``11/1``,
+       ``125/4``, ``18/1``) this is a no-op. For float approximations
+       of small rationals (e.g. IEEE754 9.09... -> ``100/11``) it
+       recovers the intended pair.
+    3. Verify the rationalised value agrees with the input to within
+       1 ppm relative tolerance so we can't silently misconfigure the
+       drive with a wildly different ratio.
+    String / int inputs are parsed directly as ``Fraction`` so
+    operator-supplied exact rationals (``"100/11"``, ``"125/4"``)
+    pass through unchanged.
+    """
     if not isinstance(robot_config, Mapping):
         raise ValueError(
             "Robot config is required to derive A6-EC drive-native gear-ratio startup settings."
@@ -325,20 +352,41 @@ def _ratio_u16_pair_for_axis(axis_index: int, *, robot_config: Mapping[str, Any]
         raise ValueError(
             f"Robot config is missing actuator_gear_ratios[{axis_index}] for A6-EC startup ratio rendering."
         )
-    ratio_token = str(raw_ratios[axis_index]).strip()
+    raw_value = raw_ratios[axis_index]
+    ratio_token = str(raw_value).strip()
     if not ratio_token:
         raise ValueError(f"Robot actuator gear ratio[{axis_index}] is empty.")
     try:
-        ratio = Fraction(ratio_token)
+        if isinstance(raw_value, float):
+            expected_float = float(raw_value)
+            ratio = Fraction(raw_value).limit_denominator(0xFFFF)
+        else:
+            ratio = Fraction(ratio_token)
+            expected_float = float(ratio)
+            if ratio.numerator > 0xFFFF or ratio.denominator > 0xFFFF:
+                # Operator-supplied rational is too wide for the SDO
+                # pair (e.g. "9090909090909091/1000000000000000");
+                # snap to the nearest u16/u16 rational.
+                ratio = ratio.limit_denominator(0xFFFF)
     except Exception as exc:
         raise ValueError(
             f"Robot actuator gear ratio[{axis_index}]='{ratio_token}' could not be converted into an exact fraction."
         ) from exc
     if ratio <= 0:
         raise ValueError(f"Robot actuator gear ratio[{axis_index}] must be > 0.")
+    approximated = float(ratio)
+    if expected_float != 0 and abs(approximated - expected_float) / abs(expected_float) > 1e-6:
+        raise ValueError(
+            f"Robot actuator gear ratio[{axis_index}]={ratio_token!r} cannot be represented as a u16/u16 pair "
+            f"within 1 ppm tolerance; best approximation {ratio.numerator}/{ratio.denominator} "
+            f"= {approximated} differs from input {expected_float}."
+        )
     numerator = int(ratio.numerator)
     denominator = int(ratio.denominator)
     if numerator <= 0 or denominator <= 0 or numerator > 0xFFFF or denominator > 0xFFFF:
+        # limit_denominator(0xFFFF) guarantees this for positive
+        # ratios, but keep the assertion as a safety net against
+        # future changes to the callers.
         raise ValueError(
             "A6-EC startup gear-ratio pair must fit in u16 registers; "
             f"axis[{axis_index}] ratio {ratio_token} resolved to {numerator}/{denominator}."

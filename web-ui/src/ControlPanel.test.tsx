@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ControlPanel, ControlPanelRuntimeHeader } from "./ControlPanel";
+import { ControlPanel, ControlPanelRuntimeHeader, preferredTelemetryJointAnglesRad } from "./ControlPanel";
 
 type FetchRecord = {
 	method: string;
@@ -158,7 +158,106 @@ describe("ControlPanel jog session lifecycle", () => {
 
 		const jogPosts = fetchCalls.filter((call) => call.method === "POST" && call.pathname.startsWith("/control/jog/session/"));
 		expect(jogPosts[0]?.pathname).toBe("/control/jog/session/start");
+		expect((jogPosts[0]?.body as { lease_timeout_s?: number } | undefined)?.lease_timeout_s).toBe(1);
 		expect(jogPosts[jogPosts.length - 1]?.pathname).toBe("/control/jog/session/stop");
+	});
+
+	it("recovers an expired active hold without posting a stop or power-down", async () => {
+		let startCount = 0;
+		let updateCount = 0;
+		vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			const url = typeof input === "string"
+				? input
+				: input instanceof URL
+					? input.toString()
+					: input.url;
+			const method = init?.method ?? "GET";
+			const parsed = new URL(url, "http://localhost");
+			const body = typeof init?.body === "string" && init.body.length > 0
+				? JSON.parse(init.body)
+				: undefined;
+			fetchCalls.push({ method, pathname: parsed.pathname, body });
+
+			if (parsed.pathname === "/info/joints" || parsed.pathname === "/info/joints-detailed") {
+				return mockJsonResponse({
+					arm_deg: [0, 0, 0, 0, 0, 0],
+					arm_display_deg: [0, 0, 0, 0, 0, 0],
+					gripper_deg: 0,
+					read_source: "live_feedback",
+				});
+			}
+			if (parsed.pathname === "/control/motion-status") {
+				return mockJsonResponse({
+					status: "ok",
+					state: "idle",
+					safe_for_power_transition: true,
+					power_transition_blockers: [],
+					power_transition_blocker_details: [],
+					execution: {
+						state_name: "idle",
+						active_mode_name: "idle",
+						controller_thread_running: false,
+						rtcore_status_present: true,
+						queue_depth: 0,
+						queue_capacity: 4096,
+						motion_done: true,
+						stale_command: false,
+						safe_for_power_transition: true,
+						power_transition_blockers: [],
+						power_transition_blocker_details: [],
+					},
+				});
+			}
+			if (parsed.pathname === "/control/jog/session/start") {
+				startCount += 1;
+				return mockJsonResponse({
+					status: "ok",
+					session: {
+						session_id: `session-${startCount}`,
+						state: "active",
+						last_seq_received: 0,
+					},
+				});
+			}
+			if (parsed.pathname === "/control/jog/session/update") {
+				updateCount += 1;
+				if (updateCount === 1) {
+					return mockJsonResponse({
+						detail: {
+							code: "SESSION_NOT_FOUND",
+							message: "Jog session not found.",
+						},
+					}, 404);
+				}
+				return mockJsonResponse({
+					status: "ok",
+					session: {
+						session_id: `session-${startCount}`,
+						state: "active",
+						last_seq_received: updateCount,
+					},
+				});
+			}
+			if (parsed.pathname === "/control/jog/session/stop") {
+				return mockJsonResponse({ status: "ok", session: { state: "stopped" } });
+			}
+			return mockJsonResponse({});
+		}));
+
+		render(<ControlPanel apiHost="" />);
+		fireEvent.click(screen.getByRole("button", { name: "Arm Jog" }));
+		const plusX = screen.getByRole("button", { name: "+X" });
+		fireEvent.pointerDown(plusX, { pointerId: 1 });
+
+		await waitFor(() => {
+			expect(startCount).toBeGreaterThanOrEqual(2);
+		});
+
+		const postedPaths = fetchCalls
+			.filter((call) => call.method === "POST")
+			.map((call) => call.pathname);
+		expect(postedPaths).not.toContain("/control/jog/session/stop");
+		expect(postedPaths).not.toContain("/control/power-down");
 	});
 
 	it("uses operator display joint angles for frontend feedback", async () => {
@@ -612,6 +711,35 @@ describe("ControlPanel jog session lifecycle", () => {
 		);
 		expect(jointFetchCount).toBeGreaterThan(1);
 		expect(clearedFeedback).toBe(true);
+	});
+
+	it("sends controller-owned joint deltas without API-side joint baselining", async () => {
+		render(<ControlPanel apiHost="" />);
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+
+		await waitFor(() => {
+			const firstJogButton = screen.getAllByRole("button", { name: "+1°" })[0] as HTMLButtonElement;
+			expect(firstJogButton.disabled).toBe(false);
+		});
+		fireEvent.click(screen.getAllByRole("button", { name: "+1°" })[0]);
+
+		await waitFor(() => {
+			expect(fetchCalls.some((call) => call.pathname === "/control/joint-jog")).toBe(true);
+		});
+		const jogCall = fetchCalls.find((call) => call.pathname === "/control/joint-jog");
+		expect(jogCall?.method).toBe("POST");
+		expect(jogCall?.body).toMatchObject({
+			joint: 1,
+			delta_deg: 1,
+			wait_for_idle: true,
+		});
+	});
+
+	it("keeps stale telemetry joint samples renderable", () => {
+		expect(preferredTelemetryJointAnglesRad({
+			joints: [1, 0, 0, 0, 0, 0],
+			joint_feedback_stale: true,
+		})).toEqual([1, 0, 0, 0, 0, 0]);
 	});
 
 	it("blocks drive power-up when the runtime is unsafe", async () => {
@@ -1208,6 +1336,39 @@ describe("ControlPanel jog session lifecycle", () => {
 		fireEvent.click(screen.getByRole("button", { name: "Show" }));
 		expect(screen.getByText(/Canonical truth trust: persisted_home_anchor_agreement/i)).toBeTruthy();
 		expect(screen.getByText(/Canonical truth unavailable: multi_turn_feedback_invalid/i)).toBeTruthy();
+	});
+
+	it("shows advisory canonical truth mismatch as a trust warning", async () => {
+		render(
+			<ControlPanel
+				apiHost=""
+				driveFaults={{
+					servo_backend: "ethercat_rtcore",
+					driver_state: "ACTIVE",
+					op_enabled_axes: 0x3f,
+					axes: [
+						{
+							axis: 0,
+							logical_joint: 1,
+							ds402_state: "OperationEnabled",
+							statusword: 0x9637,
+							error_code: 0,
+							drive_native_truth_valid: false,
+							drive_native_truth_reason: "command_frame_roundtrip_mismatch",
+							coordinate_system_valid: false,
+						},
+					],
+				}}
+			/>,
+		);
+
+		fireEvent.click(screen.getByRole("button", { name: "Show" }));
+		expect(screen.getByText(/Canonical truth trust warning: command_frame_roundtrip_mismatch/i)).toBeTruthy();
+		expect(screen.queryByText(/Canonical truth unavailable: command_frame_roundtrip_mismatch/i)).toBeNull();
+		await waitFor(() => {
+			const firstJogButton = screen.getAllByRole("button", { name: "+1°" })[0] as HTMLButtonElement;
+			expect(firstJogButton.disabled).toBe(false);
+		});
 	});
 
 	it("blocks drive-home buttons while a native-home transaction is still active", async () => {

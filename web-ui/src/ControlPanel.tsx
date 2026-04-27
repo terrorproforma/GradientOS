@@ -113,12 +113,13 @@ function preferredJointAnglesDeg(payload: JointInfoResponse | null | undefined):
 	return mergeDisplayWithCanonicalFallback(display, canonical);
 }
 
-function preferredTelemetryJointAnglesRad(
+export function preferredTelemetryJointAnglesRad(
 	telemetry: {
 		display_joints?: JointInfoValue[];
 		joints?: JointInfoValue[];
 		raw_canonical_joint_truth_available?: boolean;
 		canonical_joint_truth_available?: boolean;
+		joint_feedback_stale?: boolean;
 	} | null | undefined,
 ): number[] | null {
 	const display = Array.isArray(telemetry?.display_joints) && telemetry.display_joints.length > 0
@@ -137,12 +138,16 @@ function preferredTelemetryJointAnglesRad(
 	);
 	const hasCanonicalArray = Array.isArray(telemetry?.joints) && telemetry.joints.length > 0;
 	const canonicalAuthoritative = canonicalExplicitlyAvailable
+		|| Boolean(telemetry?.joint_feedback_stale)
 		|| (telemetry?.raw_canonical_joint_truth_available === undefined
 			&& telemetry?.canonical_joint_truth_available === undefined
 			&& hasCanonicalArray);
 	const canonical = canonicalAuthoritative && hasCanonicalArray
 		? normalizeJointAngles(telemetry?.joints)
 		: null;
+	if (!display && canonical) {
+		return canonical;
+	}
 	return mergeDisplayWithCanonicalFallback(display, canonical);
 }
 
@@ -225,7 +230,9 @@ type MotionStatusResponse = {
 	power_action?: string;
 	code?: string;
 	message?: string;
+	wait_for_idle_requested?: boolean;
 	waited_for_idle?: boolean;
+	baseline_source?: string;
 	disarmed_after_reset?: boolean;
 	backend_handled?: boolean;
 };
@@ -420,6 +427,7 @@ function commissioningMessageToneClasses(tone: CommissioningMessageTone): string
 	return "border-slate-700/60 bg-slate-900/70 text-slate-400";
 }
 const MIN_CUSTOM_JOINT_STEP_DEG = 0.001;
+const JOG_SESSION_LEASE_TIMEOUT_S = 1.0;
 
 function createJogOwnerId(): string {
 	try {
@@ -544,8 +552,23 @@ function formatNativeHomeStatus(
 
 type DriveNativeTruthStatusView = {
 	message: string;
-	tone: "valid" | "invalid";
+	tone: "valid" | "warning" | "invalid";
 };
+
+function isHardTruthBlocker(reason: string | undefined): boolean {
+	return [
+		"raw_feedback_missing",
+		"logical_joint_unmapped",
+		"drive_native_fault_present",
+		"drive_native_manufacturer_fault_present",
+		"drive_native_slave_offline",
+		"drive_native_slave_not_operational",
+		"drive_native_absolute_home_anchor_missing",
+		"multi_turn_feedback_lost_across_power_cycle",
+		"multi_turn_feedback_invalid",
+		"encoder_retention_fault_present",
+	].includes(String(reason ?? ""));
+}
 
 function formatDriveNativeTruthStatus(axis: DriveFaultAxis | undefined): DriveNativeTruthStatusView | null {
 	if (!axis) {
@@ -569,6 +592,12 @@ function formatDriveNativeTruthStatus(axis: DriveFaultAxis | undefined): DriveNa
 		return null;
 	}
 	if (truthReason.length > 0) {
+		if (!isHardTruthBlocker(truthReason)) {
+			return {
+				message: `Canonical truth trust warning: ${truthReason}`,
+				tone: "warning",
+			};
+		}
 		return {
 			message: `Canonical truth unavailable: ${truthReason}`,
 			tone: "invalid",
@@ -597,6 +626,7 @@ const AXIS_HEALTH_CHIP_TONE_CLASSES: Record<AxisHealthChipTone, string> = {
 	error: "bg-rose-900/60 text-rose-100 border border-rose-500/40",
 	info: "bg-slate-800/80 text-slate-200 border border-slate-600/40",
 };
+const JOINT_STEP_DEBOUNCE_MS = 125;
 
 function buildAxisHealthChips(axis: DriveFaultAxis | undefined): AxisHealthChip[] {
 	if (!axis) {
@@ -1237,6 +1267,10 @@ export function ControlPanel({
 	const liveState = useOptionalLiveState();
 	const latestTelemetry = liveState?.latest ?? null;
 	const isMonitorFresh = liveState?.isMonitorFresh ?? false;
+	const telemetryStale = Boolean(latestTelemetry?.joint_feedback_stale);
+	const telemetryStaleAge = typeof latestTelemetry?.joint_feedback_stale_age_s === "number"
+		? latestTelemetry.joint_feedback_stale_age_s
+		: null;
 	const sharedMotionStatus = liveState?.motionStatus ?? null;
 	const setSharedMotionStatus = liveState?.setMotionStatus;
 	const [speedVal, setSpeedVal] = useState<number>(DEFAULT_SPEED_SLIDER); // 0..1000
@@ -1248,6 +1282,7 @@ export function ControlPanel({
 	const [jointStepDeg, setJointStepDeg] = useState<number>(1);
 	const [customJointStepInput, setCustomJointStepInput] = useState<string>("");
 	const [pendingJointAction, setPendingJointAction] = useState<string | null>(null);
+	const lastJointStepCompletedAtRef = useRef(0);
 	const [pendingMotionAction, setPendingMotionAction] = useState<string | null>(null);
 	const [encoderRetentionExperimentId, setEncoderRetentionExperimentId] = useState<string | null>(null);
 	const [commissioningStatus, setCommissioningStatus] = useState<CommissioningStatus | null>(null);
@@ -1371,6 +1406,7 @@ export function ControlPanel({
 	const sendJogTickRef = useRef<() => Promise<void>>(async () => {});
 	const jogEnabledRef = useRef<boolean>(false);
 	const jogHoldActiveRef = useRef<boolean>(false);
+	const ignoreNextJogReleaseRef = useRef<boolean>(false);
 	const deadmanRef = useRef<boolean>(true);
 	const lastSentRef = useRef<JogCommandVector>([0, 0, 0, 0, 0, 0]);
 	const lastSentAtRef = useRef<number>(0);
@@ -1677,10 +1713,22 @@ export function ControlPanel({
 							nextPayload.v_pitch,
 							nextPayload.v_yaw,
 						];
+						const commandChanged =
+							nextCommand[0] !== lastSentRef.current[0] ||
+							nextCommand[1] !== lastSentRef.current[1] ||
+							nextCommand[2] !== lastSentRef.current[2] ||
+							nextCommand[3] !== lastSentRef.current[3] ||
+							nextCommand[4] !== lastSentRef.current[4] ||
+							nextCommand[5] !== lastSentRef.current[5];
 						lastSentRef.current = nextCommand;
 						lastSentAtRef.current = Date.now();
-						setLastJogCommand(nextCommand);
+						if (commandChanged || !nextPayload.active) {
+							setLastJogCommand(nextCommand);
+						}
 						if (!nextPayload.active) {
+							if (jogHoldActiveRef.current || hasActiveJogInput()) {
+								continue;
+							}
 							const activeSessionId = jogSessionIdRef.current;
 							if (activeSessionId) {
 								await post("/control/jog/session/stop", {
@@ -1702,6 +1750,7 @@ export function ControlPanel({
 							owner_id: jogOwnerIdRef.current,
 							seq: nextSeq,
 							deadman: nextPayload.deadman,
+							lease_timeout_s: JOG_SESSION_LEASE_TIMEOUT_S,
 							vx: nextPayload.vx,
 							vy: nextPayload.vy,
 							vz: nextPayload.vz,
@@ -1727,8 +1776,12 @@ export function ControlPanel({
 							const errorCode = getJogSessionErrorCode(lastRequestErrorRef.current);
 							if (isJogSessionRecoverableError(errorCode)) {
 								resetJogSessionTracking();
-								if (nextPayload.active && !isZeroJogPayload(nextPayload)) {
-									queuedJogStateRef.current = nextPayload;
+								if (nextPayload.active && hasActiveJogInput()) {
+									const currentVector = computeJogVector();
+									queuedJogStateRef.current = buildJogStatePayload(currentVector, {
+										active: true,
+										deadman: deadmanRef.current,
+									});
 									queuedJogStateSilentRef.current = nextSilent;
 								}
 								continue;
@@ -1757,7 +1810,7 @@ export function ControlPanel({
 			})();
 		}
 		return jogStatePublishLoopRef.current ?? Promise.resolve();
-	}, [post, resetJogSessionTracking]);
+	}, [buildJogStatePayload, computeJogVector, hasActiveJogInput, post, resetJogSessionTracking]);
 
 	const sendJogTick = useCallback(async () => {
 		if (!jogHoldActiveRef.current) {
@@ -2010,6 +2063,9 @@ export function ControlPanel({
 		if (pendingJointAction) {
 			return;
 		}
+		if (performance.now() - lastJointStepCompletedAtRef.current < JOINT_STEP_DEBOUNCE_MS) {
+			return;
+		}
 		const jointNumber = jointIndex + 1;
 		const signedStepDeg = Number((jointStepDeg * direction).toFixed(3));
 		const signedStepLabel = formatStepDegrees(Math.abs(signedStepDeg));
@@ -2037,6 +2093,14 @@ export function ControlPanel({
 					? result.trajectory_id
 					: null;
 				if (result.command_acknowledged) {
+					if (result.wait_for_idle_requested && result.waited_for_idle === false) {
+						setCommissioningStatus({
+							tone: "error",
+							message: `J${jointNumber} jog was accepted but did not report idle before timeout. Check motion status before sending another jog.`,
+						});
+						lastJointStepCompletedAtRef.current = performance.now();
+						return;
+					}
 					if (driveFaulted) {
 						setCommissioningStatus({
 							tone: "error",
@@ -2068,6 +2132,7 @@ export function ControlPanel({
 						message: `Failed to confirm backend acceptance for J${jointNumber}. Check controller connectivity and drive state.`,
 					});
 				}
+				lastJointStepCompletedAtRef.current = performance.now();
 			} else {
 				const requestError = lastRequestErrorRef.current?.trim();
 				setCommissioningStatus({
@@ -2459,27 +2524,49 @@ export function ControlPanel({
 		[angBaseDegS, effectiveAngularDegS, post, runDiscreteMotionCommand],
 	);
 
-	const changeLinearCount = useCallback(async (axis: "x" | "y" | "z", delta: number) => {
+	const changeLinearCount = useCallback(async (
+		axis: "x" | "y" | "z",
+		delta: number,
+		options?: { releaseWhenZero?: boolean; stopReason?: string },
+	) => {
 		linCountsRef.current = { ...linCountsRef.current, [axis]: linCountsRef.current[axis] + delta };
 		if (!hasActiveJogInput()) {
-			await releaseJogHold();
+			if (options?.releaseWhenZero === false) {
+				await enqueueJogState(buildJogStatePayload([0, 0, 0, 0, 0, 0], {
+					active: true,
+					stop_reason: options.stopReason ?? "pointer-cancel-hold-zero",
+				}), true);
+				return;
+			}
+			await releaseJogHold(options?.stopReason);
 			return;
 		}
 		jogHoldActiveRef.current = true;
 		ensureJogPolling();
 		await sendJogTick();
-	}, [ensureJogPolling, hasActiveJogInput, releaseJogHold, sendJogTick]);
+	}, [buildJogStatePayload, enqueueJogState, ensureJogPolling, hasActiveJogInput, releaseJogHold, sendJogTick]);
 
-	const changeAngularCount = useCallback(async (axis: "x" | "y" | "z", delta: number) => {
+	const changeAngularCount = useCallback(async (
+		axis: "x" | "y" | "z",
+		delta: number,
+		options?: { releaseWhenZero?: boolean; stopReason?: string },
+	) => {
 		angCountsRef.current = { ...angCountsRef.current, [axis]: angCountsRef.current[axis] + delta };
 		if (!hasActiveJogInput()) {
-			await releaseJogHold();
+			if (options?.releaseWhenZero === false) {
+				await enqueueJogState(buildJogStatePayload([0, 0, 0, 0, 0, 0], {
+					active: true,
+					stop_reason: options.stopReason ?? "pointer-cancel-hold-zero",
+				}), true);
+				return;
+			}
+			await releaseJogHold(options?.stopReason);
 			return;
 		}
 		jogHoldActiveRef.current = true;
 		ensureJogPolling();
 		await sendJogTick();
-	}, [ensureJogPolling, hasActiveJogInput, releaseJogHold, sendJogTick]);
+	}, [buildJogStatePayload, enqueueJogState, ensureJogPolling, hasActiveJogInput, releaseJogHold, sendJogTick]);
 
 	const onPress = useCallback((fn: () => void) => (e: React.PointerEvent<HTMLButtonElement>) => {
 		(e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId);
@@ -2489,6 +2576,20 @@ export function ControlPanel({
 		try {
 			(e.currentTarget as HTMLButtonElement).releasePointerCapture(e.pointerId);
 		} catch {}
+		if (ignoreNextJogReleaseRef.current) {
+			ignoreNextJogReleaseRef.current = false;
+			return;
+		}
+		fn();
+	}, []);
+	const onCancel = useCallback((fn: () => void) => (e: React.PointerEvent<HTMLButtonElement>) => {
+		try {
+			(e.currentTarget as HTMLButtonElement).releasePointerCapture(e.pointerId);
+		} catch {}
+		ignoreNextJogReleaseRef.current = true;
+		window.setTimeout(() => {
+			ignoreNextJogReleaseRef.current = false;
+		}, 750);
 		fn();
 	}, []);
 
@@ -2812,7 +2913,7 @@ export function ControlPanel({
 						Jog mode enables hold-to-jog. The controller session only exists while a jog button is actively held.
 					</div>
 				</div>
-				<div className="grid grid-cols-3 gap-1">
+				<div className="grid grid-cols-3 gap-1" style={{ touchAction: "none" }}>
 					<button
 						className="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700"
 						onPointerDown={onPress(() => {
@@ -2827,11 +2928,11 @@ export function ControlPanel({
 								performIncrementalLinearJog("x", +1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeLinearCount("x", -1).catch(() => {});
+								changeLinearCount("x", -1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						+X
 					</button>
@@ -2849,11 +2950,11 @@ export function ControlPanel({
 								performIncrementalLinearJog("y", +1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeLinearCount("y", -1).catch(() => {});
+								changeLinearCount("y", -1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						+Y
 					</button>
@@ -2871,11 +2972,11 @@ export function ControlPanel({
 								performIncrementalLinearJog("z", +1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeLinearCount("z", -1).catch(() => {});
+								changeLinearCount("z", -1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						+Z
 					</button>
@@ -2893,11 +2994,11 @@ export function ControlPanel({
 								performIncrementalLinearJog("x", -1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeLinearCount("x", +1).catch(() => {});
+								changeLinearCount("x", +1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						-X
 					</button>
@@ -2915,11 +3016,11 @@ export function ControlPanel({
 								performIncrementalLinearJog("y", -1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeLinearCount("y", +1).catch(() => {});
+								changeLinearCount("y", +1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						-Y
 					</button>
@@ -2937,16 +3038,16 @@ export function ControlPanel({
 								performIncrementalLinearJog("z", -1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeLinearCount("z", +1).catch(() => {});
+								changeLinearCount("z", +1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						-Z
 					</button>
 				</div>
-				<div className="mt-2 grid grid-cols-3 gap-1">
+				<div className="mt-2 grid grid-cols-3 gap-1" style={{ touchAction: "none" }}>
 					<button
 						className="rounded bg-slate-800 px-2 py-1 hover:bg-slate-700"
 						onPointerDown={onPress(() => {
@@ -2961,11 +3062,11 @@ export function ControlPanel({
 								performIncrementalAngularJog("roll", +1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeAngularCount("x", -1).catch(() => {});
+								changeAngularCount("x", -1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						+Roll
 					</button>
@@ -2983,11 +3084,11 @@ export function ControlPanel({
 								performIncrementalAngularJog("pitch", +1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeAngularCount("y", -1).catch(() => {});
+								changeAngularCount("y", -1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						+Pitch
 					</button>
@@ -3005,11 +3106,11 @@ export function ControlPanel({
 								performIncrementalAngularJog("yaw", +1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeAngularCount("z", -1).catch(() => {});
+								changeAngularCount("z", -1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						+Yaw
 					</button>
@@ -3027,11 +3128,11 @@ export function ControlPanel({
 								performIncrementalAngularJog("roll", -1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeAngularCount("x", +1).catch(() => {});
+								changeAngularCount("x", +1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						-Roll
 					</button>
@@ -3049,11 +3150,11 @@ export function ControlPanel({
 								performIncrementalAngularJog("pitch", -1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeAngularCount("y", +1).catch(() => {});
+								changeAngularCount("y", +1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						-Pitch
 					</button>
@@ -3071,11 +3172,11 @@ export function ControlPanel({
 								performIncrementalAngularJog("yaw", -1).catch(() => {});
 							}
 						})}
-						onPointerCancel={() => {
+						onPointerCancel={onCancel(() => {
 							if (jogEnabled) {
-								changeAngularCount("z", +1).catch(() => {});
+								changeAngularCount("z", +1, { releaseWhenZero: false }).catch(() => {});
 							}
-						}}
+						})}
 					>
 						-Yaw
 					</button>
@@ -3218,6 +3319,9 @@ export function ControlPanel({
 								const jointNumber = jointIndex + 1;
 								const angleDeg = jointAnglesDeg[jointIndex];
 								const angleLabel = Number.isFinite(angleDeg) ? `${angleDeg.toFixed(2)}°` : "--";
+								const staleTelemetryMessage = telemetryStale && Number.isFinite(angleDeg)
+									? `display holding last good sample${telemetryStaleAge !== null ? ` (${telemetryStaleAge.toFixed(1)}s)` : ""}`
+									: null;
 								const driveAxis = commissioningDriveAxesByJoint.get(jointNumber);
 								const hasDriveAxisFeedback = typeof driveAxis?.statusword === "number" && Number.isFinite(driveAxis.statusword) && driveAxis.statusword !== 0;
 								const nativeHomeStatus = formatNativeHomeStatus(driveAxis, driveFaults);
@@ -3228,8 +3332,9 @@ export function ControlPanel({
 									|| pendingJointAction === `zero-${jointIndex}`
 									|| pendingJointAction === `native-home-${jointIndex}`;
 								const hasLiveFeedback = Number.isFinite(angleDeg);
+								const hasDisplayOrStaleFeedback = hasLiveFeedback || telemetryStale;
 								const controlsDisabled = pendingJointAction !== null || motionBusy;
-								const jogDisabled = controlsDisabled || !hasLiveFeedback || !drivePowerReady;
+								const jogDisabled = controlsDisabled || !hasDisplayOrStaleFeedback || !drivePowerReady;
 								const zeroDisabled = controlsDisabled || !hasLiveFeedback;
 								const nativeHomeDisabled = controlsDisabled || nativeHomeBusy || (!hasLiveFeedback && !hasDriveAxisFeedback);
 								return (
@@ -3242,6 +3347,11 @@ export function ControlPanel({
 												J{jointNumber}
 											</div>
 											<div className="tabular-nums text-sm font-semibold text-cyan-100">{angleLabel}</div>
+											{staleTelemetryMessage ? (
+												<div className="mt-0.5 max-w-[14rem] text-[10px] leading-snug text-amber-200/90">
+													{staleTelemetryMessage}
+												</div>
+											) : null}
 											{nativeHomeStatus ? (
 												<div className="mt-0.5 max-w-[12rem] text-[10px] leading-snug text-amber-200/90">
 													{nativeHomeStatus}
@@ -3252,7 +3362,9 @@ export function ControlPanel({
 													className={`mt-0.5 max-w-[14rem] text-[10px] leading-snug ${
 														driveNativeTruthStatus.tone === "valid"
 															? "text-cyan-200/90"
-															: "text-rose-200/90"
+															: driveNativeTruthStatus.tone === "warning"
+																? "text-amber-200/90"
+																: "text-rose-200/90"
 													}`}
 												>
 													{driveNativeTruthStatus.message}
@@ -3291,7 +3403,7 @@ export function ControlPanel({
 												title={
 													!drivePowerReady && requiresExplicitDrivePower
 														? `Power up the drives before jogging J${jointNumber}`
-														: hasLiveFeedback
+														: hasDisplayOrStaleFeedback
 															? `Jog J${jointNumber} by -${jointStepLabel} degrees`
 															: `Live joint feedback is required before jogging J${jointNumber}`
 												}
@@ -3308,7 +3420,7 @@ export function ControlPanel({
 												title={
 													!drivePowerReady && requiresExplicitDrivePower
 														? `Power up the drives before jogging J${jointNumber}`
-														: hasLiveFeedback
+														: hasDisplayOrStaleFeedback
 															? `Jog J${jointNumber} by +${jointStepLabel} degrees`
 															: `Live joint feedback is required before jogging J${jointNumber}`
 												}

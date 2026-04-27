@@ -356,7 +356,14 @@ def build_rtcore_startup_env(
     env = {
         "GRADIENT_RT_NUM_AXES": str(int(axis_scaling["num_axes"])),
         "GRADIENT_RT_COUNTS_PER_REV": ",".join(str(int(value)) for value in axis_scaling["counts_per_rev"]),
-        "GRADIENT_RT_GEAR_RATIO": ",".join(f"{float(value):g}" for value in axis_scaling["gear_ratio"]),
+        # Emit gear ratios with full IEEE754 round-trip precision
+        # (``repr`` is the shortest decimal that re-parses to the same
+        # float). The previous ``:g`` format truncated to 6 sig figs,
+        # which quietly drifted host math vs the drive's exact
+        # u16/u16 SDO pair for non-trivial ratios. Keeping host and drive in
+        # lockstep matters for the RM wrap period and trajectory
+        # planning against the seam.
+        "GRADIENT_RT_GEAR_RATIO": ",".join(repr(float(value)) for value in axis_scaling["gear_ratio"]),
         "GRADIENT_RT_SIGN": ",".join(str(int(value)) for value in axis_scaling["sign"]),
         "GRADIENT_RT_DRIVE_PROFILE": normalized_profile or "",
         "GRADIENT_RT_MAX_RPM": f"{resolved_max_rpm:g}",

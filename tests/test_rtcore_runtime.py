@@ -17,11 +17,24 @@ from gradient_os.arm_controller.robots import get_robot_config
 from gradient_os.telemetry.drive_faults import build_drive_fault_snapshot
 
 
+def _fraction_from_gear_ratio(raw_value: object) -> Fraction:
+    """Mirror ``a6ec_ds402._ratio_u16_pair_for_axis`` so test expectations
+    match production (float inputs go through binary-exact Fraction +
+    limit_denominator(0xFFFF); int/string inputs parse exactly).
+    """
+    if isinstance(raw_value, float):
+        return Fraction(raw_value).limit_denominator(0xFFFF)
+    ratio = Fraction(str(raw_value).strip())
+    if ratio.numerator > 0xFFFF or ratio.denominator > 0xFFFF:
+        ratio = ratio.limit_denominator(0xFFFF)
+    return ratio
+
+
 def _expected_a6ec_ratio_pairs(robot_cfg: dict[str, object]) -> tuple[list[int], list[int]]:
     numerators: list[int] = []
     denominators: list[int] = []
     for raw_value in list(robot_cfg.get("actuator_gear_ratios", []))[:6]:
-        ratio = Fraction(str(raw_value))
+        ratio = _fraction_from_gear_ratio(raw_value)
         numerators.append(int(ratio.numerator))
         denominators.append(int(ratio.denominator))
     return numerators, denominators
@@ -33,7 +46,7 @@ def _a6ec_startup_drive_configs_for_ratio(
     mode_value: int = 4,
     reference_direction: int = 0,
 ) -> list[dict[str, int | str]]:
-    ratio = Fraction(str(raw_ratio))
+    ratio = _fraction_from_gear_ratio(raw_ratio)
     numerator = int(ratio.numerator)
     denominator = int(ratio.denominator)
     return [
@@ -111,7 +124,10 @@ def test_build_rtcore_axis_scaling_keeps_robot_gear_ratio_for_non_native_profile
 def test_render_rtcore_systemd_env_contains_scaling_and_profile():
     robot = get_robot_config("gradient05")
     robot_cfg = robot.get_config_dict()
-    expected_gear_ratio = ",".join(f"{float(value):g}" for value in robot_cfg["actuator_gear_ratios"][:6])
+    # 2026-04-23: env emission switched from ``:g`` (6 sig-figs) to
+    # ``repr(float)`` (shortest round-trip) so host math stays lockstep
+    # with the drive's exact u16/u16 SDO pair.
+    expected_gear_ratio = ",".join(repr(float(value)) for value in robot_cfg["actuator_gear_ratios"][:6])
     expected_ratio_numerators, expected_ratio_denominators = _expected_a6ec_ratio_pairs(robot_cfg)
     expected_startup_sdo = (
         "a6ec_encoder_position_tracking_mode|u16|0x2000|0x08|4,4,4,4,4,4;"

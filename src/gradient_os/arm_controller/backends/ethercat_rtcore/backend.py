@@ -242,6 +242,7 @@ _NATIVE_HOME_ABORT_DISARM_PRECONDITION_TIMEOUT = 0xF1000001
 # and RTCore use the same decode, but we keep the list local so the Python
 # contract is explicit.
 _DS402_OP_ENABLED_STATES = {5, 6}  # OperationEnabled, QuickStopActive
+_CONTROL_FEEDBACK_HARD_DS402_STATES = {8, 9}  # Fault, FaultReactionActive
 _TWO_PI = 2.0 * 3.141592653589793
 _RTCORE_METRICS_PATH = Path("/run/gradient-rt-motion/metrics.json")
 
@@ -327,6 +328,25 @@ def _native_home_state_name(value: object) -> str:
         1: "requested",
         2: "succeeded",
         3: "failed",
+    }
+    return labels.get(state, f"unknown:{state}")
+
+
+def _ds402_state_name(value: object) -> str:
+    try:
+        state = int(value)
+    except Exception:
+        state = 0
+    labels = {
+        0: "unknown",
+        1: "not_ready",
+        2: "switch_on_disabled",
+        3: "ready_to_switch_on",
+        4: "switched_on",
+        5: "operation_enabled",
+        6: "quick_stop_active",
+        7: "fault_reaction_active",
+        8: "fault",
     }
     return labels.get(state, f"unknown:{state}")
 
@@ -479,6 +499,16 @@ class RTCoreExecutionStatus:
     capability_flags: int
     active_command_seq: int
     last_update_ns: int
+
+
+@dataclass(frozen=True)
+class RTCoreTrajectorySubmission:
+    traj_id: int
+    submitted_command_seq: Optional[int]
+    expected_points: int
+    duration_s: float
+    frequency_hz: int
+    axis_mask: int
 
 
 @dataclass(frozen=True)
@@ -836,8 +866,18 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 output_target_velocity_counts_per_s=[0] * _GRADIENT_MAX_AXES,
             )
 
-    def safe_power_down(self, *, wait_for_idle: bool = False, timeout_s: float | None = None) -> bool:
-        self._best_effort_safe_power_down(wait_for_idle=wait_for_idle, timeout_s=timeout_s)
+    def safe_power_down(
+        self,
+        *,
+        wait_for_idle: bool = False,
+        timeout_s: float | None = None,
+        quick_stop: bool = True,
+    ) -> bool:
+        self._best_effort_safe_power_down(
+            wait_for_idle=wait_for_idle,
+            timeout_s=timeout_s,
+            quick_stop=quick_stop,
+        )
         return True
 
     def safe_power_up(self) -> bool:
@@ -854,6 +894,60 @@ class EthercatRTCoreBackend(ActuatorBackend):
     def get_execution_status(self) -> RTCoreExecutionStatus:
         with self._status_lock:
             return self._execution_status
+
+    def get_trajectory_completion_diagnostics(self, traj_id: int | None = None) -> dict[str, object] | None:
+        snapshot = self._load_rtcore_metrics_snapshot()
+        if not isinstance(snapshot, dict):
+            return None
+        raw = snapshot.get("trajectory_completion")
+        if not isinstance(raw, dict):
+            return None
+        try:
+            diag_traj_id = int(raw.get("traj_id", 0) or 0)
+        except Exception:
+            diag_traj_id = 0
+        if traj_id is not None and diag_traj_id not in {0, int(traj_id)}:
+            return None
+
+        axes_out: list[dict[str, int]] = []
+        raw_axes = raw.get("axes")
+        if isinstance(raw_axes, list):
+            for item in raw_axes:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    axes_out.append(
+                        {
+                            "axis_index": int(item.get("axis_index", -1)),
+                            "target_counts": int(item.get("target_counts", 0)),
+                            "feedback_counts": int(item.get("feedback_counts", 0)),
+                            "error_counts": int(item.get("error_counts", 0)),
+                        }
+                    )
+                except Exception:
+                    continue
+
+        try:
+            tolerance_counts = int(raw.get("tolerance_counts", 0) or 0)
+        except Exception:
+            tolerance_counts = 0
+        try:
+            sample_time_ns = int(raw.get("sample_time_ns", 0) or 0)
+        except Exception:
+            sample_time_ns = 0
+        try:
+            axis_mask = int(raw.get("axis_mask", 0) or 0)
+        except Exception:
+            axis_mask = 0
+
+        return {
+            "traj_id": diag_traj_id,
+            "sample_time_ns": sample_time_ns,
+            "axis_mask": axis_mask,
+            "final_due": bool(raw.get("final_due", False)),
+            "tolerance_counts": tolerance_counts,
+            "axes": axes_out,
+        }
 
     def get_jog_debug_status(self) -> RTCoreJogDebugStatus:
         with self._status_lock:
@@ -1090,6 +1184,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
             )
             return snapshot
 
+        print(
+            "[EtherCAT RTCore] Power transition prep:"
+            f" drive_power_action={'rtcore_jog_quick_stop' if quick_stop else 'rtcore_jog_stop'}"
+            f" wait_for_idle={bool(wait_for_idle)}"
+            f" require_drive_disarmed={bool(require_drive_disarmed)}"
+            f" require_drive_disarmed_axis_mask=0x{int(require_drive_disarmed_axis_mask):x}"
+        )
         try:
             self.abort_trajectory()
         except Exception as exc:
@@ -1105,6 +1206,11 @@ class EthercatRTCoreBackend(ActuatorBackend):
         # this step the host would only be "waiting", not "asking".
         if require_drive_disarmed and require_drive_disarmed_axis_mask > 0:
             try:
+                print(
+                    "[EtherCAT RTCore] Power transition prep:"
+                    " drive_power_action=axis_disable"
+                    f" axis_mask=0x{int(require_drive_disarmed_axis_mask):x}"
+                )
                 self._send_cmd_axis_disable(
                     axis_mask=int(require_drive_disarmed_axis_mask)
                 )
@@ -1282,14 +1388,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
             _CMD_TRAJECTORY_CONTROL_STRUCT.pack(0 if traj_id is None else int(traj_id), 0, 0),
         )
 
-    def execute_joint_trajectory(
+    def submit_joint_trajectory(
         self,
         joint_path: list[list[float]],
         frequency: int,
         *,
-        timeout_s: Optional[float] = None,
         axis_mask: Optional[int] = None,
-    ) -> RTCoreExecutionStatus:
+    ) -> RTCoreTrajectorySubmission:
         if joint_path is None or len(joint_path) == 0:
             raise ValueError("joint_path must not be empty")
         timing = self.resolve_trajectory_frequency(frequency)
@@ -1325,18 +1430,97 @@ class EthercatRTCoreBackend(ActuatorBackend):
             )
         self.enqueue_trajectory_points(traj_id, points)
         submitted_command_seq = self.commit_trajectory(traj_id)
+        return RTCoreTrajectorySubmission(
+            traj_id=int(traj_id),
+            submitted_command_seq=None
+            if submitted_command_seq is None
+            else int(submitted_command_seq),
+            expected_points=len(joint_path),
+            duration_s=len(joint_path) / float(frequency_hz),
+            frequency_hz=int(frequency_hz),
+            axis_mask=int(resolved_axis_mask),
+        )
 
+    def execute_joint_trajectory(
+        self,
+        joint_path: list[list[float]],
+        frequency: int,
+        *,
+        timeout_s: Optional[float] = None,
+        axis_mask: Optional[int] = None,
+    ) -> RTCoreExecutionStatus:
+        submission = self.submit_joint_trajectory(joint_path, frequency, axis_mask=axis_mask)
         wait_timeout_s = timeout_s
         if wait_timeout_s is None:
-            duration_s = len(joint_path) / float(frequency_hz)
             wait_timeout_s = max(
                 _TRAJECTORY_WAIT_SETTLE_MARGIN_S,
-                duration_s + _TRAJECTORY_WAIT_SETTLE_MARGIN_S,
+                submission.duration_s + _TRAJECTORY_WAIT_SETTLE_MARGIN_S,
             )
         return self.wait_for_trajectory_complete(
-            traj_id,
+            submission.traj_id,
             timeout_s=wait_timeout_s,
-            submitted_command_seq=submitted_command_seq,
+            submitted_command_seq=submission.submitted_command_seq,
+        )
+
+    def wait_for_trajectory_final_point_sent(
+        self,
+        traj_id: int,
+        *,
+        expected_points: int,
+        timeout_s: float,
+        submitted_command_seq: Optional[int] = None,
+    ) -> RTCoreExecutionStatus:
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        final_index = max(0, int(expected_points) - 1)
+        saw_target_trajectory = False
+        last_status: Optional[RTCoreExecutionStatus] = None
+
+        while time.monotonic() <= deadline:
+            status = self.get_execution_status()
+            last_status = status
+            active_command_seq = int(getattr(status, "active_command_seq", 0) or 0)
+            queue_depth = int(getattr(status, "queue_depth", 0) or 0)
+            current_point_index = getattr(status, "current_point_index", None)
+
+            if status.active_traj_id == int(traj_id):
+                saw_target_trajectory = True
+                if status.state in (
+                    RTCORE_EXEC_STATE_COMPLETED,
+                    RTCORE_EXEC_STATE_ABORTED,
+                    RTCORE_EXEC_STATE_FAULTED,
+                    RTCORE_EXEC_STATE_UNDERRUN,
+                ):
+                    return status
+                if queue_depth == 0 and current_point_index is not None:
+                    return status
+                if current_point_index is not None and int(current_point_index) >= final_index:
+                    return status
+            elif (
+                saw_target_trajectory
+                and submitted_command_seq is not None
+                and active_command_seq > int(submitted_command_seq)
+            ):
+                raise RuntimeError(
+                    "RTCore trajectory was superseded before final point was observed"
+                    f" (traj_id={traj_id}"
+                    f" active_traj_id={getattr(status, 'active_traj_id', None)}"
+                    f" current_point_index={getattr(status, 'current_point_index', None)}"
+                    f" queue_depth={getattr(status, 'queue_depth', None)}"
+                    f" active_command_seq={active_command_seq}"
+                    f" submitted_command_seq={submitted_command_seq})"
+                )
+            time.sleep(0.005)
+
+        timeout_status = last_status
+        raise TimeoutError(
+            "Timed out waiting for RTCore trajectory"
+            f" {traj_id} to issue final point"
+            f" (saw_target={saw_target_trajectory}"
+            f" active_traj_id={getattr(timeout_status, 'active_traj_id', None)}"
+            f" current_point_index={getattr(timeout_status, 'current_point_index', None)}"
+            f" queue_depth={getattr(timeout_status, 'queue_depth', None)}"
+            f" active_command_seq={getattr(timeout_status, 'active_command_seq', None)}"
+            f" submitted_command_seq={submitted_command_seq})"
         )
 
     def wait_for_trajectory_complete(
@@ -2143,15 +2327,30 @@ class EthercatRTCoreBackend(ActuatorBackend):
         *,
         wait_for_idle: bool = False,
         timeout_s: float | None = None,
+        quick_stop: bool = True,
     ) -> None:
         if not self._connected:
             return
 
         try:
-            self.prepare_for_power_transition(wait_for_idle=wait_for_idle, timeout_s=timeout_s)
+            print(
+                "[EtherCAT RTCore] Safe power-down:"
+                f" drive_power_action=safe_power_down quick_stop={bool(quick_stop)}"
+                f" wait_for_idle={bool(wait_for_idle)}"
+            )
+            self.prepare_for_power_transition(
+                wait_for_idle=wait_for_idle,
+                timeout_s=timeout_s,
+                quick_stop=quick_stop,
+            )
             axis_mask = self._all_axis_mask()
             if axis_mask:
+                print(
+                    "[EtherCAT RTCore] Safe power-down:"
+                    f" drive_power_action=axis_disable axis_mask=0x{int(axis_mask):x}"
+                )
                 self._send_cmd_axis_disable(axis_mask=axis_mask)
+            print("[EtherCAT RTCore] Safe power-down: drive_power_action=arm_disarm")
             self._send_cmd_arm(False)
             # Give the RTCore thread a brief window to consume the disable/disarm command
             # before we tear down IPC resources on the Python side.
@@ -2176,6 +2375,10 @@ class EthercatRTCoreBackend(ActuatorBackend):
             if not axis_mask:
                 print("[EtherCAT RTCore] WARNING: safe power-up skipped; no axes selected")
                 return
+            print(
+                "[EtherCAT RTCore] Safe power-up:"
+                f" drive_power_action=arm_enable axis_mask=0x{int(axis_mask):x}"
+            )
             self._send_cmd_arm(True)
             self._send_cmd_set_mode(axis_mask=axis_mask, mode=_MODE_CSP)
             self._send_cmd_axis_enable(axis_mask=axis_mask)
@@ -2273,6 +2476,113 @@ class EthercatRTCoreBackend(ActuatorBackend):
             return {}
 
         return {i: int(self._axis_counts[i]) for i in range(self._rt_num_axes)}
+
+    def _control_feedback_hard_fault_for_axis(self, axis_i: int) -> dict[str, object] | None:
+        try:
+            with self._status_lock:
+                ds402_state = int(self._axis_ds402_state[axis_i])
+                statusword = int(self._axis_statusword[axis_i])
+                error_code = int(self._axis_error_code[axis_i])
+                manufacturer_error_code = int(self._axis_manufacturer_error_code[axis_i])
+                fault_flags = int(self._axis_fault_flags[axis_i])
+        except Exception:
+            return {
+                "axis": int(axis_i),
+                "reason": "feedback_state_unavailable",
+            }
+
+        reason: str | None = None
+        if ds402_state in _CONTROL_FEEDBACK_HARD_DS402_STATES:
+            reason = "drive_fault_state"
+        elif error_code != 0:
+            reason = "drive_error_code_present"
+        elif manufacturer_error_code != 0:
+            reason = "drive_manufacturer_error_code_present"
+        elif fault_flags != 0:
+            reason = "drive_fault_flags_present"
+        if reason is None:
+            return None
+        return {
+            "axis": int(axis_i),
+            "logical_joint": int(self._axis_to_joint[axis_i]) if axis_i < len(self._axis_to_joint) else None,
+            "reason": reason,
+            "ds402_state": int(ds402_state),
+            "ds402_state_name": _ds402_state_name(ds402_state),
+            "statusword": int(statusword),
+            "statusword_hex": f"0x{statusword & 0xFFFF:04X}",
+            "error_code": int(error_code),
+            "error_code_hex": f"0x{error_code & 0xFFFF:04X}",
+            "manufacturer_error_code": int(manufacturer_error_code),
+            "manufacturer_error_code_hex": f"0x{manufacturer_error_code & 0xFFFFFFFF:08X}",
+            "axis_fault_flags": int(fault_flags),
+            "axis_fault_flags_hex": f"0x{fault_flags & 0xFFFFFFFF:08X}",
+        }
+
+    @staticmethod
+    def _control_feedback_fault_summary(details: list[dict[str, object]]) -> str:
+        parts: list[str] = []
+        for detail in details:
+            axis = detail.get("axis")
+            logical_joint = detail.get("logical_joint")
+            joint_label = (
+                f"J{int(logical_joint) + 1}"
+                if isinstance(logical_joint, int) and logical_joint >= 0
+                else "J?"
+            )
+            parts.append(
+                "{"
+                f"axis={axis},"
+                f"joint={joint_label},"
+                f"reason={detail.get('reason')},"
+                f"ds402={detail.get('ds402_state_name')}({detail.get('ds402_state')}),"
+                f"statusword={detail.get('statusword_hex')},"
+                f"error_code_603f={detail.get('error_code_hex')},"
+                f"manufacturer_error_203f={detail.get('manufacturer_error_code_hex')},"
+                f"axis_fault_flags={detail.get('axis_fault_flags_hex')}"
+                "}"
+            )
+        return "[" + ", ".join(parts) + "]"
+
+    def get_control_joint_positions(self, verbose: bool = False) -> list[float]:
+        """Return live joint positions for motion control.
+
+        This path intentionally avoids strict canonical-truth diagnostics. It
+        uses live PDO/reference-frame feedback and hard-fails only on control-
+        unsafe states; canonical truth remains visible through diagnostic
+        snapshots and get_joint_positions().
+        """
+        if self._connected and self._axis_config is None:
+            self._wait_for_feedback_ready(timeout_s=0.25, require_live_wkc=False)
+        if not self._connected:
+            raise RuntimeError("Control feedback unavailable (rtcore_disconnected)")
+        if self._axis_config is None:
+            raise RuntimeError("Control feedback unavailable (rtcore_feedback_not_ready)")
+        if self._rt_num_axes <= 0:
+            raise RuntimeError("Control feedback unavailable (rtcore_num_axes_invalid)")
+
+        raw_positions = self.sync_read_positions()
+        if not raw_positions:
+            raise RuntimeError("Control feedback unavailable (raw_feedback_missing)")
+
+        hard_fault_details: list[dict[str, object]] = []
+        for axis_i in range(min(self._rt_num_axes, len(self._axis_to_joint))):
+            detail = self._control_feedback_hard_fault_for_axis(axis_i)
+            if detail is not None:
+                hard_fault_details.append(detail)
+
+        if hard_fault_details:
+            hard_fault_axes = [int(detail.get("axis", -1)) for detail in hard_fault_details]
+            hard_fault_reasons = [str(detail.get("reason", "unknown")) for detail in hard_fault_details]
+            raise RuntimeError(
+                "Control feedback unavailable "
+                f"(axes={hard_fault_axes}, reasons={sorted(set(hard_fault_reasons))}, "
+                f"fault_details={self._control_feedback_fault_summary(hard_fault_details)})"
+            )
+
+        positions = self._control_joint_positions_from_raw_feedback(raw_positions)
+        if verbose:
+            print("[EtherCAT RTCore] get_control_joint_positions() -> live control feedback")
+        return positions
 
     def _canonical_joint_positions_from_raw_feedback(
         self,
@@ -2999,6 +3309,44 @@ class EthercatRTCoreBackend(ActuatorBackend):
             raw_positions,
             reference_mode="raw",
         )
+
+    def _control_joint_positions_from_raw_feedback(self, raw_positions: dict[int, int]) -> list[float]:
+        positions = self._copy_last_joint_setpoint_rad()
+        samples: list[list[float]] = [[] for _ in range(self._num_joints)]
+        drive_native_ratio_enabled = self._drive_native_ratio_enabled()
+
+        for axis_i, joint_i in enumerate(self._axis_to_joint):
+            if joint_i < 0 or joint_i >= self._num_joints:
+                continue
+            raw = raw_positions.get(axis_i)
+            if raw is None:
+                raise RuntimeError(f"Control feedback unavailable (raw_missing_axis_{axis_i})")
+
+            if drive_native_ratio_enabled:
+                reference_q = self._reference_q_before_master_offset_for_axis(
+                    axis_i,
+                    int(raw),
+                    reference_mode="raw",
+                )
+                if reference_q is None:
+                    raise RuntimeError(f"Control feedback unavailable (reference_q_axis_{axis_i})")
+                q = float(reference_q) - self._master_offset_for_joint(joint_i)
+            else:
+                sign = self._axis_config.sign[axis_i] if self._axis_config is not None else 1
+                counts_per_unit = (
+                    self._axis_config.counts_per_unit[axis_i]
+                    if self._axis_config is not None
+                    else 1.0
+                )
+                q = (float(raw) / (float(sign) * float(counts_per_unit))) - self._master_offset_for_joint(joint_i)
+
+            samples[joint_i].append(float(q))
+
+        for joint_i, joint_samples in enumerate(samples):
+            if joint_samples:
+                positions[joint_i] = float(sum(joint_samples) / len(joint_samples))
+
+        return [float(value) for value in positions]
 
     def get_display_feedback_snapshot(
         self,

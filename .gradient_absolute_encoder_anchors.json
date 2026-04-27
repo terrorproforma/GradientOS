@@ -12,96 +12,98 @@
           "updated_at": "2026-04-24T03:08:58+00:00",
           "updated_by": "ethercat_rtcore:joint1:native_home",
           "last_seen": {
-            "absolute_counts": 29913,
-            "reference_counts": 6553679,
-            "observed_at": "2026-04-24T04:01:25+00:00",
-            "observed_at_monotonic_ns": 264551709934472,
+            "absolute_counts": 313217,
+            "reference_counts": 7452927,
+            "observed_at": "2026-04-27T03:32:54+00:00",
+            "observed_at_monotonic_ns": 157611170211716,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
         {
-          "home_anchor_rad": 0.04474861642760491,
+          "home_anchor_rad": 0.04388479349642713,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             1
           ],
-          "updated_at": "2026-04-24T03:10:37+00:00",
+          "updated_at": "2026-04-25T21:46:24+00:00",
           "updated_by": "ethercat_rtcore:joint2:native_home",
           "last_seen": {
-            "absolute_counts": 1514867,
-            "reference_counts": 7975120,
-            "observed_at": "2026-04-24T04:01:28+00:00",
-            "observed_at_monotonic_ns": 264554240661240,
+            "absolute_counts": 646586,
+            "reference_counts": 7527373,
+            "observed_at": "2026-04-27T03:32:52+00:00",
+            "observed_at_monotonic_ns": 157608428672252,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
         {
-          "home_anchor_rad": -0.027439560712300283,
+          "home_anchor_rad": -0.02829619310853516,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             2
           ],
-          "updated_at": "2026-04-24T03:11:18+00:00",
+          "updated_at": "2026-04-25T21:45:27+00:00",
           "updated_by": "ethercat_rtcore:joint3:native_home",
           "last_seen": {
-            "absolute_counts": 61126,
-            "reference_counts": 6557486,
-            "observed_at": "2026-04-24T04:01:26+00:00",
-            "observed_at_monotonic_ns": 264552481899320,
+            "absolute_counts": 20676,
+            "reference_counts": 6145156,
+            "observed_at": "2026-04-27T03:32:57+00:00",
+            "observed_at_monotonic_ns": 157613683130569,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
         {
-          "home_anchor_rad": -0.011845740528672296,
+          "home_anchor_rad": -0.010868360408613295,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             3
           ],
-          "updated_at": "2026-04-24T03:12:15+00:00",
+          "updated_at": "2026-04-25T21:45:55+00:00",
           "updated_by": "ethercat_rtcore:joint4:native_home",
           "last_seen": {
-            "absolute_counts": 4561,
-            "reference_counts": 1179761,
-            "observed_at": "2026-04-24T04:01:26+00:00",
-            "observed_at_monotonic_ns": 264552854325887,
+            "absolute_counts": 4783,
+            "reference_counts": 1180343,
+            "observed_at": "2026-04-27T03:32:55+00:00",
+            "observed_at_monotonic_ns": 157612300595427,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
         {
-          "home_anchor_rad": -0.5268134531395783,
+          "home_anchor_rad": -0.6567120357327256,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             4
           ],
-          "updated_at": "2026-04-24T03:13:00+00:00",
+          "updated_at": "2026-04-26T04:59:23+00:00",
           "updated_by": "ethercat_rtcore:joint5:native_home",
           "last_seen": {
-            "absolute_counts": 279260,
-            "reference_counts": 879271,
-            "observed_at": "2026-04-24T04:01:29+00:00",
-            "observed_at_monotonic_ns": 264555524231681,
+            "absolute_counts": 237935,
+            "reference_counts": 732503,
+            "observed_at": "2026-04-27T03:32:53+00:00",
+            "observed_at_monotonic_ns": 157609552325289,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         },
         {
-          "home_anchor_rad": -0.1510060274974553,
+          "home_anchor_rad": -0.15071840609972656,
           "source": "encoder_multi_turn_counts",
           "axis_indices": [
             5
           ],
-          "updated_at": "2026-04-23T23:31:27+00:00",
+          "updated_at": "2026-04-25T21:46:40+00:00",
           "updated_by": "ethercat_rtcore:joint6:native_home",
           "last_seen": {
-            "absolute_counts": 31444,
-            "reference_counts": 655303,
-            "observed_at": "2026-04-24T04:01:26+00:00",
-            "observed_at_monotonic_ns": 264552179270943,
+            "absolute_counts": 50700,
+            "reference_counts": 716126,
+            "observed_at": "2026-04-27T03:32:53+00:00",
+            "observed_at_monotonic_ns": 157609554423402,
             "observed_by": "ethercat_rtcore:restart-trust"
           }
         }
       ],
-      "updated_at": "2026-04-24T04:01:29+00:00",
+      "updated_at": "2026-04-27T03:32:57+00:00",
       "updated_by": "ethercat_rtcore:restart-trust"
     }
   }
+}
+
 }

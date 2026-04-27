@@ -212,6 +212,10 @@ export type LiveTelemetryEvent = {
   raw: string;
   joints?: number[];
   display_joints?: number[];
+  joint_feedback_available?: boolean;
+  joint_feedback_stale?: boolean;
+  joint_feedback_stale_age_s?: number;
+  joint_feedback_error?: string;
   gripper?: number;
   servos?: Record<string, ServoSample>;
   alerts?: Alert[];

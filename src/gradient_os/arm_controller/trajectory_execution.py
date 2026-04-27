@@ -112,6 +112,73 @@ MAX_JOINT_STEP_RAD = float(os.environ.get("MINI_ARM_MAX_JOINT_STEP_RAD", "0.75")
 JOINT_LIMIT_MARGIN_RAD = float(os.environ.get("MINI_ARM_JOINT_LIMIT_MARGIN_RAD", "0.03"))
 MAX_CART_RESIDUAL_M = float(os.environ.get("MINI_ARM_MAX_CART_RESIDUAL_M", "0.012"))
 MAX_ORIENT_RESIDUAL_DEG = float(os.environ.get("MINI_ARM_MAX_ORIENT_RESIDUAL_DEG", "6.0"))
+RTCORE_STRICT_COMPLETION_SETTLE_TIMEOUT_S = float(
+    os.environ.get("GRADIENT_RTCORE_STRICT_COMPLETION_SETTLE_TIMEOUT_S", "5.0")
+)
+TRAJECTORY_LOOP_RESTART_PAUSE_S = float(
+    os.environ.get("GRADIENT_TRAJECTORY_LOOP_RESTART_PAUSE_S", "0.0")
+)
+
+
+def _format_live_endpoint_error(target_q: Sequence[float]) -> str:
+    try:
+        live_q = servo_driver.get_control_arm_state_rad(verbose=False)
+        if live_q is None:
+            return "live_endpoint_error=control_feedback_unavailable"
+        live_arr = np.asarray(live_q, dtype=float)
+        target_arr = np.asarray(target_q, dtype=float)
+        if live_arr.shape != target_arr.shape:
+            return (
+                "live_endpoint_error=shape_mismatch"
+                f" live_shape={tuple(live_arr.shape)} target_shape={tuple(target_arr.shape)}"
+            )
+        err = live_arr - target_arr
+        per_joint = [round(float(value), 6) for value in err.tolist()]
+        return (
+            f"live_endpoint_max_abs_err_rad={float(np.max(np.abs(err))):.6f}"
+            f" live_endpoint_err_rad={per_joint}"
+        )
+    except Exception as exc:
+        return f"live_endpoint_error=unavailable:{exc}"
+
+
+def _format_rtcore_completion_diagnostics(backend: object, traj_id: int) -> str | None:
+    getter = getattr(backend, "get_trajectory_completion_diagnostics", None)
+    if not callable(getter):
+        return None
+    try:
+        diag = getter(int(traj_id))
+    except Exception as exc:
+        return f"rtcore_completion_diag=unavailable:{exc}"
+    if not isinstance(diag, dict):
+        return None
+
+    axes = diag.get("axes")
+    axis_parts: list[str] = []
+    if isinstance(axes, list):
+        for item in axes:
+            if not isinstance(item, dict):
+                continue
+            try:
+                axis_parts.append(
+                    "axis{axis}:target={target}:feedback={feedback}:error={error}".format(
+                        axis=int(item.get("axis_index", -1)),
+                        target=int(item.get("target_counts", 0)),
+                        feedback=int(item.get("feedback_counts", 0)),
+                        error=int(item.get("error_counts", 0)),
+                    )
+                )
+            except Exception:
+                continue
+    if not axis_parts:
+        return None
+    return (
+        "rtcore_completion_diag="
+        f"traj_id={int(diag.get('traj_id', 0) or 0)} "
+        f"final_due={bool(diag.get('final_due', False))} "
+        f"tolerance_counts={int(diag.get('tolerance_counts', 0) or 0)} "
+        f"axes=[{';'.join(axis_parts)}]"
+    )
 
 
 def _set_planner_diagnostics(payload: dict) -> None:
@@ -1786,7 +1853,11 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
                 )
                 utils.trajectory_state_set("weld_active", bool(step.get("weld_active", False)))
                 if step_type == "move":
-                    _execute_joint_path(step["path"], step["freq"])
+                    _execute_joint_path(
+                        step["path"],
+                        step["freq"],
+                        require_completion=bool(step.get("require_completion", False)),
+                    )
                 elif step_type == "joint_move":
                     print(f"[Pi Execute] Moving joints to target configuration and waiting {step['duration']}s.")
                     servo_driver.set_servo_positions(step["target_q"], step["speed"], 0)
@@ -1830,7 +1901,8 @@ def _trajectory_executor_thread(planned_steps: list[dict], should_loop: bool):
                 )
                 print("\n[Pi Trajectory] Loop enabled. Restarting sequence...")
                 loop_iteration += 1
-                time.sleep(1)
+                if TRAJECTORY_LOOP_RESTART_PAUSE_S > 0.0:
+                    time.sleep(TRAJECTORY_LOOP_RESTART_PAUSE_S)
 
         if bool(utils.trajectory_state_get("should_stop", False)) and terminal_reason == "completed":
             terminal_state, terminal_reason = _derive_program_terminal_outcome()
@@ -1898,6 +1970,7 @@ def _open_loop_executor_thread(
     return_telemetry: bool = False,
     owns_trajectory_state: bool = True,
     target_joint_indices: list[int] | None = None,
+    require_completion: bool = False,
 ):
     """High-speed *open-loop* executor.
 
@@ -1928,9 +2001,44 @@ def _open_loop_executor_thread(
     except Exception:
         executor_speed = 4095
 
-    if use_backend and hasattr(backend, "execute_joint_trajectory"):
+    if use_backend and hasattr(backend, "submit_joint_trajectory"):
         telemetry_result = None
         offload_t0 = time.perf_counter()
+        released_for_settle = False
+        owner_thread = threading.current_thread()
+        submission = None
+
+        def _release_for_settle(traj_id: int) -> None:
+            nonlocal released_for_settle
+            if released_for_settle:
+                return
+            if owns_trajectory_state and utils.trajectory_state.get("thread") is owner_thread:
+                utils.trajectory_state.update(
+                    {
+                        "is_running": False,
+                        "should_stop": False,
+                        "thread": None,
+                        "rtcore_settle_traj_id": int(traj_id),
+                    }
+                )
+                try:
+                    utils.set_motion_state("SETTLING")
+                except Exception:
+                    pass
+                released_for_settle = True
+
+        def _finish_settle_state(traj_id: int) -> None:
+            if (
+                owns_trajectory_state
+                and utils.trajectory_state_get("rtcore_settle_traj_id", None) == int(traj_id)
+                and not bool(utils.trajectory_state_get("is_running", False))
+            ):
+                utils.trajectory_state_set("rtcore_settle_traj_id", None)
+                try:
+                    utils.set_motion_state("IDLE")
+                except Exception:
+                    pass
+
         try:
             axis_mask = None
             if target_joint_indices:
@@ -1941,15 +2049,143 @@ def _open_loop_executor_thread(
                         raise RuntimeError(
                             "Cannot start targeted RTCore trajectory; selected logical joints are unmapped."
                         )
-            status = backend.execute_joint_trajectory(  # type: ignore[attr-defined]
+            submission = backend.submit_joint_trajectory(  # type: ignore[attr-defined]
                 joint_path,
                 frequency,
                 axis_mask=axis_mask,
             )
-            state_name = str(getattr(status, "state_name", "unknown"))
-            if state_name not in ("completed", "idle"):
-                raise RuntimeError(f"RTCore trajectory execution ended in state '{state_name}'")
+            try:
+                final_status = backend.wait_for_trajectory_final_point_sent(  # type: ignore[attr-defined]
+                    int(submission.traj_id),
+                    expected_points=int(submission.expected_points),
+                    timeout_s=float(submission.duration_s) + 0.25,
+                    submitted_command_seq=(
+                        None
+                        if getattr(submission, "submitted_command_seq", None) is None
+                        else int(submission.submitted_command_seq)
+                    ),
+                )
+            except TimeoutError as exc:
+                utils.trajectory_state_set("last_bounded_endpoint", None)
+                abort_trajectory = getattr(backend, "abort_trajectory", None)
+                if callable(abort_trajectory):
+                    try:
+                        abort_trajectory(int(submission.traj_id))
+                    except Exception as abort_exc:
+                        print(f"[Pi OL] WARNING: RTCore trajectory abort after final-point timeout failed: {abort_exc}")
+                print(f"[Pi OL] ERROR: RTCore trajectory final-point wait timed out; aborted trajectory {int(submission.traj_id)}: {exc}")
+                if require_completion:
+                    wait_complete = getattr(backend, "wait_for_trajectory_complete", None)
+                    if callable(wait_complete):
+                        try:
+                            wait_complete(
+                                int(submission.traj_id),
+                                timeout_s=0.5,
+                                submitted_command_seq=(
+                                    None
+                                    if getattr(submission, "submitted_command_seq", None) is None
+                                    else int(submission.submitted_command_seq)
+                                ),
+                            )
+                        except Exception as settle_exc:
+                            print(
+                                "[Pi OL] WARNING: RTCore trajectory did not confirm abort/idle after strict final-point timeout: "
+                                f"{settle_exc}"
+                            )
+                    raise TimeoutError(
+                        "RTCore trajectory did not issue final point before strict completion deadline: "
+                        f"{exc}"
+                    ) from exc
+                if return_telemetry:
+                    telemetry_result = {
+                        "frequency": frequency,
+                        "backend_mode": "rtcore_trajectory",
+                        "execution_state": "timeout",
+                        "trajectory_id": int(submission.traj_id),
+                        "error": str(exc),
+                    }
+                return telemetry_result if return_telemetry else None
+            final_state_name = str(getattr(final_status, "state_name", "unknown")).strip().lower()
+            if final_state_name in {"aborted", "faulted", "underrun"}:
+                utils.trajectory_state_set("last_bounded_endpoint", None)
+                raise RuntimeError(
+                    "RTCore trajectory did not issue a trustworthy final endpoint:"
+                    f" {final_state_name}"
+                )
+            utils.trajectory_state_set(
+                "last_bounded_endpoint",
+                {
+                    "arm_rad": [float(value) for value in joint_path[-1]],
+                    "target_joint_indices": [int(value) for value in (target_joint_indices or [])],
+                    "traj_id": int(submission.traj_id),
+                    "final_point_monotonic": time.monotonic(),
+                },
+            )
+            _release_for_settle(int(submission.traj_id))
             utils.current_logical_joint_angles_rad = joint_path[-1]
+
+            settle_timeout_s = (
+                RTCORE_STRICT_COMPLETION_SETTLE_TIMEOUT_S if require_completion else 0.5
+            )
+            try:
+                status = backend.wait_for_trajectory_complete(  # type: ignore[attr-defined]
+                    int(submission.traj_id),
+                    timeout_s=settle_timeout_s,
+                    submitted_command_seq=(
+                        None
+                        if getattr(submission, "submitted_command_seq", None) is None
+                        else int(submission.submitted_command_seq)
+                    ),
+                )
+            except TimeoutError as exc:
+                if require_completion:
+                    endpoint_error_detail = _format_live_endpoint_error(joint_path[-1])
+                    rtcore_completion_detail = _format_rtcore_completion_diagnostics(
+                        backend,
+                        int(submission.traj_id),
+                    )
+                    utils.trajectory_state_set("last_bounded_endpoint", None)
+                    abort_trajectory = getattr(backend, "abort_trajectory", None)
+                    if callable(abort_trajectory):
+                        try:
+                            abort_trajectory(int(submission.traj_id))
+                        except Exception as abort_exc:
+                            print(
+                                "[Pi OL] WARNING: RTCore trajectory abort after strict settle timeout failed: "
+                                f"{abort_exc}"
+                            )
+                    wait_complete = getattr(backend, "wait_for_trajectory_complete", None)
+                    if callable(wait_complete):
+                        try:
+                            wait_complete(
+                                int(submission.traj_id),
+                                timeout_s=0.5,
+                                submitted_command_seq=(
+                                    None
+                                    if getattr(submission, "submitted_command_seq", None) is None
+                                    else int(submission.submitted_command_seq)
+                                ),
+                            )
+                        except Exception as settle_exc:
+                            print(
+                                "[Pi OL] WARNING: RTCore trajectory did not confirm abort/idle after strict timeout: "
+                                f"{settle_exc}"
+                            )
+                    raise TimeoutError(
+                        "RTCore trajectory did not complete before strict completion deadline "
+                        f"({settle_timeout_s:.3f}s after final point issued): {exc}; "
+                        f"{endpoint_error_detail}"
+                        + (f"; {rtcore_completion_detail}" if rtcore_completion_detail else "")
+                    ) from exc
+                status = final_status
+                print(f"[Pi OL] RTCore trajectory settle wait timed out (non-fatal): {exc}")
+            state_name = str(getattr(status, "state_name", "unknown"))
+            # Strict mode is used by the loop move-to-start preflight. It must
+            # not accept `executing`, because RTCore only leaves executing once
+            # targeted axes are inside its final-position completion window.
+            accepted_states = {"completed", "idle"} if require_completion else {"completed", "idle", "executing"}
+            if state_name not in accepted_states:
+                raise RuntimeError(f"RTCore trajectory execution ended in state '{state_name}'")
             elapsed_s = time.perf_counter() - offload_t0
             print(
                 "[Pi OL] RTCore trajectory execution finished:"
@@ -1966,7 +2202,13 @@ def _open_loop_executor_thread(
                     "elapsed_s": float(elapsed_s),
                 }
         finally:
-            if owns_trajectory_state and utils.trajectory_state.get("thread") is threading.current_thread():
+            if submission is not None:
+                _finish_settle_state(int(submission.traj_id))
+            if (
+                not released_for_settle
+                and owns_trajectory_state
+                and utils.trajectory_state.get("thread") is owner_thread
+            ):
                 utils.trajectory_state.update({"is_running": False, "should_stop": False, "thread": None})
                 utils.trajectory_state.pop('diagnostics_session_id', None)
                 utils.trajectory_state.pop('diagnostics_folder_type', None)
@@ -2469,7 +2711,12 @@ def _closed_loop_executor_thread(
             return telemetry_result
 
 
-def _execute_joint_path(joint_path: list[list[float]], frequency: int):
+def _execute_joint_path(
+    joint_path: list[list[float]],
+    frequency: int,
+    *,
+    require_completion: bool = False,
+):
     """Executes a pre-computed joint path synchronously (blocking).
 
     Current implementation chooses the **open-loop** executor for speed.
@@ -2489,5 +2736,6 @@ def _execute_joint_path(joint_path: list[list[float]], frequency: int):
         frequency,
         diagnostics=diagnostics_enabled,
         owns_trajectory_state=False,
+        require_completion=bool(require_completion),
     )
 

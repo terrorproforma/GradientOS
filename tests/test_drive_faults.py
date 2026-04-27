@@ -689,6 +689,113 @@ def test_build_drive_fault_snapshot_carries_native_home_active_mask(monkeypatch)
     assert snapshot["axes"][1]["native_home_active"] is True
 
 
+def test_a6ec_gear_ratio_u16_pair_recovers_100_over_11_from_ieee754_float():
+    """A6-EC C10.18 / C10.19 gear-ratio SDO writes must fit in u16
+    registers. The robot config stores ``actuator_gear_ratios`` as a
+    list of floats; non-trivial mechanical ratios such as ``100/11``
+    round-trip in Python as the float ``9.090909090909091``. The naive
+    ``Fraction(str(float))`` path parses that decimal string into
+    ``9090909090909091 / 1000000000000000`` which overflows the u16
+    limit and would break startup. Verify the profile helper recovers
+    the exact ``(100, 11)`` pair via
+    ``Fraction(raw_float).limit_denominator(0xFFFF)``.
+    """
+    from gradient_os.arm_controller.profiles.drive.a6ec_ds402 import (
+        _ratio_u16_pair_for_axis,
+    )
+
+    robot_cfg = {
+        "actuator_gear_ratios": [100.0, 100.0, 100.0, 18.0, 9.090909090909091, 10.0],
+    }
+    numerator, denominator = _ratio_u16_pair_for_axis(4, robot_config=robot_cfg)
+    assert (numerator, denominator) == (100, 11)
+    # Exact-representable ratios (ints, power-of-two denominators) must
+    # round-trip without limit_denominator touching them.
+    for axis_i, expected in [
+        (0, (100, 1)),   # 100.0
+        (3, (18, 1)),    # 18.0
+        (5, (10, 1)),    # 10.0
+    ]:
+        assert _ratio_u16_pair_for_axis(axis_i, robot_config=robot_cfg) == expected
+
+
+def test_a6ec_gear_ratio_u16_pair_accepts_exact_fraction_string():
+    """Operators can supply exact rationals as strings when the
+    intended value is not IEEE754-exact (``"100/11"`` is nicer than
+    ``9.090909090909091`` in a human review). Both paths must land
+    on the same u16 pair.
+    """
+    from gradient_os.arm_controller.profiles.drive.a6ec_ds402 import (
+        _ratio_u16_pair_for_axis,
+    )
+
+    robot_cfg = {"actuator_gear_ratios": [1.0, 1.0, 1.0, 1.0, "100/11", 1.0]}
+    assert _ratio_u16_pair_for_axis(4, robot_config=robot_cfg) == (100, 11)
+
+
+def test_a6ec_gear_ratio_u16_pair_rejects_ratio_that_cannot_be_approximated():
+    """If the input float is genuinely far from any u16/u16 rational
+    (within 1 ppm relative tolerance), the helper must raise instead
+    of silently snapping to a wildly different value. Pick a ratio
+    with a prime denominator larger than 65535 so limit_denominator
+    is forced to deviate beyond the tolerance.
+    """
+    import math
+
+    from gradient_os.arm_controller.profiles.drive.a6ec_ds402 import (
+        _ratio_u16_pair_for_axis,
+    )
+
+    robot_cfg = {"actuator_gear_ratios": [1.0, 1.0, 1.0, 1.0, math.pi, 1.0]}
+    try:
+        _ratio_u16_pair_for_axis(4, robot_config=robot_cfg)
+    except ValueError as exc:
+        assert "1 ppm" in str(exc) or "u16" in str(exc)
+    else:
+        # math.pi has no u16/u16 approximation within 1 ppm; the helper
+        # must refuse it loudly.
+        raise AssertionError("Expected ValueError for math.pi gear ratio")
+
+
+def test_rtcore_env_emits_gear_ratio_with_full_precision():
+    """The ``GRADIENT_RT_GEAR_RATIO`` env var must preserve enough
+    float precision that RTCore's host-side ``counts_per_unit`` math
+    stays in lockstep with exact drive SDO pairs. The previous ``:g``
+    format truncated to 6 sig figs, which could silently drift host
+    vs drive for non-trivial ratios.
+    Lock in ``repr(float)`` (shortest-round-trip) so the C++ parser
+    reconstructs the exact IEEE754 double the profile used.
+    """
+    from gradient_os.arm_controller.robots import get_robot_config
+    from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import (
+        render_rtcore_systemd_env,
+    )
+
+    robot = get_robot_config("gradient05").get_config_dict()
+    env = render_rtcore_systemd_env(
+        robot_config=robot, drive_profile="a6ec_ds402", max_rpm=6000
+    )
+    gear_line = next(
+        (line for line in env.splitlines() if line.startswith("GRADIENT_RT_GEAR_RATIO=")),
+        None,
+    )
+    assert gear_line is not None, "GRADIENT_RT_GEAR_RATIO missing from env"
+    # Strip KEY= and surrounding quotes so downstream parsing can
+    # split on comma without worrying about shell quoting.
+    value = gear_line.split("=", 1)[1].strip().strip('"').strip("'")
+    tokens = value.split(",")
+    assert len(tokens) == 6
+    # Each token must parse back into the exact same IEEE754 double
+    # that the profile saw (which is what ``repr(float)`` guarantees).
+    expected = robot["actuator_gear_ratios"][:6]
+    for token, raw in zip(tokens, expected):
+        parsed = float(token)
+        assert parsed == float(raw), (
+            f"gear ratio token {token!r} lost precision: re-parsed as {parsed!r} "
+            f"but robot config has {raw!r}"
+        )
+
+
 def test_describe_encoder_retention_fault_falls_back_to_bus_code_when_203f_is_zero():
     """When the drive does not PDO-map 0x203F (observed live on
     A6-EC), the manufacturer code reads as zero but the firmware

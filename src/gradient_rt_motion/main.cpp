@@ -2276,6 +2276,18 @@ int main(int argc, char** argv) {
       gradient::ipc::v1::MOTION_CAP_JOG_COMMAND};
   std::atomic<uint64_t> motion_active_command_seq{0};
   std::atomic<uint64_t> motion_last_update_ns{0};
+  std::atomic<uint64_t> trajectory_completion_diag_traj_id{0};
+  std::atomic<uint64_t> trajectory_completion_diag_sample_time_ns{0};
+  std::atomic<uint32_t> trajectory_completion_diag_axis_mask{0};
+  std::atomic<uint32_t> trajectory_completion_diag_final_due{0};
+  std::atomic<int32_t> trajectory_completion_diag_tolerance_counts{
+      kTrajectoryCompletionToleranceCounts};
+  std::array<std::atomic<int32_t>, gradient::ipc::v1::GRADIENT_MAX_AXES>
+      trajectory_completion_diag_target_counts{};
+  std::array<std::atomic<int32_t>, gradient::ipc::v1::GRADIENT_MAX_AXES>
+      trajectory_completion_diag_feedback_counts{};
+  std::array<std::atomic<int64_t>, gradient::ipc::v1::GRADIENT_MAX_AXES>
+      trajectory_completion_diag_error_counts{};
 #if GRADIENT_HAVE_ECRT
   ec_master_t* shared_master = nullptr;
   // Serialize non-RT SDO traffic against master teardown so the metrics/helper
@@ -4147,10 +4159,12 @@ int main(int argc, char** argv) {
           uint16_t first_faulted_error_code = 0;
           uint8_t first_faulted_ds402_state = 0;
           bool all_axes_at_target = final_due;
+          uint32_t completion_diag_axis_mask = 0;
           for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
             if ((final_point.axis_mask & (1u << i)) == 0u) {
               continue;
             }
+            completion_diag_axis_mask |= (1u << i);
             const uint8_t ds402 = latest_feedback.ds402_state[i];
             if (latest_feedback.error_code[i] != 0 ||
                 ds402 == gradient::ipc::v1::DS402_FAULT ||
@@ -4176,6 +4190,12 @@ int main(int argc, char** argv) {
             const int64_t comparable_error_counts =
                 wrap_period_counts > 0 ? shortest_periodic_error_counts(error_counts, wrap_period_counts)
                                        : error_counts;
+            trajectory_completion_diag_target_counts[i].store(final_target_counts,
+                                                              std::memory_order_relaxed);
+            trajectory_completion_diag_feedback_counts[i].store(final_feedback_counts,
+                                                                std::memory_order_relaxed);
+            trajectory_completion_diag_error_counts[i].store(comparable_error_counts,
+                                                             std::memory_order_relaxed);
             if (comparable_error_counts <
                     -static_cast<int64_t>(kTrajectoryCompletionToleranceCounts) ||
                 comparable_error_counts >
@@ -4183,6 +4203,12 @@ int main(int argc, char** argv) {
               all_axes_at_target = false;
             }
           }
+          trajectory_completion_diag_traj_id.store(active_traj_id_rt, std::memory_order_relaxed);
+          trajectory_completion_diag_sample_time_ns.store(diag_now_ns, std::memory_order_relaxed);
+          trajectory_completion_diag_axis_mask.store(completion_diag_axis_mask, std::memory_order_relaxed);
+          trajectory_completion_diag_final_due.store(final_due ? 1u : 0u, std::memory_order_relaxed);
+          trajectory_completion_diag_tolerance_counts.store(
+              kTrajectoryCompletionToleranceCounts, std::memory_order_relaxed);
           if (any_faulted) {
             logf("FAULT_EXEC_E2 diag_now_ns=%llu traj_id=%llu final_due=%u axis_index=%u "
                  "error_code=0x%04X ds402_state=%u",
@@ -5186,6 +5212,40 @@ int main(int argc, char** argv) {
       oss << "\"axis_enable_mask\":" << en_mask << ",";
       oss << "\"native_home_active_axis_mask\":"
           << native_home_active_axis_mask.load(std::memory_order_relaxed) << ",";
+      const uint64_t completion_diag_traj_id =
+          trajectory_completion_diag_traj_id.load(std::memory_order_relaxed);
+      const uint32_t completion_diag_axis_mask =
+          trajectory_completion_diag_axis_mask.load(std::memory_order_relaxed);
+      oss << "\"trajectory_completion\":{";
+      oss << "\"traj_id\":" << completion_diag_traj_id << ",";
+      oss << "\"sample_time_ns\":"
+          << trajectory_completion_diag_sample_time_ns.load(std::memory_order_relaxed) << ",";
+      oss << "\"axis_mask\":" << completion_diag_axis_mask << ",";
+      oss << "\"final_due\":"
+          << trajectory_completion_diag_final_due.load(std::memory_order_relaxed) << ",";
+      oss << "\"tolerance_counts\":"
+          << trajectory_completion_diag_tolerance_counts.load(std::memory_order_relaxed) << ",";
+      oss << "\"axes\":[";
+      bool first_completion_axis = true;
+      for (uint32_t i = 0; i < opt.num_axes && i < gradient::ipc::v1::GRADIENT_MAX_AXES; ++i) {
+        if ((completion_diag_axis_mask & (1u << i)) == 0u) {
+          continue;
+        }
+        if (!first_completion_axis) {
+          oss << ",";
+        }
+        first_completion_axis = false;
+        oss << "{";
+        oss << "\"axis_index\":" << i << ",";
+        oss << "\"target_counts\":"
+            << trajectory_completion_diag_target_counts[i].load(std::memory_order_relaxed) << ",";
+        oss << "\"feedback_counts\":"
+            << trajectory_completion_diag_feedback_counts[i].load(std::memory_order_relaxed) << ",";
+        oss << "\"error_counts\":"
+            << trajectory_completion_diag_error_counts[i].load(std::memory_order_relaxed);
+        oss << "}";
+      }
+      oss << "]},";
       oss << "\"have_feedback\":" << (have_fb ? 1 : 0) << ",";
       oss << "\"wkc_actual\":" << (have_fb ? wkc_actual : 0) << ",";
       oss << "\"wkc_expected\":" << wkc_expected << ",";

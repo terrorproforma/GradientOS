@@ -1006,6 +1006,23 @@ def get_current_arm_state_rad(verbose: bool = True) -> list[float]:
     return current_logical_angles_rad
 
 
+def get_control_arm_state_rad(verbose: bool = False) -> list[float]:
+    """Read joint state for motion control.
+
+    Backends may expose a relaxed live-control feedback path that hard-fails
+    only on fault/offline/unsafe states. Legacy and non-supporting backends
+    continue to use the strict public state read.
+    """
+    backend = _get_backend()
+    if backend is not None and backend.is_initialized:
+        getter = getattr(backend, "get_control_joint_positions", None)
+        if callable(getter):
+            positions = getter(verbose=verbose)
+            utils.current_logical_joint_angles_rad = positions
+            return positions
+    return get_current_arm_state_rad(verbose=verbose)
+
+
 def _build_logical_to_servo_id_map() -> dict[int, list[int]]:
     """
     Build a map from logical joint index (0-based) to physical servo IDs.

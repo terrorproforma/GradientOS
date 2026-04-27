@@ -74,7 +74,7 @@ _API_PERF: dict[str, Any] = {
     "last_round_trip_ms": None,
     "by_command": {},
 }
-_DEFAULT_JOG_SESSION_LEASE_TIMEOUT_S = 0.4
+_DEFAULT_JOG_SESSION_LEASE_TIMEOUT_S = 1.0
 
 
 def _command_label(message: str) -> str:
@@ -868,6 +868,7 @@ class TelemetryHub:
         self._transport: asyncio.DatagramTransport | None = None
         self._aux_transport: asyncio.DatagramTransport | None = None
         self._servo_proc: subprocess.Popen | None = None
+        self._monitor_sequence = 0
         self._advertise_host = os.environ.get("GRADIENT_MONITOR_HOST")
         self._bind_host = os.environ.get("GRADIENT_MONITOR_BIND", "127.0.0.1")
         self._telemetry_hz = _read_int_env(
@@ -887,7 +888,7 @@ class TelemetryHub:
         self._autostart_servo_telemetry: bool = _auto_env in {"1", "true", "yes", "on"}
 
     async def register(self) -> Tuple[int, asyncio.Queue[str]]:
-        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=50)
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=5)
         async with self._lock:
             first_client = not self._subscribers
             if first_client:
@@ -999,6 +1000,13 @@ class TelemetryHub:
             parsed = json.loads(text)
         except json.JSONDecodeError:
             return text
+        self._monitor_sequence += 1
+        timing = parsed.get("monitor_timing")
+        if not isinstance(timing, dict):
+            timing = {}
+        timing["api_received_t"] = time.time()
+        timing["api_sequence"] = self._monitor_sequence
+        parsed["monitor_timing"] = timing
         return json.dumps(parsed)
 
 
@@ -1130,6 +1138,40 @@ def create_app() -> FastAPI:
             return 409
         return 503
 
+    def _status_code_for_apply_joint_error(code: str) -> int:
+        normalized = str(code or "").strip().upper()
+        if normalized in {
+            "DRIVE_NOT_OP_ENABLED",
+            "DRIVE_FAULTED",
+            "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
+            "MOTION_ACTIVE",
+        }:
+            return 409
+        if normalized.startswith("INVALID_") or normalized in {"BAD_ARGS"}:
+            return 400
+        if normalized in {"RTCORE_UNAVAILABLE", "CMD_RING_UNAVAILABLE", "CMD_RING_OVERFLOW"}:
+            return 503
+        return 503
+
+    def _controller_apply_joint_call(
+        command: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float,
+    ) -> tuple[str, dict[str, Any]]:
+        message = f"{command},{_encode_payload_b64(payload)}"
+        ok, detail = _send_controller_command(message, timeout=timeout, expect_response=True)
+        if ok:
+            return detail, _parse_controller_ack_payload(detail, command)
+
+        error_payload = _parse_controller_error_payload(detail, command)
+        if error_payload is not None:
+            raise HTTPException(
+                status_code=_status_code_for_apply_joint_error(str(error_payload.get("code", ""))),
+                detail=error_payload,
+            )
+        raise _parse_apply_joint_setpoint_error(detail)
+
     def _controller_structured_call(command: str, response_command: str, *, timeout: float) -> tuple[str, dict[str, Any]]:
         ok, detail = _send_controller_command(command, timeout=timeout, expect_response=True)
         if ok:
@@ -1197,7 +1239,7 @@ def create_app() -> FastAPI:
         execution_mode: str,
         timeout_detail: str,
     ) -> dict[str, Any] | None:
-        for attempt_index in range(3):
+        for attempt_index in range(8):
             try:
                 status_detail = await run_in_threadpool(
                     _controller_call_or_503, "GET_MOTION_STATUS", timeout=1.0, expect_response=True
@@ -1218,8 +1260,8 @@ def create_app() -> FastAPI:
                     "run_request_detail": timeout_detail,
                     **status_payload,
                 }
-            if attempt_index < 2:
-                await asyncio.sleep(0.25)
+            if attempt_index < 7:
+                await asyncio.sleep(0.2)
         return None
 
     def _parse_kinematics_error(detail: str) -> HTTPException:
@@ -1709,130 +1751,31 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="delta_deg must be a number")
         wait_for_idle = bool(payload.get("wait_for_idle", False))
 
-        detail = await run_in_threadpool(
-            _controller_call_or_503,
-            "GET_JOINT_STATE",
-            timeout=1.0,
-            expect_response=True,
-        )
         try:
-            joint_state = _parse_joint_state_response(detail)
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        read_source = str(joint_state.get("read_source", "live_feedback")).strip().lower()
-        if read_source != "live_feedback":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
-                    "message": "Live canonical joint feedback is unavailable; refusing to baseline joint jog from cached state.",
-                    "read_source": joint_state.get("read_source"),
-                    "canonical_joint_truth_available": bool(
-                        joint_state.get("canonical_joint_truth_available", False)
-                    ),
-                },
-            )
-        if joint_state.get("canonical_joint_truth_available") is False:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
-                    "message": "Live canonical joint feedback is unavailable; refusing to baseline joint jog without anchored absolute truth.",
-                    "read_source": joint_state.get("read_source"),
-                    "canonical_joint_truth_available": False,
-                    "canonical_joint_truth_unavailable_axes": joint_state.get(
-                        "canonical_joint_truth_unavailable_axes", []
-                    ),
-                    "canonical_joint_truth_unavailable_joints": joint_state.get(
-                        "canonical_joint_truth_unavailable_joints", []
-                    ),
-                },
-            )
-        angles = joint_state.get("arm_deg")
-        if not isinstance(angles, list):
-            raise HTTPException(status_code=502, detail=f"Malformed joint reply: {detail}")
-        if len(angles) < joint:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Joint {joint} unavailable in controller feedback.",
-            )
-        display_angles = joint_state.get("arm_display_deg")
-        selected_joint_feedback = _selected_joint_feedback_snapshot(joint_state, joint=joint)
-        raw_deg = selected_joint_feedback.get("current_raw_deg")
-        display_deg = selected_joint_feedback.get("current_display_deg")
-        display_source = selected_joint_feedback.get("display_source")
-        absolute_source = selected_joint_feedback.get("absolute_source")
-        axis_counts = selected_joint_feedback.get("axis_counts")
-        absolute_counts = selected_joint_feedback.get("absolute_counts")
-        truth_available = bool(selected_joint_feedback.get("truth_available", True))
-        if not truth_available:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
-                    "message": "Selected joint is missing anchored absolute truth; refusing to baseline joint jog.",
+            detail, controller_payload = await run_in_threadpool(
+                _controller_apply_joint_call,
+                "APPLY_JOINT_DELTA",
+                {
                     "joint": joint,
-                    "selected_joint_feedback": selected_joint_feedback,
+                    "delta_deg": delta_deg,
+                    "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
+                    "wait_for_idle": wait_for_idle,
                 },
+                timeout=10.0 if wait_for_idle else 2.0,
             )
-        if display_source == "truth_unavailable":
-            logger.warning(
-                "Joint jog baseline snapshot joint=%s canonical_deg=%s display_deg=%s "
-                "display_source=%s absolute_source=%s axis_counts=%s absolute_counts=%s",
-                joint,
-                None if raw_deg is None else round(float(raw_deg), 6),
-                None if display_deg is None else round(float(display_deg), 6),
-                display_source,
-                absolute_source,
-                axis_counts,
-                absolute_counts,
-            )
-
-        target_arm_deg = list(angles[:6])
-        target_arm_deg[joint - 1] = float(target_arm_deg[joint - 1]) + float(delta_deg)
-        # Raw comma-separated joint commands are interpreted by the controller as radians.
-        # The joint snapshot carries degrees for UI/API consumption, so convert back to
-        # radians here before handing the command to the controller.
-        target_arm_rad = [float(np.deg2rad(value)) for value in target_arm_deg]
-        try:
-            detail = await run_in_threadpool(
-                _controller_call_or_503,
-                "APPLY_JOINT_SETPOINT,"
-                + _encode_payload_b64(
-                    {
-                        "arm_angles_rad": target_arm_rad,
-                        "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
-                        "target_joint_indices": [joint - 1],
-                    }
-                ),
-                timeout=2.0,
-                expect_response=True,
-            )
-        except HTTPException as exc:
-            detail_text = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail)
-            raise _parse_apply_joint_setpoint_error(detail_text) from exc
-        payload = _parse_controller_ack_payload(detail, "APPLY_JOINT_SETPOINT")
-        command_acknowledged = bool(payload.get("accepted", detail.startswith("ACK,APPLY_JOINT_SETPOINT")))
+        except HTTPException:
+            raise
+        command_acknowledged = bool(
+            controller_payload.get("accepted", detail.startswith("ACK,APPLY_JOINT_DELTA"))
+        )
         return {
             "status": "ok",
             "joint": joint,
             "delta_deg": delta_deg,
-            "feedback_snapshot_source": "GET_JOINT_STATE",
-            "current_arm_deg": [float(value) for value in angles[:6]],
-            "current_arm_display_deg": (
-                [float(value) if value is not None else None for value in display_angles[:6]]
-                if isinstance(display_angles, list)
-                else None
-            ),
-            "selected_joint_feedback": selected_joint_feedback,
-            "target_arm_deg": target_arm_deg,
-            "target_arm_rad": target_arm_rad,
             "detail": detail,
             "command_acknowledged": command_acknowledged,
             "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
-            "wait_for_idle_requested": wait_for_idle,
-            "waited_for_idle": False,
-            **payload,
+            **controller_payload,
         }
 
     @api.post("/control/rest", summary="Move all joints to predefined REST pose")
@@ -2884,8 +2827,14 @@ def create_app() -> FastAPI:
         command = "RUN_TRAJECTORY," + ",".join(parts)
         request_execution_mode = execution_mode or runtime_mode
         try:
+            # 2026-04-26 loop-trajectory reliability: the controller still
+            # plans the trajectory synchronously when use_cache=false, and a
+            # multi-waypoint preview can spend several seconds in planning
+            # before it can ACK. The 8 s ceiling covers normal planning;
+            # the timeout-inference fallback below remains a backstop for
+            # unusually slow planning or a delayed ACK.
             detail = await run_in_threadpool(
-                _controller_call_or_503, command, timeout=2.0, expect_response=True
+                _controller_call_or_503, command, timeout=8.0, expect_response=True
             )
         except HTTPException as exc:
             timeout_detail = exc.detail if isinstance(exc.detail, str) else ""

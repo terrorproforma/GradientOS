@@ -90,7 +90,8 @@ class Gradient05Config(RobotConfig):
         These values come from the current Gradient-05 EtherCAT bring-up notes
         and are used by the RTCore backend to convert raw counts into radians.
         """
-        return [100.0, 100.0, 100.0, 18.0, 11.0, 10.0]  # J5 updated 2026-04-23 from 31.25 to 11 (gearbox swap)
+        # J5 is commissioned as an exact 100:11 drive-native ratio.
+        return [100.0, 100.0, 100.0, 18.0, 100.0 / 11.0, 10.0]
 
     @property
     def actuator_position_signs(self) -> list[int]:

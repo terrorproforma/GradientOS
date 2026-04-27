@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from gradient_os.arm_controller import command_api
 
@@ -1448,7 +1449,7 @@ def test_handle_set_orientation_forces_rtcore_path_when_closed_loop_requested(mo
     monkeypatch.setattr(command_api.utils, "set_motion_state", lambda _state: None)
     monkeypatch.setattr(
         command_api,
-        "_get_live_pose_snapshot",
+        "_get_control_pose_snapshot",
         lambda: (
             np.zeros(6, dtype=float),
             np.array([0.1, 0.2, 0.3], dtype=float),
@@ -1556,7 +1557,7 @@ def test_handle_set_orientation_preserves_closed_loop_on_non_rtcore_backend(monk
     monkeypatch.setattr(command_api.utils, "set_motion_state", lambda _state: None)
     monkeypatch.setattr(
         command_api,
-        "_get_live_pose_snapshot",
+        "_get_control_pose_snapshot",
         lambda: (
             np.zeros(6, dtype=float),
             np.array([0.1, 0.2, 0.3], dtype=float),
@@ -1833,3 +1834,585 @@ def test_handle_stop_command_skips_legacy_brake_write_for_rtcore_backend(monkeyp
     assert jog_stops == ["controller-stop"]
     assert aborted == ["abort"]
     assert servo_writes == []
+
+
+def test_handle_apply_joint_delta_uses_live_baseline_when_available(monkeypatch):
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_control_arm_state_rad",
+        lambda verbose=False: [0.0] * 6,
+    )
+    monkeypatch.setattr(command_api, "_require_target_axes_motion_ready", lambda _indices: None)
+    monkeypatch.setattr(command_api.utils, "trajectory_state_get", lambda key, default=None: False if key == "is_running" else default)
+
+    def fake_setpoint(target_q, **kwargs):
+        captured["target_q"] = list(target_q)
+        captured["kwargs"] = dict(kwargs)
+        return {"accepted": True, "duration_s": 0.25, "state": "accepted"}
+
+    monkeypatch.setattr(command_api, "handle_apply_joint_setpoint", fake_setpoint)
+
+    payload = command_api.handle_apply_joint_delta(joint=3, delta_deg=5.0, max_motor_rpm=100.0)
+
+    assert payload["baseline_source"] == "control_feedback"
+    assert captured["target_q"][2] == np.deg2rad(5.0)
+    assert captured["kwargs"]["target_joint_indices"] == [2]
+
+
+def test_handle_apply_joint_delta_uses_control_feedback_not_strict_canonical(monkeypatch):
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: (_ for _ in ()).throw(RuntimeError("Canonical joint truth unavailable (test)")),
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_control_arm_state_rad",
+        lambda verbose=False: [0.0] * 6,
+    )
+    monkeypatch.setattr(command_api, "_require_target_axes_motion_ready", lambda _indices: None)
+    monkeypatch.setattr(command_api.utils, "trajectory_state_get", lambda key, default=None: False if key == "is_running" else default)
+
+    def fake_setpoint(target_q, **kwargs):
+        captured["target_q"] = list(target_q)
+        captured["kwargs"] = dict(kwargs)
+        return {"accepted": True, "duration_s": 0.25, "state": "accepted"}
+
+    monkeypatch.setattr(command_api, "handle_apply_joint_setpoint", fake_setpoint)
+
+    payload = command_api.handle_apply_joint_delta(joint=3, delta_deg=5.0, max_motor_rpm=100.0)
+
+    assert payload["baseline_source"] == "control_feedback"
+    assert captured["target_q"][2] == np.deg2rad(5.0)
+
+
+def test_handle_apply_joint_delta_chains_from_recent_endpoint_on_truth_flicker(monkeypatch):
+    captured: dict[str, object] = {}
+    endpoint = {
+        "arm_rad": [0.0, 0.0, np.deg2rad(5.0), 0.0, 0.0, 0.0],
+        "target_joint_indices": [2],
+        "traj_id": 42,
+        "final_point_monotonic": command_api.time.monotonic(),
+    }
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: (_ for _ in ()).throw(RuntimeError("Canonical joint truth unavailable (test)")),
+    )
+    monkeypatch.setattr(command_api, "_require_target_axes_motion_ready", lambda _indices: None)
+
+    def fake_state_get(key, default=None):
+        if key == "is_running":
+            return False
+        if key == "last_bounded_endpoint":
+            return endpoint
+        return default
+
+    monkeypatch.setattr(command_api.utils, "trajectory_state_get", fake_state_get)
+
+    def fake_setpoint(target_q, **kwargs):
+        captured["target_q"] = list(target_q)
+        return {"accepted": True, "duration_s": 0.25, "state": "accepted"}
+
+    monkeypatch.setattr(command_api, "handle_apply_joint_setpoint", fake_setpoint)
+
+    payload = command_api.handle_apply_joint_delta(joint=3, delta_deg=5.0, max_motor_rpm=100.0)
+
+    assert payload["baseline_source"] == "recent_bounded_endpoint"
+    assert captured["target_q"][2] == np.deg2rad(10.0)
+
+
+def test_handle_apply_joint_delta_does_not_chain_across_joints(monkeypatch):
+    endpoint = {
+        "arm_rad": [0.0, 0.0, np.deg2rad(5.0), 0.0, 0.0, 0.0],
+        "target_joint_indices": [2],
+        "traj_id": 42,
+        "final_point_monotonic": command_api.time.monotonic(),
+    }
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: (_ for _ in ()).throw(RuntimeError("Canonical joint truth unavailable (test)")),
+    )
+    monkeypatch.setattr(command_api, "_require_target_axes_motion_ready", lambda _indices: None)
+
+    def fake_state_get(key, default=None):
+        if key == "is_running":
+            return False
+        if key == "last_bounded_endpoint":
+            return endpoint
+        return default
+
+    monkeypatch.setattr(command_api.utils, "trajectory_state_get", fake_state_get)
+
+    try:
+        command_api.handle_apply_joint_delta(joint=5, delta_deg=5.0, max_motor_rpm=100.0)
+    except RuntimeError as exc:
+        assert str(exc).startswith("CONTROL_FEEDBACK_UNAVAILABLE")
+    else:
+        raise AssertionError("Expected canonical truth rejection for cross-joint endpoint chain")
+
+
+def test_move_line_relative_uses_control_pose_snapshot(monkeypatch):
+    captured: dict[str, object] = {}
+    control_q = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0]
+    start_pos = np.array([0.1, 0.2, 0.3], dtype=float)
+
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: (_ for _ in ()).throw(RuntimeError("Canonical joint truth unavailable (test)")),
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_control_arm_state_rad",
+        lambda verbose=False: list(control_q),
+    )
+    monkeypatch.setattr(command_api.ik_solver, "get_fk", lambda q: start_pos.copy())
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", lambda q: np.eye(4))
+    monkeypatch.setattr(
+        command_api,
+        "_resolve_profile_params_for_speed_multiplier",
+        lambda speed: (float(speed), 0.12, 0.34),
+    )
+
+    def fake_move_profiled(target_x, target_y, target_z, **kwargs):
+        captured["target"] = [float(target_x), float(target_y), float(target_z)]
+        captured["kwargs"] = dict(kwargs)
+        return {"accepted": True}
+
+    monkeypatch.setattr(command_api, "handle_move_profiled", fake_move_profiled)
+
+    result = command_api.handle_move_line_relative(0.01, -0.02, 0.03, speed=0.5)
+
+    assert result["accepted"] is True
+    assert captured["target"] == pytest.approx([0.11, 0.18, 0.33])
+    assert result["cartesian_relative_debug"]["current_joints_deg"] == pytest.approx(list(np.rad2deg(control_q)))
+
+
+def test_move_line_relative_rejects_when_axes_not_operation_enabled(monkeypatch):
+    class FakeBackend:
+        def _all_axis_mask(self):
+            return 0x3F
+
+        def describe_motion_snapshot(self):
+            return {
+                "per_axis_ds402_state": [2, 2, 2, 2, 2, 2],
+                "faulted_axis_indices": [],
+            }
+
+    monkeypatch.setattr(command_api, "_get_active_backend", lambda: FakeBackend())
+    monkeypatch.setattr(command_api.utils, "trajectory_state_get", lambda key, default=None: False if key == "is_running" else default)
+
+    with pytest.raises(RuntimeError, match="DRIVE_NOT_OP_ENABLED"):
+        command_api.handle_move_line_relative(0.0, 0.0, 0.05, speed=1.0)
+
+
+def test_handle_stop_command_clears_bounded_endpoint(monkeypatch):
+    calls: list[tuple[str, object]] = []
+    monkeypatch.setattr(command_api.utils, "trajectory_state_update", lambda **kwargs: None)
+    monkeypatch.setattr(command_api.utils, "trajectory_state_set", lambda key, value: calls.append((key, value)))
+    monkeypatch.setattr(command_api.utils, "trajectory_state_snapshot", lambda: {})
+    monkeypatch.setattr(command_api.utils, "set_motion_state", lambda _state: None)
+    monkeypatch.setattr(command_api, "_program_status_from_snapshot", lambda _snapshot: None)
+    monkeypatch.setattr(command_api, "stop_active_jog_session", lambda reason="controller-stop": {})
+    monkeypatch.setattr(command_api.backend_registry, "get_active_backend", lambda: None)
+    monkeypatch.setattr(command_api.servo_driver, "get_current_arm_state_rad", lambda verbose=False: None)
+
+    command_api.handle_stop_command()
+
+    assert calls
+    key, value = calls[0]
+    assert key == "last_bounded_endpoint"
+    assert value["cleared"] is True
+    assert value["reason"] == "stop"
+
+
+def test_stop_latch_rejects_direct_setpoint_until_power_up(monkeypatch):
+    command_api.utils.trajectory_state_update(
+        motion_stop_latched=True,
+        motion_stop_latched_reason="operator_abort",
+        should_stop=True,
+        stop_request_reason="operator_abort",
+    )
+
+    with pytest.raises(RuntimeError, match="MOTION_STOP_LATCHED"):
+        command_api.handle_apply_joint_setpoint(
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            max_motor_rpm=100.0,
+        )
+
+    class _Backend:
+        def safe_power_up(self):
+            return True
+
+    monkeypatch.setattr(command_api.backend_registry, "get_active_backend", lambda: _Backend())
+    monkeypatch.setattr(command_api, "get_motion_execution_status", lambda: {"safe_for_power_transition": True})
+
+    command_api.handle_safe_power_up()
+
+    assert command_api.utils.trajectory_state_get("motion_stop_latched") is False
+    assert command_api.utils.trajectory_state_get("should_stop") is False
+
+
+def test_stop_latch_rejects_run_trajectory(monkeypatch):
+    command_api.utils.trajectory_state_update(
+        motion_stop_latched=True,
+        motion_stop_latched_reason="operator_abort",
+        should_stop=True,
+        stop_request_reason="operator_abort",
+    )
+
+    with pytest.raises(RuntimeError, match="MOTION_STOP_LATCHED"):
+        command_api.handle_run_trajectory("loop-test", use_cache=True, loop_override=False)
+
+    command_api.utils.trajectory_state_update(
+        motion_stop_latched=False,
+        motion_stop_latched_at=None,
+        motion_stop_latched_reason=None,
+        should_stop=False,
+        stop_request_reason=None,
+    )
+
+
+def test_handle_apply_joint_delta_rejects_disabled_axis_before_enqueue(monkeypatch):
+    class FakeBackend:
+        def logical_joint_indices_to_axis_mask(self, _indices):
+            return 0x1
+
+        def describe_motion_snapshot(self):
+            return {
+                "per_axis_ds402_state": [2],
+                "faulted_axis_indices": [],
+            }
+
+    monkeypatch.setattr(command_api, "_get_active_backend", lambda: FakeBackend())
+
+    try:
+        command_api.handle_apply_joint_delta(joint=1, delta_deg=1.0, max_motor_rpm=100.0)
+    except RuntimeError as exc:
+        assert str(exc).startswith("DRIVE_NOT_OP_ENABLED:")
+    else:
+        raise AssertionError("Expected disabled-axis rejection before enqueue")
+
+
+# -----------------------------------------------------------------------------
+# Loop trajectory reliability: the loop move-to-start wrapper must not run
+# inline inside `handle_run_trajectory`, must fault the program if its strict
+# preflight or endpoint check fails, and must NOT relabel loop-body failures
+# as `loop_start_failed`.
+# -----------------------------------------------------------------------------
+
+
+class _FakeLoopThread:
+    """Fake `threading.Thread` that records target/kwargs without auto-running."""
+
+    instances: list["_FakeLoopThread"] = []
+
+    def __init__(self, target=None, args=(), kwargs=None, daemon=None, **_rest):
+        self.target = target
+        self.args = tuple(args or ())
+        self.kwargs = dict(kwargs or {})
+        self.daemon = daemon
+        self.started = False
+        _FakeLoopThread.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def is_alive(self):
+        return False
+
+    def join(self, timeout=None):
+        return None
+
+
+def _setup_loop_run_trajectory_test(monkeypatch, tmp_path):
+    """Common state/monkeypatches for the loop-mode `handle_run_trajectory` tests."""
+    import json as _json
+
+    _FakeLoopThread.instances = []
+    monkeypatch.setattr(command_api.utils, "TRAJECTORY_CACHE_DIR", str(tmp_path), raising=False)
+    monkeypatch.setattr(command_api.utils, "NUM_LOGICAL_JOINTS", 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "DEFAULT_PROFILE_VELOCITY", 0.05, raising=False)
+
+    cached_steps = [
+        {"type": "move", "path": [[0.0] * 6, [0.05] * 6], "freq": 100},
+        {"type": "move", "path": [[0.05] * 6, [0.1] * 6], "freq": 100},
+    ]
+    cache_path = tmp_path / "loop-test.json"
+    cache_path.write_text(_json.dumps(cached_steps))
+
+    monkeypatch.setattr(
+        command_api,
+        "_load_trajectory_by_name",
+        lambda _name: {"moves": [], "loop": True, "description": "loop-test"},
+    )
+    monkeypatch.setattr(command_api, "_get_best_available_joint_state", lambda: np.zeros(6))
+    monkeypatch.setattr(command_api, "_backend_supports_rtcore_execution", lambda: False)
+
+    def _fake_fk_matrix(_q):
+        return np.eye(4, dtype=float)
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+    monkeypatch.setattr(
+        command_api.ik_solver,
+        "solve_ik_path_batch",
+        lambda **_kwargs: [[0.0] * 6, [0.1] * 6],
+    )
+
+    initial_calls: list[dict] = []
+    loop_calls: list[tuple] = []
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_open_loop_executor_thread",
+        lambda **kwargs: initial_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_trajectory_executor_thread",
+        lambda *args: loop_calls.append(args),
+    )
+
+    monkeypatch.setattr(command_api.threading, "Thread", _FakeLoopThread)
+
+    command_api.utils.trajectory_state.update(
+        {
+            "should_stop": False,
+            "is_running": False,
+            "is_jogging": False,
+            "thread": None,
+            "stop_request_reason": None,
+            "weld_active": False,
+            "current_weld_type": None,
+        }
+    )
+    command_api.utils.program_status_reset(name="loop-test", active=False, state="idle")
+
+    return initial_calls, loop_calls
+
+
+def test_handle_run_trajectory_loop_does_not_execute_move_to_start_inline(monkeypatch, tmp_path):
+    initial_calls, loop_calls = _setup_loop_run_trajectory_test(monkeypatch, tmp_path)
+
+    result = command_api.handle_run_trajectory(
+        "loop-test", use_cache=True, loop_override=True
+    )
+
+    assert result["accepted"] is True
+    assert initial_calls == []
+    assert loop_calls == []
+    assert _FakeLoopThread.instances, "expected at least one Thread to be created"
+    last_thread = _FakeLoopThread.instances[-1]
+    assert last_thread.target is command_api._looping_trajectory_executor_thread
+    assert last_thread.started is True
+    assert "initial_joint_path" in last_thread.kwargs
+    assert "loop_steps" in last_thread.kwargs
+    assert last_thread.kwargs["loop_enabled"] is True
+    loop_steps = last_thread.kwargs["loop_steps"]
+    assert len(loop_steps) == 1
+    assert loop_steps[0]["type"] == "move"
+    assert loop_steps[0]["require_completion"] is True
+    assert loop_steps[0]["logical_step_count"] == 2
+
+
+def test_looping_trajectory_executor_thread_faults_on_preflight_failure(monkeypatch):
+    loop_calls: list[tuple] = []
+
+    def _raise_initial(**_kwargs):
+        raise TimeoutError("strict completion")
+
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_open_loop_executor_thread",
+        _raise_initial,
+    )
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_trajectory_executor_thread",
+        lambda *args: loop_calls.append(args),
+    )
+    monkeypatch.setattr(command_api.servo_driver, "get_control_arm_state_rad", lambda verbose=False: np.zeros(6))
+
+    command_api.utils.trajectory_state.update(
+        {
+            "should_stop": False,
+            "is_running": True,
+            "thread": None,
+            "stop_request_reason": None,
+            "active_program_name": "loop-test",
+        }
+    )
+    command_api.utils.program_status_reset(
+        name="loop-test", active=True, state="executing"
+    )
+
+    command_api._looping_trajectory_executor_thread(
+        initial_joint_path=[[0.0] * 6, [0.1] * 6],
+        initial_frequency_hz=100,
+        loop_steps=[{"type": "move", "path": [[0.1] * 6], "freq": 100}],
+        loop_enabled=True,
+    )
+
+    assert loop_calls == []
+    program = command_api.utils.program_status_snapshot()
+    assert program["state"] == "faulted"
+    assert program["terminal_reason"] == "loop_start_failed"
+    assert command_api.utils.trajectory_state.get("is_running") is False
+
+
+def test_looping_trajectory_executor_thread_does_not_relabel_body_failures(monkeypatch):
+    initial_calls: list[dict] = []
+    body_calls: list[tuple] = []
+
+    def _ok_initial(**kwargs):
+        initial_calls.append(kwargs)
+
+    def _body_raises(steps, loop_enabled):
+        body_calls.append((steps, loop_enabled))
+        # Real `_trajectory_executor_thread` records its own terminal reason on
+        # body failures. Simulate the resulting program status here, then raise
+        # so we can verify the wrapper does NOT overwrite it with
+        # `loop_start_failed`.
+        command_api.utils.program_status_update(
+            active=False,
+            state="faulted",
+            terminal_reason="rtcore_fault",
+        )
+        raise RuntimeError("body failed")
+
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_open_loop_executor_thread",
+        _ok_initial,
+    )
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_trajectory_executor_thread",
+        _body_raises,
+    )
+    monkeypatch.setattr(command_api.servo_driver, "get_control_arm_state_rad", lambda verbose=False: np.full(6, 0.1))
+
+    command_api.utils.trajectory_state.update(
+        {
+            "should_stop": False,
+            "is_running": True,
+            "thread": None,
+            "stop_request_reason": None,
+            "active_program_name": "loop-test",
+        }
+    )
+    command_api.utils.program_status_reset(
+        name="loop-test", active=True, state="executing"
+    )
+
+    with pytest.raises(RuntimeError, match="body failed"):
+        command_api._looping_trajectory_executor_thread(
+            initial_joint_path=[[0.0] * 6, [0.1] * 6],
+            initial_frequency_hz=100,
+            loop_steps=[{"type": "move", "path": [[0.1] * 6], "freq": 100}],
+            loop_enabled=True,
+        )
+
+    assert initial_calls, "preflight must have run"
+    assert body_calls, "loop body must have been invoked after a successful preflight"
+    program = command_api.utils.program_status_snapshot()
+    assert program["state"] == "faulted"
+    assert program["terminal_reason"] == "rtcore_fault"
+
+
+def test_looping_trajectory_executor_thread_starts_body_when_live_endpoint_matches(monkeypatch):
+    initial_calls: list[dict] = []
+    body_calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_open_loop_executor_thread",
+        lambda **kwargs: initial_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_trajectory_executor_thread",
+        lambda *args: body_calls.append(args),
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_control_arm_state_rad",
+        lambda verbose=False: np.full(6, 0.1),
+    )
+
+    command_api.utils.trajectory_state.update(
+        {
+            "should_stop": False,
+            "is_running": True,
+            "thread": None,
+            "stop_request_reason": None,
+            "active_program_name": "loop-test",
+        }
+    )
+    command_api.utils.program_status_reset(
+        name="loop-test", active=True, state="executing"
+    )
+
+    command_api._looping_trajectory_executor_thread(
+        initial_joint_path=[[0.0] * 6, [0.1] * 6],
+        initial_frequency_hz=100,
+        loop_steps=[{"type": "move", "path": [[0.1] * 6], "freq": 100}],
+        loop_enabled=True,
+    )
+
+    assert initial_calls
+    assert initial_calls[0]["require_completion"] is True
+    assert body_calls == [
+        ([{"type": "move", "path": [[0.1] * 6], "freq": 100}], True)
+    ]
+
+
+def test_looping_trajectory_executor_thread_faults_on_endpoint_mismatch(monkeypatch):
+    initial_calls: list[dict] = []
+    body_calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_open_loop_executor_thread",
+        lambda **kwargs: initial_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        command_api.trajectory_execution,
+        "_trajectory_executor_thread",
+        lambda *args: body_calls.append(args),
+    )
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_control_arm_state_rad",
+        lambda verbose=False: np.full(6, 0.5),  # 0.5 rad away from any reasonable target
+    )
+
+    command_api.utils.trajectory_state.update(
+        {
+            "should_stop": False,
+            "is_running": True,
+            "thread": None,
+            "stop_request_reason": None,
+            "active_program_name": "loop-test",
+        }
+    )
+    command_api.utils.program_status_reset(
+        name="loop-test", active=True, state="executing"
+    )
+
+    command_api._looping_trajectory_executor_thread(
+        initial_joint_path=[[0.0] * 6, [0.1] * 6],
+        initial_frequency_hz=100,
+        loop_steps=[{"type": "move", "path": [[0.1] * 6], "freq": 100}],
+        loop_enabled=True,
+    )
+
+    assert initial_calls, "preflight must have run before endpoint verification"
+    assert body_calls == []
+    program = command_api.utils.program_status_snapshot()
+    assert program["state"] == "faulted"
+    assert program["terminal_reason"] == "loop_start_failed"
+    assert command_api.utils.trajectory_state.get("is_running") is False

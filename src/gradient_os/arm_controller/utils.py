@@ -268,6 +268,11 @@ trajectory_state = {
     "should_stop": False,
     "thread": None,
     "stop_request_reason": None,
+    "motion_stop_latched": False,
+    "motion_stop_latched_at": None,
+    "motion_stop_latched_reason": None,
+    "rtcore_settle_traj_id": None,
+    "last_bounded_endpoint": None,
     # Weld execution state for telemetry/UI overlays.
     "weld_active": False,
     "current_weld_type": None,
@@ -297,9 +302,10 @@ trajectory_state = {
 trajectory_state_lock = threading.RLock()
 
 MOTION_STATE_TRANSITIONS: dict[str, set[str]] = {
-    "IDLE": {"PLANNING", "EXECUTING", "FAULT", "E_STOP"},
+    "IDLE": {"PLANNING", "EXECUTING", "SETTLING", "FAULT", "E_STOP"},
     "PLANNING": {"IDLE", "EXECUTING", "FAULT", "E_STOP"},
-    "EXECUTING": {"PAUSED", "IDLE", "FAULT", "E_STOP"},
+    "EXECUTING": {"SETTLING", "PAUSED", "IDLE", "FAULT", "E_STOP"},
+    "SETTLING": {"IDLE", "EXECUTING", "FAULT", "E_STOP"},
     "PAUSED": {"EXECUTING", "IDLE", "FAULT", "E_STOP"},
     "FAULT": {"IDLE", "E_STOP"},
     "E_STOP": {"IDLE"},

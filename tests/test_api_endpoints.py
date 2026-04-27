@@ -657,6 +657,20 @@ def patch_send(monkeypatch):
             return True, f"ACK,SET_ACTIVE_TOOL,{runtime_state['tool']['active_tool_id']}"
         if command.startswith("APPLY_JOINT_SETPOINT,"):
             return True, f"ACK,APPLY_JOINT_SETPOINT,{_payload_token(accepted_motion_payload)}"
+        if command.startswith("APPLY_JOINT_DELTA,"):
+            payload = _decode_command_payload(command)
+            response = {
+                **accepted_motion_payload,
+                "joint": payload["joint"],
+                "delta_deg": payload["delta_deg"],
+                "baseline_source": "live_feedback",
+                "wait_for_idle_requested": bool(payload.get("wait_for_idle", False)),
+                "waited_for_idle": bool(payload.get("wait_for_idle", False)),
+            }
+            if response["waited_for_idle"]:
+                response["state"] = "completed"
+                response["wait_result"] = completed_motion_payload
+            return True, f"ACK,APPLY_JOINT_DELTA,{_payload_token(response)}"
         if command.startswith("REQUEST_RESTART,"):
             reason = command.split(",", 1)[1] if "," in command else "api-request"
             return True, f"ACK,REQUEST_RESTART,{reason}"
@@ -1161,46 +1175,33 @@ def test_control_encoder_retention_capture_writes_snapshot_and_comparison(client
 
 
 def test_control_joint_jog(client):
+    start_len = len(client.command_calls)
     resp = client.post("/control/joint-jog", json={"joint": 3, "delta_deg": 2.5})
     assert resp.status_code == 200
     body = resp.json()
     assert body["joint"] == 3
     assert body["delta_deg"] == pytest.approx(2.5)
-    assert body["feedback_snapshot_source"] == "GET_JOINT_STATE"
-    assert body["current_arm_deg"] == pytest.approx([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-    assert body["current_arm_display_deg"] == pytest.approx([1.5, 2.5, 3.5, 4.5, 5.5, 6.5])
-    assert body["selected_joint_feedback"]["joint"] == 3
-    assert body["selected_joint_feedback"]["current_raw_deg"] == pytest.approx(3.0)
-    assert body["selected_joint_feedback"]["current_display_deg"] == pytest.approx(3.5)
-    assert body["selected_joint_feedback"]["raw_minus_display_deg"] == pytest.approx(-0.5)
-    assert body["selected_joint_feedback"]["axis_index"] == 2
-    assert body["selected_joint_feedback"]["axis_counts"] == 303
     assert body["max_motor_rpm"] == pytest.approx(100.0)
-    assert body["target_arm_deg"] == [1.0, 2.0, 5.5, 4.0, 5.0, 6.0]
-    assert body["target_arm_rad"] == pytest.approx([
-        0.017453292519943295,
-        0.03490658503988659,
-        0.09599310885968812,
-        0.06981317007977318,
-        0.08726646259971647,
-        0.10471975511965978,
-    ])
     assert body["command_acknowledged"] is True
+    assert body["baseline_source"] == "live_feedback"
     assert body["completion_scope"] == "rtcore_execution"
     assert body["state"] == "accepted"
     assert body["trajectory_id"] == 7
     assert body["waited_for_idle"] is False
-    assert client.command_calls[-2] == ("GET_JOINT_STATE", 1.0, True)
-    last_command, timeout_s, expect_response = client.command_calls[-1]
+    commands = client.command_calls[start_len:]
+    assert len(commands) == 1
+    last_command, timeout_s, expect_response = commands[0]
     assert timeout_s == 2.0
     assert expect_response is True
-    assert last_command.startswith("APPLY_JOINT_SETPOINT,")
-    payload = json.loads(base64.urlsafe_b64decode(last_command.split(",", 1)[1]).decode("utf-8"))
+    assert last_command.startswith("APPLY_JOINT_DELTA,")
+    payload = _decode_command_payload(last_command)
     assert payload["max_motor_rpm"] == pytest.approx(100.0)
-    assert payload["target_joint_indices"] == [2]
+    assert payload["joint"] == 3
+    assert payload["delta_deg"] == pytest.approx(2.5)
+    assert payload["wait_for_idle"] is False
 
 
-def test_control_joint_jog_ignores_wait_for_idle_flag(client):
+def test_control_joint_jog_wait_for_idle_is_controller_owned(client):
     start_len = len(client.command_calls)
     resp = client.post(
         "/control/joint-jog",
@@ -1212,36 +1213,31 @@ def test_control_joint_jog_ignores_wait_for_idle_flag(client):
     assert body["joint"] == 2
     assert body["delta_deg"] == pytest.approx(-1.0)
     assert body["wait_for_idle_requested"] is True
-    assert body["waited_for_idle"] is False
+    assert body["waited_for_idle"] is True
     assert body["max_motor_rpm"] == pytest.approx(100.0)
 
     commands = client.command_calls[start_len:]
-    assert len(commands) == 2
-    assert commands[0] == ("GET_JOINT_STATE", 1.0, True)
-    assert commands[1][0].startswith("APPLY_JOINT_SETPOINT,")
+    assert len(commands) == 1
+    assert commands[0][0].startswith("APPLY_JOINT_DELTA,")
     _, timeout_s, expect_response = commands[-1]
-    assert timeout_s == 2.0
+    assert timeout_s == 10.0
     assert expect_response is True
     payload = _decode_command_payload(commands[-1][0])
     assert payload["max_motor_rpm"] == pytest.approx(100.0)
-    assert payload["target_joint_indices"] == [1]
+    assert payload["joint"] == 2
+    assert payload["delta_deg"] == pytest.approx(-1.0)
+    assert payload["wait_for_idle"] is True
 
 
 def test_control_joint_jog_surfaces_backend_rejection(client, monkeypatch):
     def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
-        if command == "GET_JOINT_STATE":
-            return True, (
-                "JOINT_STATE_JSON,"
-                + json.dumps(
-                    {
-                        "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-                        "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                    },
-                    separators=(",", ":"),
-                )
+        if command.startswith("APPLY_JOINT_DELTA,"):
+            return False, "ERROR,APPLY_JOINT_DELTA," + _payload_token(
+                {
+                    "code": "CMD_RING_UNAVAILABLE",
+                    "message": "RTCore did not provide a setpoint slot",
+                }
             )
-        if command.startswith("APPLY_JOINT_SETPOINT,"):
-            return False, "ERROR,APPLY_JOINT_SETPOINT,RTCore did not provide a setpoint slot"
         return True, "ACK"
 
     monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
@@ -1250,27 +1246,19 @@ def test_control_joint_jog_surfaces_backend_rejection(client, monkeypatch):
 
     assert resp.status_code == 503
     assert resp.json()["detail"] == {
-        "code": "APPLY_JOINT_SETPOINT_REJECTED",
+        "code": "CMD_RING_UNAVAILABLE",
         "message": "RTCore did not provide a setpoint slot",
     }
 
 
-def test_control_joint_jog_rejects_when_canonical_truth_is_unavailable(client, monkeypatch):
+def test_control_joint_jog_maps_controller_truth_rejection(client, monkeypatch):
     def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
-        if command == "GET_JOINT_STATE":
-            return True, (
-                "JOINT_STATE_JSON,"
-                + json.dumps(
-                    {
-                        "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-                        "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                        "read_source": "live_feedback",
-                        "canonical_joint_truth_available": False,
-                        "canonical_joint_truth_unavailable_axes": [0],
-                        "canonical_joint_truth_unavailable_joints": [1],
-                    },
-                    separators=(",", ":"),
-                )
+        if command.startswith("APPLY_JOINT_DELTA,"):
+            return False, "ERROR,APPLY_JOINT_DELTA," + _payload_token(
+                {
+                    "code": "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
+                    "message": "CANONICAL_JOINT_TRUTH_UNAVAILABLE: no live or recent bounded endpoint baseline",
+                }
             )
         return True, "ACK"
 
@@ -1281,72 +1269,7 @@ def test_control_joint_jog_rejects_when_canonical_truth_is_unavailable(client, m
     assert resp.status_code == 409
     assert resp.json()["detail"] == {
         "code": "CANONICAL_JOINT_TRUTH_UNAVAILABLE",
-        "message": "Live canonical joint feedback is unavailable; refusing to baseline joint jog without anchored absolute truth.",
-        "read_source": "live_feedback",
-        "canonical_joint_truth_available": False,
-        "canonical_joint_truth_unavailable_axes": [0],
-        "canonical_joint_truth_unavailable_joints": [1],
-    }
-
-
-def test_control_joint_jog_rejects_when_selected_joint_truth_is_unavailable(client, monkeypatch):
-    def fake_send(command: str, timeout: float = 0.5, expect_response: bool = True):
-        if command == "GET_JOINT_STATE":
-            return True, (
-                "JOINT_STATE_JSON,"
-                + json.dumps(
-                    {
-                        "arm_rad": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-                        "arm_deg": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                        "arm_display_deg": [None, None, None, None, None, None],
-                        "read_source": "live_feedback",
-                        "canonical_joint_truth_available": True,
-                        "display_joint_truth_available": False,
-                        "axis_to_joint": [0],
-                        "axis_counts": [131060],
-                        "axis_absolute_feedback": [
-                            {
-                                "axis": 0,
-                                "logical_joint": 1,
-                                "truth_available": False,
-                                "truth_reason": "command_frame_roundtrip_mismatch",
-                                "drive_native_truth_verification_source": "persisted_home_anchor_agreement",
-                                "display_source": "truth_unavailable",
-                                "absolute_source": "encoder_multi_turn_counts",
-                                "absolute_counts": 1234,
-                            }
-                        ],
-                    },
-                    separators=(",", ":"),
-                )
-            )
-        return True, "ACK"
-
-    monkeypatch.setattr("gradient_os.api.main._send_controller_command", fake_send)
-
-    resp = client.post("/control/joint-jog", json={"joint": 1, "delta_deg": 1.0})
-
-    assert resp.status_code == 409
-    detail = resp.json()["detail"]
-    assert detail["code"] == "CANONICAL_JOINT_TRUTH_UNAVAILABLE"
-    assert detail["message"] == (
-        "Selected joint is missing anchored absolute truth; refusing to baseline joint jog."
-    )
-    assert detail["joint"] == 1
-    assert detail["selected_joint_feedback"] == {
-        "joint": 1,
-        "canonical_joint_truth_available": True,
-        "current_joint_deg": 1.0,
-        "current_canonical_deg": 1.0,
-        "current_raw_deg": 1.0,
-        "axis_index": 0,
-        "axis_counts": 131060,
-        "display_source": "truth_unavailable",
-        "absolute_source": "encoder_multi_turn_counts",
-        "drive_native_truth_verification_source": "persisted_home_anchor_agreement",
-        "truth_reason": "command_frame_roundtrip_mismatch",
-        "truth_available": False,
-        "absolute_counts": 1234,
+        "message": "CANONICAL_JOINT_TRUTH_UNAVAILABLE: no live or recent bounded endpoint baseline",
     }
 
 
@@ -1747,7 +1670,7 @@ def test_trajectory_run(client):
     assert body["program"]["state"] == "accepted"
     assert body["program_segment_execution_policy"] == "rtcore_queued"
     assert body["program_rtcore_segments"] is True
-    assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false", 2.0, True)
+    assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false", 8.0, True)
 
 
 def test_trajectory_run_with_loop_override(client):
@@ -1756,7 +1679,7 @@ def test_trajectory_run_with_loop_override(client):
     body = resp.json()
     assert body["program"]["loop_enabled"] is True
     assert body["program_loop_enabled"] is True
-    assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false,true", 2.0, True)
+    assert client.command_calls[-1] == ("RUN_TRAJECTORY,alpha,false,true", 8.0, True)
 
 
 def test_trajectory_run_timeout_is_inferred_from_motion_status(client, monkeypatch):
@@ -1794,7 +1717,7 @@ def test_trajectory_run_timeout_is_inferred_from_motion_status(client, monkeypat
     assert body["run_request_timed_out"] is True
     assert body["run_request_detail"] == "No response for command 'RUN_TRAJECTORY,__planner_preview__,false'"
     assert body["program_name"] == "__planner_preview__"
-    assert call_log[1] == ("RUN_TRAJECTORY,__planner_preview__,false", 2.0, True)
+    assert call_log[1] == ("RUN_TRAJECTORY,__planner_preview__,false", 8.0, True)
     assert call_log[2] == ("GET_MOTION_STATUS", 1.0, True)
 
 

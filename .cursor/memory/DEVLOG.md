@@ -1,3 +1,87 @@
+## 2026-04-27 00:35 +0000 - Loop trajectory ACK no longer waits for physical move-to-start
+
+- Task summary:
+  - Implemented `/home/pi/.cursor/plans/loop_trajectory_reliability_9db63052.plan.md`. Loop-mode `RUN_TRAJECTORY` previously held `handle_run_trajectory` synchronously through full trajectory planning AND a physical move-to-start RTCore wrapper before sending ACK. The API's 2 s timeout would expire mid-wrapper, the controller would non-fatally swallow the wrapper timeout, and then start the loop body anyway with axis 0 still far from the next command-frame target — tripping `command_frame_live_deviation_out_of_range`. Two safety problems fixed in one pass: (1) the wrapper now runs in a background thread that the controller hands off to AFTER ACK, so the API can ACK as soon as planning completes; (2) the wrapper preflight is strict-completion — any timeout/fault/abort/endpoint-mismatch faults the program and the loop body never starts.
+- What changed:
+  - `src/gradient_os/arm_controller/trajectory_execution.py`: `_open_loop_executor_thread` now accepts `require_completion: bool = False`. In strict mode a settle-timeout aborts the trajectory, issues a follow-up `wait_for_trajectory_complete` to confirm the abort took, clears `last_bounded_endpoint`, and re-raises a `TimeoutError("strict completion ...")`. The `state_name` acceptance set is also tightened: strict mode rejects `executing` (the bug that let the loop body race the in-flight wrapper); default mode keeps the existing `{"completed", "idle", "executing"}` non-fatal behavior.
+  - `src/gradient_os/arm_controller/command_api.py`: added `_finish_failed_program_run(state, terminal_reason, failing_step_index)` (mirrors the cleanup the synchronous loop branch used to do inline) and `_looping_trajectory_executor_thread(initial_joint_path, initial_frequency_hz, loop_steps, loop_enabled)` (background entry point). The wrapper runs `_open_loop_executor_thread(..., require_completion=True, owns_trajectory_state=False)`, then verifies live `q` matches `initial_joint_path[-1]` within 0.05 rad, then hands off to `_trajectory_executor_thread` for the loop body. The try/except scope is intentionally tight around preflight + endpoint verification so body-time failures keep their own terminal_reason instead of being relabeled `loop_start_failed`.
+  - `src/gradient_os/arm_controller/command_api.py::handle_run_trajectory`: deleted the synchronous `initial_thread = threading.Thread(...); initial_thread.start(); while initial_thread.is_alive(): ...` block in the loop branch. The loop branch now only plans `joint_path_initial`, builds `loop_steps`, and spawns `_looping_trajectory_executor_thread` as the executor thread. Non-loop branch is unchanged.
+  - `src/gradient_os/api/main.py`: `/trajectory/run` controller-call timeout raised from `2.0` to `8.0` to tolerate synchronous trajectory planning when `use_cache=false`. Timeout-inference fallback strengthened from 3 polls × 250 ms (= 750 ms) to 8 polls × 200 ms (= 1.6 s).
+- Tests added (all passing locally):
+  - `tests/test_trajectory_execution_backends.py::test_open_loop_executor_strict_completion_raises_on_settle_timeout` — verifies strict mode aborts and re-raises on settle timeout, confirms `last_bounded_endpoint` is cleared and at least 2 `wait_for_trajectory_complete` calls happen (in-line + post-abort confirmation).
+  - `tests/test_trajectory_execution_backends.py::test_open_loop_executor_strict_completion_raises_on_final_point_timeout` — verifies strict mode also aborts and re-raises when `wait_for_trajectory_final_point_sent(...)` times out, closing the remaining preflight-success hole.
+  - `tests/test_trajectory_execution_backends.py::test_open_loop_executor_default_completion_timeout_stays_non_fatal` — verifies the non-loop default path still swallows settle timeouts non-fatally and does NOT call `abort_trajectory`.
+  - `tests/test_command_api_direct_setpoint.py::test_handle_run_trajectory_loop_does_not_execute_move_to_start_inline` — asserts `RUN_TRAJECTORY` with `loop_override=True` returns `accepted=True`, the executor thread's `target is _looping_trajectory_executor_thread`, and NEITHER `_open_loop_executor_thread` NOR `_trajectory_executor_thread` runs inline before the API ACK.
+  - `tests/test_command_api_direct_setpoint.py::test_looping_trajectory_executor_thread_faults_on_preflight_failure` — direct call to wrapper with monkeypatched preflight `raise TimeoutError("strict completion")`; asserts loop body is NOT invoked, `program_status.state == "faulted"`, `terminal_reason == "loop_start_failed"`, `is_running` cleared.
+  - `tests/test_command_api_direct_setpoint.py::test_looping_trajectory_executor_thread_does_not_relabel_body_failures` — direct call with successful preflight + endpoint match, body raises `RuntimeError("body failed")` after stamping `terminal_reason="rtcore_fault"`; asserts the wrapper does NOT overwrite that with `loop_start_failed`.
+  - `tests/test_command_api_direct_setpoint.py::test_looping_trajectory_executor_thread_faults_on_endpoint_mismatch` — preflight succeeds but live q stays at `[0.5]*6` (>0.05 rad from target `[0.1]*6`); asserts loop body is NOT invoked, program faults with `loop_start_failed`.
+- Tests updated for new timeout: `tests/test_api_endpoints.py` — three assertions changed from `2.0` to `8.0` (`test_trajectory_run`, `test_trajectory_run_with_loop_override`, `test_trajectory_run_timeout_is_inferred_from_motion_status`).
+- Validation performed:
+  - `source ./start.sh && python -m pytest tests/test_trajectory_execution_backends.py::test_open_loop_executor_strict_completion_raises_on_settle_timeout tests/test_trajectory_execution_backends.py::test_open_loop_executor_strict_completion_raises_on_final_point_timeout tests/test_trajectory_execution_backends.py::test_open_loop_executor_default_completion_timeout_stays_non_fatal -q` -> `3 passed`.
+  - 3 focused loop-wrapper tests in isolation -> `3 passed`.
+  - `source ./start.sh && python -m pytest tests/test_cartesian_jog_resilience.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q` -> `171 passed`.
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/command_api.py src/gradient_os/arm_controller/trajectory_execution.py src/gradient_os/api/main.py tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py tests/test_api_endpoints.py` -> pass.
+  - `ReadLints` on every touched Python file -> clean.
+- Pre-existing test pollution observed (NOT introduced by this change):
+  - When running `pytest tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py` without `tests/test_api_endpoints.py` between them, the four `test_handle_apply_joint_delta_*` tests fail with `ValueError: joint must be in 1..2` — i.e., `utils.NUM_LOGICAL_JOINTS` reverts to `2` after `_configure_backend_executor_test`'s monkeypatch. Confirmed pre-existing by running the same combination with my new tests excluded (`-k "not strict_completion and not default_completion_timeout"`); same failure. The contamination is fragile and hides when test order changes (running the full plan slice with `test_api_endpoints.py` between them passes cleanly). Worth fixing in a separate pass; not scope of this change.
+- Live smoke checklist (operator-required, NOT executed here):
+  1. Plan the same 11-waypoint preview.
+  2. Run with loop disabled — should ACK promptly and complete (regression check; behavior unchanged).
+  3. Enable loop and run.
+  4. Expected log sequence:
+     - `RUN_TRAJECTORY,__planner_preview__,false,true`
+     - `Trajectory thread started. Main loop is responsive.` (after planning, BEFORE any physical move-to-start motion)
+     - `Executing loop move-to-start preflight.`
+     - only after preflight completes: `Loop move-to-start preflight complete. Starting loop body.`
+  5. If preflight does not complete: program ends in `state=faulted terminal_reason=loop_start_failed`, no loop body execution, no `command_frame_live_deviation_out_of_range`.
+- Follow-ups / risk:
+  - Synchronous trajectory PLANNING (when `use_cache=false`) is still on the controller's command path. The 8 s API ceiling covers observed planning latencies for the 11-waypoint preview but a future architecture pass should move planning into a background job similar to what we just did for the wrapper. Until then, very long programs with `use_cache=false` may still trip the API ceiling, in which case the strengthened timeout-inference fallback (8 polls × 200 ms) acts as a backstop and surfaces the run as `accepted=True ack_inferred=True run_request_timed_out=True`.
+  - Final review fix: strict preflight now raises on both final-point timeout and settle timeout, and endpoint verification uses live control feedback (`servo_driver.get_control_arm_state_rad`) rather than cached best-available state.
+  - Pre-existing test pollution between `test_trajectory_execution_backends.py` and `test_command_api_direct_setpoint.py::test_handle_apply_joint_delta_*` should be fixed in a follow-up.
+  - The 0.05 rad endpoint tolerance was chosen to be larger than typical servo following noise but tight enough to catch a stale or in-flight wrapper completion. If operators report false-positive `loop_start_failed` faults after legitimate preflights, widen this empirically rather than removing the gate.
+
+## 2026-04-26 20:50 +0000 - Control-feedback fault logs now preserve A6-EC codes
+
+- What changed:
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`: expanded the hard-control-feedback fault detail from a reason-only string (`drive_fault_state`) to a per-axis diagnostic summary containing axis, logical joint, DS402 state/name, statusword, `0x603F` error code, manufacturer `0x203F` code, and axis fault flags. Existing jog/control logs now retain the exact drive codes before `RESET_FAULTS` clears them.
+  - `tests/test_gradient05_limits_and_backends.py`: updated `test_control_joint_positions_reject_drive_fault` to simulate a J2 fault and assert the exception/loggable message includes `statusword=0x9638`, `error_code_603f=0x8611`, `manufacturer_error_203f=0x00000470`, DS402 `fault(8)`, and fault flags.
+- Validation performed:
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py -q -k 'control_joint_positions_reject_drive_fault'` -> `1 passed`.
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_cartesian_jog_resilience.py -q` -> `183 passed`.
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_gradient05_limits_and_backends.py` -> pass.
+  - `ReadLints` on touched files -> clean.
+- Follow-up:
+  - A future UI improvement can parse `fault_details` out of the error string or expose it structurally, but the operator-visible logs now preserve the codes by default.
+
+## 2026-04-26 20:20 +0000 - Live J2 crash/fault triage after held-jog fix
+
+- Investigation summary:
+  - Operator reported they physically crashed the robot and J2 faulted. Terminal trace showed normal jog sessions with `lease_timeout_s=1.0`; all `ui-release` stops logged `quick_stop=False drive_power_action=rtcore_jog_stop`, so the held-jog lease/brake fix was not the cause.
+  - The first hard fault evidence was `[Jog] control feedback miss (Control feedback unavailable (axes=[1], reasons=['drive_fault_state']))` at `20:07:54+0000`, immediately after a new `+Z` jog session started. In Gradient-05's 1:1 axis mapping, axis `1` is J2. That means the backend refused control feedback because J2 was already in a hard DS402 drive fault/fault-reaction state.
+  - No `Collision DETECTED` watchdog log appeared in the terminal excerpt. The operator then explicitly ran `SAFE_POWER_DOWN`, `RESET_FAULTS`, and `SAFE_POWER_UP`; current RTCore metrics after reset showed all axis `error_code=0` / `manufacturer_error_code=0`, so the exact latched J2 vendor code was no longer available from `metrics.json`.
+- Validation performed:
+  - Read terminal logs and `/run/gradient-rt-motion/metrics.json`; no code changes or tests run for this triage.
+- Follow-up:
+  - If a crash/fault happens again, capture `/info/joints-detailed` or `/run/gradient-rt-motion/metrics.json` before `RESET_FAULTS` to preserve the J2 statusword/error/manufacturer code.
+
+## 2026-04-26 17:45 +0000 - Held-jog lease expiry no longer requests DS402 quick-stop
+
+- Task summary:
+  - Implemented the jog-hold stability plan's surgical fix: browser/controller jog-session lease expiry now maps to a soft RTCore jog stop (`quick_stop=False`) instead of DS402 quick-stop. Explicit hard-stop paths (`controller-stop`, `controller-shutdown`, `fk-failed`, safe power-down/collision paths) still request quick-stop.
+  - Added explicit drive-power action logs for jog backend stop requests, jog-thread exits, safe power-down, backend power-transition prep, axis-disable, arm-disarm, and safe power-up. Lease-expired jog exits now log `drive_power_action=rtcore_jog_stop`.
+  - Debounced advisory `canonical_truth_unavailable` dashboard transitions during active jog while keeping non-advisory/hard truth reasons immediate.
+  - Hardened `ControlPanel` recovery so active held jog retries recoverable `SESSION_EXPIRED` / `SESSION_NOT_FOUND` / `SESSION_INACTIVE` from current refs without posting a stale stop or power-down. UI now sends explicit `lease_timeout_s=1.0` for controller/API session tolerance, while RTCore motor-side lease remains `0.2s`. Unchanged keepalive publishes no longer call `setLastJogCommand`.
+- Validation performed:
+  - `source ./start.sh && python -m pytest tests/test_cartesian_jog_resilience.py tests/test_run_controller_helpers.py -q` -> `42 passed`.
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py -q` -> `69 passed`.
+  - `source ./start.sh && python -m pytest tests/test_command_api_direct_setpoint.py tests/test_realtime_jog_backend_compatibility.py -q` -> `43 passed`.
+  - Combined touched Python slice `tests/test_cartesian_jog_resilience.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_realtime_jog_backend_compatibility.py -q` -> `154 passed`.
+  - `cd web-ui && npm test -- src/ControlPanel.test.tsx` -> `33 passed`.
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/command_api.py src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/run_controller.py src/gradient_os/api/main.py tests/test_cartesian_jog_resilience.py tests/test_run_controller_helpers.py` -> pass.
+  - `ReadLints` on touched Python/TypeScript files -> clean.
+- Follow-ups / risks:
+  - Live hardware smoke still required: hold jog and verify no `JOG_SESSION_STOP`, `SAFE_POWER_DOWN`, `axis_disable`, `arm_disarm`, RTCore quick-stop, DS402 state transition, or brake-state transition occurs unless operator release/disarm/pagehide/hard fault actually happens.
+
 ## 2026-04-21 03:55 +0000 — Killed the "laggy jog" feel: arm-time fast-path + widened shaft-frame tolerance + hot-path restructure
 
 - Task summary:
@@ -6952,3 +7036,412 @@ Native-home pathway was exercised end-to-end on J6 against the new RTCore binary
   - The fast-trace drop-in stays installed with HZ=0. Leaving the file intact keeps the J6 seam-whip verification ergonomics but means any operator who flips HZ back to 1000 and forgets to flip it off will refill tmpfs at ~60 MB/min. Consider adding a `preserve_rtcore_fast_trace_if_any` guard in `start-stack.sh` that warns when fast-trace is active on boot.
   - `/run` tmpfs fill as a probe failure mode is now documented in the scratchpad. A future robustness pass could have the probe script explicitly check `df /run` when metrics.json is unreadable and surface a clearer `tmpfs_full` reason in the probe snapshot instead of the generic `rtcore_state=UNKNOWN`.
 
+## 2026-04-25 20:40 +0000 - Implemented realtime one-shot joint jog path and stale-tolerant display
+
+- What changed:
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`: split trajectory submission from strict completion wait via `RTCoreTrajectorySubmission`, `submit_joint_trajectory`, and `wait_for_trajectory_final_point_sent`; preserved existing `execute_joint_trajectory` strict settle behavior.
+  - `src/gradient_os/arm_controller/utils.py`: added controller `SETTLING` motion state and endpoint-cache state keys.
+  - `src/gradient_os/arm_controller/trajectory_execution.py`: RTCore path now releases `is_running` after the final trajectory point is issued, records `last_bounded_endpoint`, and treats post-final-point settle timeout as non-fatal diagnostics.
+  - `src/gradient_os/arm_controller/command_api.py` and `src/gradient_os/run_controller.py`: added controller-owned `APPLY_JOINT_DELTA`, DS402/fault readiness preflight, endpoint-chain baselining, structured errors, wait-for-idle handling, and endpoint invalidation on STOP/power/reset operations.
+  - `src/gradient_os/api/main.py`: `/control/joint-jog` is now transport-only and forwards `APPLY_JOINT_DELTA`; API no longer calls `GET_JOINT_STATE` or constructs absolute joint targets. SSE queue reduced to 5 frames.
+  - `src/gradient_os/run_controller.py`: monitor telemetry now emits last-good joints with `joint_feedback_stale` metadata instead of blanking transient truth flickers.
+  - `web-ui/src/App.tsx`, `web-ui/src/liveState.tsx`, `web-ui/src/ControlPanel.tsx`, `web-ui/src/ArmVisualizer.tsx`: carried stale telemetry metadata, displayed stale sample badge, and moved robot-joint application into the render loop with bounded visual interpolation.
+  - Tests updated for controller-owned `APPLY_JOINT_DELTA`, endpoint chaining, disabled-axis rejection, and RTCore submit/final-point behavior.
+
+- Validation performed:
+  - `python3 -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/arm_controller/utils.py src/gradient_os/arm_controller/trajectory_execution.py src/gradient_os/arm_controller/command_api.py src/gradient_os/run_controller.py src/gradient_os/api/main.py` -> pass.
+  - Targeted realtime-jog Python tests with `PYTHONPATH=src uv run --no-project ... pytest ...` -> `12 passed`.
+  - Planned Python regression slice (`test_gradient05_limits_and_backends.py`, `test_rtcore_runtime.py`, `test_drive_faults.py`, `test_api_endpoints.py`, `test_trajectory_execution_backends.py`, `test_command_api_direct_setpoint.py`, `test_cartesian_jog_resilience.py`, `test_run_controller_helpers.py`, `test_realtime_jog_backend_compatibility.py`, `test_absolute_encoder_anchors.py`) -> `328 passed`.
+  - `npm test` in `web-ui/` -> `37 passed`.
+  - `ReadLints` on all touched Python/TS/TSX files -> clean.
+
+- Follow-ups / risks:
+  - Hardware jog smoke was not run by automation because it moves the physical robot; perform operator-supervised live validation for: click during EXECUTING rejects `MOTION_ACTIVE`, click during SETTLING accepts/chains, STOP clears endpoint, disabled-drive jog rejects quickly.
+  - `uv run --extra dev` is currently blocked by optional `picamera2 -> python-prctl` requiring libcap headers; offline validation used `uv --no-project` with explicit test dependencies.
+
+## 2026-04-25 21:05 +0000 - Realtime-jog review gaps closed; J5 ratio corrected to exact 10:1
+
+- What changed:
+  - Addressed the follow-up review transcript gaps by adding missing regression tests for final-point wait semantics, faulted final-point endpoint clearing, old settle watcher isolation, API transport-only joint delta, stale telemetry renderability, and cross-joint endpoint-chain rejection.
+  - Updated `src/gradient_os/arm_controller/robots/gradient05/config.py` so J5's gear ratio is exactly `10.0` per operator correction. Adjusted comments and expectations that previously referenced `100/11` as J5-specific.
+
+- Validation performed:
+  - New targeted backend/realtime/ratio tests -> `12 passed`.
+  - Planned Python regression slice -> `333 passed`.
+  - `npm test -- src/ControlPanel.test.tsx` -> `31 passed`.
+  - Full `web-ui` vitest suite -> `39 passed`.
+
+- Follow-ups / risks:
+  - Hardware jog smoke remains operator-supervised only; do not run unattended because it moves the physical robot.
+  - Follow-up live-review patch: `wait_for_trajectory_final_point_sent` now raises when RTCore reports a newer command superseded the observed trajectory before the final point. Added regression `test_wait_for_trajectory_final_point_sent_rejects_superseded_command_before_final_point`. Targeted final-point wait tests -> `4 passed`; planned Python regression slice -> `334 passed`; lints clean on touched files.
+  - Follow-up live-test response: held-jog `pointercancel` no longer sends `JOG_SESSION_STOP`; it zeroes the active velocity while keeping the jog session alive, preventing browser/DOM cancellation from de-energizing the drive/brakes while the operator is still holding. Added base/world-frame `MOVE_LINE_RELATIVE detail` logging with delta, start/target pose, current joints, orientation, speed, and closed-loop flag. Validation: `py_compile` on changed Python, `npm test -- src/ControlPanel.test.tsx` -> `31 passed`, planned Python regression slice -> `334 passed`, `ReadLints` clean.
+
+## 2026-04-25 23:51 +0000 - Advisory canonical truth moved out of motion-control feedback
+
+- What changed:
+  - Added `EthercatRTCoreBackend.get_control_joint_positions()` and `servo_driver.get_control_arm_state_rad()` for live control feedback that skips strict canonical truth diagnostics but hard-fails on RTCore disconnect, missing feedback/config, DS402 Fault/FaultReactionActive, drive/manufacturer errors, or fault flags.
+  - Moved Cartesian jog, one-shot joint delta baselines, bounded setpoint planning, and Cartesian/orientation motion planning to the control-feedback path while keeping `get_joint_positions()` strict for diagnostic surfaces.
+  - Changed the jog loop so a control-feedback miss holds the RTCore jog lease with zero velocity and waits for resync instead of integrating a Cartesian target from stale `q_current`.
+  - Updated `ControlPanel` so advisory canonical mismatches render as trust warnings and no longer disable jog controls when display/stale feedback exists; hard truth blockers remain red/unavailable.
+  - Added backend, command API, jog-loop, relative move, and UI regressions for the new control/advisory split.
+
+- Validation performed:
+  - `python3 -m py_compile src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py src/gradient_os/arm_controller/servo_driver.py src/gradient_os/arm_controller/command_api.py` -> pass.
+  - Targeted Python tests (`test_gradient05_limits_and_backends.py`, `test_command_api_direct_setpoint.py`, `test_cartesian_jog_resilience.py`) -> `212 passed`.
+  - Broader Python slice from the plan -> `305 passed`.
+  - `npm test -- src/ControlPanel.test.tsx` -> `32 passed`.
+  - Full `web-ui` `npm test` -> `40 passed`.
+  - `ReadLints` on touched files -> clean.
+
+- Follow-ups / risks:
+  - Live held-jog validation was not run by automation because it moves the physical robot. Operator-supervised validation still needed for held `+Z`, advisory truth flicker during motion, no diagonal drift, and hard blocking on actual drive fault/offline/invalid anchor.
+
+## 2026-04-26 00:38 +0000 - Live jog residual wobble triage and velocity taper
+
+- What changed:
+  - Inspected live terminal/API evidence after operator reported residual start/stop wobble. Logs showed clean control feedback: no `control feedback miss`, no truth flicker, no IK/gate failures, no DS402 fault/offline, and `/info/joints-detailed` truth available on all axes with tiny shaft/roundtrip errors.
+  - Identified the likely residual source as jog dynamics: repeated normal `ui-release` stops, some very short sessions, and RTCore's `cmd_stop` path snapping hold targets to live feedback for stop-arrest.
+  - Added controller-side jog velocity taper in `src/gradient_os/arm_controller/command_api.py`: slew-limits linear/angular jog velocity before IK and sends a zero-velocity lease update plus a short settle before normal UI-release stop. Controller-stop/fault/lease-expired paths remain immediate.
+  - Added regressions in `tests/test_cartesian_jog_resilience.py` for the slew limiter and zero-before-stop release behavior.
+
+- Validation performed:
+  - `python3 -m py_compile src/gradient_os/arm_controller/command_api.py` -> pass.
+  - `PYTHONPATH=src uv run --no-project --with pytest==8.4.2 --with numpy==2.3.0 --with scipy==1.15.3 python -m pytest tests/test_cartesian_jog_resilience.py -q` -> `20 passed`.
+  - Broader Python slice (`test_gradient05_limits_and_backends.py`, `test_api_endpoints.py`, `test_trajectory_execution_backends.py`, `test_command_api_direct_setpoint.py`, `test_cartesian_jog_resilience.py`, `test_run_controller_helpers.py`, `test_realtime_jog_backend_compatibility.py`) -> `307 passed`.
+  - `ReadLints` on touched files -> clean.
+
+- Follow-ups / risks:
+  - Needs operator-supervised retest of held jog start/stop feel. If wobble persists, next evidence should be higher-rate pose/RTCore trace around release/start, because normal logs only show the controller/RTCore state after the fact.
+
+## 2026-04-26 03:27 +0000 - 3D stage live telemetry decoupled from React re-render loop
+
+- What changed:
+  - Investigated operator report that the 3D stage was laggy and jumped during live operation.
+  - `web-ui/src/ArmVisualizer.tsx`: added `pushLiveJointSample()` to the visualizer imperative handle and route incoming joint samples into the existing `requestAnimationFrame` interpolation buffer directly.
+  - `web-ui/src/App.tsx`: monitor SSE handler now pushes accepted joint samples to the visualizer immediately, while broad `setLatest` / panel state updates are throttled to 10 Hz so the app shell does not re-render at monitor packet rate.
+  - Existing `joints` prop path remains as a fallback/initial snapshot for when the visualizer mounts late or telemetry falls back through `/info/joints`.
+
+- Validation performed:
+  - `npm test -- src/App.test.ts src/ControlPanel.test.tsx` -> `35 passed`.
+  - Full `web-ui` `npm test` -> `40 passed`.
+  - `npm run build` -> pass. Vite still reports the pre-existing large chunk warning for `ArmVisualizer`/OCCT assets.
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/ArmVisualizer.tsx` -> clean.
+
+- Follow-ups / risks:
+  - Requires browser/live-stack retest. Expected improvement: 3D robot follows telemetry at monitor rate without the full React app re-rendering every packet.
+
+## 2026-04-26 03:35 +0000 - Live visualization throttle raised to 50 Hz
+
+- What changed:
+  - Updated `web-ui/src/App.tsx::REACT_TELEMETRY_MIN_INTERVAL_MS` from `100` ms to `20` ms after operator correction that 10 Hz looks unacceptable for the live visualization.
+  - The 3D visualizer direct sample path still receives every accepted monitor joint sample; the shared React live-state path now also targets 50 Hz.
+
+- Validation performed:
+  - `npm test -- src/App.test.ts src/ControlPanel.test.tsx` -> `35 passed`.
+  - `npm run build` -> pass. Existing Vite warnings about OCCT browser externals and large visualizer chunk remain.
+  - `ReadLints` on `web-ui/src/App.tsx` -> clean.
+
+- Follow-ups / risks:
+  - Requires browser/live-stack retest after web UI reload/restart.
+
+## 2026-04-26 03:40 +0000 - Prevented disarmed Cartesian trajectory enqueue and cleaned final-point timeout
+
+- What changed:
+  - Investigated traceback from `MOVE_LINE_RELATIVE,0,0,0.05`: RTCore accepted trajectory `1`, but Python timed out waiting for final point while status stayed at `current_point_index=0 queue_depth=201`. The physical pose did not change.
+  - `src/gradient_os/arm_controller/command_api.py`: added `_require_target_axes_motion_ready(None)` before Cartesian/profiled move planning/submission, including relative move wrappers. This makes disarmed/not-OperationEnabled axes reject before RTCore trajectory enqueue.
+  - `src/gradient_os/arm_controller/trajectory_execution.py`: final-point timeout now clears `last_bounded_endpoint`, aborts the RTCore trajectory if available, logs a clear error, and exits the executor cleanly instead of producing an uncaught thread traceback.
+  - Added regression coverage in `tests/test_command_api_direct_setpoint.py` and `tests/test_trajectory_execution_backends.py`.
+
+- Validation performed:
+  - `python3 -m py_compile src/gradient_os/arm_controller/command_api.py src/gradient_os/arm_controller/trajectory_execution.py` -> pass.
+  - Focused command/executor tests -> `53 passed`.
+  - Broader motion regression slice -> `309 passed`.
+  - `ReadLints` on touched files -> clean.
+  - `./start-stack.sh status` after investigation showed `launcher_state: absent`, `controller: down`, `api: down`, `web: down`.
+
+- Follow-ups / risks:
+  - Restart the stack before live retest. After restart, explicit Power Up is required before any Cartesian/profiled motion.
+
+## 2026-04-26 03:55 +0000 - Restored master-style smooth-chase 3D stage; removed telemetry throttle and per-sample bounds recompute
+
+- Context:
+  - Operator: "3d visualisation is insanely laggy this needs to be faster - the frontend already gets streamed the joint telemetry - do not throttle the visual updates. it used to work perfectly before the changes made on this branch so it can work again." Earlier 03:27 + 03:35 fixes (imperative push + 50 Hz `setLatest` throttle) did not resolve it.
+  - Compared the branch against `master` and found two stacked regressions inside `web-ui/src/ArmVisualizer.tsx`:
+    1. The animate loop rendered through `interpolateLiveJointSamples` with `LIVE_JOINT_LOOKBACK_MS = 30` and a 40 ms extrapolate cap. That builds in a fixed ~30 ms render delay vs the latest accepted telemetry sample. Master had no such buffer.
+    2. `pushLiveJointSample` set `pendingDynamicBoundsRef = true` on every accepted sample (gated by `LIVE_BOUNDS_REFRESH_INTERVAL_MS = 20`). At ~50 Hz telemetry that pumped `alignToGroundAndUpdateBounds` 50x/sec - which traverses the URDF, recomputes the visible-world bbox, and rewrites bounding markers/walls/edges on the main thread. That starved the render loop.
+
+- What changed (`web-ui/src/ArmVisualizer.tsx`):
+  - Replaced the sample-buffer interpolation path with master's smooth chase. New module constant `LIVE_JOINT_SMOOTHING_RAD_PER_S = 12` (same value master used).
+  - Removed `LIVE_JOINT_LOOKBACK_MS`, `LIVE_JOINT_MAX_EXTRAPOLATE_MS`, `liveJointSamplesRef`, `interpolateLiveJointSamples`, and the old `applyLiveJointSample` helper.
+  - `pushLiveJointSample(values)` now only sets `targetAnglesRef.current`, plus seeding `currentAnglesRef.current` on first sample. No sample buffer, no per-sample bounds nudge.
+  - Animate loop reads `targetAnglesRef`, blends `currentAnglesRef` toward it at `LIVE_JOINT_SMOOTHING_RAD_PER_S`, applies the result to the URDF joints, and only schedules a bounds refresh when (a) joints actually changed, (b) the 200 ms `LIVE_BOUNDS_REFRESH_INTERVAL_MS` interval has elapsed, and (c) the bounding box overlay is visible.
+  - Bumped `LIVE_BOUNDS_REFRESH_INTERVAL_MS` from `20` to `200` ms. The bounding box is decorative; refreshing it at 5 Hz instead of 50 Hz reclaims ~45 expensive recomputes per second on the main thread.
+
+- What changed (`web-ui/src/App.tsx`):
+  - Removed `REACT_TELEMETRY_MIN_INTERVAL_MS`, `lastReactTelemetryPublishMsRef`, and `hasPublishedTelemetryRef`. The 20 ms throttle on `setLatest` is gone; React state, drive faults, and motion status now publish on every accepted SSE packet, exactly as master did.
+  - Direct `visualizerRef.current?.pushLiveJointSample(poseJoints)` still runs on every accepted packet (cheap with the new minimal `pushLiveJointSample`). Joints prop path remains as a fallback for initial mount and the `/info/joints` HTTP fallback.
+
+- Validation performed:
+  - `npm test -- --run` in `web-ui/` -> `40 passed (4 files)`.
+  - `npm run build` -> pass (existing OCCT external-module warning and `ArmVisualizer` chunk-size warning unchanged).
+  - `ReadLints` on `web-ui/src/App.tsx` and `web-ui/src/ArmVisualizer.tsx` -> only the pre-existing `__synthesized_from_monitor_axes` literal-type warning at `App.tsx:5095`, which is unrelated to this change.
+
+- Follow-ups / risks:
+  - Operator-supervised live validation needed: open the 3D stage with the stack running, drive a held jog, and confirm the arm tracks live telemetry smoothly without lag or jumps. If fast jogs visually trail the wire, bump `LIVE_JOINT_SMOOTHING_RAD_PER_S` (12 -> 30-60) - a single-line tweak.
+  - The branch's earlier interpolation buffer was added to "smooth out" telemetry jitter. With the smooth chase restored, jitter is naturally damped by the 12 rad/s blend; if the operator reports residual single-frame jitter, prefer increasing the smoothing rate over reintroducing a lookback buffer.
+
+## 2026-04-26 04:20 +0000 - Iteration 2: snap to target (no smoothing) and re-throttle React panels
+
+- Context:
+  - Operator pushback after the 03:55 fix: "ITS STILL INSANELY LAGGY BEHIND REAL LIFE - IT WAS NOT LIKE THIS BEFORE". The previous iteration matched master at 12 rad/s smoothing, which mathematically leaves a `velocity / smoothing` steady-state visual trail (≈50° at a J6 jog of 100 motor RPM output). Master had the same property; operators just were not doing continuous fast jogs back then.
+
+- What changed (`web-ui/src/ArmVisualizer.tsx`):
+  - Removed `LIVE_JOINT_SMOOTHING_RAD_PER_S` and the smoothing blend in the animate loop. The animate loop now writes `targetAngles[index]` straight to `joint.setJointValue(...)` every frame. `currentAnglesRef` is kept in sync only to detect "did this joint actually move" for gating the dynamic-bounds refresh.
+  - The visualizer now tracks telemetry 1:1: telemetry at ~50 Hz + animate at ~60 Hz means the rendered arm is at most one animate frame (~16 ms) behind the latest accepted SSE sample plus SSE/network jitter.
+
+- What changed (`web-ui/src/App.tsx`):
+  - Re-introduced a moderate React-state throttle (`REACT_TELEMETRY_MIN_INTERVAL_MS = 33`, ≈30 Hz). The 03:55 iteration removed the throttle entirely, which made `setLatest` re-render the full App tree + `ControlPanel.tsx` (which reads `latest` via `LiveStateContext`) on every accepted SSE packet. On the Pi that saturates the main thread and starves the WebGL rAF loop — which IS the visible lag.
+  - The visualizer is still on the imperative direct path (`visualizerRef.current.pushLiveJointSample(poseJoints)`) and still receives every accepted SSE packet, so this throttle does NOT throttle visual updates per the operator's instruction. It only throttles text-panel updates.
+  - Alerts continue to force-publish so the operator never misses a safety event.
+
+- Validation performed:
+  - `npm test -- --run` -> `40 passed (4 files)`.
+  - `npm run build` -> pass; ArmVisualizer/app chunks rebuilt (`ArmVisualizer-Uc7SlZQO.js`, `app-BG719dUk.js`).
+  - `ReadLints` -> only the pre-existing unrelated `__synthesized_from_monitor_axes` warning at `App.tsx:5103`.
+
+- Follow-ups / risks:
+  - Operator must hard-reload the browser (Ctrl+Shift+R / Cmd+Shift+R). HMR for `ArmVisualizer.tsx` (forwardRef + heavy `useImperativeHandle` + Three.js side effects) often does not propagate cleanly, so a stale module may still be running.
+  - If the visualizer now appears jittery instead of laggy, the source is telemetry packet jitter / SSE jitter, not the visualizer code path. Mitigation if needed: a low-pass on the WIRE side of telemetry (RTCore or controller) rather than re-introducing easing in the visualizer.
+  - Watch for any text-panel "feels stale" complaints; if the 30 Hz React cadence isn't fast enough for joint readouts in `ControlPanel`, the right fix is to subscribe panel components to a separate ref-driven channel (the same pattern the visualizer already uses) rather than push the React rate back to 50 Hz on the Pi.
+
+## 2026-04-26 04:35 +0000 - Prevented stale React telemetry from echoing into live 3D stage
+
+- What changed:
+  - `web-ui/src/App.tsx`: when the monitor stream is connected, `LazyArmVisualizer` now receives `joints={undefined}` so throttled React `latest` samples cannot replay older poses through `ArmVisualizer`'s prop effect after newer samples arrived through `visualizerRef.current.pushLiveJointSample(...)`.
+  - Preserved the disconnected/fallback prop path so the stage can still render the last known snapshot when the live stream is not connected.
+
+- Validation performed:
+  - `npm test -- src/App.test.ts --run` in `web-ui/` -> `3 passed`.
+  - `ReadLints` on `web-ui/src/App.tsx` reported only the pre-existing `__synthesized_from_monitor_axes` type warning.
+
+- Follow-ups / risks:
+  - Requires browser hard reload/live retest. Expected result: no delayed React prop echo causing the stage to trail or snap back behind the direct SSE sample stream.
+
+## 2026-04-26 04:42 +0000 - Added end-to-end 3D visualization lag instrumentation
+
+- What changed:
+  - `src/gradient_os/api/main.py`: `/monitor` payloads now include `monitor_timing.api_received_t` and `monitor_timing.api_sequence` when the API receives controller UDP telemetry.
+  - `web-ui/src/visualizerLagTelemetry.ts`: added a rolling lag probe for monitor/fallback samples, tracking controller sample age, API-to-browser age, browser receive-to-visible time, push-to-visible time, frame interval, frame work, superseded samples, and dropped samples.
+  - `web-ui/src/App.tsx`: stamps browser receive time for each monitor event, records push timing when handing samples to `ArmVisualizer`, and renders a small `3D Lag Probe` badge over the stage.
+  - `web-ui/src/ArmVisualizer.tsx`: accepts an optional timing id in `pushLiveJointSample(...)` and records when that sample is actually applied/rendered by the rAF loop. Console warnings now emit structured `[GradientOS 3D lag]` entries when any segment exceeds 250 ms.
+
+- Validation performed:
+  - `python3 -m py_compile src/gradient_os/api/main.py` -> pass.
+  - `npm test -- src/App.test.ts --run` in `web-ui/` -> `3 passed`.
+  - `npm run build` in `web-ui/` -> pass; existing Vite OCCT externalization/chunk-size warnings remain.
+  - `ReadLints` on touched files -> clean.
+
+- Follow-ups / risks:
+  - Requires live browser retest after API/web reload. Use the badge/console to identify the segment owning the reported 1-2s delay before making another performance change.
+
+## 2026-04-26 04:43 +0000 - Corrected Gradient-05 J5 gear ratio to 11:1
+
+- What changed:
+  - `src/gradient_os/arm_controller/robots/gradient05/config.py`: set J5 `actuator_gear_ratios[4]` to exact `11.0` and updated the inline comment.
+  - `tests/test_gradient05_limits_and_backends.py`: updated the Gradient-05 default ratio expectation and J5 derived wrap-period expectation to `1_441_792` counts.
+
+- Validation performed:
+  - Initial `python3 -m pytest ...` failed because system Python has no `pytest`.
+  - Corrected workflow per operator instruction: `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py::test_gradient05_config_defaults_and_mapping_shape tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_a6ec_reference_wrap_period_uses_per_axis_gear_ratios tests/test_rtcore_runtime.py::test_render_rtcore_systemd_env_contains_scaling_and_profile tests/test_rtcore_runtime.py::test_build_rtcore_drive_startup_config_uses_drive_profile_defaults_when_robot_has_no_override tests/test_rtcore_runtime.py::test_build_rtcore_drive_startup_config_uses_drive_profile_module -q` -> `5 passed`.
+  - `ReadLints` clean on the touched config/test files.
+
+- Follow-ups / risks:
+  - Changing the drive-native mechanical ratio means the next live startup/readback should confirm A6-EC `C10.18/C10.19` for J5 is `11/1`; per SOP/manufacturer notes, changing that drive ratio requires a fresh homing cycle afterward.
+
+## 2026-04-26 04:53 +0000 - Corrected Gradient-05 J5 gear ratio again to 100:11
+
+- What changed:
+  - Operator corrected the previous `11:1` instruction: J5 is actually `100/11`.
+  - `src/gradient_os/arm_controller/robots/gradient05/config.py`: set J5 to `100.0 / 11.0` with an inline `100:11` comment.
+  - `tests/test_gradient05_limits_and_backends.py`: updated the Gradient-05 default ratio expectation and the rounded J5 wrap-period expectation to `1_191_564` counts.
+
+- Validation performed:
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py::test_gradient05_config_defaults_and_mapping_shape tests/test_gradient05_limits_and_backends.py::test_ethercat_backend_a6ec_reference_wrap_period_uses_per_axis_gear_ratios tests/test_drive_faults.py::test_a6ec_gear_ratio_u16_pair_recovers_100_over_11_from_ieee754_float tests/test_rtcore_runtime.py::test_render_rtcore_systemd_env_contains_scaling_and_profile tests/test_rtcore_runtime.py::test_build_rtcore_drive_startup_config_uses_drive_profile_defaults_when_robot_has_no_override tests/test_rtcore_runtime.py::test_build_rtcore_drive_startup_config_uses_drive_profile_module -q` -> `6 passed`.
+  - `ReadLints` clean on the touched config/test files.
+
+- Follow-ups / risks:
+  - Next live startup/readback should confirm J5 A6-EC `C10.18/C10.19` is `100/11`; changing that drive-native ratio still requires fresh homing afterward.
+
+## 2026-04-26 05:05 +0000 - Cleaned up cockpit overlay layout
+
+- What changed:
+  - `web-ui/src/App.tsx`: compacted the runtime header so the LIVE/SIM selector and drive-state chips wrap instead of overlapping adjacent status controls.
+  - Moved the `3D Lag Probe` from the top-right stage corner to the bottom-right and reduced its footprint.
+  - Replaced separate left/right stage overlays with a single top bar so `3D Stage` / `Vision Feed` no longer collide with the stage title chips.
+  - Hid the bottom stage guidance while the 3D visualizer is paused and made the remaining guidance non-interactive, preventing it from blocking the `Load 3D Workspace` button.
+
+- Validation performed:
+  - Browser sanity check against `http://localhost:8000/` caught and confirmed the blocked startup button issue before the final patch.
+  - `ReadLints` on `web-ui/src/App.tsx` -> clean.
+  - `npm test -- src/App.test.ts --run` in `web-ui/` -> `3 passed`.
+  - `npm run build` in `web-ui/` -> pass; existing Vite OCCT externalization/chunk-size warnings remain.
+
+- Follow-ups / risks:
+  - The open browser view disappeared during the final visual click attempt, so final visual confirmation is from the pre-final screenshot plus automated build/test checks. Hard reload the UI if HMR shows stale chrome.
+
+## 2026-04-27 01:27 +0000 - Looped trajectory preflight accepts final-point plus live endpoint proof
+
+- What changed:
+  - Investigated prior transcript `161b0127-4149-494a-adee-9c1c3e590f57`, which narrowed the loop issue to move-to-start preflight faulting after the robot physically reached the start because RTCore had not yet reported `motion_done=True`.
+  - SUPERSEDED by the 01:56 correction below: this first patch incorrectly treated "final point issued" as enough executor-side proof and deferred completion to live endpoint verification.
+  - `src/gradient_os/arm_controller/command_api.py`: clarified loop-wrapper contract: final point must be issued and live control feedback must match the wrapper endpoint before the loop body starts.
+  - Updated regressions in `tests/test_trajectory_execution_backends.py` and `tests/test_command_api_direct_setpoint.py`.
+
+- Validation performed:
+  - `source ./start.sh && python -m pytest tests/test_trajectory_execution_backends.py::test_open_loop_executor_strict_completion_allows_settle_timeout_after_final_point tests/test_trajectory_execution_backends.py::test_open_loop_executor_strict_completion_raises_on_final_point_timeout tests/test_command_api_direct_setpoint.py::test_looping_trajectory_executor_thread_starts_body_when_live_endpoint_matches tests/test_command_api_direct_setpoint.py::test_looping_trajectory_executor_thread_faults_on_endpoint_mismatch -q` -> `4 passed`.
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q` -> `130 passed`.
+  - `source ./start.sh && python -m pytest tests/test_cartesian_jog_resilience.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q` -> `172 passed`.
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/trajectory_execution.py src/gradient_os/arm_controller/command_api.py tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py` -> pass.
+  - `ReadLints` on touched Python/test files -> clean. `git diff --check` on touched files -> clean.
+
+- Follow-ups / risks:
+  - Operator-supervised live loop smoke is still needed: run a looped `racetrack_linear_1`, confirm the UI receives ACK after planning, the move-to-start completes, the loop body starts, and Stop/Power Down remain clear.
+
+## 2026-04-27 01:56 +0000 - Added Gradient-05 robot spec sheet
+
+- What changed:
+  - Added top-level `GRADIENT_05_ROBOT_SPEC_SHEET.md`, an AR-style Markdown spec sheet for the Gradient-05 robot.
+  - Sourced axis count, joint limits, gear ratios, encoder resolution, backend defaults, and controller defaults from `Gradient05Config` / runtime sources.
+  - Derived approximate reach/envelope values from `robots/gradient-05/gradient-05.urdf` and marked payload, mass, repeatability, wrist moments, and final drawing dimensions as TBD because they are not present in the repo.
+
+- Validation performed:
+  - `GRADIENT_START_QUIET=1 source ./start.sh && python ...` one-off URDF envelope calculation completed.
+  - `git diff --check -- "GRADIENT_05_ROBOT_SPEC_SHEET.md"` -> pass.
+  - `ReadLints` on `GRADIENT_05_ROBOT_SPEC_SHEET.md` -> clean.
+
+- Follow-ups / risks:
+  - The Gradient-05 asset manifest/README still label the URDF/DH as template data, so the published reach figures should be re-derived after production CAD/URDF replacement.
+  - Payload, repeatability, robot mass, and allowable wrist moments need mechanical/CAD/test inputs before they can be filled in.
+
+## 2026-04-27 01:56 +0000 - Corrected loop preflight to keep RTCore motion_done as required
+
+- What changed:
+  - Re-examined the loop preflight safety question after operator challenged the previous patch as papering over root cause.
+  - Root cause from RTCore code: `queue_depth=0, state=executing, motion_done=False` means the final point is due/issued, but at least one targeted axis feedback is still outside RTCore's final-position completion window (`kTrajectoryCompletionToleranceCounts = 128` counts).
+  - `src/gradient_os/arm_controller/trajectory_execution.py`: restored strict-mode behavior so loop preflight does NOT accept `executing`; it must see RTCore terminal `completed`/`idle` before live endpoint verification can pass the wrapper.
+  - Increased the strict post-final-point settle wait from the too-short `0.5s` probe to `GRADIENT_RTCORE_STRICT_COMPLETION_SETTLE_TIMEOUT_S` (default `5.0s`). If RTCore still does not complete, the wrapper aborts, clears `last_bounded_endpoint`, and raises.
+  - `src/gradient_os/arm_controller/command_api.py`: updated the loop-wrapper docstring so RTCore completion is first-class, not replaceable by endpoint verification.
+  - `tests/test_trajectory_execution_backends.py`: restored the strict settle-timeout regression to expect abort/raise and verify the new 5s wait.
+
+- Validation performed:
+  - `source ./start.sh && python -m pytest tests/test_trajectory_execution_backends.py::test_open_loop_executor_strict_completion_raises_on_settle_timeout tests/test_trajectory_execution_backends.py::test_open_loop_executor_strict_completion_raises_on_final_point_timeout tests/test_command_api_direct_setpoint.py::test_looping_trajectory_executor_thread_starts_body_when_live_endpoint_matches tests/test_command_api_direct_setpoint.py::test_looping_trajectory_executor_thread_faults_on_endpoint_mismatch -q` -> `4 passed`.
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q` -> `130 passed`.
+  - `source ./start.sh && python -m pytest tests/test_cartesian_jog_resilience.py tests/test_run_controller_helpers.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q` -> `172 passed`.
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/trajectory_execution.py src/gradient_os/arm_controller/command_api.py tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py` -> pass.
+  - `ReadLints` on touched files -> clean. `git diff --check` on touched files -> clean.
+
+- Follow-ups / risks:
+  - Live loop smoke should now distinguish two cases: if the wrapper completes within the longer 5s settle, the original issue was a too-short Python settle wait; if it still times out, capture RTCore metrics/trace for per-axis final target error because the drive is not settling inside RTCore's 128-count completion window.
+
+## 2026-04-27 02:11 +0000 - Added live endpoint error diagnostic for strict loop preflight timeout
+
+- What changed:
+  - Compared non-loop vs loop execution paths. Non-loop runs normal `_trajectory_executor_thread` and its RTCore segment calls use non-strict `_open_loop_executor_thread`; loop mode adds a distinct move-to-start wrapper with strict RTCore completion before the body can start.
+  - `src/gradient_os/arm_controller/trajectory_execution.py`: strict completion timeout errors now include controller live endpoint error vs the wrapper target (`live_endpoint_max_abs_err_rad` and per-joint error list) before aborting. This does not replace RTCore's count-level completion gate; it makes the next live failure explain whether the wrapper is barely outside tolerance or materially off target.
+  - `tests/test_trajectory_execution_backends.py`: pinned the new diagnostic text in the strict settle-timeout regression.
+
+- Validation performed:
+  - Focused strict/loop regressions -> `4 passed`.
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q` -> `130 passed`.
+  - Broader motion/API slice -> `172 passed`.
+  - `py_compile` on touched Python/test files -> pass.
+  - `ReadLints` on touched files -> clean. `git diff --check` -> clean.
+
+- Follow-ups / risks:
+  - If loop preflight still fails live, compare `live_endpoint_max_abs_err_rad` with RTCore's 128-count completion window. If live rad error is small but RTCore stays executing, add/count-level RTCore final-target diagnostics rather than weakening the gate.
+
+## 2026-04-27 02:29 +0000 - RTCore trajectory completion count diagnostics
+
+- What changed:
+  - Added count-level RTCore diagnostics for strict loop preflight failures without changing the motion completion gate.
+  - `src/gradient_rt_motion/main.cpp`: RTCore now records the latest trajectory completion check in `metrics.json` under `trajectory_completion`, including `traj_id`, `final_due`, `tolerance_counts`, axis mask, and per-axis final target/feedback/error counts.
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`: added `get_trajectory_completion_diagnostics(...)` to parse the metrics payload.
+  - `src/gradient_os/arm_controller/trajectory_execution.py`: strict completion timeout errors now include both controller live endpoint error and RTCore per-axis count diagnostics when available.
+  - `tests/test_trajectory_execution_backends.py`: regression now asserts the timeout includes `tolerance_counts` and per-axis target/feedback/error counts.
+
+- Validation performed:
+  - `make -C src/gradient_rt_motion` -> pass.
+  - Focused strict/loop regressions -> `4 passed`.
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q` -> `130 passed`.
+  - Broader motion/API slice -> `172 passed`.
+  - `py_compile` on touched Python/test files -> pass.
+  - `ReadLints` on touched Python/test files -> clean. `git diff --check` on touched files -> clean.
+
+- Follow-ups / risks:
+  - Next live loop run should report exact axis/count error if preflight still times out. Use that to decide whether the problem is servo settling/tuning, trajectory shape/speed, command-frame mismatch, or an unrealistically tight completion tolerance for this robot.
+
+## 2026-04-27 02:54 +0000 - Loop trajectory body now uses compound strict RTCore path
+
+- What changed:
+  - Investigated live loop report: regular run collapsed `11` planned steps into one `1577`-sample RTCore trajectory and completed cleanly. Loop mode moved to start, then executed `11` separate RTCore uploads. Several loop segments ended `state=executing motion_done=False`; one segment timed out before final point with `queue_depth=215`, then the next/reset segment started. That explains both the visible pauses and the erratic/jerky motion.
+  - `src/gradient_os/arm_controller/command_api.py`: loop body now collapses `planned_steps[1:] + reset_move` via `_collapse_runtime_move_pause_steps(...)`, matching the regular trajectory execution strategy. The compound loop body is marked `require_completion=True` before each repeat.
+  - Fallback if collapse is impossible: each loop-body move is marked `require_completion=True` so a segment cannot be preempted by the next segment after a timeout.
+  - `src/gradient_os/arm_controller/trajectory_execution.py`: `_execute_joint_path(...)` now accepts `require_completion`; `_trajectory_executor_thread(...)` forwards the step flag. Removed the hard-coded `1s` loop restart sleep by replacing it with `GRADIENT_TRAJECTORY_LOOP_RESTART_PAUSE_S` defaulting to `0.0`.
+  - Updated loop reliability regressions in `tests/test_command_api_direct_setpoint.py` and `tests/test_trajectory_execution_backends.py`.
+
+- Validation performed:
+  - Focused loop-path regressions -> `4 passed`.
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q` -> `131 passed`.
+  - Broader motion/API slice -> `173 passed`.
+  - `py_compile` on touched Python/test files -> pass.
+  - `ReadLints` on touched files -> clean. `git diff --check` -> clean.
+
+- Follow-ups / risks:
+  - Requires operator-supervised live retest. Expected log shape: after move-to-start, loop body should be a single compound `Starting Open-Loop Executor` per loop iteration, not eleven per-move uploads; no segment should advance after `final point not observed`.
+
+## 2026-04-27 03:29 +0000 - Live observation: compound loop path running cleanly
+
+- What changed:
+  - Read-only live observation while operator had loop running. Did not send any controller/API commands.
+  - Confirmed regular run shape: non-loop `__planner_preview__` collapsed into one compound RTCore trajectory (`1986` samples) and completed.
+  - Confirmed loop shape after patch: move-to-start preflight completed (`traj_id=9`, `526` samples), then loop body collapsed into one `2074`-sample RTCore trajectory.
+  - Observed loop body iterations `traj_id=10`, `11`, `12`, and `13` all finish `state=completed` before `Loop enabled. Restarting sequence...`; each restart begins `Executing Step 1/1 (move)` and one `Starting Open-Loop Executor at 100 Hz (2074 steps)`.
+
+- Validation performed:
+  - Read-only log inspection of `logs/startups/20260427-025736/controller.log`, terminal mirror, and `/run/gradient-rt-motion/metrics.json`.
+
+- Follow-ups / risks:
+  - Dashboard canonical-truth AVAILABLE/UNAVAILABLE flicker continues during motion, but the loop motion path itself now shows the desired single compound upload per iteration and no settle-timeout/fault/STOP/command-frame errors in the observed window.
+
+## 2026-04-27 03:58 +0000 - STOP now latches motion inhibit until explicit power-up
+
+- What changed:
+  - Investigated operator report that the robot kept moving after several STOP clicks. Logs showed STOP did reach the controller at `03:51:31` multiple times and aborted the active loop trajectory immediately, but a new `/control/home` request at `03:51:39` started `APPLY_JOINT_SETPOINT` trajectory `72`, which caused the later motion.
+  - `src/gradient_os/arm_controller/utils.py`: added `motion_stop_latched`, timestamp, and reason fields to trajectory state.
+  - `src/gradient_os/arm_controller/command_api.py`: STOP now latches motion inhibit in addition to aborting the active RTCore trajectory. New program/non-program motion, direct setpoints, joint deltas, jog session starts, and trajectory runs reject with `MOTION_STOP_LATCHED` while the latch is active. `SAFE_POWER_UP` clears the latch as the explicit operator recovery action.
+  - `src/gradient_os/run_controller.py`: maps `MOTION_STOP_LATCHED` to a structured apply-joint-delta error code.
+  - `tests/test_command_api_direct_setpoint.py`: added regressions that direct setpoint and trajectory run are rejected while STOP is latched, and that safe power-up clears the latch.
+
+- Validation performed:
+  - Focused stop-latch tests -> `3 passed`.
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py -q` -> `133 passed`.
+  - Broader motion/API slice -> `175 passed`.
+  - `py_compile` on touched Python/test files -> pass.
+  - `ReadLints` on touched files -> clean. `git diff --check` on touched files -> clean.
+
+- Follow-ups / risks:
+  - UI should surface the stop-latched state clearly if the operator presses Home/Run after STOP; controller-side safety now rejects it, but frontend copy can be improved separately.
+
+## 2026-04-27 02:13 +0000 - Corrected Gradient-05 spec-sheet axis speeds
+
+- What changed:
+  - `GRADIENT_05_ROBOT_SPEC_SHEET.md`: replaced the URDF `2.0 rad/s` velocity-derived axis speed with motor-speed-derived joint speeds.
+  - Added rated and peak columns using `joint deg/s = motor RPM * 6 / gear_ratio`, with 3,000 RPM rated and 6,000 RPM peak.
+  - Added motor rated/peak speed rows to the controller defaults table.
+
+- Validation performed:
+  - `git diff --check -- "GRADIENT_05_ROBOT_SPEC_SHEET.md"` -> pass.
+  - `ReadLints` on `GRADIENT_05_ROBOT_SPEC_SHEET.md` -> clean.
+
+- Follow-ups / risks:
+  - These are mechanical ratio-derived maxima; controller jog/profile, drive thermal, payload, and safety policies may still command lower speeds.

@@ -24,6 +24,10 @@ import { STLLoader } from "three/examples/jsm/loaders/STLLoader";
 import URDFLoader, { type URDFRobot } from "urdf-loader";
 import occtWasmUrl from "occt-import-js/dist/occt-import-js.wasm?url";
 import type { Point3 } from "./previewUtils";
+import {
+  recordVisualizerLagApplied,
+  recordVisualizerLagSuperseded,
+} from "./visualizerLagTelemetry";
 
 declare const __GRADIENT_PUBLIC_DIR_FS__: string;
 
@@ -117,7 +121,11 @@ const WELD_ANGLE_PREVIEW_VECTOR_LENGTH_M = 0.065;
 const WELD_ANGLE_PREVIEW_ARC_RADIUS_BASE_M = 0.018;
 const WELD_ANGLE_PREVIEW_LABEL_SCALE = 0.032;
 const WELD_ANGLE_PREVIEW_LABEL_OFFSET_M = 0.014;
-const LIVE_BOUNDS_REFRESH_INTERVAL_MS = 20;
+// How often the dynamic workspace-bounds box is allowed to recompute when the
+// arm is moving. The recompute walks the whole URDF, rebuilds bounding markers
+// and walls, so doing it per telemetry packet (~20 ms) saturates the main
+// thread and starves the render loop. 200 ms is plenty for a decorative box.
+const LIVE_BOUNDS_REFRESH_INTERVAL_MS = 200;
 const PREVIEW_CP_LABEL_SCALE = 0.018;
 const PREVIEW_MOVE_LABEL_SCALE = 0.017;
 const PREVIEW_CP_LABEL_OFFSET = new THREE.Vector3(0.012, 0.006, 0.012);
@@ -998,6 +1006,7 @@ function _createFallbackToolMarker(): THREE.Group {
 export type ArmVisualizerHandle = {
   resetView: () => void;
   focusOnPoints: (points: Point3[]) => void;
+  pushLiveJointSample: (joints: number[], timingId?: number) => void;
 };
 
 export const ArmVisualizer = forwardRef(function ArmVisualizer(
@@ -1035,6 +1044,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   const sceneRef = useRef<THREE.Scene | null>(null);
   const robotRef = useRef<URDFRobot | null>(null);
   const targetAnglesRef = useRef<number[] | null>(null);
+  const targetTimingIdRef = useRef<number | null>(null);
   const currentAnglesRef = useRef<number[] | null>(null);
   const previousTimeRef = useRef<number | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -1060,6 +1070,34 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
   const selectedTopologyEdgeIdsRef = useRef<Set<string>>(
     new Set(selectedTopologyEdgeIds ?? []),
   );
+
+  // Hot path: gets called every time a telemetry packet (or fallback /info/joints
+  // poll) arrives. Must stay cheap. No sample buffering, no interpolation, no
+  // per-sample workspace-bounds recompute — those starved the main thread when
+  // telemetry arrived at ~50 Hz. The animate loop below applies the latest
+  // target directly and records when that sample becomes visible.
+  const pushLiveJointSample = (values: number[], timingId?: number) => {
+    if (!Array.isArray(values) || values.length === 0) {
+      return;
+    }
+    const nextAngles = values
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value));
+    if (nextAngles.length === 0) {
+      return;
+    }
+    if (
+      targetTimingIdRef.current !== null &&
+      targetTimingIdRef.current !== timingId
+    ) {
+      recordVisualizerLagSuperseded(targetTimingIdRef.current);
+    }
+    targetAnglesRef.current = nextAngles;
+    targetTimingIdRef.current = typeof timingId === "number" ? timingId : null;
+    if (!currentAnglesRef.current || currentAnglesRef.current.length !== nextAngles.length) {
+      currentAnglesRef.current = nextAngles.slice();
+    }
+  };
   const hoveredTopologyEdgeIdRef = useRef<string | null>(null);
   const onPointSelectedRef = useRef(onPointSelected);
   const onTopologyEdgeSelectedRef = useRef(onTopologyEdgeSelected);
@@ -1819,11 +1857,72 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     const animate = (time?: number) => {
       animationFrameId = requestAnimationFrame(animate);
 
-      const deltaSeconds =
-        previousTimeRef.current !== null && time !== undefined
-          ? Math.min((time - previousTimeRef.current) / 1000, 0.05)
-          : 0.016;
-      previousTimeRef.current = time ?? null;
+      const frameStartPerfMs = performance.now();
+      const frameTimeMs = typeof time === "number" ? time : frameStartPerfMs;
+      const previousFrameTimeMs = previousTimeRef.current;
+      const frameIntervalMs =
+        previousFrameTimeMs === null ? undefined : frameTimeMs - previousFrameTimeMs;
+      previousTimeRef.current = frameTimeMs;
+
+      const robot = robotRef.current;
+      let jointsChanged = false;
+      let appliedTimingId: number | null = null;
+      if (robot && isGroundedRef.current) {
+        const targetAngles = targetAnglesRef.current;
+        if (targetAngles && targetAngles.length > 0) {
+          const timingIdForFrame = targetTimingIdRef.current;
+          if (
+            !currentAnglesRef.current ||
+            currentAnglesRef.current.length !== targetAngles.length
+          ) {
+            currentAnglesRef.current = targetAngles.slice();
+          }
+          const currentAngles = currentAnglesRef.current;
+          const jointsMap = robot.joints;
+          // Track real life 1:1. Telemetry already arrives at ~50 Hz and the
+          // animate loop runs at ~60 Hz, so writing the latest target straight
+          // to the URDF gives the operator the truest possible "what the arm
+          // is doing right now" view. Any easing/smoothing here directly
+          // translates to visible lag during fast jogs; per the operator,
+          // that is unacceptable. Keep `currentAnglesRef` in sync only so
+          // downstream "did the joints move?" checks (bounding-box refresh)
+          // still work.
+          for (let index = 0; index < targetAngles.length; index += 1) {
+            const targetValue = targetAngles[index];
+            if (!Number.isFinite(targetValue)) {
+              continue;
+            }
+            const previousValue = currentAngles[index];
+            if (
+              typeof previousValue !== "number" ||
+              Math.abs(previousValue - targetValue) > 1e-5
+            ) {
+              jointsChanged = true;
+            }
+            currentAngles[index] = targetValue;
+            const joint = jointsMap[`joint${index + 1}`];
+            if (joint) {
+              joint.setJointValue(targetValue);
+            }
+          }
+          if (timingIdForFrame !== null) {
+            appliedTimingId = timingIdForFrame;
+            targetTimingIdRef.current = null;
+          }
+        }
+      }
+
+      // Bounding box / workspace markers only need to follow the arm at a
+      // human-perceivable cadence, NOT every animation frame. Recomputing them
+      // every frame walked the URDF and rebuilt geometry, which is what made
+      // the live stage feel laggy when telemetry arrived at ~50 Hz.
+      if (jointsChanged && isGroundedRef.current && showBoundingBoxRef.current) {
+        const nowMs = performance.now();
+        if (nowMs - lastLiveBoundsRefreshMsRef.current >= LIVE_BOUNDS_REFRESH_INTERVAL_MS) {
+          lastLiveBoundsRefreshMsRef.current = nowMs;
+          pendingDynamicBoundsRef.current = true;
+        }
+      }
 
       if (pendingDynamicBoundsRef.current) {
         pendingDynamicBoundsRef.current = false;
@@ -1855,6 +1954,13 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       renderer.render(orientationScene, orientationCamera);
       renderer.setScissorTest(false);
       renderer.setViewport(0, 0, canvasWidth, canvasHeight);
+      if (appliedTimingId !== null) {
+        recordVisualizerLagApplied(appliedTimingId, {
+          frameTimeMs,
+          frameIntervalMs,
+          frameWorkMs: performance.now() - frameStartPerfMs,
+        });
+      }
     };
     animate();
 
@@ -1968,6 +2074,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
       sceneRef.current = null;
       robotRef.current = null;
       targetAnglesRef.current = null;
+      targetTimingIdRef.current = null;
       currentAnglesRef.current = null;
       previousTimeRef.current = null;
       cameraRef.current = null;
@@ -2074,6 +2181,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         camera.updateProjectionMatrix();
         controls.update();
       },
+      pushLiveJointSample,
     }),
     [],
   );
@@ -2881,32 +2989,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
     if (!joints || joints.length === 0) {
       return;
     }
-    const nextAngles = joints.slice();
-    targetAnglesRef.current = nextAngles;
-    // The visualized robot should be a live digital twin of telemetry, not a
-    // smoothed approximation that lags behind the hardware.
-    currentAnglesRef.current = nextAngles.slice();
-    if (!isGroundedRef.current) {
-      return;
-    }
-    const robot = robotRef.current;
-    if (robot) {
-      nextAngles.forEach((value, index) => {
-        const joint = robot.joints[`joint${index + 1}`];
-        if (joint) {
-          joint.setJointValue(value);
-        }
-      });
-      // Recomputing scene bounds on every telemetry packet makes the live view
-      // feel sluggish. Only refresh occasionally, and only if the bounds are visible.
-      if (showBoundingBoxRef.current) {
-        const nowMs = performance.now();
-        if (nowMs - lastLiveBoundsRefreshMsRef.current >= LIVE_BOUNDS_REFRESH_INTERVAL_MS) {
-          lastLiveBoundsRefreshMsRef.current = nowMs;
-          pendingDynamicBoundsRef.current = true;
-        }
-      }
-    }
+    pushLiveJointSample(joints);
   }, [joints]);
 
   useEffect(() => {

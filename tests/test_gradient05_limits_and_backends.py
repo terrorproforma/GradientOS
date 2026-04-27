@@ -28,6 +28,7 @@ from gradient_os.arm_controller.backends.ethercat_rtcore.backend import (
 )
 from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import (
     RTCORE_EXEC_STATE_COMPLETED,
+    RTCORE_EXEC_STATE_EXECUTING,
     RTCORE_EXEC_STATE_IDLE,
 )
 from gradient_os.arm_controller.backends.simulation import backend as sim_backend_module
@@ -129,7 +130,7 @@ def test_gradient05_config_defaults_and_mapping_shape():
         5: [5],
     }
     assert cfg.actuator_encoder_counts_per_rev == [131072] * 6
-    assert cfg.actuator_gear_ratios == [100.0, 100.0, 100.0, 18.0, 11.0, 10.0]
+    assert cfg.actuator_gear_ratios == [100.0, 100.0, 100.0, 18.0, 100.0 / 11.0, 10.0]
     assert cfg.actuator_position_signs == [-1, 1, -1, -1, -1, -1]
     assert cfg.logical_joint_limits_rad == [
         (-6.3, 6.3),
@@ -2161,6 +2162,95 @@ def test_ethercat_backend_marks_truth_unavailable_when_absolute_anchor_does_not_
         backend.get_joint_positions()
 
 
+def test_control_joint_positions_survive_command_roundtrip_mismatch(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    metrics_path = tmp_path / "metrics.json"
+    monkeypatch.setattr(rtcore_backend_module, "_RTCORE_METRICS_PATH", metrics_path)
+    _write_rtcore_metrics_snapshot(
+        metrics_path,
+        [
+            {
+                "native_home_position_offset": 0,
+                "absolute_feedback": {
+                    "encoder_multi_turn_low": {"valid": 1, "value": 1234},
+                    "encoder_multi_turn_high": {"valid": 1, "value": 0},
+                },
+            }
+        ],
+    )
+    backend = _force_legacy_truth_fallback(
+        EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    )
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[100.0] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[131072] + [0] * 15,
+    )
+    backend._rt_drive_profile_id = "a6ec_ds402"
+    backend._axis_counts[0] = 234
+    backend._absolute_encoder_home_anchors[0] = {"home_anchor_rad": 0.0, "source": "pytest", "axis_indices": [0]}
+
+    with pytest.raises(RuntimeError, match="Canonical joint truth unavailable"):
+        backend.get_joint_positions()
+    assert backend.get_control_joint_positions()[0] == pytest.approx(2.34)
+
+
+def test_control_joint_positions_reject_drive_fault(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 2
+    backend._axis_to_joint = [0, 1]
+    backend._axis_config = _AxisConfig(
+        num_axes=2,
+        counts_per_unit=[100.0, 100.0] + [0.0] * 14,
+        sign=[1, 1] + [0] * 14,
+        counts_per_rev=[131072, 131072] + [0] * 14,
+    )
+    backend._axis_counts[0] = 234
+    backend._axis_counts[1] = 345
+    backend._axis_ds402_state[1] = 8
+    backend._axis_statusword[1] = 0x9638
+    backend._axis_error_code[1] = 0x8611
+    backend._axis_manufacturer_error_code[1] = 0x00000470
+    backend._axis_fault_flags[1] = 0x5
+
+    with pytest.raises(RuntimeError) as exc_info:
+        backend.get_control_joint_positions()
+    message = str(exc_info.value)
+    assert "Control feedback unavailable" in message
+    assert "axes=[1]" in message
+    assert "drive_fault_state" in message
+    assert "joint=J2" in message
+    assert "ds402=fault(8)" in message
+    assert "statusword=0x9638" in message
+    assert "error_code_603f=0x8611" in message
+    assert "manufacturer_error_203f=0x00000470" in message
+    assert "axis_fault_flags=0x00000005" in message
+
+
+def test_control_joint_positions_reject_missing_raw_feedback(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._connected = True
+    backend._rt_num_axes = 1
+    backend._axis_to_joint = [0]
+    backend._axis_config = _AxisConfig(
+        num_axes=1,
+        counts_per_unit=[100.0] + [0.0] * 15,
+        sign=[1] + [0] * 15,
+        counts_per_rev=[131072] + [0] * 15,
+    )
+    monkeypatch.setattr(backend, "sync_read_positions", lambda timeout_s=None: {})
+
+    with pytest.raises(RuntimeError, match="raw_feedback_missing"):
+        backend.get_control_joint_positions()
+
+
 def test_ethercat_backend_accepts_stationary_roundtrip_wander_within_configured_tolerance(
     monkeypatch, tmp_path
 ):
@@ -3916,7 +4006,7 @@ def test_ethercat_backend_a6ec_reference_wrap_period_uses_per_axis_gear_ratios(
             robot_cfg["actuator_gear_ratios"][:6],
         )
     ]
-    assert expected_period_counts[4] == 1_441_792  # J5: 131072 counts/rev * 11 gear ratio
+    assert expected_period_counts[4] == 1_191_564  # J5: round(131072 counts/rev * exact 100:11 gear ratio)
 
     for axis_i, expected_period in enumerate(expected_period_counts):
         counts_per_unit = float(backend._axis_config.counts_per_unit[axis_i])
@@ -5652,6 +5742,153 @@ def test_ethercat_backend_execute_joint_trajectory_uses_quantized_timing_for_j5_
         "step_ns": 4_000_000,
         "cycles_per_point": 4,
     }
+
+
+def _rtcore_execution_status_for_final_point_test(
+    *,
+    state: int = RTCORE_EXEC_STATE_EXECUTING,
+    state_name: str = "executing",
+    active_traj_id: int = 77,
+    current_point_index: int | None = 0,
+    queue_depth: int = 1,
+    motion_done: bool = False,
+    active_command_seq: int = 123,
+) -> RTCoreExecutionStatus:
+    return RTCoreExecutionStatus(
+        active_mode=2,
+        active_mode_name="trajectory",
+        state=state,
+        state_name=state_name,
+        active_traj_id=active_traj_id,
+        current_point_index=current_point_index,
+        queue_depth=queue_depth,
+        queue_capacity=4096,
+        last_event_code=0,
+        underrun_count=0,
+        stale_command=False,
+        motion_done=motion_done,
+        capability_flags=0,
+        active_command_seq=active_command_seq,
+        last_update_ns=456,
+    )
+
+
+def test_wait_for_trajectory_final_point_sent_does_not_return_on_acceptance_only(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    statuses = iter(
+        [
+            _rtcore_execution_status_for_final_point_test(current_point_index=0, queue_depth=2),
+            _rtcore_execution_status_for_final_point_test(current_point_index=1, queue_depth=1),
+            _rtcore_execution_status_for_final_point_test(
+                state=RTCORE_EXEC_STATE_COMPLETED,
+                state_name="completed",
+                current_point_index=2,
+                queue_depth=0,
+                motion_done=True,
+            ),
+        ]
+    )
+    monkeypatch.setattr(backend, "get_execution_status", lambda: next(statuses))
+    monkeypatch.setattr(rtcore_backend_module.time, "sleep", lambda _seconds: None)
+
+    result = backend.wait_for_trajectory_final_point_sent(
+        77,
+        expected_points=3,
+        timeout_s=1.0,
+        submitted_command_seq=123,
+    )
+
+    assert result.state_name == "completed"
+
+
+def test_wait_for_trajectory_final_point_sent_returns_when_queue_depth_zero(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    status = _rtcore_execution_status_for_final_point_test(
+        current_point_index=1,
+        queue_depth=0,
+        motion_done=False,
+    )
+    monkeypatch.setattr(backend, "get_execution_status", lambda: status)
+
+    result = backend.wait_for_trajectory_final_point_sent(
+        77,
+        expected_points=3,
+        timeout_s=1.0,
+        submitted_command_seq=123,
+    )
+
+    assert result is status
+    assert result.motion_done is False
+
+
+def test_wait_for_trajectory_final_point_sent_ignores_zero_queue_before_point_observed(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    statuses = iter(
+        [
+            _rtcore_execution_status_for_final_point_test(
+                current_point_index=None,
+                queue_depth=0,
+                motion_done=False,
+            ),
+            _rtcore_execution_status_for_final_point_test(
+                current_point_index=2,
+                queue_depth=0,
+                motion_done=False,
+            ),
+        ]
+    )
+    monkeypatch.setattr(backend, "get_execution_status", lambda: next(statuses))
+    monkeypatch.setattr(rtcore_backend_module.time, "sleep", lambda _seconds: None)
+
+    result = backend.wait_for_trajectory_final_point_sent(
+        77,
+        expected_points=3,
+        timeout_s=1.0,
+        submitted_command_seq=123,
+    )
+
+    assert result.current_point_index == 2
+
+
+def test_wait_for_trajectory_final_point_sent_rejects_superseded_command_before_final_point(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    statuses = iter(
+        [
+            _rtcore_execution_status_for_final_point_test(
+                current_point_index=0,
+                queue_depth=2,
+                active_command_seq=123,
+            ),
+            _rtcore_execution_status_for_final_point_test(
+                active_traj_id=88,
+                current_point_index=0,
+                queue_depth=2,
+                active_command_seq=124,
+            ),
+        ]
+    )
+    monkeypatch.setattr(backend, "get_execution_status", lambda: next(statuses))
+    monkeypatch.setattr(rtcore_backend_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="superseded before final point"):
+        backend.wait_for_trajectory_final_point_sent(
+            77,
+            expected_points=3,
+            timeout_s=1.0,
+            submitted_command_seq=123,
+        )
 
 
 def test_ethercat_backend_cmd_ring_write_waits_for_space():

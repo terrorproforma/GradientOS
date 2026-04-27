@@ -94,6 +94,14 @@ _CANONICAL_TRUTH_MONITOR_STATE: dict[str, object] = {
     "joints": (),
     "read_source": None,
 }
+_CANONICAL_TRUTH_ADVISORY_DEBOUNCE_SAMPLES = 3
+_CANONICAL_TRUTH_ADVISORY_REASONS = {
+    "canonical_truth_unavailable",
+}
+_CANONICAL_TRUTH_ADVISORY_PENDING: dict[str, object] = {
+    "state": None,
+    "count": 0,
+}
 
 # Phase 4 (2026-04-20): collision watchdog lifecycle. The singleton
 # handle lets the controller start the watchdog whenever the live
@@ -475,6 +483,23 @@ def _send_controller_error_payload(
 def _send_motion_status(sock: socket.socket, addr, payload: dict[str, object]) -> None:
     message = f"MOTION_STATUS,{_encode_controller_payload_b64(payload)}"
     sock.sendto(message.encode("utf-8"), addr)
+
+
+def _apply_joint_delta_error_code(exc: Exception) -> str:
+    text = str(exc)
+    if text.startswith("DRIVE_NOT_OP_ENABLED:"):
+        return "DRIVE_NOT_OP_ENABLED"
+    if text.startswith("DRIVE_FAULTED:"):
+        return "DRIVE_FAULTED"
+    if text.startswith("MOTION_STOP_LATCHED:"):
+        return "MOTION_STOP_LATCHED"
+    if text.startswith("CANONICAL_JOINT_TRUTH_UNAVAILABLE:"):
+        return "CANONICAL_JOINT_TRUTH_UNAVAILABLE"
+    if "another task is running" in text:
+        return "MOTION_ACTIVE"
+    if isinstance(exc, (TypeError, ValueError)):
+        return "BAD_ARGS"
+    return "APPLY_JOINT_DELTA_FAILED"
 
 
 def _sync_backend_raw_positions(backend: object | None) -> dict[int, int] | None:
@@ -1299,6 +1324,32 @@ def _emit_canonical_truth_monitor_transition(snapshot: dict[str, object]) -> Non
         "read_source": read_source,
     }
     with _CANONICAL_TRUTH_MONITOR_LOCK:
+        if available:
+            _CANONICAL_TRUTH_ADVISORY_PENDING["state"] = None
+            _CANONICAL_TRUTH_ADVISORY_PENDING["count"] = 0
+        else:
+            jog_active = False
+            try:
+                jog_snapshot = command_api.handle_get_jog_session_state()
+                jog_active = bool(jog_snapshot.get("session_active", False))
+            except Exception:
+                jog_active = False
+            advisory = jog_active and reason in _CANONICAL_TRUTH_ADVISORY_REASONS
+            if advisory:
+                pending_state = _CANONICAL_TRUTH_ADVISORY_PENDING.get("state")
+                pending_count = int(_CANONICAL_TRUTH_ADVISORY_PENDING.get("count", 0) or 0)
+                if pending_state == next_state:
+                    pending_count += 1
+                else:
+                    pending_state = dict(next_state)
+                    pending_count = 1
+                _CANONICAL_TRUTH_ADVISORY_PENDING["state"] = pending_state
+                _CANONICAL_TRUTH_ADVISORY_PENDING["count"] = pending_count
+                if pending_count < _CANONICAL_TRUTH_ADVISORY_DEBOUNCE_SAMPLES:
+                    return
+            else:
+                _CANONICAL_TRUTH_ADVISORY_PENDING["state"] = None
+                _CANONICAL_TRUTH_ADVISORY_PENDING["count"] = 0
         if next_state == _CANONICAL_TRUTH_MONITOR_STATE:
             return
         _CANONICAL_TRUTH_MONITOR_STATE.update(next_state)
@@ -1897,22 +1948,40 @@ Examples:
             last_extra_ts = 0.0  # throttle extended servo telemetry to ~2 Hz
             last_motion_status_ts = 0.0
             cached_motion_status: dict[str, object] | None = None
+            last_good_joint_rad: list[float] | None = None
+            last_good_joint_ts = 0.0
             
             while not telemetry_stop_event.is_set():
                 try:
                     joint_feedback_available = True
+                    joint_feedback_stale = False
                     joint_feedback_error = None
                     try:
                         q = servo_driver.get_current_arm_state_rad(verbose=False)
+                        if isinstance(q, list) and q:
+                            last_good_joint_rad = [float(value) for value in q]
+                            last_good_joint_ts = time.time()
                     except Exception as exc:
                         q = None
                         joint_feedback_available = False
+                        joint_feedback_stale = True
                         joint_feedback_error = str(exc)
+                        if (
+                            last_good_joint_rad is not None
+                            and (time.time() - last_good_joint_ts) <= 2.0
+                        ):
+                            q = list(last_good_joint_rad)
                     g = utils.current_gripper_angle_rad if utils.gripper_present else None
                     msg: dict[str, object] = {
                         "t": time.time(),
                         "joint_feedback_available": joint_feedback_available,
+                        "joint_feedback_stale": joint_feedback_stale,
                     }
+                    if joint_feedback_stale and last_good_joint_rad is not None:
+                        msg["joint_feedback_stale_age_s"] = max(
+                            0.0,
+                            time.time() - last_good_joint_ts,
+                        )
                     if joint_feedback_error:
                         msg["joint_feedback_error"] = joint_feedback_error
                     correlation_id = utils.trajectory_state_get("last_correlation_id")
@@ -2285,6 +2354,14 @@ Examples:
 
                         backend = backend_registry.get_active_backend()
                         if backend and hasattr(backend, "native_home_joint"):
+                            utils.trajectory_state_set(
+                                "last_bounded_endpoint",
+                                {
+                                    "cleared": True,
+                                    "reason": "native_home_joint",
+                                    "cleared_at_monotonic": time.monotonic(),
+                                },
+                            )
                             result = backend.native_home_joint(logical_joint_index)
                             if isinstance(result, dict):
                                 prefix = "ACK" if bool(result.get("accepted", False)) else "ERROR"
@@ -2715,6 +2792,37 @@ Examples:
                         except Exception:
                             pass
                         sock.sendto(f"ERROR,WAIT_FOR_IDLE,{msg}".encode("utf-8"), addr)
+
+                elif command == "APPLY_JOINT_DELTA":
+                    try:
+                        payload_b64 = parts[1].strip() if len(parts) > 1 else ""
+                        if not payload_b64:
+                            raise ValueError("Missing base64 payload")
+                        payload_json = base64.urlsafe_b64decode(payload_b64.encode("ascii")).decode("utf-8")
+                        payload = json.loads(payload_json)
+                        if not isinstance(payload, dict):
+                            raise ValueError("Payload must be an object")
+                        joint = int(payload.get("joint"))
+                        delta_deg = float(payload.get("delta_deg"))
+                        max_motor_rpm = float(payload.get("max_motor_rpm", 100.0))
+                        wait_for_idle = bool(payload.get("wait_for_idle", False))
+                        result = command_api.handle_apply_joint_delta(
+                            joint=joint,
+                            delta_deg=delta_deg,
+                            max_motor_rpm=max_motor_rpm,
+                            wait_for_idle=wait_for_idle,
+                        )
+                        _send_controller_ack(sock, addr, "APPLY_JOINT_DELTA", result)
+                    except Exception as e:
+                        print(f"[Controller] APPLY_JOINT_DELTA rejected: {e}")
+                        traceback.print_exc()
+                        _send_controller_error_payload(
+                            sock,
+                            addr,
+                            "APPLY_JOINT_DELTA",
+                            _apply_joint_delta_error_code(e),
+                            str(e),
+                        )
 
                 elif command == "SAFE_POWER_DOWN":
                     wait_for_idle = False

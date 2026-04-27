@@ -72,6 +72,13 @@ import {
   type ProgramTimelineLane,
 } from "./components/ProgramTimeline";
 import { LiveStateProvider, LIVE_MONITOR_STALE_MS } from "./liveState";
+import {
+  getVisualizerLagSnapshot,
+  recordVisualizerLagDropped,
+  recordVisualizerLagPushed,
+  recordVisualizerLagReceived,
+  type VisualizerLagSnapshot,
+} from "./visualizerLagTelemetry";
 
 type Alert = {
   level: "error" | "warning" | "info";
@@ -241,6 +248,10 @@ type TelemetryEvent = {
   raw: string;
   joints?: number[];
   display_joints?: number[];
+  joint_feedback_available?: boolean;
+  joint_feedback_stale?: boolean;
+  joint_feedback_stale_age_s?: number;
+  joint_feedback_error?: string;
   gripper?: number;
   servos?: Record<string, ServoSample>;
   alerts?: Alert[];
@@ -250,6 +261,17 @@ type TelemetryEvent = {
   comms?: Record<string, unknown>;
   motion_status?: MotionStatusResponse | null;
 };
+
+function finiteNumberFromUnknown(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
 
 type MotionExecutionPayload = {
   controller_motion_state?: string;
@@ -371,6 +393,14 @@ async function readApiErrorResponse(response: Response): Promise<PlannerFailureS
 }
 
 const LIVE_JOINT_FALLBACK_MAX_AGE_S = LIVE_MONITOR_STALE_MS / 1000;
+// Per-packet React state churn budget. The 3D stage no longer reads telemetry
+// through React state — it gets every accepted sample directly via
+// `visualizerRef.current.pushLiveJointSample(...)`. So this interval only
+// gates how often `setLatest` re-renders the heavy App + ControlPanel tree
+// (panels, drive faults, motion status, etc.). 33 ms ≈ 30 Hz is fast enough
+// that text panels still feel live, slow enough that the main thread keeps
+// frame-rate budget for the WebGL render loop on the Pi.
+const REACT_TELEMETRY_MIN_INTERVAL_MS = 33;
 const TERMINAL_MOTION_STATES = new Set(["idle", "completed", "aborted", "faulted", "underrun", "timeout"]);
 const FAILED_MOTION_STATES = new Set(["aborted", "faulted", "underrun", "timeout"]);
 
@@ -2131,6 +2161,55 @@ function TelemetryPanel({ latest }: { latest: TelemetryEvent | null }) {
           No telemetry yet. Connect to the API and start streaming.
         </p>
       )}
+    </div>
+  );
+}
+
+function formatLagMs(value: number | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "--";
+  }
+  if (Math.abs(value) >= 1000) {
+    return `${(value / 1000).toFixed(2)}s`;
+  }
+  return `${Math.round(value)}ms`;
+}
+
+function VisualizerLagBadge({ snapshot }: { snapshot: VisualizerLagSnapshot }) {
+  const latest = snapshot.latest;
+  const tone =
+    latest && Math.max(
+      latest.sourceAgeMs ?? 0,
+      latest.apiToBrowserMs ?? 0,
+      latest.receiveToVisibleMs ?? 0,
+      latest.pushToVisibleMs ?? 0,
+      latest.frameIntervalMs ?? 0,
+    ) >= 500
+      ? "border-rose-400/45 bg-rose-950/70 text-rose-50"
+      : "border-cyan-400/30 bg-slate-950/75 text-cyan-50";
+  return (
+    <div className={`pointer-events-none absolute bottom-4 right-4 z-30 w-[min(19rem,calc(100%-2rem))] rounded-xl border px-2.5 py-2 text-[10px] shadow-2xl shadow-black/40 backdrop-blur ${tone}`}>
+      <div className="mb-1 flex items-center justify-between gap-3">
+        <span className="font-semibold uppercase tracking-[0.18em]">3D Lag Probe</span>
+        <span className="tabular-nums text-slate-300/85">
+          applied {snapshot.applied} / recv {snapshot.received}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 tabular-nums">
+        <span>controller age</span>
+        <span>{formatLagMs(latest?.sourceAgeMs)}</span>
+        <span>API to browser</span>
+        <span>{formatLagMs(latest?.apiToBrowserMs)}</span>
+        <span>browser to visible</span>
+        <span>{formatLagMs(latest?.receiveToVisibleMs)}</span>
+        <span>push to visible</span>
+        <span>{formatLagMs(latest?.pushToVisibleMs)}</span>
+        <span>frame interval</span>
+        <span>{formatLagMs(latest?.frameIntervalMs)}</span>
+      </div>
+      <div className="mt-1 truncate text-[10px] leading-snug text-slate-300/90">
+        {snapshot.diagnosis}
+      </div>
     </div>
   );
 }
@@ -5114,6 +5193,9 @@ export default function App() {
   const [isVisualizerEnabled, setIsVisualizerEnabled] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [latest, setLatest] = useState<TelemetryEvent | null>(null);
+  const [visualizerLagSnapshot, setVisualizerLagSnapshot] = useState<VisualizerLagSnapshot>(
+    () => getVisualizerLagSnapshot(),
+  );
   const [error, setError] = useState<string | null>(null);
   const [visionError, setVisionError] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -6640,6 +6722,8 @@ export default function App() {
   const trajectoryRefreshInFlight = useRef(false);
   const lastTelemetrySourceTimeRef = useRef<number | null>(null);
   const lastAcceptedJointsRef = useRef<number[] | null>(null);
+  const lastReactTelemetryPublishMsRef = useRef(0);
+  const hasPublishedTelemetryRef = useRef(false);
   const lastAutoWeldAnglePreviewKeyRef = useRef<string>("");
 
   const disconnect = useCallback(() => {
@@ -6679,9 +6763,13 @@ export default function App() {
     setPendingWeldProgramRestore(null);
     lastTelemetrySourceTimeRef.current = null;
     lastAcceptedJointsRef.current = null;
+    lastReactTelemetryPublishMsRef.current = 0;
+    hasPublishedTelemetryRef.current = false;
   }, [cancelTrajectoryPreviewRequest]);
 
   const handleMessage = useCallback((payload: string) => {
+    const browserReceiveWallMs = Date.now();
+    const browserReceivePerfMs = performance.now();
     let joints: number[] | undefined;
     let displayJoints: number[] | undefined;
     let gripper: number | undefined;
@@ -6691,6 +6779,8 @@ export default function App() {
     let weldActiveValue: boolean | undefined;
     let weldTypeValue: string | undefined;
     let sourceTimeSec: number | undefined;
+    let apiReceivedTimeSec: number | undefined;
+    let apiSequence: number | undefined;
     let commsValue: Record<string, unknown> | undefined;
     let motionStatusValue: MotionStatusResponse | null = null;
 
@@ -6703,6 +6793,15 @@ export default function App() {
         if (Number.isFinite(parsedTime)) {
           sourceTimeSec = parsedTime;
         }
+      }
+      const monitorTiming = parsed?.monitor_timing;
+      if (monitorTiming && typeof monitorTiming === "object") {
+        apiReceivedTimeSec = finiteNumberFromUnknown(
+          (monitorTiming as Record<string, unknown>).api_received_t,
+        );
+        apiSequence = finiteNumberFromUnknown(
+          (monitorTiming as Record<string, unknown>).api_sequence,
+        );
       }
       if (Array.isArray(parsed?.joints)) {
         joints = parsed.joints
@@ -6801,7 +6900,7 @@ export default function App() {
     }
 
     const next: TelemetryEvent = {
-      timestamp: Date.now(),
+      timestamp: browserReceiveWallMs,
       raw: payload,
       joints,
       display_joints: displayJoints,
@@ -6816,13 +6915,25 @@ export default function App() {
     };
 
     const candidateTimeSec = sourceTimeSec ?? next.timestamp / 1000;
+    const poseJoints =
+      Array.isArray(displayJoints) && displayJoints.length > 0 ? displayJoints : joints;
+    const visualizerLagId =
+      visualizerRef.current !== null && Array.isArray(poseJoints) && poseJoints.length > 0
+        ? recordVisualizerLagReceived({
+            source: "monitor",
+            sourceTimeSec,
+            apiReceivedTimeSec,
+            apiSequence,
+            browserReceiveWallMs,
+            browserReceivePerfMs,
+          })
+        : undefined;
     const lastTimeSec = lastTelemetrySourceTimeRef.current;
     if (lastTimeSec !== null && candidateTimeSec <= lastTimeSec) {
       // Drop out-of-order telemetry packets to prevent visual snap-backs.
+      recordVisualizerLagDropped(visualizerLagId);
       return;
     }
-    const poseJoints =
-      Array.isArray(displayJoints) && displayJoints.length > 0 ? displayJoints : joints;
     if (Array.isArray(poseJoints) && poseJoints.length > 0 && lastAcceptedJointsRef.current) {
       const previous = lastAcceptedJointsRef.current;
       if (previous.length === poseJoints.length) {
@@ -6838,6 +6949,7 @@ export default function App() {
         // Reject single-frame spikes (commonly stale packets) that imply impossible
         // arm motion over one telemetry interval.
         if (dtSec <= 0.25 && maxJump > 0.8) {
+          recordVisualizerLagDropped(visualizerLagId);
           return;
         }
       }
@@ -6846,17 +6958,39 @@ export default function App() {
     lastTelemetrySourceTimeRef.current = candidateTimeSec;
     if (Array.isArray(poseJoints) && poseJoints.length > 0) {
       lastAcceptedJointsRef.current = poseJoints.slice();
+      // Direct, unthrottled handoff to the 3D stage. The visualizer's
+      // requestAnimationFrame loop snaps to this target so the rendered arm
+      // tracks real-life telemetry 1:1.
+      visualizerRef.current?.pushLiveJointSample(
+        poseJoints,
+        recordVisualizerLagPushed(visualizerLagId),
+      );
     }
 
-    setLatest((prev) => {
-      const mergedDriveFaults = mergeDriveFaultSnapshots(prev?.drive_faults, next.drive_faults);
-      return {
-        ...next,
-        drive_faults: mergedDriveFaults,
-      };
-    });
-    if (motionStatusValue) {
-      setMotionStatus(motionStatusValue);
+    // The visualizer is already up to date via `pushLiveJointSample` above.
+    // What's left below is just the React state that drives panels/text/
+    // status indicators. Re-rendering that whole tree on every SSE packet
+    // saturates the main thread on the Pi and starves the WebGL render
+    // loop, which is the actual lag source the operator sees. Throttle it,
+    // but always publish when alerts arrive (operator-visible safety info).
+    const hasAlerts = Array.isArray(next.alerts) && next.alerts.length > 0;
+    const shouldPublishReactTelemetry =
+      !hasPublishedTelemetryRef.current ||
+      hasAlerts ||
+      next.timestamp - lastReactTelemetryPublishMsRef.current >= REACT_TELEMETRY_MIN_INTERVAL_MS;
+    if (shouldPublishReactTelemetry) {
+      hasPublishedTelemetryRef.current = true;
+      lastReactTelemetryPublishMsRef.current = next.timestamp;
+      setLatest((prev) => {
+        const mergedDriveFaults = mergeDriveFaultSnapshots(prev?.drive_faults, next.drive_faults);
+        return {
+          ...next,
+          drive_faults: mergedDriveFaults,
+        };
+      });
+      if (motionStatusValue) {
+        setMotionStatus(motionStatusValue);
+      }
     }
     // Merge alerts into state (keep last 20)
     if (Array.isArray(next.alerts) && next.alerts.length > 0) {
@@ -6945,6 +7079,19 @@ export default function App() {
           : undefined;
 
       lastAcceptedJointsRef.current = nextJoints.slice();
+      const browserReceiveWallMs = Date.now();
+      const visualizerLagId =
+        visualizerRef.current !== null
+          ? recordVisualizerLagReceived({
+              source: "fallback",
+              browserReceiveWallMs,
+              browserReceivePerfMs: performance.now(),
+            })
+          : undefined;
+      visualizerRef.current?.pushLiveJointSample(
+        nextJoints,
+        recordVisualizerLagPushed(visualizerLagId),
+      );
       setLatest((prev) => {
         if (
           areJointArraysClose(prev?.display_joints, nextJoints) &&
@@ -6978,6 +7125,23 @@ export default function App() {
   }, [connect, disconnect, isConnected]);
   const livePoseJoints = preferredDisplayPoseJoints(latest);
   const hasLiveJointPose = Array.isArray(livePoseJoints) && livePoseJoints.length > 0;
+  // While the monitor stream is connected, the visualizer gets every accepted
+  // sample through the imperative ref. Do not echo throttled React telemetry
+  // back through the `joints` prop, or an older sample can overwrite a newer
+  // direct one and make the stage trail real motion.
+  const visualizerPropJoints = isConnected ? undefined : livePoseJoints ?? undefined;
+
+  useEffect(() => {
+    if (!isVisualizerEnabled) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setVisualizerLagSnapshot(getVisualizerLagSnapshot());
+    }, 500);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [isVisualizerEnabled]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -9314,13 +9478,13 @@ export default function App() {
   return (
     <LiveStateProvider value={liveStateValue}>
       <div className="flex h-[100dvh] min-h-0 flex-col overflow-hidden bg-gradient-to-b from-slate-900/80 via-slate-950 to-black text-slate-100">
-      <header className={`relative shrink-0 flex flex-col border-b border-slate-800/40 bg-slate-950/60 px-6 pt-2 pb-0 shadow-inner shadow-slate-900/40 backdrop-blur ${
-        hasHeaderAlert ? "gap-1 pb-1" : "gap-0"
+      <header className={`relative shrink-0 flex flex-col border-b border-slate-800/40 bg-slate-950/60 px-4 pt-2 pb-1 shadow-inner shadow-slate-900/40 backdrop-blur sm:px-6 ${
+        hasHeaderAlert ? "gap-1" : "gap-0"
       }`}>
-        <div className={`relative flex flex-col gap-2 xl:flex-row xl:items-stretch ${
-          hasHeaderAlert ? "min-h-[3.25rem]" : "min-h-[3rem]"
+        <div className={`relative flex flex-col gap-2 xl:flex-row xl:items-center ${
+          hasHeaderAlert ? "min-h-[3.25rem]" : "min-h-[2.75rem]"
         }`}>
-          <div className="flex shrink-0 flex-col justify-center">
+          <div className="hidden shrink-0 flex-col justify-center 2xl:flex">
             <div className="flex justify-end text-lg font-semibold tracking-tight text-cyan-300 sm:text-xl w-full leading-tight">
               Control Center
             </div>
@@ -9328,19 +9492,19 @@ export default function App() {
               Gradient Robotics
             </div>
           </div>
-          <div className="flex h-full min-w-0 justify-center xl:pointer-events-none xl:absolute xl:inset-y-0 xl:left-1/2 xl:w-[min(52rem,calc(100%-28rem))] xl:-translate-x-1/2">
-            <div className="flex h-full min-w-0 items-stretch justify-center gap-2">
-              <div className="pointer-events-auto flex min-w-0 items-center gap-2 rounded-xl border border-slate-700/70 bg-slate-950/80 px-2 py-1 shadow-[0_0_24px_rgba(15,23,42,0.28)]">
-                <div className="hidden min-w-0 flex-col justify-center sm:flex">
+          <div className="flex min-w-0 flex-1 justify-start xl:justify-center">
+            <div className="flex min-w-0 flex-wrap items-center justify-center gap-2">
+              <div className="pointer-events-auto flex h-9 min-w-0 items-center gap-2 rounded-xl border border-slate-700/70 bg-slate-950/80 px-2 py-1 shadow-[0_0_24px_rgba(15,23,42,0.28)]">
+                <div className="hidden min-w-0 flex-col justify-center lg:flex">
                   <div className="text-[9px] font-semibold uppercase tracking-[0.18em] text-cyan-200/75">
-                    Runtime Mode
+                    Runtime
                   </div>
                   <div className={`text-[10px] font-semibold ${runtimeModeChangePending ? "text-amber-200" : "text-slate-200"}`}>
                     {runtimeModeChangePending
                       ? `Current ${activeRuntimeModeLabel} · desired ${desiredRuntimeModeLabel}`
                       : `${activeRuntimeModeLabel} active`}
                   </div>
-                  <div className="text-[10px] text-slate-400">
+                  <div className="hidden text-[10px] text-slate-400 2xl:block">
                     Tap LIVE or SIM to hot-switch without restarting.
                   </div>
                 </div>
@@ -9388,11 +9552,11 @@ export default function App() {
                 activeServoBackend={runtimeConfigSnapshot?.active?.servo_backend?.effective_backend ?? null}
                 onJointFeedback={handleFallbackJointFeedback}
                 onError={(message) => setError(message)}
-                className="min-w-0 h-full flex-wrap justify-center xl:pointer-events-auto xl:flex-nowrap"
+                className="h-9 min-w-0 flex-wrap justify-center xl:pointer-events-auto xl:flex-nowrap"
               />
             </div>
           </div>
-          <div className="flex items-center gap-2 xl:ml-auto">
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 xl:ml-auto">
             {apiHealthError ? (
               <span
                 className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
@@ -9600,7 +9764,7 @@ export default function App() {
                     robotId={visualizerRobotId}
                     activeTool={visualizerTool}
                     ref={visualizerRef}
-                    joints={livePoseJoints ?? undefined}
+                    joints={visualizerPropJoints}
                     showBoundingBox={showBoundingBox}
                     selectionMode={isPlanning && !isPlanLoading}
                     onPointSelected={handlePointSelected}
@@ -9630,10 +9794,11 @@ export default function App() {
                       Live joint feedback unavailable. Stage pose may be stale.
                     </div>
                   ) : null}
+                  <VisualizerLagBadge snapshot={visualizerLagSnapshot} />
                 </Suspense>
               ) : (
                 <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.12),transparent_32%),linear-gradient(180deg,rgba(2,6,23,0.88),rgba(2,6,23,1))]">
-                  <div className="pointer-events-none flex h-full items-center justify-center px-6">
+                  <div className="pointer-events-none flex h-full items-start justify-center px-6 pb-6 pt-20">
                     <div className="pointer-events-auto max-w-xl rounded-2xl border border-slate-700/70 bg-slate-950/88 p-6 shadow-2xl shadow-black/40 backdrop-blur">
                       <div className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-300/80">
                         Lightweight startup
@@ -9664,7 +9829,7 @@ export default function App() {
               {isVisionActive ? (
                 <div className="absolute inset-0 z-10 bg-[radial-gradient(circle_at_top,rgba(34,211,238,0.1),transparent_34%),linear-gradient(180deg,rgba(2,6,23,0.86),rgba(2,6,23,1))]">
                   {visionError ? (
-                    <div className="pointer-events-none flex h-full items-center justify-center px-6">
+                    <div className="pointer-events-none flex h-full items-start justify-center px-6 pb-6 pt-20">
                       <div className="pointer-events-auto max-w-xl rounded-2xl border border-slate-700/70 bg-slate-950/88 p-6 shadow-2xl shadow-black/40 backdrop-blur">
                         <div className="text-xs font-semibold uppercase tracking-[0.22em] text-cyan-300/80">
                           Vision Feed
@@ -9708,7 +9873,7 @@ export default function App() {
                   )}
                 </div>
               ) : null}
-              <div className="pointer-events-none absolute inset-x-4 top-4 z-20 flex justify-center">
+              <div className="pointer-events-none absolute inset-x-4 top-16 z-20 flex justify-center">
                 <AlertsPanel
                   alerts={alerts}
                   onDismiss={(idx) =>
@@ -9720,8 +9885,8 @@ export default function App() {
                   }
                 />
               </div>
-              <div className="pointer-events-none absolute left-4 top-4 z-20">
-                <div className="pointer-events-auto inline-flex max-w-[calc(100%-17rem)] items-center gap-1.5 border border-slate-700/70 bg-slate-950/82 px-2 py-1.5 text-xs text-slate-200">
+              <div className="pointer-events-none absolute inset-x-4 top-4 z-30 flex items-start justify-between gap-3">
+                <div className="flex min-w-0 max-w-[calc(100%-17rem)] items-center gap-1.5 rounded-2xl border border-slate-700/70 bg-slate-950/86 px-2.5 py-1.5 text-xs text-slate-200 shadow-xl shadow-black/20 backdrop-blur">
                   <div className="flex min-w-0 items-center gap-2 border-r border-slate-700/70 pr-2">
                     <span className="max-w-[10rem] truncate text-sm font-semibold tracking-tight text-slate-50">
                       {stageSurfaceHeading}
@@ -9739,28 +9904,7 @@ export default function App() {
                     </span>
                   ) : null}
                 </div>
-              </div>
-              {showTrajectoryRunPreparationOverlay ? (
-                <div className="pointer-events-none absolute inset-x-0 top-16 z-20 flex justify-center px-6">
-                  <div className="pointer-events-auto flex w-full max-w-xl items-start gap-3 rounded-2xl border border-cyan-400/35 bg-slate-950/92 px-4 py-3 text-left shadow-xl shadow-black/30 backdrop-blur">
-                    <RefreshCcw
-                      size={16}
-                      strokeWidth={2.2}
-                      className="mt-0.5 shrink-0 animate-spin text-cyan-300"
-                    />
-                    <div className="min-w-0">
-                      <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200/90">
-                        {trajectoryRunPreparationTitle}
-                      </div>
-                      <div className="mt-1 text-sm text-slate-100">
-                        {trajectoryRunPreparationMessage}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              ) : null}
-              <div className="pointer-events-none absolute right-4 top-4 z-20">
-                <div className="pointer-events-auto inline-flex items-center gap-1 rounded-2xl border border-slate-700/70 bg-slate-950/82 p-1.5 shadow-xl shadow-black/20 backdrop-blur">
+                <div className="pointer-events-auto inline-flex shrink-0 items-center gap-1 rounded-2xl border border-slate-700/70 bg-slate-950/86 p-1.5 shadow-xl shadow-black/20 backdrop-blur">
                   <button
                     type="button"
                     onClick={showStage3d}
@@ -9785,11 +9929,32 @@ export default function App() {
                   </button>
                 </div>
               </div>
-              <div className="pointer-events-none absolute bottom-4 left-4 z-20">
-                <div className="pointer-events-auto rounded-2xl border border-slate-700/70 bg-slate-950/82 px-4 py-3 text-sm text-slate-300 shadow-xl shadow-black/20 backdrop-blur">
-                  <span>{stageGuidance}</span>
+              {showTrajectoryRunPreparationOverlay ? (
+                <div className="pointer-events-none absolute inset-x-0 top-16 z-20 flex justify-center px-6">
+                  <div className="pointer-events-auto flex w-full max-w-xl items-start gap-3 rounded-2xl border border-cyan-400/35 bg-slate-950/92 px-4 py-3 text-left shadow-xl shadow-black/30 backdrop-blur">
+                    <RefreshCcw
+                      size={16}
+                      strokeWidth={2.2}
+                      className="mt-0.5 shrink-0 animate-spin text-cyan-300"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyan-200/90">
+                        {trajectoryRunPreparationTitle}
+                      </div>
+                      <div className="mt-1 text-sm text-slate-100">
+                        {trajectoryRunPreparationMessage}
+                      </div>
+                    </div>
+                  </div>
                 </div>
-              </div>
+              ) : null}
+              {isVisualizerEnabled || isVisionActive ? (
+                <div className="pointer-events-none absolute bottom-4 left-4 z-20 max-w-[calc(100%-22rem)]">
+                  <div className="rounded-2xl border border-slate-700/70 bg-slate-950/82 px-4 py-3 text-sm text-slate-300 shadow-xl shadow-black/20 backdrop-blur">
+                    <span>{stageGuidance}</span>
+                  </div>
+                </div>
+              ) : null}
               </section>
           </div>
           <div className="col-start-1 row-start-2 min-h-0">

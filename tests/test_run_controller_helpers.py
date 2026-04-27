@@ -100,6 +100,68 @@ def test_build_monitor_motion_status_payload_fails_closed(monkeypatch):
     assert run_controller._build_monitor_motion_status_payload() is None
 
 
+def _reset_canonical_truth_monitor_state() -> None:
+    with run_controller._CANONICAL_TRUTH_MONITOR_LOCK:
+        run_controller._CANONICAL_TRUTH_MONITOR_STATE.update(
+            {
+                "available": None,
+                "reason": None,
+                "axes": (),
+                "joints": (),
+                "read_source": None,
+            }
+        )
+        run_controller._CANONICAL_TRUTH_ADVISORY_PENDING.update(
+            {
+                "state": None,
+                "count": 0,
+            }
+        )
+
+
+def test_canonical_truth_monitor_debounces_advisory_unavailable_during_jog(monkeypatch, capsys):
+    _reset_canonical_truth_monitor_state()
+    monkeypatch.setattr(
+        run_controller.command_api,
+        "handle_get_jog_session_state",
+        lambda: {"session_active": True},
+    )
+    snapshot = {
+        "canonical_joint_truth_available": False,
+        "canonical_joint_truth_reason": "canonical_truth_unavailable",
+        "canonical_joint_truth_unavailable_axes": [0],
+        "canonical_joint_truth_unavailable_joints": [1],
+        "read_source": "unavailable",
+    }
+
+    run_controller._emit_canonical_truth_monitor_transition(snapshot)
+    run_controller._emit_canonical_truth_monitor_transition(snapshot)
+    assert capsys.readouterr().out == ""
+
+    run_controller._emit_canonical_truth_monitor_transition(snapshot)
+    assert "Canonical joint truth monitor: UNAVAILABLE" in capsys.readouterr().out
+
+
+def test_canonical_truth_monitor_does_not_debounce_hard_unavailable_reason(monkeypatch, capsys):
+    _reset_canonical_truth_monitor_state()
+    monkeypatch.setattr(
+        run_controller.command_api,
+        "handle_get_jog_session_state",
+        lambda: {"session_active": True},
+    )
+    snapshot = {
+        "canonical_joint_truth_available": False,
+        "canonical_joint_truth_reason": "absolute_home_anchor_missing",
+        "canonical_joint_truth_unavailable_axes": [0],
+        "canonical_joint_truth_unavailable_joints": [1],
+        "read_source": "unavailable",
+    }
+
+    run_controller._emit_canonical_truth_monitor_transition(snapshot)
+
+    assert "reason=absolute_home_anchor_missing" in capsys.readouterr().out
+
+
 def test_attach_monitor_joint_feedback_uses_display_snapshot_when_available():
     msg: dict[str, object] = {}
 

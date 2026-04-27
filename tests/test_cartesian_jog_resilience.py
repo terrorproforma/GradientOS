@@ -100,8 +100,7 @@ def test_record_jog_truth_flicker_throttles_log_emission(monkeypatch: pytest.Mon
     log_text = stderr_buffer.getvalue()
     log_lines = [line for line in log_text.splitlines() if line.strip()]
     assert len(log_lines) == 1, f"Expected exactly one throttled log line, got: {log_lines!r}"
-    assert "truth flicker" in log_lines[0]
-    assert "using cached feedback" in log_lines[0]
+    assert "control feedback miss" in log_lines[0]
 
 
 def test_record_jog_truth_flicker_re_emits_log_after_throttle_window(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -168,6 +167,15 @@ def test_new_jog_perf_state_includes_truth_flicker_defaults() -> None:
     assert state["truth_flicker_last_reason"] == ""
     assert state["truth_flicker_last_wall_s"] == 0.0
     assert state["truth_flicker_last_log_wall_s"] == 0.0
+
+
+def test_slew_limited_vector_caps_per_tick_delta() -> None:
+    current = command_api.np.array([0.0, 0.02, -0.02])
+    target = command_api.np.array([0.05, -0.05, -0.021])
+
+    result = command_api._slew_limited_vector(current, target, 0.01)
+
+    assert result.tolist() == pytest.approx([0.01, 0.01, -0.021])
 
 
 def test_record_jog_truth_flicker_is_thread_safe() -> None:
@@ -304,7 +312,7 @@ def test_handle_jog_session_start_refuses_when_strict_truth_fails(
         command_api.handle_jog_session_start(
             {"owner_id": "test-ui", "seq": 0, "deadman": True}
         )
-    assert excinfo.value.code == "CANONICAL_JOINT_TRUTH_UNAVAILABLE"
+    assert excinfo.value.code == "CONTROL_FEEDBACK_UNAVAILABLE"
     assert "Canonical joint truth unavailable" in str(excinfo.value)
 
 
@@ -529,7 +537,7 @@ def test_jog_thread_source_contains_session_inactive_race_guard() -> None:
 
 
 def test_try_except_is_present_at_jog_loop_call_sites() -> None:
-    """Source-level guard: the three ``get_current_arm_state_rad`` call
+    """Source-level guard: the three ``get_control_arm_state_rad`` call
     sites inside ``_jog_controller_thread`` must be wrapped in
     try/except RuntimeError. If someone ever rewrites that thread and
     drops the wrap, this regression fires before a latent halt hits
@@ -538,13 +546,13 @@ def test_try_except_is_present_at_jog_loop_call_sites() -> None:
 
     source = inspect.getsource(command_api._jog_controller_thread)
 
-    # Every get_current_arm_state_rad call in this function should be
+    # Every get_control_arm_state_rad call in this function should be
     # preceded by a `try:` and followed by an `except RuntimeError`
     # calling _record_jog_truth_flicker. Exact structural regex keeps
     # the test cheap.
-    call_count = source.count("servo_driver.get_current_arm_state_rad(verbose=False)")
+    call_count = source.count("servo_driver.get_control_arm_state_rad(verbose=False)")
     assert call_count >= 3, (
-        f"Expected at least 3 get_current_arm_state_rad call sites in "
+        f"Expected at least 3 get_control_arm_state_rad call sites in "
         f"_jog_controller_thread, found {call_count}"
     )
     wrap_count = source.count("_record_jog_truth_flicker")
@@ -552,3 +560,103 @@ def test_try_except_is_present_at_jog_loop_call_sites() -> None:
         f"Expected at least 3 _record_jog_truth_flicker invocations to "
         f"match the call sites, found {wrap_count}"
     )
+
+
+def test_ui_release_sends_zero_velocity_before_rtcore_jog_stop(monkeypatch: pytest.MonkeyPatch, _fresh_jog_session: None) -> None:
+    updates: list[tuple[list[float], float]] = []
+    stops: list[bool] = []
+    sleeps: list[float] = []
+
+    class FakeBackend:
+        def update_joint_velocity_lease_jog(self, velocities, timeout_s):
+            updates.append((list(velocities), float(timeout_s)))
+
+        def stop_joint_velocity_lease_jog(self, *, quick_stop=False):
+            stops.append(bool(quick_stop))
+
+    session = command_api._JOG_SESSION_MANAGER.start_session(
+        owner_id="test-ui",
+        seq=0,
+        lease_timeout_s=0.4,
+        deadman=True,
+        velocity_vector=[0.05, 0.0, 0.0, 0.0, 0.0, 0.0],
+        backend_mode="joint_velocity_lease",
+        backend_timeout_s=0.2,
+    )
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: FakeBackend())
+    monkeypatch.setattr(command_api, "_sync_jog_trajectory_state", lambda *args, **kwargs: None)
+    monkeypatch.setattr(command_api, "_wait_for_jog_thread_stop", lambda *args, **kwargs: None)
+    monkeypatch.setattr(command_api.time, "sleep", lambda seconds: sleeps.append(float(seconds)))
+    monkeypatch.setattr(command_api, "JOG_UI_RELEASE_ZERO_SETTLE_S", 0.06)
+
+    command_api.handle_jog_session_stop({
+        "session_id": session["session_id"],
+        "owner_id": "test-ui",
+        "reason": "ui-release",
+    })
+
+    assert updates == [([0.0] * 6, pytest.approx(0.2))]
+    assert sleeps == [pytest.approx(0.06)]
+    assert stops == [False]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("lease-expired-before-loop", False),
+        ("lease-expired-before-send", False),
+        ("motion-resume-lease-expired", False),
+        ("SESSION_EXPIRED", False),
+        ("session-stop:controller-stop", True),
+        ("session-stop:controller-shutdown", True),
+        ("fk-failed", True),
+    ],
+)
+def test_jog_quick_stop_policy_keeps_session_lease_expiry_soft(reason: str, expected: bool) -> None:
+    assert command_api._jog_stop_reason_requests_quick_stop(reason) is expected
+
+
+def test_lease_expiry_backend_stop_is_soft_not_ds402_quick_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    _fresh_jog_session: None,
+) -> None:
+    stops: list[bool] = []
+
+    class FakeBackend:
+        def stop_joint_velocity_lease_jog(self, *, quick_stop=False):
+            stops.append(bool(quick_stop))
+
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: FakeBackend())
+
+    command_api._stop_rtcore_jog_backend_best_effort("lease-expired-before-loop")
+
+    assert stops == [False]
+
+
+def test_controller_stop_backend_stop_still_requests_quick_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    _fresh_jog_session: None,
+) -> None:
+    stops: list[bool] = []
+
+    class FakeBackend:
+        def stop_joint_velocity_lease_jog(self, *, quick_stop=False):
+            stops.append(bool(quick_stop))
+
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: FakeBackend())
+
+    command_api._stop_rtcore_jog_backend_best_effort("session-stop:controller-stop")
+
+    assert stops == [True]
+
+
+def test_jog_thread_holds_zero_when_control_feedback_unavailable() -> None:
+    """A missed control-feedback tick must hold the RTCore lease instead of
+    integrating a Cartesian target from stale q_current."""
+    import inspect
+
+    source = inspect.getsource(command_api._jog_controller_thread)
+
+    assert "pending_resync_reason = \"control-feedback-unavailable\"" in source
+    assert "[0.0] * int(commanded_joints_for_hold.size)" in source
+    assert "continue" in source[source.index("pending_resync_reason = \"control-feedback-unavailable\"") :]
