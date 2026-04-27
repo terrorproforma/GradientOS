@@ -24,11 +24,13 @@
 # ```
 
 from .base import RobotConfig
+from .fr10 import FR10Config
 from .gradient0 import Gradient0Config
 
 # Registry of available robot configurations
 _ROBOT_REGISTRY: dict[str, type[RobotConfig]] = {
     'gradient0': Gradient0Config,
+    'fr10': FR10Config,
 }
 
 
@@ -78,6 +80,7 @@ def register_robot(name: str, config_class: type[RobotConfig]) -> None:
 __all__ = [
     'RobotConfig',
     'Gradient0Config',
+    'FR10Config',
     'get_robot_config',
     'list_available_robots',
     'register_robot',

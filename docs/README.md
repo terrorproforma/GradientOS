@@ -142,11 +142,47 @@ If scripts are not on PATH, run through modules:
 ## Project Layout
 
 - `src/gradient_os/arm_controller/` - controller runtime and command handlers
+- `src/gradient_os/arm_controller/backends/` - actuator backends (`feetech`, `ethercat_rtcore`, `fairino`, `simulation`)
+- `src/gradient_os/arm_controller/robots/` - robot configs (`gradient0`, `fr10`)
 - `src/gradient_os/api/` - HTTP/SSE API
 - `src/gradient_os/cad/` - topology extraction and STEP-driven planning helpers
 - `src/gradient_os/vision/` - vision pipeline
 - `web-ui/` - React operator interface
 - `docs/` - subsystem docs and references
+
+## Supported Robots
+
+Pick a robot at startup with `--robot <name>`. Each robot config picks its own
+default backend, so `--robot fr10` just works.
+
+| Robot | Backend | What it talks to |
+|---|---|---|
+| `gradient0` | `feetech` | Feetech serial-bus servos over USB |
+| `gradient0` | `ethercat_rtcore` | `gradient-rt-motion` daemon (PREEMPT_RT) |
+| `fr10` | `fairino` | Fairino FR10 controller at `192.168.58.2` (network client) |
+| (any) | `simulation` | In-memory mock |
+
+### Fairino FR10 (Milestone 1: read-only)
+
+The FR10 backend is a **network client** — the FR10 owns its own real-time
+loop, calibration, and PID. GradientOS is just a planner and UI on top.
+
+- Set `END_EFFECTOR_OFFSET` to identity in `src/gradient_os/ik_solver.py`
+  before starting Fairino. The FR10 owns the tool transform via
+  `toolcoord1`; doubling up causes a fixture crash. The backend refuses to
+  start otherwise.
+- Install the SDK extra: `uv pip install -e '.[fairino]'`.
+- Walk the three `TODO(SDK):` markers in
+  `arm_controller/backends/fairino/rpc_client.py` against the installed
+  Fairino wheel.
+- Bring-up runbook lives in the `Fairino-FR10` repo at
+  `Docs/runbooks/milestone_1_readonly_bringup.md`.
+
+Env overrides for the Fairino backend (all optional):
+`GRADIENT_FAIRINO_IP`, `GRADIENT_FAIRINO_RPC_PORT`,
+`GRADIENT_FAIRINO_STATE_PORT`, `GRADIENT_FAIRINO_POLL_HZ`,
+`GRADIENT_FAIRINO_CONNECT_TIMEOUT_S`,
+`GRADIENT_FAIRINO_STALE_SNAPSHOT_S`.
 - `tests/` - automated tests
 
 ## Documentation Map

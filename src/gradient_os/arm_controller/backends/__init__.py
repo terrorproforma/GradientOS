@@ -35,6 +35,7 @@ from . import registry
 # Import backend classes
 from .feetech import FeetechBackend
 from .ethercat_rtcore import EthercatRTCoreBackend
+from .fairino import FairinoBackend
 from .simulation import SimulationBackend
 
 # =============================================================================
@@ -79,6 +80,18 @@ def _create_simulation_backend(robot_config: dict, **kwargs) -> SimulationBacken
         robot_config=robot_config,  # Pass full config for servo ID mapping
     )
 
+def _create_fairino_backend(robot_config: dict, **kwargs) -> FairinoBackend:
+    """
+    Factory for FairinoBackend (network client targeting an FR10 controller).
+
+    The FR10 owns its own real-time loop, calibration, and PID, so the bulk
+    of `robot_config` is unused here — only `num_logical_joints` is checked.
+    All network endpoints come from FairinoBackendConfig.from_env() (see
+    backends/fairino/config.py for the list of GRADIENT_FAIRINO_* env vars).
+    """
+    return FairinoBackend(robot_config=robot_config)
+
+
 def _create_ethercat_rtcore_backend(robot_config: dict, **kwargs) -> EthercatRTCoreBackend:
     """
     Factory for EthercatRTCoreBackend (RTCore proxy).
@@ -119,4 +132,11 @@ registry.register_backend_class(
     config_module_path="gradient_os.arm_controller.backends.ethercat_rtcore.config",
 )
 
-__all__ = ['FeetechBackend', 'SimulationBackend', 'EthercatRTCoreBackend', 'registry']
+# Fairino FR-series network client (FR10)
+registry.register_backend_class(
+    name="fairino",
+    factory=_create_fairino_backend,
+    config_module_path="gradient_os.arm_controller.backends.fairino.config",
+)
+
+__all__ = ['FeetechBackend', 'SimulationBackend', 'EthercatRTCoreBackend', 'FairinoBackend', 'registry']

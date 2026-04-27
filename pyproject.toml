@@ -66,6 +66,13 @@ vision = [
 picamera = [
     "picamera2==0.3.30 ; platform_system == \"Linux\"",
 ]
+fairino = [
+    # Fairino FR-series Python SDK. Pin pending verification of the exact PyPI
+    # package name and version once the SDK is installed locally — see
+    # src/gradient_os/arm_controller/backends/fairino/rpc_client.py for the
+    # quarantined call sites.
+    "fairino",
+]
 ai = [
     "ultralytics",
     "torch",
