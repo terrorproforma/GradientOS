@@ -74,6 +74,11 @@ PYBIND11_MODULE(pyquik, m) {
             self.FK(q, T);
             Eigen::Matrix4d tool = T.bottomRows<4>();
             return tool; // Copy returned to Python
+        }, py::arg("q"))
+        .def("jacobian", [](const RobotDyn& self, const Eigen::VectorXd& q) {
+            Eigen::Matrix<double, 6, Eigen::Dynamic> J(6, self.dof);
+            self.jacobian(q, J);
+            return J; // Copy returned to Python
         }, py::arg("q"));
 
     py::enum_<quik::ALGORITHM_t>(m, "Algorithm")

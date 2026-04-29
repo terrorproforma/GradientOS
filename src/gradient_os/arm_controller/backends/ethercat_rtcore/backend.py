@@ -71,6 +71,10 @@ _GRADIENT_MAX_AXES = 16
 # fresh sample, and long enough that routine feedback cycles do not
 # hammer the disk.
 _LAST_SEEN_PERSIST_INTERVAL_S = 5.0
+_ALLOW_STARTUP_ANCHOR_BOOTSTRAP = os.environ.get(
+    "GRADIENT_ALLOW_STARTUP_ANCHOR_BOOTSTRAP",
+    "0",
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # Phase 3 (2026-04-20): freshness window for the atomic PDO multi-turn
 # branch of _absolute_axis_q_from_metrics. Samples older than this (e.g.
@@ -302,6 +306,7 @@ assert _STATUS_EXTENDED_SNAPSHOT_HEADER_STRUCT.size == 16, (
 _TRAJECTORY_WAIT_SETTLE_MARGIN_S = 5.0
 _CMD_RING_WRITE_WAIT_S = 0.5
 _CMD_RING_WRITE_RETRY_S = 0.001
+_JOG_DEBUG_HOLD_REFERENCE_MAX_AGE_S = 0.25
 
 
 def _post_home_truth_reason_is_retryable(reason: object) -> bool:
@@ -700,6 +705,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         self._last_wkc_actual = 0
         self._last_master_state = 0
         self._last_status_snapshot_monotonic_s = 0.0
+        self._last_jog_debug_monotonic_s = 0.0
         self._execution_status = RTCoreExecutionStatus(
             active_mode=RTCORE_MOTION_MODE_IDLE,
             active_mode_name=rtcore_motion_mode_id_to_name(RTCORE_MOTION_MODE_IDLE) or "idle",
@@ -759,12 +765,25 @@ class EthercatRTCoreBackend(ActuatorBackend):
         try:
             ok = self._connect_ipc()
             if ok and self._absolute_home_anchor_required():
-                try:
-                    self._bootstrap_missing_absolute_home_anchors(
-                        actor="ethercat_rtcore:startup_alignment",
+                missing_anchor_joints = [
+                    joint_i + 1
+                    for joint_i in sorted({joint_i for joint_i in self._axis_to_joint if 0 <= joint_i < self._num_joints})
+                    if self._absolute_home_anchor_for_joint(joint_i) is None
+                ]
+                if missing_anchor_joints and _ALLOW_STARTUP_ANCHOR_BOOTSTRAP:
+                    try:
+                        self._bootstrap_missing_absolute_home_anchors(
+                            actor="ethercat_rtcore:startup_alignment",
+                        )
+                    except Exception as exc:
+                        print(f"[EtherCAT RTCore] WARNING: absolute-home anchor bootstrap failed: {exc}")
+                elif missing_anchor_joints:
+                    print(
+                        "[EtherCAT RTCore] Absolute-home anchors missing at startup; "
+                        "refusing automatic bootstrap. Run native home or set "
+                        "GRADIENT_ALLOW_STARTUP_ANCHOR_BOOTSTRAP=1 only for explicit commissioning. "
+                        f"joints={missing_anchor_joints}"
                     )
-                except Exception as exc:
-                    print(f"[EtherCAT RTCore] WARNING: absolute-home anchor bootstrap failed: {exc}")
             self._initialized = bool(ok)
             return bool(ok)
         except Exception as e:
@@ -1318,8 +1337,13 @@ class EthercatRTCoreBackend(ActuatorBackend):
         # explicit bound values.
         previous_axis_counts: list[int | None] = [None] * self._rt_num_axes
         initial_live_counts: list[int | None] = [None] * self._rt_num_axes
+        initial_reference_from_hold: list[bool] = [False] * self._rt_num_axes
         for axis_i in range(self._rt_num_axes):
-            initial_live_counts[axis_i] = self._live_reference_counts_for_axis(axis_i)
+            reference_counts, reference_is_hold = self._trajectory_turn_reference_for_axis(axis_i)
+            initial_live_counts[axis_i] = reference_counts
+            initial_reference_from_hold[axis_i] = bool(reference_is_hold)
+        trajectory_axis_turn_shift_counts: list[int] = [0] * self._rt_num_axes
+        trajectory_axis_turn_shift_ready: list[bool] = [False] * self._rt_num_axes
         for idx, point in enumerate(points):
             t_from_start_ns = int(point.get("t_from_start_ns", 0))
             axis_mask = int(point.get("axis_mask", (1 << self._rt_num_axes) - 1))
@@ -1339,11 +1363,19 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 raise ValueError(
                     f"Expected {self._rt_num_axes} RT axis values, got {len(axis_q)}"
                 )
+            self._align_continuous_trajectory_axis_q_to_turn_reference(
+                axis_q=axis_q,
+                axis_mask=int(axis_mask),
+                initial_reference_counts=initial_live_counts,
+                turn_shift_counts=trajectory_axis_turn_shift_counts,
+                turn_shift_ready=trajectory_axis_turn_shift_ready,
+            )
             self._enforce_trajectory_wire_frame_safety(
                 axis_q=axis_q,
                 axis_mask=int(axis_mask),
                 previous_axis_counts=previous_axis_counts,
                 initial_live_counts=initial_live_counts,
+                initial_reference_from_hold=initial_reference_from_hold,
                 point_index=int(idx),
                 traj_id=int(traj_id),
             )
@@ -4828,6 +4860,60 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 return None
             return int(self._axis_counts[axis_i])
 
+    def _live_command_hold_counts_for_axis(self, axis_i: int) -> int | None:
+        """Return RTCore's current continuous 0x607A hold target for an axis.
+
+        Continuous-command axes (A6-EC rotation mode) must align new
+        trajectories to the command frame RTCore is already holding, not
+        to sawtooth 0x6064 feedback. The hold target is published in the
+        RTCore jog-debug status ring today; despite the name, this is the
+        status payload that already carries `hold_target_counts` and
+        `have_hold_mask` at runtime.
+
+        Returns None if RTCore has not yet latched a hold target for this
+        axis, so callers can fall back to feedback for startup and
+        non-continuous cases.
+        """
+        now_s = time.monotonic()
+        with self._status_lock:
+            jog_status = self._jog_debug_status
+            if axis_i < 0 or axis_i >= int(jog_status.num_axes):
+                return None
+            if int(jog_status.sample_time_ns) <= 0:
+                return None
+            if (
+                self._last_jog_debug_monotonic_s <= 0.0
+                or (now_s - float(self._last_jog_debug_monotonic_s))
+                > _JOG_DEBUG_HOLD_REFERENCE_MAX_AGE_S
+            ):
+                return None
+            if (int(jog_status.have_hold_mask) & (1 << int(axis_i))) == 0:
+                return None
+            if axis_i >= len(jog_status.hold_target_counts):
+                return None
+            return int(jog_status.hold_target_counts[axis_i])
+
+    def _trajectory_turn_reference_for_axis(self, axis_i: int) -> tuple[int | None, bool]:
+        """Return (reference_counts, reference_is_rtcore_hold_target)."""
+        logical_joint_idx = (
+            self._axis_to_joint[axis_i] if 0 <= axis_i < len(self._axis_to_joint) else axis_i
+        )
+        if self._experimental_continuous_607a_enabled_for_joint(logical_joint_idx):
+            hold_counts = self._live_command_hold_counts_for_axis(axis_i)
+            if hold_counts is not None:
+                return int(hold_counts), True
+        return self._live_reference_counts_for_axis(axis_i), False
+
+    def _trajectory_turn_reference_counts_for_axis(self, axis_i: int) -> int | None:
+        """Reference count used to align point 0 of a new trajectory.
+
+        For continuous-command axes, prefer RTCore's continuous hold
+        target. For sawtooth-command axes, or before RTCore has latched a
+        hold target, fall back to live 0x6064 feedback.
+        """
+        reference_counts, _is_hold_target = self._trajectory_turn_reference_for_axis(axis_i)
+        return reference_counts
+
     def _native_home_offset_counts_for_axis(self, axis_i: int) -> int:
         self._refresh_native_home_offsets_from_metrics()
         with self._status_lock:
@@ -6241,6 +6327,66 @@ class EthercatRTCoreBackend(ActuatorBackend):
                 )
         return axis_q
 
+    def _align_continuous_trajectory_axis_q_to_turn_reference(
+        self,
+        *,
+        axis_q: list[float],
+        axis_mask: int,
+        initial_reference_counts: list[int | None],
+        turn_shift_counts: list[int],
+        turn_shift_ready: list[bool],
+    ) -> None:
+        """Apply one per-trajectory turn shift for continuous 607A axes.
+
+        Continuous command targets must preserve canonical deltas. Align point
+        0 to the current trajectory turn reference once, then apply the same
+        shift to every point so long moves like Home `+360 -> 0` unwind slowly
+        instead of doing a fast first-turn catch-up before the bounded profile.
+        """
+        cfg = self._axis_config
+        if cfg is None:
+            return
+        num_axes = min(int(cfg.num_axes), self._rt_num_axes, len(axis_q))
+        for axis_i in range(num_axes):
+            if axis_mask != 0 and (axis_mask & (1 << axis_i)) == 0:
+                continue
+            logical_joint_idx = (
+                self._axis_to_joint[axis_i] if 0 <= axis_i < len(self._axis_to_joint) else axis_i
+            )
+            if not self._experimental_continuous_607a_enabled_for_joint(logical_joint_idx):
+                continue
+            counts_per_unit = float(cfg.counts_per_unit[axis_i])
+            sign = int(cfg.sign[axis_i])
+            period_counts = self._reference_wrap_period_counts_for_axis(axis_i)
+            if counts_per_unit <= 0.0 or sign not in (-1, 1) or period_counts <= 0:
+                continue
+            if not turn_shift_ready[axis_i]:
+                live_counts = (
+                    initial_reference_counts[axis_i]
+                    if axis_i < len(initial_reference_counts)
+                    else None
+                )
+                if live_counts is None:
+                    turn_shift_ready[axis_i] = True
+                    turn_shift_counts[axis_i] = 0
+                else:
+                    comparison_live_counts = self._logicalized_live_reference_counts_for_axis(
+                        axis_i,
+                        logical_joint_idx=logical_joint_idx,
+                        live_reference_counts=int(live_counts),
+                    )
+                    if comparison_live_counts is None:
+                        comparison_live_counts = int(live_counts)
+                    current_counts = int(round(float(axis_q[axis_i]) * float(sign) * counts_per_unit))
+                    turn_delta_counts = current_counts - int(comparison_live_counts)
+                    turn_shift_counts[axis_i] = -int(round(turn_delta_counts / float(period_counts))) * int(period_counts)
+                    turn_shift_ready[axis_i] = True
+            shift_counts = int(turn_shift_counts[axis_i])
+            if shift_counts:
+                axis_q[axis_i] = float(axis_q[axis_i]) + (
+                    float(shift_counts) / (float(sign) * counts_per_unit)
+                )
+
     def _enforce_trajectory_wire_frame_safety(
         self,
         *,
@@ -6250,6 +6396,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
         initial_live_counts: list[int | None],
         point_index: int,
         traj_id: int,
+        initial_reference_from_hold: list[bool] | None = None,
     ) -> None:
         # Per-point wire-frame safety cage (2026-04-17 J6 incident hardening).
         #
@@ -6340,10 +6487,19 @@ class EthercatRTCoreBackend(ActuatorBackend):
                         f" linear_step_counts={linear_step}"
                         f" period_counts={int(period_counts)}"
                     )
-            # Only gate point 0 against live 6064; later points may legitimately
-            # travel far from live by the end of a long bounded move.
+            # Only gate point 0 against the upload-time turn reference; later
+            # points may legitimately travel far from that reference by the end
+            # of a long bounded move. For continuous-command axes this reference
+            # may be RTCore's continuous 0x607A hold target rather than live
+            # sawtooth 0x6064 feedback.
             if prev is None:
                 live_counts = initial_live_counts[axis_i]
+                reference_is_hold = (
+                    bool(initial_reference_from_hold[axis_i])
+                    if initial_reference_from_hold is not None
+                    and axis_i < len(initial_reference_from_hold)
+                    else False
+                )
                 max_live_deviation_counts = int(
                     round(
                         _TRAJECTORY_MAX_FIRST_POINT_DEVIATION_FROM_LIVE_RAD
@@ -6358,12 +6514,17 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     )
                     if comparison_live_counts is None:
                         comparison_live_counts = int(live_counts)
-                    # Same shortest-angular treatment as per-point step:
-                    # after wrap-to-[0, RM), point 0's `current_counts`
-                    # can be on the opposite side of the seam from
-                    # live_6064 even when the physical delta is tiny.
+                    # Feedback references use shortest-angular treatment:
+                    # after wrap-to-[0, RM), point 0's `current_counts` can be
+                    # on the opposite side of the seam from live 6064 even when
+                    # the physical delta is tiny. RTCore hold references are
+                    # already continuous-command-frame references; using
+                    # shortest-angular math there would hide the exact full-turn
+                    # first-point bug this guard is meant to catch.
                     linear_deviation = current_counts - int(comparison_live_counts)
-                    if period_counts > 0:
+                    if reference_is_hold:
+                        deviation_counts = linear_deviation
+                    elif period_counts > 0:
                         period_float = float(period_counts)
                         half_period = 0.5 * period_float
                         deviation_counts = int(round(
@@ -6559,6 +6720,7 @@ class EthercatRTCoreBackend(ActuatorBackend):
                     parsed_state = self._parse_jog_debug_state(payload)
                     with self._status_lock:
                         self._jog_debug_status = parsed_state
+                        self._last_jog_debug_monotonic_s = time.monotonic()
                 except Exception:
                     pass
 

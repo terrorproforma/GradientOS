@@ -194,6 +194,13 @@ def get_runtime_state_snapshot() -> dict[str, Any]:
         }
 
 
+def get_revision() -> int:
+    """Return the active runtime-kinematics revision for cache invalidation."""
+    with _LOCK:
+        _ensure_initialized()
+        return int(_REVISION)
+
+
 def get_runtime_matrices() -> tuple[np.ndarray, np.ndarray]:
     with _LOCK:
         _ensure_initialized()
@@ -202,6 +209,13 @@ def get_runtime_matrices() -> tuple[np.ndarray, np.ndarray]:
         tool_runtime_trim = _matrix_from_offset(_TOOL_RUNTIME_OFFSET)
         tool_matrix = tool_base_matrix.dot(tool_runtime_trim)
     return base_matrix, tool_matrix
+
+
+def runtime_offsets_are_identity() -> bool:
+    """Return True when runtime base and tool transforms are both identity."""
+    base_matrix, tool_matrix = get_runtime_matrices()
+    identity = np.eye(4, dtype=float)
+    return bool(np.allclose(base_matrix, identity) and np.allclose(tool_matrix, identity))
 
 
 def set_active_tool_definition(

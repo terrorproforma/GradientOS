@@ -2740,6 +2740,13 @@ Examples:
                     except Exception:
                         print("[Controller] Error parsing SET_JOG_DEBUG.")
 
+                elif command == "SET_JOG_AB_COMPARE":
+                    try:
+                        flag = parts[1].strip().lower() in {"true","1","yes","on"}
+                        command_api.set_jog_diagnostic_ab_compare(flag)
+                    except Exception:
+                        print("[Controller] Error parsing SET_JOG_AB_COMPARE.")
+
                 elif command == "GET_JOINT_ANGLES":
                     snapshot = _build_joint_state_snapshot()
                     arm_deg = [float(value) for value in snapshot.get("arm_deg", [])]
@@ -3333,6 +3340,7 @@ Examples:
                         speed_raw = payload.get("speed")
                         accel_raw = payload.get("acceleration")
                         max_motor_rpm_raw = payload.get("max_motor_rpm")
+                        canonical_wrap_target = bool(payload.get("canonical_wrap_target", False))
                         target_joint_indices_raw = payload.get("target_joint_indices")
                         target_joint_indices = None
                         if target_joint_indices_raw is not None:
@@ -3346,6 +3354,7 @@ Examples:
                             acceleration=float(accel_raw) if accel_raw is not None else None,
                             max_motor_rpm=float(max_motor_rpm_raw) if max_motor_rpm_raw is not None else None,
                             target_joint_indices=target_joint_indices,
+                            canonical_wrap_target=canonical_wrap_target,
                         )
                         _send_controller_ack(sock, addr, "APPLY_JOINT_SETPOINT", payload)
                     except Exception as e:

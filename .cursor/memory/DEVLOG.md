@@ -7445,3 +7445,315 @@ Native-home pathway was exercised end-to-end on J6 against the new RTCore binary
 
 - Follow-ups / risks:
   - These are mechanical ratio-derived maxima; controller jog/profile, drive thermal, payload, and safety policies may still command lower speeds.
+
+## 2026-04-27 20:12 +0000 - Hardened Jacobian Cartesian jog implementation plan
+
+- What changed:
+  - Updated `/home/pi/.cursor/plans/jacobian_cartesian_jog_2dc8dd65.plan.md` after reviewing the related transcript context.
+  - Clarified that held Cartesian jog should use Jacobian-DLS as the root fix, not RPM caps or IK-amplification rejection.
+  - Added plan requirements for active-FK/runtime-frame Jacobian compatibility, spatial finite-difference fallback, command-hold horizon timing, same-tick drift fail-closed behavior, runtime A/B compare toggling, and `jacobian_compute_ms` telemetry.
+  - Follow-up plan tightening: clarified Edit 2.2 also replaces the raw-`dt` target-pose block, added pyquik Jacobian startup/build-skew fallback, explicit `kinematics_runtime.get_revision()` cache key, temporary rollback flag guidance, FD Jacobian budget envelope, singularity advisory duplicate-control choice, and actionable `/kinematics/runtime-offsets` live validation instructions.
+
+- Validation performed:
+  - Read-only consistency checks with `rg` over the plan for stale endpoint/timing/frame wording.
+  - `ReadLints` on `/home/pi/.cursor/plans/jacobian_cartesian_jog_2dc8dd65.plan.md` -> clean.
+
+- Follow-ups / risks:
+  - Implementation is still pending. During implementation, benchmark FD Jacobian cost on the Pi and verify analytical pyquik Jacobian compatibility against the active FK backend before enabling the analytical path.
+
+## 2026-04-27 20:56 +0000 - Built Jacobian-DLS held Cartesian jog offline
+
+- What changed:
+  - `src/numeric_solver/pyquik/bindings.cpp`: added `Robot.jacobian(...)` pybind binding and rebuilt `pyquik.cpython-311-aarch64-linux-gnu.so`.
+  - `src/gradient_os/kinematics/runtime.py`: added runtime revision and identity-offset helpers for Jacobian cache invalidation.
+  - `src/gradient_os/ik_solver.py`: added Jacobian availability warmup/status, active-FK-compatible spatial Jacobian computation, analytical-vs-FD compatibility cache, and FD fallback.
+  - `src/gradient_os/arm_controller/command_api.py`: added Jacobian-DLS held-jog path with command-horizon target generation, drift watchdog hold-zero, singularity advisory, A/B compare telemetry, rollback IK path, and enriched `ik_debug`.
+  - `src/gradient_os/api/main.py` and `src/gradient_os/run_controller.py`: added runtime `SET_JOG_AB_COMPARE` toggle through existing `/control/jog/debug`.
+  - Added `scripts/cartesian_jog_diagnostic_capture.py` plus Jacobian/API/analyzer tests.
+  - Follow-up review gap closure: added tests for DLS singular damping, 2π seed invariance, no-IK Jacobian hot path, same-tick drift watchdog blocking/no command advance on drift tick, analytical mismatch fallback, and non-identity base/tool runtime-offset Jacobian consistency.
+
+- Validation performed:
+  - `cmake -B build && cmake --build build` in `src/numeric_solver/pyquik` -> pass.
+  - `source ./start.sh && python -m py_compile ...` on changed Python files and new tests -> pass.
+  - pyquik smoke: `robot.jacobian(np.zeros(6))` -> shape `(6, 6)`.
+  - Focused tests -> `11 passed` before the follow-up gap-closure tests.
+  - Expanded API/command slice -> `136 passed`.
+  - Expanded broader motion slice -> `112 passed`.
+  - `ReadLints` on touched Python/test/script files -> clean.
+  - `git diff --check` on touched files -> clean.
+
+- Follow-ups / risks:
+  - Operator-supervised live validation is still required before trusting physical behavior. Use the new capture script plus RTCore fast trace to verify no full-turn motion, classify IK-vs-seam flavor, observe singularity advisory behavior, and measure `jacobian_compute_ms` on the Pi.
+
+## 2026-04-28 00:26 +0000 - Live reproduction classified as RTCore jog command-wrap bug
+
+- What changed:
+  - Investigated operator report that J6 still physically spun after the Jacobian build.
+  - Log evidence: `logs/startups/20260427-235547/controller.log` shows J6 display jumped from `-179.26776123 deg` to `737.45288086 deg` between lines 14783-14788, after the preceding `v_yaw=-15` jog session had already stopped at line 14448.
+  - Root cause: `src/gradient_rt_motion/main.cpp` jog integration wrapped `jog_target_counts_float` with `feedback_counts_wrap`. A6 profile has `feedback_counts_wrap=True` for modulo feedback comparison and `command_counts_wrap=False` for continuous 0x607A commands, so jog targets were being folded into the wrong frame.
+  - Fixed RTCore jog integration to wrap jog targets only when `command_counts_wrap` is true.
+  - Fixed `scripts/cartesian_jog_diagnostic_capture.py` to extract jog data from `controller.jog` in `/debug/performance`; the first capture file stored `jog={}` / `ik_debug=null` because it read the wrong response level.
+  - Added analyzer test for the nested `/debug/performance` shape.
+
+- Validation performed:
+  - `make -C src/gradient_rt_motion` -> pass.
+  - `source ./start.sh && python -m pytest tests/test_cartesian_jog_diagnostic_capture.py -q` -> `5 passed`.
+  - Focused post-fix validation -> `18 passed`.
+  - `py_compile` on `scripts/cartesian_jog_diagnostic_capture.py` -> pass.
+  - `ReadLints` on touched RTCore/script/test files -> clean.
+  - `git diff --check` on touched RTCore/script/test/memory files -> clean.
+
+- Follow-ups / risks:
+  - The currently running RTCore process is still the old binary until the stack is restarted safely. Retest only after restarting via the project stack controls, then rerun the yaw/J6 reproducer with the corrected capture script.
+  - Operator correction: although the first logged display jump appeared after the UI-release/stop log, the operator was tapping yaw jog while edging toward the seam. Treat the post-stop physical/display jump as potentially caused by the immediately preceding jog target because drive motion can lag the button release.
+
+## 2026-04-28 01:22 +0000 - Home now targets canonical zero wrap for cable unwind
+
+- What changed:
+  - Investigated operator report that after rehome J6 display/canonical was still around `360 deg` while raw `6064` was near the single-turn home frame.
+  - Root cause: `/control/home` sent `[0]*6`, but bounded setpoint planning used `get_control_arm_state_rad()` as its start baseline. On EtherCAT RTCore that relaxed control path reads the raw/reference frame, so it can see J6 near `0 deg` while the operator-facing canonical/display frame is at `360 deg`; Home then becomes a nearest-wrap no-op instead of unwinding cable twist.
+  - `src/gradient_os/api/main.py`: `/control/home` now sends `canonical_wrap_target=True`.
+  - `src/gradient_os/run_controller.py`: `APPLY_JOINT_SETPOINT` forwards `canonical_wrap_target`.
+  - `src/gradient_os/arm_controller/command_api.py`: bounded setpoint planning uses strict/display `get_current_arm_state_rad()` when `canonical_wrap_target=True`, preserving the canonical full-turn delta to zero. Ordinary bounded setpoints still use relaxed control feedback.
+  - Added tests for API payload and canonical-wrap baseline selection.
+
+- Validation performed:
+  - `py_compile` on changed API/controller/command/test files -> pass.
+  - Focused tests -> `3 passed`.
+  - `source ./start.sh && python -m pytest tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py -q` -> `126 passed`.
+  - `ReadLints` on touched files -> clean.
+  - `git diff --check` on touched files -> clean.
+
+- Follow-ups / risks:
+  - This changes `/control/home` semantics intentionally: Home unwinds to canonical zero, which may command a full revolution if the canonical frame is one turn off. Keep operator supervision for first live validation.
+
+## 2026-04-28 01:43 +0000 - Aligned continuous 607A trajectories to live turn frame
+
+- What changed:
+  - Investigated operator report that Home produced a fast movement followed by slow rotation.
+  - Log evidence confirmed `/control/home` planned `current_deg[..., J6=360.005] -> target_deg[..., J6=0.0]` with `duration_s=6.000`, so API/controller speed policy was correct.
+  - Root cause: the continuous 607A trajectory's first point was one full continuous turn away from RTCore's current hold target. RTCore therefore did a fast initial catch-up before following the slow bounded path.
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`: added `_align_continuous_trajectory_axis_q_to_live_turn(...)`, which applies one per-trajectory turn shift for continuous 607A axes so point 0 aligns with live hold while every subsequent point keeps the same signed delta. Home `+360° -> 0°` now becomes a slow full-turn unwind from the current hold frame instead of a catch-up jump plus slow path.
+  - Added regression `test_a6ec_continuous_trajectory_aligns_home_unwind_to_live_turn`.
+
+- Validation performed:
+  - `make -C src/gradient_rt_motion` -> no rebuild needed after Python/backend-only change.
+  - Focused tests -> `3 passed`.
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py -q` -> `282 passed`.
+  - `py_compile` on touched Python files -> pass.
+  - `ReadLints` on touched files -> clean.
+  - `git diff --check` on touched files -> clean.
+
+- Follow-ups / risks:
+  - Restart controller/API before retesting Home; this is Python backend code. First live validation should remain operator-supervised.
+
+## 2026-04-28 05:09 +0000 - Fixed post-Home held-jog 360-degree spin (continuous-frame seed bug)
+
+- What changed:
+  - Investigated operator-reproduced bug: after Home unwinds J6 to canonical 0 deg, the next held yaw jog command produces a full 360 deg spin at max profile speed on the first jog cycle. Repeats reliably.
+  - Root cause: held-jog initialization in `src/gradient_rt_motion/main.cpp` seeded `jog_target_counts_float[i]` from `csp_wire_counts_from_feedback(latest_feedback.pos_counts[i])`. On A6-EC J6 (`feedback_counts_wrap=true`, `command_counts_wrap=false`), feedback is single-turn sawtooth while RTCore's hold target lives in continuous wire counts. After a canonical-wrap home unwind the drive's 0x607A target sits in a different motor turn from the single-turn feedback slice, so the first jog command commands a wire count one full motor turn from the drive's current target -> drive slews that whole turn at max profile speed before settling into the held-jog rate.
+  - Same bug also affected post-jog snap paths (`snap_jog_hold_to_feedback_mask` at line 3948 and `jog_stop_arrest_cycles_left[i]` at line 3954): both unconditionally snapped `hold_target_counts[i]` to single-turn feedback after a jog stops, re-creating the same one-turn step on the next commanded cycle.
+  - Added helper `nearest_turn_equivalent_to_continuous(prev, feedback, turn_period_counts)` in `main.cpp` that returns the wire-count equivalent of `feedback` whose continuous value lies closest to `prev`, preserving multi-turn while still snapping to where the encoder reports the axis to be.
+  - Held-jog init now seeds `jog_target_counts_float[i]` from `hold_target_counts[i]` for continuous-command axes (`!command_counts_wrap` and `have_hold[i]`); falls back to feedback otherwise (very first jog after start, sawtooth-command axes).
+  - Both post-jog snap paths now use `nearest_turn_equivalent_to_continuous(...)` for continuous-command axes; sawtooth-command axes keep the existing feedback snap.
+
+- Validation performed:
+  - `make -C src/gradient_rt_motion` -> pass (no warnings about new code).
+  - Installed updated binary: `sudo install -m 755 src/gradient_rt_motion/gradient-rt-motion /usr/local/bin/gradient-rt-motion`. Confirmed `md5sum` parity (`fbd9cbff23024e02d43cf6549790effe`).
+  - `./start-stack.sh stop --hard` clean (RTCore + EtherCAT master shut down without orphaning the kernel module).
+  - Python regression slice `tests/test_gradient05_limits_and_backends.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py tests/test_realtime_jog_backend_compatibility.py tests/test_cartesian_jog_resilience.py tests/test_rtcore_runtime.py` -> `340 passed, 1 failed`. The single failure (`test_realtime_jog_loop_commands_joint_space_via_servo_driver`) is pre-existing/unrelated to RTCore changes (Python-only mock test, `set_servo_positions` capture is empty; the C++ binary is not exercised by this test).
+  - `git diff src/gradient_rt_motion/main.cpp` -> `1 file changed, 80 insertions(+), 6 deletions(-)`, all comments + new helper + two `if (have_hold[i] && !opt.axis[i].command_counts_wrap)` branches.
+
+- Follow-ups / risks:
+  - Stack bring-up after the hard stop is currently blocked by physical power: `sudo ethercat master` reports `Link: DOWN, Slaves: 0`. Operator must restore arm physical power before retesting. The new RTCore binary is already installed at `/usr/local/bin/gradient-rt-motion` and will be picked up automatically by `./start-stack.sh` once power is restored.
+  - First live retest after power-up: do Home -> wait for completion -> press yaw jog. Expected: smooth jog at v_yaw rate, no fast first-cycle lurch. Then release jog -> press jog again. Expected: same smooth jog (hold-snap preservation working).
+  - Yaw button polarity issue (positive button -> -v_yaw -> +J6 motion) is still a separate UI/sign concern; this fix does not change EE Jacobian sign convention.
+
+## 2026-04-28 20:20 +0000 - Rewrote turn-frame fix plan to target IK winding without broad state bloat
+
+- What changed:
+  - Rewrote `/home/pi/.cursor/plans/turn-frame_fix_stack_d8c7e686.plan.md`.
+  - Marked RTCore jog seed/snap implementation as already landed/installed, with only live retest pending after physical power is restored.
+  - Promoted the remaining high-priority fix to a minimal controller IK turn-intent guard: normalize/retry/reject hidden continuous-joint windings from `solve_ik_path_batch(...)`, specifically covering `ROTATE,z,-15 -> +375 deg` and equivalent implicit kinematic paths.
+  - Deferred broad `csp_continuous_turn_anchor_counts` architecture unless targeted live retests prove `hold_target_counts`/trajectory alignment still lose turn state. The plan now explicitly says not to make motion policy depend on `JogDebugSnapshot`.
+  - Kept smooth-step peak speed and canonical-truth flicker as separate narrow follow-ups, not blockers for the unsafe turn-frame bug.
+
+- Validation performed:
+  - Read-only review against current source and prior devlog/scratchpad.
+  - `ReadLints` on the rewritten plan -> clean.
+
+- Follow-ups / risks:
+  - Implement PR2 next: the controller-level IK turn-intent guard. Without it, smooth FK-valid kinematic paths can still choose a hidden full-turn branch even though RTCore jog seeding is fixed.
+
+## 2026-04-28 21:30 +0000 - Made turn-frame plan copy/paste implementation ready
+
+- What changed:
+  - Updated `/home/pi/.cursor/plans/turn-frame_fix_stack_d8c7e686.plan.md` after reviewing feedback transcripts `c0b4553d...` and `e42be0c2...`.
+  - Replaced non-copyable placeholders with source-exact snippets:
+    - `command_api.py`: `_continuous_joint_indices_from_active_backend()` now uses `_get_active_backend()` and a public/private backend accessor fallback; `validate_kinematic_turn_intent` now fails closed if `start_q` is shorter than the IK output; bounded setpoint executor snippet includes exact `allow_continuous_wind` kwarg.
+    - `backend.py`: added exact `continuous_command_logical_joint_indices()` accessor snippet and PR4 global `motion_done` settle-window tracking snippet.
+    - `run_controller.py`: exact before/after for ROTATE and SET_ORIENTATION `TurnWindingExceededError` handling using `_encode_controller_payload_b64`.
+    - `api/main.py`: exact before/after for `/control/rotate` and `/control/set-orientation` to translate `IK_TURN_WINDING_EXCEEDED` into HTTP 400 with structured detail.
+    - Tests: replaced the PR4 placeholder backend fixture with a concrete `EthercatRTCoreBackend` + `_AxisConfig` setup.
+  - Follow-up pass from additional review:
+    - Moved the IK turn-intent guard home from `command_api.py` to `trajectory_execution.py` in the plan to avoid circular imports.
+    - Added exact `run_controller.py` import change for `trajectory_execution` and changed error catches to `trajectory_execution.TurnWindingExceededError`.
+    - Added an exact policy list for all `_open_loop_executor_thread(...)` callers, including `pid_tuner.py` and direct test calls.
+    - Removed placeholder language from the plan (`...`, `illustrative`, `adjust`, `whatever`, `grep`, `fill in`, `line depends`, etc.).
+
+- Validation performed:
+  - `ReadLints` on the plan -> clean.
+  - `rg` placeholder scan on the plan -> no matches.
+
+- Follow-ups / risks:
+  - The plan is now suitable as an implementation checklist, but code itself has not been changed in this turn beyond the plan and memory files.
+
+## 2026-04-28 21:51 +0000 - Updated turn-frame plan for high-res Home-after-jog evidence
+
+- What changed:
+  - Reviewed transcript `e8f34890-c392-4bf9-b215-a1a6189afb1d`.
+  - Updated `/home/pi/.cursor/plans/turn-frame_fix_stack_d8c7e686.plan.md` to promote the latest reproduced failure into an active PR:
+    - New PR2: trajectory upload must align point 0 to RTCore continuous `hold_target_counts`, not sawtooth feedback, after seam-crossing jog.
+    - Existing IK turn-intent guard moved to PR3.
+    - Smooth-step peak cap moved to PR4.
+    - Canonical truth settle window moved to PR5.
+  - Added copy/paste code snippets for `backend.py`: `_live_command_hold_counts_for_axis`, `_trajectory_turn_reference_counts_for_axis`, `submit_joint_trajectory` reference selection, helper rename to `_align_continuous_trajectory_axis_q_to_turn_reference`, and a regression `test_a6ec_continuous_trajectory_aligns_to_rtcore_hold_after_jog`.
+  - Updated sequencing, validation matrix, pass criteria, deferred-anchor triggers, and out-of-scope list to reflect the new evidence.
+
+- Validation performed:
+  - `ReadLints` on the plan -> clean.
+  - Placeholder scan on the plan (`...`, `illustrative`, `adjust`, `fill in`, `line depends`, `grep`, etc.) -> no matches.
+
+- Follow-ups / risks:
+  - Implement PR2 next before IK guard; latest live evidence shows Home-after-jog is a trajectory alignment bug, not only an IK branch bug.
+
+## 2026-04-28 04:39 +0000 - Live operator retest validated canonical-wrap + trajectory alignment fixes
+
+- What changed:
+  - No code edits this session. Started a diagnostic capture and live monitoring while operator retested Home and yaw jog with the latest stack.
+  - Captured `logs/cartesian-jog-diagnostic/operator-test-20260428-043822/python-jog-20260428-043822.jsonl` (1579 records) and tailed `logs/startups/20260428-043422/controller.log` for the duration.
+  - Operator sequence: SAFE_POWER_UP -> Home -> yaw held jog `v_yaw=-15` (~35 ticks) -> Home -> a few `ROTATE z=±15°` commands.
+
+- Behavioral findings (no fixes were violated):
+  - Home #1 (`traj_id=2`): payload `canonical_wrap_target=true`. Bounded plan `J6=286.125° -> 0°` `duration_s=4.769s` `points=477`. RTCore `state=completed elapsed=5.200s`. No fast initial catch-up; `elapsed-duration=0.43s` is normal settle window.
+  - Held yaw jog (`joint_velocity_lease` mode): J6 progressed monotonically `286° -> 404°` over ~35s (~3.4°/s, matching `v_yaw=15 deg/s` mapped through IK). Clean stop reason `ui-release`, no `MOTION_STOP_LATCHED`, no fault, no full-turn lurch at the seam.
+  - Home #2 (`traj_id=12`): payload `canonical_wrap_target=true`. Bounded plan `J6=404.05° -> 0°` `duration_s=6.734s` `points=674`. RTCore `state=completed elapsed=7.452s`. After Home #2 the controller logged J6 logical angle = `0.005 rad` (0.3°), so the full-turn unwind landed on canonical zero correctly.
+  - Canonical truth UNAVAILABLE warnings (`drive_native_command_frame_roundtrip_mismatch` axes=[5]) during the long Home unwinds are expected and advisory after the 2026-04-25 control-feedback split; they did NOT block motion. Truth recovered AVAILABLE after motion settled.
+  - Operator-reported "yaw button feels backwards" reproduced: `v_yaw=-15` mapped to +J6 motion. Filed as a separate UI/sign issue; not in scope for the canonical-wrap or jog seam fixes.
+
+- Validation performed:
+  - Read-only log/metrics inspection (no controller commands sent).
+  - Controller log scan for `APPLY_JOINT_SETPOINT|JOG_SESSION|Open-Loop|trajectory_completion|MOTION_STOP|drive_fault|ERROR` -> only the expected events for the operator's sequence. No motion-stop latch, no faults, no aborted trajectories.
+  - Diagnostic capture analyzer noted `ik_debug=null` and `rtcore_jog_debug.active_jog=false` for all 1579 records because (a) `SET_JOG_AB_COMPARE,false` was set right before the test and (b) the yaw jog ran in `joint_velocity_lease` mode rather than the Cartesian held-jog Jacobian path that populates `ik_debug`. Documented in scratchpad as a monitoring guardrail for future retests.
+
+- Follow-ups / risks:
+  - Yaw button sign mismatch: triage independently. Confirm operator's mental model (`+yaw button => +J6 deg` or `+yaw button => +EE z-axis rotation per right-hand-rule`) before changing any sign in the UI or controller IK mapping.
+  - For future single-joint or yaw-only retests where Jacobian-DLS telemetry is needed, enable `SET_JOG_AB_COMPARE=true` and (if needed) `scripts/cartesian_jog_diagnostic_capture.py enable-fast-trace` before the operator presses the button.
+
+## 2026-04-28 02:18 +0000 - Verified home/seam fixes are in source and restarted stack
+
+- What changed:
+  - No code edits this session. Verified the four prior fixes are present in the working tree and that the running binaries match the corrected sources, then brought the stack back up so Python backend changes are loaded for live retest.
+  - Confirmed source-level state of all four fixes:
+    - `src/gradient_os/api/main.py` `/control/home` payload includes `canonical_wrap_target: True`.
+    - `src/gradient_os/run_controller.py` `APPLY_JOINT_SETPOINT` UDP handler forwards `canonical_wrap_target` into `command_api.handle_apply_joint_setpoint(...)`.
+    - `src/gradient_os/arm_controller/command_api.py` bounded planner branches on `canonical_wrap_target` to use strict-display `get_current_arm_state_rad()`.
+    - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py` trajectory upload calls `_align_continuous_trajectory_axis_q_to_live_turn(...)` for every point with the helper at line 6270.
+    - `src/gradient_rt_motion/main.cpp` jog integration uses `command_counts_wrap` policy for `wrap_period_counts`.
+  - Verified RTCore binary parity: `md5sum /usr/local/bin/gradient-rt-motion src/gradient_rt_motion/gradient-rt-motion` -> identical `3219ab0f907a5360993c0bb6904764ca`. Both binaries were built from `main.cpp` last modified `2026-04-28 00:16:06 UTC`, so the jog seam fix is already installed/live.
+
+- Validation performed:
+  - Initial state: `./start-stack.sh status` -> `launcher_state: absent` / `controller down / api down / web down`.
+  - `make -C src/gradient_rt_motion` -> `Nothing to be done for 'all'` (binary already up to date).
+  - Focused tests: `tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_aligns_home_unwind_to_live_turn`, `tests/test_api_endpoints.py::test_control_home`, `tests/test_command_api_direct_setpoint.py::test_apply_joint_setpoint_canonical_wrap_target_uses_display_baseline` -> `3 passed`.
+  - Broader regression slice: `tests/test_gradient05_limits_and_backends.py tests/test_api_endpoints.py tests/test_command_api_direct_setpoint.py tests/test_trajectory_execution_backends.py` -> `298 passed`.
+  - Stack restart: `./start-stack.sh` -> launcher running, controller/api/web all `up`, RTCore reports `startup_ready=1 operational=6/6 wkc=18/12`, J6 statusword `0x1650` err `0x0` (BUS_UP_DISARMED, no faults), drives `armed=0` and require operator-controlled safe-power-up before motion.
+
+- Follow-ups / risks:
+  - First live retest after this restart should still be operator-supervised. Expected behavior: Home plans canonical unwind from live J6 (currently `~301° canonical`) to `0°` and RTCore executes one continuous slow trajectory with point 0 already on the live hold turn (no fast initial catch-up).
+  - Operator-reported "yaw jog feels inverted" is a separate UI/sign concern. Triage independently from the canonical-wrap and jog seam fixes; do not fold into Home scope.
+
+## 2026-04-28 22:08 +0000 - PR2 trajectory upload aligns to RTCore hold target
+
+- What changed:
+  - Implemented PR2 only from `/home/pi/.cursor/plans/turn-frame_fix_stack_d8c7e686.plan.md`.
+  - `src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py`: added `_live_command_hold_counts_for_axis(...)` and `_trajectory_turn_reference_counts_for_axis(...)`; trajectory upload now seeds point-0 turn alignment from RTCore `hold_target_counts` for continuous-command axes and falls back to 6064 feedback otherwise.
+  - Renamed `_align_continuous_trajectory_axis_q_to_live_turn(...)` to `_align_continuous_trajectory_axis_q_to_turn_reference(...)` and changed its parameter to `initial_reference_counts`.
+  - `tests/test_gradient05_limits_and_backends.py`: added `test_a6ec_continuous_trajectory_aligns_to_rtcore_hold_after_jog`.
+  - Follow-up hardening in the same PR2 scope:
+    - Added `_JOG_DEBUG_HOLD_REFERENCE_MAX_AGE_S` and `_last_jog_debug_monotonic_s`; hold-target references now require a nonzero RTCore jog-debug sample and a recent status-ring receive before they are used for trajectory alignment.
+    - Added `initial_reference_from_hold` tracking through `enqueue_trajectory_points(...)` so first-point safety knows whether a turn reference came from continuous 0x607A hold state or sawtooth feedback.
+    - First-point safety now uses linear deviation for continuous hold references, so a one-turn mismatch is rejected instead of being hidden by shortest-angular math.
+    - Added upload-level regression `test_a6ec_continuous_trajectory_upload_uses_hold_turn_after_jog` and safety regression `test_a6ec_continuous_trajectory_first_point_safety_rejects_hold_turn_mismatch`.
+
+- Validation performed:
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_aligns_to_rtcore_hold_after_jog tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_aligns_home_unwind_to_live_turn -q` -> `2 passed`.
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py -q` -> `228 passed`.
+  - Follow-up focused hardening tests: `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_aligns_to_rtcore_hold_after_jog tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_upload_uses_hold_turn_after_jog tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_first_point_safety_rejects_hold_turn_mismatch tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_aligns_home_unwind_to_live_turn -q` -> `4 passed`.
+  - Follow-up broader slice: `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py tests/test_trajectory_execution_backends.py tests/test_command_api_direct_setpoint.py -q` -> `230 passed`.
+  - `ReadLints` on `backend.py` and `tests/test_gradient05_limits_and_backends.py` -> clean.
+  - `git diff --check -- src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_gradient05_limits_and_backends.py` -> clean.
+
+- Follow-ups / risks:
+  - Live validation still pending with operator and physical power: Home -> jog J6/yaw across seam -> release -> Home again. Pass requires no max-profile first-cycle spin and fast trace first-sample delta from held target near zero.
+  - Stopped at PR2 per plan; PR3/PR4/PR5 not implemented.
+
+## 2026-04-29 00:01 +0000 - Installed GitNexus for Cursor on ARM64 Pi
+
+- What changed:
+  - Installed GitNexus `1.6.3` into a user-local Node 20 runtime at `/home/pi/.local/gitnexus-runtime` because the system Node is `18.20.4` and GitNexus requires Node `>=20`.
+  - Added Cursor global MCP config at `/home/pi/.cursor/mcp.json` pointing to the local Node 20 CLI with `GITNEXUS_MAX_DB_SIZE=1073741824`.
+  - Added `.gitnexus/` to `.gitignore`; the index is local/untracked.
+  - Patched the installed GitNexus runtime for this Pi:
+    - Rebuilt `tree-sitter` and all `tree-sitter-*` native addons with Node 20 headers via local `node-gyp` to avoid Node 18 `libnode.so.108` segfaults.
+    - Patched LadybugDB `new lbug.Database(...)` calls in installed `dist` files to honor `GITNEXUS_MAX_DB_SIZE`, matching upstream Raspberry Pi workaround for the default 8 TiB mmap failure.
+
+- Validation performed:
+  - `gitnexus analyze --skip-agents-md --name GradientOS .` with `GITNEXUS_MAX_DB_SIZE=1073741824` and `GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=120000` succeeded: `426 files`, `17,756 symbols`, `26,225 edges`, `418 clusters`, `300 processes`.
+  - `gitnexus status` reports `GradientOS` up to date at commit `bf22a96`.
+  - `gitnexus context EthercatRTCoreBackend --repo GradientOS` returned class context successfully.
+  - MCP smoke test stayed running until forced `timeout`; GitNexus logs `MCP server starting with 1 repo(s): GradientOS`. The SIGTERM cleanup path logs an upstream `process.exit('SIGTERM')` type warning only when the test timeout kills it.
+  - `ReadLints` on `.gitignore` clean.
+
+- Follow-ups / risks:
+  - Cursor may need MCP reload/restart to discover the new `gitnexus` server.
+  - Free-text `gitnexus query` still logs FTS read-only index warnings and returned an empty result for `RTCore backend`; symbol/context-style tools work against the indexed graph.
+  - Local patches live under `/home/pi/.local/gitnexus-runtime` and may be overwritten by future `npm install -g` / GitNexus upgrades; preserve the Node 20 rebuild and LadybugDB max DB size workaround on upgrade.
+
+## 2026-04-28 23:42 +0000 - Live PR2 validation passed for Home-after-jog
+
+- What changed:
+  - Ran operator-supervised live validation for PR2 after the backend.py hardening.
+  - Captured high-frequency telemetry in `logs/cartesian-jog-diagnostic/highres-pr2-20260428-233834/` with RTCore fast trace start byte `412400991`.
+  - Operator sequence included jog sessions across/near the seam followed by `APPLY_JOINT_SETPOINT` Home.
+
+- Validation performed:
+  - Controller follower showed a post-jog Home at controller-follow lines `32230-32233`: `current_deg[..., J6=29.697] -> target 0`, `duration_s=0.495`, `points=50`, RTCore `state=completed`, `elapsed=0.562s`.
+  - Filtered RTCore 1 kHz trace over the Python capture window had no sustained full-turn/max-profile target slew. Largest target deltas inside the capture window were small single-sample timing artifacts / bounded trajectory increments, not the prior ~13,107 counts/ms full-turn chase.
+  - Full trace contained one later `target_position` collapse from `1966080 -> 655360` while feedback was already `~655360`; immediately after, status moved out of Operation Enabled. This was hold/disable synchronization at the same physical pose, not the old target-away-from-feedback chase.
+  - Post-state trajectory completion for `traj_id=2` reported J6 `target_counts=655360`, `feedback_counts=655264`, `error_counts=-96` within tolerance `128`.
+
+- Follow-ups / risks:
+  - PR2 live validation passes the specific repro: Home -> jog across seam -> release -> Home does not max-speed spin.
+  - Separate issues remain out of this PR2 scope: canonical truth flicker during/after long moves, yaw sign convention, PR3 IK turn-intent guard for `ROTATE,z` hidden winding, and PR4 smooth-step peak cap.
+
+## 2026-04-29 00:12 +0000 - Fixed RTCore disarm-time continuous hold collapse causing J6 Er87.1
+
+- What changed:
+  - Operator reported J6 drive display flashing `Er87.1` after power down.
+  - Preserved evidence before reset: direct EtherCAT reads showed slave 5 / J6 `6041=0x1618`, `603F=0xff00`, `203F=0x0871` (`Er87.1`, one-time excessive position reference increment). Other slaves were `6041=0x1650`, zero fault registers.
+  - Root cause from fast trace: after PR2 live validation, RTCore collapsed J6 `target_position` from `1966080 -> 655360` while the drive was still `0x1637` OperationEnabled. Feedback was already at the equivalent physical pose, but the raw 0x607A increment was one full J6 motor turn, so the drive faulted Er87.1.
+  - `src/gradient_rt_motion/main.cpp`: added local helpers in the cyclic loop to preserve continuous-command hold targets during disable/service/passive transitions while the drive remains OperationEnabled or QuickStopActive.
+  - Updated service-mode, `!want_enable`, and passive-startup hold-mirror paths to fold feedback to the nearest equivalent of the previous continuous hold target for `command_counts_wrap=false` axes, instead of unconditionally assigning sawtooth feedback.
+  - Installed rebuilt RTCore binary to `/usr/local/bin/gradient-rt-motion` (md5 `6ee4edc0d87be3afaec333a1db43e5c5`).
+
+- Validation performed:
+  - `make -C src/gradient_rt_motion` -> pass.
+  - After operator hard-stopped, repeated rebuild/install check: `make -C src/gradient_rt_motion` -> `Nothing to be done for 'all'`; `md5sum src/gradient_rt_motion/gradient-rt-motion /usr/local/bin/gradient-rt-motion` -> both `6ee4edc0d87be3afaec333a1db43e5c5`.
+  - `source ./start.sh && python -m pytest tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_aligns_to_rtcore_hold_after_jog tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_upload_uses_hold_turn_after_jog tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_first_point_safety_rejects_hold_turn_mismatch tests/test_gradient05_limits_and_backends.py::test_a6ec_continuous_trajectory_aligns_home_unwind_to_live_turn -q` -> `4 passed`.
+  - `git diff --check -- src/gradient_rt_motion/main.cpp src/gradient_os/arm_controller/backends/ethercat_rtcore/backend.py tests/test_gradient05_limits_and_backends.py` -> clean.
+  - Did NOT restart RTCore or reset the J6 fault in this turn; the new binary is installed but running service still needs a safe stop/restart after operator approves recovery.
+
+- Follow-ups / risks:
+  - Recovery/retest sequence: reset J6 faults only after operator is ready; `./start-stack.sh stop --hard`; restart stack so new RTCore binary loads; safe power-up; run Home -> jog seam -> release -> Home -> safe power-down. Pass requires no visible spin and no new J6 `Er87.1` on power-down/disarm.
+  - If Er87.1 still appears, inspect remaining `hold_target_counts[i] = feedback_wire_target_counts` paths at first OperationEnabled latch / service transitions and consider moving hold-target state into a first-class RTCore status field.

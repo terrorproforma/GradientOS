@@ -18,6 +18,8 @@ To keep implementation quality and session continuity high, maintain these repo-
 - `.cursor/skills/devlog-loop/SKILL.md` -> writes to `.cursor/memory/DEVLOG.md` (template: `.cursor/skills/devlog-loop/references/devlog-entry-template.md`).
 - `.cursor/skills/learning-scratchpad-loop/SKILL.md` -> writes to `.cursor/memory/AGENT_SCRATCHPAD.md` (template: `.cursor/skills/learning-scratchpad-loop/references/scratchpad-template.md`).
 
+- use `start.sh` to activate the project env. 
+
 Non-negotiable workflow rule:
 
 - Never hand off or stop after implementation without appending both `.cursor/memory/DEVLOG.md` and `.cursor/memory/AGENT_SCRATCHPAD.md`.

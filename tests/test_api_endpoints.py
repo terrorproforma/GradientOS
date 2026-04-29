@@ -876,6 +876,22 @@ def test_control_wait_for_idle_accepts_timeout_override(client):
     assert client.command_calls[-1] == ("WAIT_FOR_IDLE,12.5", 17.5, True)
 
 
+def test_control_jog_debug_ab_compare_does_not_toggle_debug(client):
+    resp = client.post("/control/jog/debug", json={"ab_compare": False})
+
+    assert resp.status_code == 200
+    assert ("SET_JOG_AB_COMPARE,false", 1.0, False) in client.command_calls
+    assert all(call[0] != "SET_JOG_DEBUG,false" for call in client.command_calls)
+
+
+def test_control_jog_debug_can_toggle_debug_and_ab_compare(client):
+    resp = client.post("/control/jog/debug", json={"enabled": True, "ab_compare": True})
+
+    assert resp.status_code == 200
+    assert ("SET_JOG_DEBUG,true", 1.0, False) in client.command_calls
+    assert ("SET_JOG_AB_COMPARE,true", 1.0, False) in client.command_calls
+
+
 def test_control_motion_status(client):
     resp = client.get("/control/motion-status")
     assert resp.status_code == 200
@@ -1006,6 +1022,7 @@ def test_control_home(client):
     payload = json.loads(base64.urlsafe_b64decode(command.split(",", 1)[1]).decode("utf-8"))
     assert payload["arm_angles_rad"] == [0.0] * 6
     assert payload["max_motor_rpm"] == pytest.approx(100.0)
+    assert payload["canonical_wrap_target"] is True
 
 
 def test_control_rest(client):

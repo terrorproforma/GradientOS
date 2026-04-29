@@ -250,6 +250,41 @@ int32_t wrap_counts_into_period(int64_t counts, uint32_t period_counts) {
   return clamp_i64_to_i32(wrapped);
 }
 
+// For continuous-command axes (`command_counts_wrap=false`) the drive's
+// 0x607A target lives in a continuous wire frame, while 0x6064 feedback
+// is a single-turn sawtooth (e.g. A6-EC J6 with `feedback_counts_wrap=true`).
+// Snapping a hold target directly to feedback or seeding a jog target from
+// feedback discards the turn the drive is actually holding at, so the
+// next commanded cycle would step a full revolution and the drive would
+// slew that whole turn at max profile speed.
+//
+// Returns the wire-count equivalent of `feedback_counts` whose continuous
+// value lies closest to `prev_continuous_counts`. This preserves the
+// drive's current motor turn while still snapping to where the encoder
+// reports the axis to be.
+int32_t nearest_turn_equivalent_to_continuous(int32_t prev_continuous_counts,
+                                              int32_t feedback_counts,
+                                              uint32_t turn_period_counts) {
+  if (turn_period_counts == 0) {
+    return feedback_counts;
+  }
+  const int64_t period = static_cast<int64_t>(turn_period_counts);
+  const int64_t prev = static_cast<int64_t>(prev_continuous_counts);
+  const int64_t fb = static_cast<int64_t>(feedback_counts);
+  const int64_t delta = fb - prev;
+  // Round delta to the nearest multiple of period and use the negative of
+  // that as a shift so `fb + shift` lands inside +/- half-period of `prev`.
+  int64_t turns = delta / period;
+  int64_t remainder = delta - turns * period;
+  if (remainder > period / 2) {
+    turns += 1;
+  } else if (remainder < -period / 2) {
+    turns -= 1;
+  }
+  const int64_t shift = -turns * period;
+  return clamp_i64_to_i32(fb + shift);
+}
+
 int32_t advance_csp_hold_target_counts(int32_t current_counts,
                                        int32_t desired_counts,
                                        int32_t max_step_counts,
@@ -3839,13 +3874,34 @@ int main(int argc, char** argv) {
                   continue;
                 }
                 if (!have_jog_target[i]) {
-                  jog_target_counts_float[i] = static_cast<double>(
-                      csp_wire_counts_from_feedback(latest_feedback.pos_counts[i]));
+                  // Continuous-command axes (e.g. A6-EC J6,
+                  // command_counts_wrap=false) must seed the jog target from
+                  // the live commanded hold target, NOT single-turn
+                  // feedback. 0x6064 is a sawtooth in that mode while
+                  // 0x607A lives in continuous wire counts; seeding from
+                  // feedback can land in a different motor turn from the
+                  // drive's current 0x607A target, causing the first jog
+                  // cycle to command a full-revolution step which the
+                  // drive then slews at max profile speed. After a
+                  // canonical-wrap home unwind this surfaces as a
+                  // reproducible 360-degree spin on the first held jog.
+                  if (have_hold[i] && !opt.axis[i].command_counts_wrap) {
+                    jog_target_counts_float[i] =
+                        static_cast<double>(hold_target_counts[i]);
+                  } else {
+                    jog_target_counts_float[i] = static_cast<double>(
+                        csp_wire_counts_from_feedback(latest_feedback.pos_counts[i]));
+                  }
                   have_jog_target[i] = true;
                 }
                 jog_target_counts_float[i] += active_jog_velocity_counts_per_s[i] * period_s;
+                // Jog targets are 0x607A commands, so use the command-wrap
+                // policy here. A6-EC feedback is a sawtooth and still uses
+                // feedback_counts_wrap for comparisons, but command_counts_wrap=false
+                // means the outgoing jog target must remain continuous across
+                // the seam instead of folding back into [0, RM).
                 const uint32_t wrap_period_counts =
-                    opt.axis[i].feedback_counts_wrap ? wrapped_axis_period_counts(opt.axis[i]) : 0;
+                    opt.axis[i].command_counts_wrap ? wrapped_axis_period_counts(opt.axis[i]) : 0;
                 if (wrap_period_counts > 0) {
                   jog_target_counts_float[i] = wrap_counts_into_period_double(
                       jog_target_counts_float[i], static_cast<double>(wrap_period_counts));
@@ -3879,6 +3935,30 @@ int main(int argc, char** argv) {
             stop_arrest_mask |= (1u << i);
           }
         }
+        auto continuous_hold_equivalent_to_feedback = [&](uint32_t axis_i,
+                                                          int32_t previous_hold_counts,
+                                                          int32_t feedback_counts) -> int32_t {
+          if (axis_i >= opt.num_axes || opt.axis[axis_i].command_counts_wrap) {
+            return feedback_counts;
+          }
+          const uint32_t turn_period_counts = wrapped_axis_period_counts(opt.axis[axis_i]);
+          return nearest_turn_equivalent_to_continuous(
+              previous_hold_counts, feedback_counts, turn_period_counts);
+        };
+        auto should_preserve_continuous_hold_during_disable = [&](uint32_t axis_i,
+                                                                  gradient::ds402::State state) -> bool {
+          if (axis_i >= opt.num_axes || opt.axis[axis_i].command_counts_wrap || !have_hold[axis_i]) {
+            return false;
+          }
+          // While the drive is still actively enforcing profile-position
+          // command increments, collapsing continuous 0x607A hold to
+          // sawtooth 0x6064 feedback creates a raw one-turn target jump.
+          // A6-EC flags that as Er87.1 even if the physical pose is the
+          // same modulo the rotation period. Once the drive has left active
+          // command tracking, raw feedback mirroring is safe again.
+          return state == gradient::ds402::State::OperationEnabled ||
+                 state == gradient::ds402::State::QuickStopActive;
+        };
         for (uint32_t i = 0; i < opt.num_axes; ++i) {
           uint8_t* axis_pd = opt.split_domains_per_axis ? axis_domain_pd[i] : domain_pd;
           const uint16_t sw = EC_READ_U16(axis_pd + off[i].sw);
@@ -3912,11 +3992,17 @@ int main(int argc, char** argv) {
 
           if (!startup_passive_active) {
             if (service_mode_active) {
-              hold_target_counts[i] = feedback_wire_target_counts;
-              have_hold[i] = false;
+              if (should_preserve_continuous_hold_during_disable(i, st)) {
+                hold_target_counts[i] = continuous_hold_equivalent_to_feedback(
+                    i, hold_target_counts[i], feedback_wire_target_counts);
+                have_hold[i] = true;
+              } else {
+                hold_target_counts[i] = feedback_wire_target_counts;
+                have_hold[i] = false;
+              }
               cw = static_cast<uint16_t>(
                   service_controlword_override[i].load(std::memory_order_relaxed) & 0xFFFFu);
-              target_pos_out = feedback_wire_target_counts;
+              target_pos_out = hold_target_counts[i];
               target_vel_out = 0;
               target_torque_out = 0;
               const int32_t service_mode = service_mode_override[i].load(std::memory_order_relaxed);
@@ -3943,13 +4029,31 @@ int main(int argc, char** argv) {
               if ((snap_jog_hold_to_feedback_mask & (1u << i)) != 0u) {
                 // When jog stops or expires we must immediately collapse the CSP hold target
                 // onto live feedback, otherwise the axis can keep chasing the last jog target.
-                hold_target_counts[i] = feedback_wire_target_counts;
+                // For continuous-command axes (`command_counts_wrap=false`) the snap must
+                // preserve multi-turn information by selecting the wire-count equivalent of
+                // feedback that lies in the same motor turn as the previous hold target.
+                // Without this, a subsequent jog or trajectory would see a one-turn step on
+                // its first commanded cycle and slew that whole turn at max profile speed.
+                if (have_hold[i] && !opt.axis[i].command_counts_wrap) {
+                  const uint32_t turn_period_counts = wrapped_axis_period_counts(opt.axis[i]);
+                  hold_target_counts[i] = nearest_turn_equivalent_to_continuous(
+                      hold_target_counts[i], feedback_wire_target_counts, turn_period_counts);
+                } else {
+                  hold_target_counts[i] = feedback_wire_target_counts;
+                }
                 have_hold[i] = true;
               }
               if (jog_stop_arrest_cycles_left[i] > 0) {
                 // Briefly keep re-latching hold to live feedback after a jog stop/timeout so
-                // the drive does not keep chasing a stale frozen CSP target.
-                hold_target_counts[i] = feedback_wire_target_counts;
+                // the drive does not keep chasing a stale frozen CSP target. Same continuous-
+                // command turn preservation applies as in the snap path above.
+                if (have_hold[i] && !opt.axis[i].command_counts_wrap) {
+                  const uint32_t turn_period_counts = wrapped_axis_period_counts(opt.axis[i]);
+                  hold_target_counts[i] = nearest_turn_equivalent_to_continuous(
+                      hold_target_counts[i], feedback_wire_target_counts, turn_period_counts);
+                } else {
+                  hold_target_counts[i] = feedback_wire_target_counts;
+                }
                 have_hold[i] = true;
               }
               if (want_enable && st == gradient::ds402::State::OperationEnabled) {
@@ -3991,9 +4095,20 @@ int main(int argc, char** argv) {
                   }
                 }
               } else {
-                // Track feedback until OP; keeps 0x607A aligned during state transitions.
-                hold_target_counts[i] = feedback_wire_target_counts;
-                have_hold[i] = false;
+                // Track feedback until OP; keeps 0x607A aligned during state
+                // transitions. For continuous-command axes that are still in
+                // an active command-tracking DS402 state while being disabled,
+                // preserve the current 0x607A turn and fold feedback into that
+                // turn. Otherwise a disarm/power-down cycle can collapse
+                // 607A by one full rotation and trip A6-EC Er87.1.
+                if (should_preserve_continuous_hold_during_disable(i, st)) {
+                  hold_target_counts[i] = continuous_hold_equivalent_to_feedback(
+                      i, hold_target_counts[i], feedback_wire_target_counts);
+                  have_hold[i] = true;
+                } else {
+                  hold_target_counts[i] = feedback_wire_target_counts;
+                  have_hold[i] = false;
+                }
               }
               cw = gradient::ds402::controlword_for_enable(st, want_enable, want_fault_reset);
               if (want_jog_quick_stop &&
@@ -4014,8 +4129,14 @@ int main(int argc, char** argv) {
             // During passive startup we still exchange cyclic PDO frames, but avoid
             // DS402 state-driving writes so we can distinguish process-data transport
             // problems from higher-level controlword/mode/target sequencing problems.
-            hold_target_counts[i] = feedback_wire_target_counts;
-            have_hold[i] = false;
+            if (should_preserve_continuous_hold_during_disable(i, st)) {
+              hold_target_counts[i] = continuous_hold_equivalent_to_feedback(
+                  i, hold_target_counts[i], feedback_wire_target_counts);
+              have_hold[i] = true;
+            } else {
+              hold_target_counts[i] = feedback_wire_target_counts;
+              have_hold[i] = false;
+            }
           }
 
           // Outputs (RxPDO 0x1702).

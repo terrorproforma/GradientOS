@@ -2,8 +2,10 @@ import json
 
 from gradient_os.absolute_encoder_anchors import (
     ANCHORS_ENV_VAR,
+    AnchorStoreError,
     invalidate_absolute_encoder_anchors,
     load_absolute_encoder_anchors,
+    load_absolute_encoder_anchors_store,
     save_absolute_encoder_anchor,
 )
 
@@ -90,3 +92,16 @@ def test_invalidate_absolute_encoder_anchors_empty_list_round_trips(tmp_path, mo
     after = load_absolute_encoder_anchors("test_robot", num_joints=3)
     assert [entry is None for entry in seeded] == [entry is None for entry in after]
     assert all(entry is not None for entry in after)
+
+
+def test_malformed_absolute_encoder_anchor_store_fails_closed(tmp_path, monkeypatch):
+    anchors_path = tmp_path / "anchors.json"
+    anchors_path.write_text('{"version": 1, "robots": {}}\n}\n', encoding="utf-8")
+    monkeypatch.setenv(ANCHORS_ENV_VAR, str(anchors_path))
+
+    try:
+        load_absolute_encoder_anchors_store()
+    except AnchorStoreError as exc:
+        assert "malformed JSON" in str(exc)
+    else:
+        raise AssertionError("Malformed anchor JSON must not be treated as an empty store.")

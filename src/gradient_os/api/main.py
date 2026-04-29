@@ -1674,6 +1674,7 @@ def create_app() -> FastAPI:
                 {
                     "arm_angles_rad": [0.0] * 6,
                     "max_motor_rpm": _SAFE_COMMISSIONING_MAX_MOTOR_RPM,
+                    "canonical_wrap_target": True,
                 }
             ),
             timeout=2.0,
@@ -1922,9 +1923,14 @@ def create_app() -> FastAPI:
 
     @api.post("/control/jog/debug", summary="Enable/disable jog debug logging")
     async def control_jog_debug(payload: dict[str, Any]):
-        enabled = _coerce_request_bool("enabled", payload.get("enabled"), default=False)
-        cmd = f"SET_JOG_DEBUG,{'true' if enabled else 'false'}"
-        await run_in_threadpool(_controller_call_or_503, cmd, timeout=1.0, expect_response=False)
+        if "enabled" in payload:
+            enabled = _coerce_request_bool("enabled", payload.get("enabled"), default=False)
+            cmd = f"SET_JOG_DEBUG,{'true' if enabled else 'false'}"
+            await run_in_threadpool(_controller_call_or_503, cmd, timeout=1.0, expect_response=False)
+        if "ab_compare" in payload:
+            ab_compare = _coerce_request_bool("ab_compare", payload.get("ab_compare"), default=False)
+            cmd = f"SET_JOG_AB_COMPARE,{'true' if ab_compare else 'false'}"
+            await run_in_threadpool(_controller_call_or_503, cmd, timeout=1.0, expect_response=False)
         return {"status": "ok"}
 
     @api.post("/control/jog/session/start", summary="Start a controller-owned jog session")

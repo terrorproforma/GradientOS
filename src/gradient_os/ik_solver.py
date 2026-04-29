@@ -134,6 +134,10 @@ _ROBOT_ID: str = robot_assets.get_active_robot_id()
 _solve_ik_impl = None  # type: ignore
 _fk_matrix_impl = None  # type: ignore
 NUM_JOINTS = 6  # default until backend sets the real value
+_JACOBIAN_ROBOT_CACHE: dict[str, object] = {}
+_JACOBIAN_FK_COMPAT_CACHE: dict[tuple[str, str, int | str], bool] = {}
+_JACOBIAN_AVAILABLE = False
+_JACOBIAN_UNAVAILABLE_REASON = "jacobian-not-initialized"
 
 
 def _normalize_backend_name(raw: str) -> str:
@@ -141,6 +145,51 @@ def _normalize_backend_name(raw: str) -> str:
     if backend not in {"ikfast", "numeric", "trac"}:
         raise ValueError(f"Unknown MINI_ARM_SOLVER backend '{backend}'")
     return backend
+
+
+def _ensure_jacobian_robot():
+    """Lazy-load the pyquik Robot used by held-jog Jacobian math."""
+    cached = _JACOBIAN_ROBOT_CACHE.get(_ROBOT_ID)
+    if cached is not None:
+        return cached
+    from numeric_solver.numeric_wrapper import _ensure_loaded as _ensure_numeric_loaded
+
+    robot, _ = _ensure_numeric_loaded(_ROBOT_ID)
+    _JACOBIAN_ROBOT_CACHE[_ROBOT_ID] = robot
+    return robot
+
+
+def _refresh_jacobian_availability() -> None:
+    """Warm the pyquik Jacobian binding and record a clear fallback reason."""
+    global _JACOBIAN_AVAILABLE, _JACOBIAN_UNAVAILABLE_REASON
+    try:
+        robot = _ensure_jacobian_robot()
+        jacobian_fn = getattr(robot, "jacobian", None)
+        if not callable(jacobian_fn):
+            raise RuntimeError("pyquik Robot does not expose jacobian()")
+        dof = int(getattr(robot, "dof", NUM_JOINTS) or NUM_JOINTS)
+        q = np.zeros(dof, dtype=float)
+        J = np.asarray(jacobian_fn(q), dtype=float)
+        if J.ndim != 2 or J.shape[0] != 6 or J.shape[1] != dof:
+            raise RuntimeError(f"pyquik Robot.jacobian returned unexpected shape {J.shape}")
+    except Exception as exc:
+        _JACOBIAN_AVAILABLE = False
+        _JACOBIAN_UNAVAILABLE_REASON = str(exc)[:240] or exc.__class__.__name__
+        print(f"[IK Solver] WARNING: held-jog Jacobian unavailable: {_JACOBIAN_UNAVAILABLE_REASON}")
+        return
+    _JACOBIAN_AVAILABLE = True
+    _JACOBIAN_UNAVAILABLE_REASON = ""
+
+
+def is_jacobian_available() -> bool:
+    return bool(_JACOBIAN_AVAILABLE)
+
+
+def get_jacobian_status() -> dict[str, object]:
+    return {
+        "available": bool(_JACOBIAN_AVAILABLE),
+        "unavailable_reason": _JACOBIAN_UNAVAILABLE_REASON,
+    }
 
 
 def _init_ikfast_backend():
@@ -321,6 +370,7 @@ def configure(*, robot_id: str | None = None, backend_name: str | None = None) -
     os.environ["GRADIENT_ROBOT_ID"] = _ROBOT_ID
     os.environ["MINI_ARM_SOLVER"] = _BACKEND_NAME
     _init_backend()
+    _refresh_jacobian_availability()
     return {
         "robot_id": _ROBOT_ID,
         "backend_name": _BACKEND_NAME,
@@ -367,6 +417,82 @@ def get_fk(active_joint_angles):
     if fk_matrix is not None:
         return fk_matrix[:3, 3]
     return None
+
+
+def _finite_difference_jacobian_via_fk_runtime(joint_angles, eps: float = 1e-5) -> np.ndarray:
+    """Return spatial/world-frame finite-difference Jacobian via get_fk_matrix()."""
+    q = np.asarray(joint_angles, dtype=float).reshape(-1)
+    joint_count = q.size
+    J = np.zeros((6, joint_count), dtype=float)
+    for idx in range(joint_count):
+        q_plus = q.copy()
+        q_minus = q.copy()
+        q_plus[idx] += eps
+        q_minus[idx] -= eps
+        T_plus = get_fk_matrix(q_plus)
+        T_minus = get_fk_matrix(q_minus)
+        if T_plus is None or T_minus is None:
+            raise RuntimeError("FK failed while computing finite-difference Jacobian.")
+        T_plus = np.asarray(T_plus, dtype=float).reshape(4, 4)
+        T_minus = np.asarray(T_minus, dtype=float).reshape(4, 4)
+        J[:3, idx] = (T_plus[:3, 3] - T_minus[:3, 3]) / (2.0 * eps)
+
+        # Spatial/world-frame angular velocity. Cartesian jog applies angular
+        # deltas as R_delta @ R_commanded, so body-frame log would disagree.
+        dR = T_plus[:3, :3] @ T_minus[:3, :3].T
+        cos_theta = np.clip((np.trace(dR) - 1.0) / 2.0, -1.0, 1.0)
+        theta = float(np.arccos(cos_theta))
+        if abs(theta) < 1e-9:
+            J[3:, idx] = 0.0
+        else:
+            scale = theta / (2.0 * np.sin(theta))
+            log_R = scale * (dR - dR.T)
+            J[3:, idx] = np.array([log_R[2, 1], log_R[0, 2], log_R[1, 0]]) / (2.0 * eps)
+    return J
+
+
+def _analytical_jacobian_matches_active_fk() -> bool:
+    revision_key: int | str
+    if kinematics_runtime.runtime_offsets_are_identity():
+        revision_key = "identity-runtime"
+    else:
+        revision_key = kinematics_runtime.get_revision()
+    cache_key = (_ROBOT_ID, _BACKEND_NAME, revision_key)
+    cached = _JACOBIAN_FK_COMPAT_CACHE.get(cache_key)
+    if cached is not None:
+        return bool(cached)
+    if not _JACOBIAN_AVAILABLE:
+        _JACOBIAN_FK_COMPAT_CACHE[cache_key] = False
+        return False
+    try:
+        robot = _ensure_jacobian_robot()
+        dof = int(getattr(robot, "dof", NUM_JOINTS) or NUM_JOINTS)
+        reference_vectors = [
+            np.linspace(0.11, 0.11 * dof, dof, dtype=float),
+            np.linspace(-0.17, 0.19, dof, dtype=float),
+        ]
+        for q in reference_vectors:
+            J_analytic = np.asarray(robot.jacobian(q), dtype=float)
+            J_fd = _finite_difference_jacobian_via_fk_runtime(q)
+            if not np.allclose(J_analytic, J_fd, atol=2e-3, rtol=2e-2):
+                _JACOBIAN_FK_COMPAT_CACHE[cache_key] = False
+                return False
+    except Exception:
+        _JACOBIAN_FK_COMPAT_CACHE[cache_key] = False
+        return False
+    _JACOBIAN_FK_COMPAT_CACHE[cache_key] = True
+    return True
+
+
+def compute_jacobian(joint_angles) -> np.ndarray:
+    """Return a 6xN spatial Jacobian aligned with get_fk_matrix() semantics."""
+    if not _JACOBIAN_AVAILABLE:
+        raise RuntimeError(_JACOBIAN_UNAVAILABLE_REASON or "held-jog Jacobian unavailable")
+    if kinematics_runtime.runtime_offsets_are_identity() and _analytical_jacobian_matches_active_fk():
+        robot = _ensure_jacobian_robot()
+        q = np.asarray(joint_angles, dtype=float).reshape(-1)
+        return np.asarray(robot.jacobian(q), dtype=float)
+    return _finite_difference_jacobian_via_fk_runtime(joint_angles)
 
 # ----------------------------------------------------------------------------------
 # Path IK (Sequential) helper – now supports a `verbose` flag to silence prints

@@ -2471,6 +2471,24 @@ def test_ethercat_backend_startup_bootstraps_missing_absolute_home_anchor(monkey
     assert backend.get_joint_positions()[0] == pytest.approx(0.25)
 
 
+def test_ethercat_backend_initialize_does_not_auto_bootstrap_missing_anchors(monkeypatch, tmp_path):
+    monkeypatch.delenv("GRADIENT_ALLOW_STARTUP_ANCHOR_BOOTSTRAP", raising=False)
+    monkeypatch.setattr(rtcore_backend_module, "_ALLOW_STARTUP_ANCHOR_BOOTSTRAP", False)
+    monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
+    monkeypatch.setenv(
+        "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH",
+        str(tmp_path / "absolute_encoder_anchors.json"),
+    )
+    backend = EthercatRTCoreBackend(robot_config=Gradient05Config().get_config_dict())
+    backend._axis_to_joint = [0]
+    monkeypatch.setattr(backend, "_connect_ipc", lambda: True)
+
+    assert backend.initialize() is True
+
+    anchors = load_absolute_encoder_anchors(backend._robot_id, num_joints=backend._num_joints)
+    assert anchors[0] is None
+
+
 def test_ethercat_backend_startup_bootstrap_uses_display_reference_mode(monkeypatch, tmp_path):
     monkeypatch.setenv("GRADIENT_JOINT_ZERO_OFFSETS_PATH", str(tmp_path / "joint_zero_offsets.json"))
     monkeypatch.setenv(
@@ -5304,6 +5322,230 @@ def test_a6ec_command_axis_q_trajectory_waypoints_monotonic_with_multi_turn(
             f"{axis_q!r} (= {math.degrees(axis_q):.3f}°) instead of "
             f"{canonical_deg}° exactly. The fold introduced a turn-shift "
             f"when it should have passed canonical through directly."
+        )
+
+
+def test_a6ec_continuous_trajectory_aligns_home_unwind_to_live_turn(
+    monkeypatch, tmp_path
+):
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch,
+        tmp_path,
+        u40_20_motor_counts=0,
+    )
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [
+            {"home_anchor_rad": 0.0, "source": "encoder_multi_turn_counts"}
+        ]
+    axis_q_values = [
+        backend._command_axis_q_for_joint_value(
+            axis_i=0,
+            logical_joint_idx=0,
+            canonical_q=math.radians(deg),
+            live_reference_counts=half_rm,
+        )
+        for deg in [360.0 - (3.6 * index) for index in range(101)]
+    ]
+    shifts = [0]
+    ready = [False]
+    shifted_axis_q_values = []
+    for axis_q in axis_q_values:
+        point_axis_q = [axis_q]
+        backend._align_continuous_trajectory_axis_q_to_turn_reference(
+            axis_q=point_axis_q,
+            axis_mask=0x1,
+            initial_reference_counts=[half_rm],
+            turn_shift_counts=shifts,
+            turn_shift_ready=ready,
+        )
+        shifted_axis_q_values.append(point_axis_q[0])
+
+    # Point 0 aligns with RTCore's live/hold turn frame instead of starting
+    # one full continuous turn away. The final point preserves the full
+    # canonical unwind delta, so Home +360° -> 0° becomes a slow -360° path.
+    assert math.isclose(shifted_axis_q_values[0], 0.0, abs_tol=1e-6)
+    assert math.isclose(shifted_axis_q_values[-1], math.radians(-360.0), abs_tol=1e-6)
+
+
+def test_a6ec_continuous_trajectory_aligns_to_rtcore_hold_after_jog(monkeypatch, tmp_path):
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch,
+        tmp_path,
+        u40_20_motor_counts=0,
+    )
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [
+            {"home_anchor_rad": 0.0, "source": "encoder_multi_turn_counts"}
+        ]
+        # Simulate a seam-crossing jog that left RTCore holding a continuous
+        # target one full turn away from sawtooth feedback. This is the
+        # latest live failure mode: Home after jog must align to hold target,
+        # not feedback.
+        backend._axis_counts[0] = half_rm
+        backend._jog_debug_status = RTCoreJogDebugStatus(
+            num_axes=1,
+            active_jog=False,
+            active_jog_axis_mask=0,
+            command_sp_mask=0,
+            have_hold_mask=0x1,
+            have_jog_target_mask=0,
+            snap_hold_mask=0,
+            stop_arrest_mask=0,
+            latest_cmd_axis_mask=0,
+            latest_cmd_flags=0,
+            latest_cmd_timeout_ns=0,
+            sample_time_ns=123,
+            active_jog_cmd_seq=0,
+            latest_jog_seq_seen=0,
+            active_jog_deadline_ns=0,
+            last_stop_reason=0,
+            last_stop_reason_name="none",
+            last_stop_axis_mask=0,
+            last_stop_time_ns=0,
+            last_stop_cmd_seq=0,
+            feedback_pos_counts=[half_rm] + [0] * 15,
+            hold_target_counts=[half_rm + rm] + [0] * 15,
+            output_target_counts=[half_rm + rm] + [0] * 15,
+            output_target_velocity_counts_per_s=[0] * 16,
+        )
+        backend._last_jog_debug_monotonic_s = time.monotonic()
+
+    assert backend._trajectory_turn_reference_counts_for_axis(0) == half_rm + rm
+
+    axis_q_values = [
+        backend._command_axis_q_for_joint_value(
+            axis_i=0,
+            logical_joint_idx=0,
+            canonical_q=math.radians(deg),
+            live_reference_counts=half_rm,
+        )
+        for deg in [360.0 - (3.6 * index) for index in range(101)]
+    ]
+    shifts = [0]
+    ready = [False]
+    shifted_axis_q_values = []
+    for axis_q in axis_q_values:
+        point_axis_q = [axis_q]
+        backend._align_continuous_trajectory_axis_q_to_turn_reference(
+            axis_q=point_axis_q,
+            axis_mask=0x1,
+            initial_reference_counts=[half_rm + rm],
+            turn_shift_counts=shifts,
+            turn_shift_ready=ready,
+        )
+        shifted_axis_q_values.append(point_axis_q[0])
+
+    # Point 0 must stay on the same continuous turn RTCore is already
+    # holding after the seam-crossing jog. If this used feedback instead,
+    # it would be one period lower and Home would start with a max-speed
+    # catch-up.
+    first_controller_counts = int(round(shifted_axis_q_values[0] * -1.0 * counts_per_unit))
+    first_wire_counts = first_controller_counts - (-half_rm)
+    assert first_wire_counts == pytest.approx(half_rm + rm, abs=4)
+    assert math.isclose(
+        shifted_axis_q_values[-1] - shifted_axis_q_values[0],
+        math.radians(-360.0),
+        abs_tol=1e-6,
+    )
+
+
+def test_a6ec_continuous_trajectory_upload_uses_hold_turn_after_jog(monkeypatch, tmp_path):
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch,
+        tmp_path,
+        u40_20_motor_counts=0,
+    )
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [
+            {"home_anchor_rad": 0.0, "source": "encoder_multi_turn_counts"}
+        ]
+        backend._axis_counts[0] = half_rm
+        backend._jog_debug_status = RTCoreJogDebugStatus(
+            num_axes=1,
+            active_jog=False,
+            active_jog_axis_mask=0,
+            command_sp_mask=0,
+            have_hold_mask=0x1,
+            have_jog_target_mask=0,
+            snap_hold_mask=0,
+            stop_arrest_mask=0,
+            latest_cmd_axis_mask=0,
+            latest_cmd_flags=0,
+            latest_cmd_timeout_ns=0,
+            sample_time_ns=456,
+            active_jog_cmd_seq=0,
+            latest_jog_seq_seen=0,
+            active_jog_deadline_ns=0,
+            last_stop_reason=0,
+            last_stop_reason_name="none",
+            last_stop_axis_mask=0,
+            last_stop_time_ns=0,
+            last_stop_cmd_seq=0,
+            feedback_pos_counts=[half_rm] + [0] * 15,
+            hold_target_counts=[half_rm + rm] + [0] * 15,
+            output_target_counts=[half_rm + rm] + [0] * 15,
+            output_target_velocity_counts_per_s=[0] * 16,
+        )
+        backend._last_jog_debug_monotonic_s = time.monotonic()
+
+    axis_q_values = [
+        backend._command_axis_q_for_joint_value(
+            axis_i=0,
+            logical_joint_idx=0,
+            canonical_q=math.radians(deg),
+            live_reference_counts=half_rm,
+        )
+        for deg in [360.0 - (3.6 * index) for index in range(101)]
+    ]
+    captured: list[tuple[int, bytes]] = []
+    monkeypatch.setattr(
+        backend,
+        "_cmd_ring_write",
+        lambda msg_type, payload: captured.append((msg_type, payload)) or 1,
+    )
+
+    backend.enqueue_trajectory_points(
+        99,
+        [
+            {"axis_q": [axis_q], "t_from_start_ns": index * 10_000_000}
+            for index, axis_q in enumerate(axis_q_values)
+        ],
+    )
+
+    assert len(captured) == len(axis_q_values)
+    _msg_type, payload = captured[0]
+    unpacked = _TRAJECTORY_POINT_STRUCT.unpack(payload)
+    q_values = unpacked[4:20]
+    first_controller_counts = int(round(float(q_values[0]) * -1.0 * counts_per_unit))
+    first_wire_counts = first_controller_counts - (-half_rm)
+    assert first_wire_counts == pytest.approx(half_rm + rm, abs=4)
+
+
+def test_a6ec_continuous_trajectory_first_point_safety_rejects_hold_turn_mismatch(
+    monkeypatch, tmp_path
+):
+    backend, rm, half_rm, counts_per_unit = _setup_midpoint_home_fold_backend(
+        monkeypatch,
+        tmp_path,
+        u40_20_motor_counts=0,
+    )
+    with backend._status_lock:
+        backend._absolute_encoder_home_anchors = [
+            {"home_anchor_rad": 0.0, "source": "encoder_multi_turn_counts"}
+        ]
+
+    # This point is equivalent modulo one turn, but one full continuous turn
+    # below RTCore's held command frame. The first-point cage must reject it
+    # linearly when the reference came from hold_target_counts.
+    with pytest.raises(RuntimeError, match="command_frame_live_deviation_out_of_range"):
+        backend._enforce_trajectory_wire_frame_safety(
+            axis_q=[0.0],
+            axis_mask=0x1,
+            previous_axis_counts=[None],
+            initial_live_counts=[half_rm + rm],
+            initial_reference_from_hold=[True],
+            point_index=0,
+            traj_id=123,
         )
 
 

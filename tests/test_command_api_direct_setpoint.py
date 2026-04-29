@@ -4,6 +4,14 @@ import pytest
 from gradient_os.arm_controller import command_api
 
 
+@pytest.fixture(autouse=True)
+def _default_legacy_jog_path(monkeypatch):
+    # Existing jog-loop regressions in this file exercise the rollback IK path.
+    # New Jacobian-specific tests opt in explicitly.
+    monkeypatch.setattr(command_api, "JOG_USE_JACOBIAN", False, raising=False)
+    monkeypatch.setattr(command_api.utils, "NUM_LOGICAL_JOINTS", 6, raising=False)
+
+
 def test_plan_preview_trajectory_points_prefers_live_joint_feedback(monkeypatch, tmp_path):
     monkeypatch.setattr(command_api, "RECORDED_TRAJ_DIR", str(tmp_path / "recorded"))
     monkeypatch.setattr(command_api.utils, "TRAJECTORY_CACHE_DIR", str(tmp_path / "cache"))
@@ -894,6 +902,47 @@ def test_build_motion_execution_metadata_refreshes_stale_rtcore_ack_snapshot(mon
     assert result["execution"]["last_submitted_traj_id"] == 3
 
 
+def test_apply_joint_setpoint_canonical_wrap_target_uses_display_baseline(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _FakeThread:
+        def __init__(self, *, target, kwargs, daemon):
+            captured["thread_target"] = target
+            captured["thread_kwargs"] = kwargs
+            self.daemon = daemon
+
+        def start(self):
+            captured["thread_started"] = True
+
+    def _fake_bounded_path(current_q, target_q, **kwargs):
+        captured["current_q"] = list(np.asarray(current_q, dtype=float))
+        captured["target_q"] = list(np.asarray(target_q, dtype=float))
+        return [captured["current_q"], captured["target_q"]], 1.0
+
+    monkeypatch.setattr(command_api.threading, "Thread", _FakeThread)
+    monkeypatch.setattr(command_api, "_build_bounded_joint_path", _fake_bounded_path)
+    monkeypatch.setattr(command_api, "_require_target_axes_motion_ready", lambda _indices: None)
+    monkeypatch.setattr(command_api.utils, "trajectory_state_get", lambda key, default=None: False if key == "is_running" else default)
+    monkeypatch.setattr(command_api.utils, "set_motion_state", lambda _state: None)
+    monkeypatch.setattr(command_api.servo_driver, "get_current_arm_state_rad", lambda verbose=False: [0.0, 0.0, 0.0, 0.0, 0.0, 2.0 * np.pi])
+    monkeypatch.setattr(
+        command_api.servo_driver,
+        "get_control_arm_state_rad",
+        lambda verbose=False: (_ for _ in ()).throw(AssertionError("control baseline should not be used")),
+    )
+
+    payload = command_api.handle_apply_joint_setpoint(
+        [0.0] * 6,
+        max_motor_rpm=100.0,
+        canonical_wrap_target=True,
+    )
+
+    assert payload["accepted"] is True
+    assert payload["canonical_wrap_target"] is True
+    assert captured["current_q"] == [0.0, 0.0, 0.0, 0.0, 0.0, 2.0 * np.pi]
+    assert captured["target_q"] == [0.0] * 6
+
+
 def test_realtime_jog_loop_uses_rtcore_joint_velocity_backend(monkeypatch):
     class _FakeRTCoreJogBackend:
         def __init__(self, manager):
@@ -982,6 +1031,258 @@ def test_realtime_jog_loop_uses_rtcore_joint_velocity_backend(monkeypatch):
     assert any(abs(float(value)) > 0.0 for value in send_calls[0][1])
     assert timeout_calls == [("timeout", command_api.JOG_BACKEND_LEASE_TIMEOUT_S)]
     assert direct_write_calls == []
+
+
+def test_jacobian_jog_produces_q_dot_proportional_to_twist(monkeypatch):
+    monkeypatch.setattr(command_api.ik_solver, "compute_jacobian", lambda _q: np.eye(6, dtype=float))
+    twist = np.array([0.01, -0.02, 0.03, 0.1, -0.2, 0.3], dtype=float)
+
+    q_dot, diag = command_api._compute_jog_joint_velocity_via_jacobian(
+        q_seed=np.zeros(6, dtype=float),
+        twist=twist,
+    )
+
+    np.testing.assert_allclose(q_dot, twist, atol=1e-9)
+    assert diag["jacobian_near_singular"] is False
+    assert diag["q_dot_rad_s"] == [float(value) for value in twist.tolist()]
+
+
+def test_jacobian_jog_clamps_velocity_at_singularity(monkeypatch):
+    J = np.diag([1.0, 1.0, 1.0, 1.0, 0.0, 1.0])
+    monkeypatch.setattr(command_api.ik_solver, "compute_jacobian", lambda _q: J)
+
+    q_dot, diag = command_api._compute_jog_joint_velocity_via_jacobian(
+        q_seed=np.zeros(6, dtype=float),
+        twist=np.array([0.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=float),
+        sigma_threshold=0.05,
+        lambda_max=0.1,
+    )
+
+    assert diag["jacobian_near_singular"] is True
+    assert diag["jacobian_damping_lambda_squared"] > 0.0
+    np.testing.assert_allclose(q_dot, np.zeros(6, dtype=float), atol=1e-9)
+
+
+def test_jacobian_jog_continuous_through_2pi_seed_offset(monkeypatch):
+    monkeypatch.setattr(command_api.ik_solver, "compute_jacobian", lambda _q: np.eye(6, dtype=float))
+    twist = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.1], dtype=float)
+
+    q_dot_a, _ = command_api._compute_jog_joint_velocity_via_jacobian(
+        q_seed=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 3.14], dtype=float),
+        twist=twist,
+    )
+    q_dot_b, _ = command_api._compute_jog_joint_velocity_via_jacobian(
+        q_seed=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 3.14 + 2.0 * np.pi], dtype=float),
+        twist=twist,
+    )
+
+    np.testing.assert_allclose(q_dot_a, q_dot_b, atol=1e-12)
+    assert abs(float(q_dot_a[5])) < 0.2
+
+
+def test_realtime_jog_loop_jacobian_short_tick_uses_hold_horizon(monkeypatch):
+    class _FakeRTCoreJogBackend:
+        def __init__(self, manager):
+            self.calls: list[tuple[str, list[float] | float]] = []
+            self._manager = manager
+
+        def start_joint_velocity_lease_jog(self, *, timeout_s):
+            self.calls.append(("start", float(timeout_s)))
+
+        def update_joint_velocity_lease_jog(self, joint_velocities_rad_s, *, timeout_s):
+            self.calls.append(("send", list(joint_velocities_rad_s)))
+            self.calls.append(("timeout", float(timeout_s)))
+
+        def stop_joint_velocity_lease_jog(self, *, quick_stop=False):
+            self.calls.append(("stop", 0.0))
+
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        backend_mode="joint_velocity_lease",
+        backend_timeout_s=command_api.JOG_VELOCITY_TIMEOUT_S,
+        session_id="test-session",
+    )
+    backend = _FakeRTCoreJogBackend(fresh_manager)
+
+    monotonic_values = [10.0, 10.005]
+    monotonic_last = {"value": 10.005}
+
+    def _fake_monotonic():
+        if monotonic_values:
+            monotonic_last["value"] = monotonic_values.pop(0)
+        else:
+            monotonic_last["value"] += 0.0001
+        return monotonic_last["value"]
+
+    def _sleep_and_stop(_seconds):
+        fresh_manager.stop_session(
+            session_id="test-session",
+            owner_id="test-owner",
+            reason="test-stop",
+            allow_missing=True,
+        )
+
+    monkeypatch.setattr(command_api, "JOG_USE_JACOBIAN", True, raising=False)
+    monkeypatch.setattr(command_api, "JOG_LINEAR_ACCEL_M_S2", 1000.0, raising=False)
+    monkeypatch.setattr(command_api, "JOG_ANGULAR_ACCEL_DEG_S2", 1000.0, raising=False)
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: backend)
+    monkeypatch.setattr(command_api.utils, "NUM_LOGICAL_JOINTS", 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "LOGICAL_JOINT_LIMITS_RAD", [(-3.14, 3.14)] * 6, raising=False)
+    monkeypatch.setattr(command_api.utils, "gripper_present", False, raising=False)
+    monkeypatch.setattr(command_api.time, "monotonic", _fake_monotonic)
+    monkeypatch.setattr(command_api.time, "sleep", _sleep_and_stop)
+    monkeypatch.setattr(command_api.servo_driver, "get_current_arm_state_rad", lambda verbose=False: [0.0] * 6)
+    monkeypatch.setattr(command_api.ik_solver, "is_jacobian_available", lambda: True)
+    monkeypatch.setattr(command_api.ik_solver, "get_jacobian_status", lambda: {"available": True, "unavailable_reason": ""})
+    monkeypatch.setattr(command_api.ik_solver, "compute_jacobian", lambda _q: np.eye(6, dtype=float))
+
+    def _fake_fk_matrix(joints):
+        q = np.asarray(joints, dtype=float).reshape(-1)
+        pose = np.eye(4, dtype=float)
+        pose[:3, 3] = q[:3]
+        return pose
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+    command_api._reset_jog_perf("joint_velocity_lease", True)
+
+    command_api._jog_controller_thread()
+
+    send_calls = [entry for entry in backend.calls if entry[0] == "send"]
+    assert send_calls
+    np.testing.assert_allclose(send_calls[0][1], [0.01, 0.0, 0.0, 0.0, 0.0, 0.0], atol=1e-9)
+    perf = command_api.get_jog_performance_snapshot()
+    assert perf["stages"]["jacobian_compute_ms"]["count"] >= 1
+    ik_debug = perf["ik_debug"]
+    assert ik_debug["using_jacobian"] is True
+    assert ik_debug["command_horizon_s"] == pytest.approx(1.0 / command_api.JOG_CONTROL_FREQUENCY_HZ)
+
+
+def test_realtime_jog_loop_uses_jacobian_not_full_ik(monkeypatch):
+    class _FakeRTCoreJogBackend:
+        def __init__(self, manager):
+            self.calls: list[tuple[str, list[float] | float]] = []
+            self._manager = manager
+
+        def start_joint_velocity_lease_jog(self, *, timeout_s):
+            self.calls.append(("start", float(timeout_s)))
+
+        def update_joint_velocity_lease_jog(self, joint_velocities_rad_s, *, timeout_s):
+            self.calls.append(("send", list(joint_velocities_rad_s)))
+
+        def stop_joint_velocity_lease_jog(self, *, quick_stop=False):
+            self.calls.append(("stop", 0.0))
+
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        backend_mode="joint_velocity_lease",
+        backend_timeout_s=command_api.JOG_VELOCITY_TIMEOUT_S,
+        session_id="test-session",
+    )
+    backend = _FakeRTCoreJogBackend(fresh_manager)
+
+    monkeypatch.setattr(command_api, "JOG_USE_JACOBIAN", True, raising=False)
+    monkeypatch.setattr(command_api, "JOG_LINEAR_ACCEL_M_S2", 1000.0, raising=False)
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: backend)
+    monkeypatch.setattr(command_api.time, "sleep", lambda _seconds: fresh_manager.stop_session(session_id="test-session", owner_id="test-owner", reason="test-stop", allow_missing=True))
+    monkeypatch.setattr(command_api.servo_driver, "get_current_arm_state_rad", lambda verbose=False: [0.0] * 6)
+    monkeypatch.setattr(command_api.ik_solver, "is_jacobian_available", lambda: True)
+    monkeypatch.setattr(command_api.ik_solver, "get_jacobian_status", lambda: {"available": True, "unavailable_reason": ""})
+    monkeypatch.setattr(command_api.ik_solver, "compute_jacobian", lambda _q: np.eye(6, dtype=float))
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", lambda _q: np.eye(4, dtype=float))
+    monkeypatch.setattr(
+        command_api.ik_solver,
+        "solve_ik",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("IK should not run in Jacobian hot path")),
+    )
+
+    command_api._jog_controller_thread()
+
+    assert [entry for entry in backend.calls if entry[0] == "send"]
+
+
+def test_drift_watchdog_blocks_velocity_send_until_resync(monkeypatch):
+    class _FakeRTCoreJogBackend:
+        def __init__(self):
+            self.calls: list[tuple[str, list[float] | float]] = []
+
+        def start_joint_velocity_lease_jog(self, *, timeout_s):
+            self.calls.append(("start", float(timeout_s)))
+
+        def update_joint_velocity_lease_jog(self, joint_velocities_rad_s, *, timeout_s):
+            self.calls.append(("send", list(joint_velocities_rad_s)))
+
+        def stop_joint_velocity_lease_jog(self, *, quick_stop=False):
+            self.calls.append(("stop", 0.0))
+
+    fresh_manager = command_api.JogSessionManager()
+    fresh_manager.start_session(
+        owner_id="test-owner",
+        seq=0,
+        lease_timeout_s=command_api.JOG_CONTROLLER_LEASE_TIMEOUT_S,
+        deadman=True,
+        velocity_vector=(0.01, 0.0, 0.0, 0.0, 0.0, 0.0),
+        backend_mode="joint_velocity_lease",
+        backend_timeout_s=command_api.JOG_VELOCITY_TIMEOUT_S,
+        session_id="test-session",
+    )
+    backend = _FakeRTCoreJogBackend()
+    control_reads = iter([[0.0] * 6, [0.0] * 6, [0.2, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    sleep_calls = {"count": 0}
+
+    def _sleep_and_stop(_seconds):
+        sleep_calls["count"] += 1
+        if sleep_calls["count"] >= 2:
+            fresh_manager.stop_session(
+                session_id="test-session",
+                owner_id="test-owner",
+                reason="test-stop",
+                allow_missing=True,
+            )
+
+    monkeypatch.setattr(command_api, "JOG_USE_JACOBIAN", True, raising=False)
+    monkeypatch.setattr(command_api, "JOG_MAX_COMMAND_DRIFT_RAD", 0.15, raising=False)
+    monkeypatch.setattr(command_api, "JOG_LINEAR_ACCEL_M_S2", 1000.0, raising=False)
+    monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
+    monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: backend)
+    monkeypatch.setattr(command_api.time, "sleep", _sleep_and_stop)
+    monkeypatch.setattr(command_api.servo_driver, "get_current_arm_state_rad", lambda verbose=False: next(control_reads))
+    monkeypatch.setattr(command_api.ik_solver, "is_jacobian_available", lambda: True)
+    monkeypatch.setattr(command_api.ik_solver, "get_jacobian_status", lambda: {"available": True, "unavailable_reason": ""})
+    monkeypatch.setattr(command_api.ik_solver, "compute_jacobian", lambda _q: np.eye(6, dtype=float))
+
+    def _fake_fk_matrix(joints):
+        q = np.asarray(joints, dtype=float)
+        pose = np.eye(4, dtype=float)
+        pose[:3, 3] = q[:3]
+        return pose
+
+    monkeypatch.setattr(command_api.ik_solver, "get_fk_matrix", _fake_fk_matrix)
+
+    command_api._jog_controller_thread()
+
+    send_calls = [entry for entry in backend.calls if entry[0] == "send"]
+    assert len(send_calls) == 2
+    assert any(abs(value) > 0.0 for value in send_calls[0][1])
+    assert send_calls[-1] == ("send", [0.0] * 6)
+    snapshot = fresh_manager.get_snapshot()
+    assert snapshot["last_gate_failure_reason"] == "JOG_COMMAND_DRIFT_EXCEEDED"
+    np.testing.assert_allclose(
+        snapshot["commanded_joint_vector"],
+        [0.0002, 0.0, 0.0, 0.0, 0.0, 0.0],
+        atol=1e-12,
+    )
 
 
 def test_realtime_jog_loop_pure_rotation_keeps_commanded_xyz_fixed(monkeypatch):

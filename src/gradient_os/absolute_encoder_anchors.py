@@ -9,6 +9,10 @@ ANCHORS_ENV_VAR = "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH"
 DEFAULT_ANCHORS_BASENAME = ".gradient_absolute_encoder_anchors.json"
 
 
+class AnchorStoreError(RuntimeError):
+    """Raised when the authoritative absolute-home anchor store is invalid."""
+
+
 def _utc_now_iso() -> str:
     return datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds")
 
@@ -110,11 +114,24 @@ def load_absolute_encoder_anchors_store() -> dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
-    except Exception:
-        return _empty_store()
+    except json.JSONDecodeError as exc:
+        raise AnchorStoreError(
+            f"Absolute encoder anchor store is malformed JSON: {path}: {exc}. "
+            "Refusing to treat this as an empty anchor store."
+        ) from exc
+    except OSError as exc:
+        raise AnchorStoreError(
+            f"Absolute encoder anchor store could not be read: {path}: {exc}."
+        ) from exc
     if not isinstance(payload, dict):
-        return _empty_store()
+        raise AnchorStoreError(
+            f"Absolute encoder anchor store must be a JSON object: {path}."
+        )
     robots = payload.get("robots")
+    if robots is not None and not isinstance(robots, dict):
+        raise AnchorStoreError(
+            f"Absolute encoder anchor store field 'robots' must be an object: {path}."
+        )
     return {
         "version": 1,
         "robots": robots if isinstance(robots, dict) else {},

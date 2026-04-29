@@ -35,6 +35,7 @@ servo_telemetry.csv
 trajectory_cache/
 closed_loop/
 open_loop/
+.gitnexus/
 bash.text
 logs/
 
