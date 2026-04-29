@@ -60,6 +60,7 @@ def test_realtime_jog_loop_commands_joint_space_via_servo_driver(monkeypatch):
     )
     monkeypatch.setattr(command_api, "_JOG_SESSION_MANAGER", fresh_manager)
     monkeypatch.setattr(command_api, "_get_rtcore_jog_backend", lambda: None)
+    monkeypatch.setattr(command_api, "JOG_USE_JACOBIAN", False, raising=False)
     monkeypatch.setattr(command_api.utils, "gripper_present", False, raising=False)
 
     def _sleep_and_stop(_seconds):

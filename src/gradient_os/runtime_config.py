@@ -7,13 +7,13 @@ from typing import Any
 
 from . import robot_assets
 from . import tool_library
-from .arm_controller.backends.ethercat_rtcore.runtime import DEFAULT_RT_MAX_RPM
 from .arm_controller.backends import registry as backend_registry
 from .arm_controller.robots import (
     get_robot_config,
     get_robot_name_by_id,
     list_available_robots,
 )
+from .runtime_defaults import DEFAULT_RT_MAX_RPM
 
 RUNTIME_CONFIG_ENV_VAR = "GRADIENT_RUNTIME_CONFIG_PATH"
 ALLOW_UNSAFE_ENV_VAR = "GRADIENT_ALLOW_UNSAFE_OVERRIDES"

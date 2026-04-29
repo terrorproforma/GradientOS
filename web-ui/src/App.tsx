@@ -36,7 +36,7 @@ import {
   X,
 } from "lucide-react";
 import { resolveDefaultApiHost, resolveDefaultVisionHost } from "./useEndpoint";
-import { preferredDisplayPoseJoints } from "./poseTelemetry";
+import { preferredDisplayPoseJoints, preferredLiveVisualizerPoseJoints } from "./poseTelemetry";
 import {
   type ArmVisualizerHandle,
   type StepLoadStatus,
@@ -603,6 +603,19 @@ type RuntimeConfigSnapshot = {
   restart_required: boolean;
   runtime_config_path?: string;
 };
+
+function formatRtMaxRpmInput(value: number | null | undefined): string | null {
+  return typeof value === "number" && Number.isFinite(value) ? String(value) : null;
+}
+
+function resolveRtMaxRpmInput(snapshot: RuntimeConfigSnapshot): string {
+  return (
+    formatRtMaxRpmInput(snapshot.desired?.overrides?.rt_max_rpm) ??
+    formatRtMaxRpmInput(snapshot.active?.rtcore?.default_max_rpm) ??
+    formatRtMaxRpmInput(snapshot.active?.rtcore?.effective_max_rpm) ??
+    ""
+  );
+}
 
 type PersistedSettings = {
   showBoundingBox: boolean;
@@ -4379,7 +4392,7 @@ function SettingsDialog({
                   disabled={isRuntimeConfigBusy || isRestartingController}
                 />
                 <span className="mt-1 block text-[11px] text-slate-400">
-                  `0` disables the RTCore clamp. `6000` matches the drive absolute max and effectively removes the old `100 RPM` cap for normal motion.
+                  `0` disables the RTCore clamp. Leave blank to use the RTCore startup default from runtime config.
                 </span>
               </label>
               {activeRuntimeConfig?.rtcore ? (
@@ -5204,7 +5217,7 @@ export default function App() {
   const [runtimeConfigSnapshot, setRuntimeConfigSnapshot] = useState<RuntimeConfigSnapshot | null>(null);
   const [selectedRobotName, setSelectedRobotName] = useState("");
   const [selectedRuntimeMode, setSelectedRuntimeMode] = useState<RuntimeExecutionMode>("live");
-  const [selectedRtMaxRpmInput, setSelectedRtMaxRpmInput] = useState("6000");
+  const [selectedRtMaxRpmInput, setSelectedRtMaxRpmInput] = useState("");
   const [toolLibrary, setToolLibrary] = useState<ToolDefinition[]>([]);
   const [selectedToolId, setSelectedToolId] = useState("identity");
   const [toolFilterRobotId, setToolFilterRobotId] = useState("all");
@@ -5691,8 +5704,6 @@ export default function App() {
     const desiredRobot = runtimePayload?.desired?.robot;
     const desiredSimMode = runtimePayload?.desired?.sim_mode;
     const desiredTool = runtimePayload?.desired?.active_tool_id;
-    const desiredRtMaxRpm = runtimePayload?.desired?.overrides?.rt_max_rpm;
-    const activeRtMaxRpm = runtimePayload?.active?.rtcore?.effective_max_rpm;
     setSelectedRobotName((previous) => {
       if (typeof desiredRobot === "string" && desiredRobot.trim().length > 0) {
         return desiredRobot;
@@ -5719,15 +5730,7 @@ export default function App() {
       }
       return previous;
     });
-    setSelectedRtMaxRpmInput(() => {
-      if (typeof desiredRtMaxRpm === "number" && Number.isFinite(desiredRtMaxRpm)) {
-        return String(desiredRtMaxRpm);
-      }
-      if (typeof activeRtMaxRpm === "number" && Number.isFinite(activeRtMaxRpm)) {
-        return String(activeRtMaxRpm);
-      }
-      return "6000";
-    });
+    setSelectedRtMaxRpmInput(resolveRtMaxRpmInput(runtimePayload));
     setRuntimeConfigError(null);
     return runtimePayload;
   }, [normalizedApiHost]);
@@ -6007,8 +6010,8 @@ export default function App() {
       return;
     }
     const trimmedRtMaxRpm = selectedRtMaxRpmInput.trim();
-    const parsedRtMaxRpm = trimmedRtMaxRpm.length === 0 ? 6000 : Number(trimmedRtMaxRpm);
-    if (!Number.isFinite(parsedRtMaxRpm) || parsedRtMaxRpm < 0) {
+    const parsedRtMaxRpm = trimmedRtMaxRpm.length === 0 ? null : Number(trimmedRtMaxRpm);
+    if (parsedRtMaxRpm !== null && (!Number.isFinite(parsedRtMaxRpm) || parsedRtMaxRpm < 0)) {
       setRuntimeConfigError("RTCore max RPM must be a number greater than or equal to 0.");
       return;
     }
@@ -6915,8 +6918,8 @@ export default function App() {
     };
 
     const candidateTimeSec = sourceTimeSec ?? next.timestamp / 1000;
-    const poseJoints =
-      Array.isArray(displayJoints) && displayJoints.length > 0 ? displayJoints : joints;
+    const poseJoints = preferredLiveVisualizerPoseJoints(next);
+    const usedDisplayJoints = poseJoints === displayJoints;
     const visualizerLagId =
       visualizerRef.current !== null && Array.isArray(poseJoints) && poseJoints.length > 0
         ? recordVisualizerLagReceived({
@@ -6926,6 +6929,9 @@ export default function App() {
             apiSequence,
             browserReceiveWallMs,
             browserReceivePerfMs,
+            payloadBytes: payload.length,
+            jointCount: poseJoints.length,
+            usedDisplayJoints,
           })
         : undefined;
     const lastTimeSec = lastTelemetrySourceTimeRef.current;
@@ -7002,7 +7008,7 @@ export default function App() {
   }, []);
 
   const connect = useCallback(() => {
-    if (isConnected) {
+    if (isConnected || eventSourceRef.current !== null) {
       return;
     }
     const host = normalizedApiHost;
@@ -7014,11 +7020,17 @@ export default function App() {
       eventSourceRef.current = es;
 
       es.onopen = () => {
+        if (eventSourceRef.current !== es) {
+          return;
+        }
         setIsConnected(true);
         setLatest(null);
       };
 
       es.onerror = () => {
+        if (eventSourceRef.current !== es) {
+          return;
+        }
         setError(
           "Connection lost. Ensure the API is reachable and CORS allows this origin.",
         );
@@ -7026,6 +7038,9 @@ export default function App() {
       };
 
       es.onmessage = (evt) => {
+        if (eventSourceRef.current !== es) {
+          return;
+        }
         handleMessage(evt.data);
       };
     } catch (err) {
@@ -7036,6 +7051,13 @@ export default function App() {
 
   const handleFallbackJointFeedback = useCallback(
     (anglesDeg: number[], gripperDeg?: number) => {
+      const lastTelemetrySec = lastTelemetrySourceTimeRef.current;
+      const nowSec = Date.now() / 1000;
+      // Once /monitor is fresh, REST joint reads must not feed or clear the
+      // visualizer path. They are only for disconnected/stale recovery.
+      if (lastTelemetrySec !== null && nowSec - lastTelemetrySec < LIVE_JOINT_FALLBACK_MAX_AGE_S) {
+        return;
+      }
       if (!Array.isArray(anglesDeg) || anglesDeg.length === 0) {
         lastAcceptedJointsRef.current = null;
         setLatest((prev) => {
@@ -7062,14 +7084,6 @@ export default function App() {
         .filter((value) => Number.isFinite(value))
         .map((value) => degToRad(value));
       if (nextJoints.length === 0) {
-        return;
-      }
-
-      const lastTelemetrySec = lastTelemetrySourceTimeRef.current;
-      const nowSec = Date.now() / 1000;
-      // Only fall back when the monitor stream is visibly late; otherwise let
-      // the primary SSE telemetry remain the single source of truth.
-      if (lastTelemetrySec !== null && nowSec - lastTelemetrySec < LIVE_JOINT_FALLBACK_MAX_AGE_S) {
         return;
       }
 

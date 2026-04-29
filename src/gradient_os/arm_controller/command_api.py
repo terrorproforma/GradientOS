@@ -387,6 +387,7 @@ def _build_jog_ik_debug_payload(
     command_horizon_s: "float | None" = None,
     using_jacobian: bool = False,
     jacobian_unavailable_reason: "str | None" = None,
+    accepted_commanded_pose_snapshot: "dict[str, object] | None" = None,
 ) -> dict[str, object]:
     """2026-04-21 extracted helper: used to be an inline dict literal
     inside `_jog_controller_thread`. Pulled out so both the hot path
@@ -408,7 +409,9 @@ def _build_jog_ik_debug_payload(
         "solved_pose": _pose_snapshot_from_matrix(solved_pose_matrix),
         "applied_pose": _pose_snapshot_from_matrix(applied_pose_matrix),
         "accepted_commanded_pose": (
-            target_pose_snapshot if gate_ok else current_commanded_pose_snapshot
+            accepted_commanded_pose_snapshot
+            if accepted_commanded_pose_snapshot is not None
+            else (target_pose_snapshot if gate_ok else current_commanded_pose_snapshot)
         ),
         "target_vs_solved": _pose_error_snapshot(
             target_position,
@@ -448,6 +451,36 @@ def _build_jog_ik_debug_payload(
         ),
         "twist": (
             jacobian_diag.get("twist")
+            if isinstance(jacobian_diag, dict)
+            else None
+        ),
+        "achieved_twist": (
+            jacobian_diag.get("achieved_twist")
+            if isinstance(jacobian_diag, dict)
+            else None
+        ),
+        "twist_residual": (
+            jacobian_diag.get("twist_residual")
+            if isinstance(jacobian_diag, dict)
+            else None
+        ),
+        "twist_residual_norm": (
+            jacobian_diag.get("twist_residual_norm")
+            if isinstance(jacobian_diag, dict)
+            else None
+        ),
+        "twist_attenuation_ratio": (
+            jacobian_diag.get("twist_attenuation_ratio")
+            if isinstance(jacobian_diag, dict)
+            else None
+        ),
+        "linear_attenuation_ratio": (
+            jacobian_diag.get("linear_attenuation_ratio")
+            if isinstance(jacobian_diag, dict)
+            else None
+        ),
+        "angular_attenuation_ratio": (
+            jacobian_diag.get("angular_attenuation_ratio")
             if isinstance(jacobian_diag, dict)
             else None
         ),
@@ -606,6 +639,14 @@ def _compute_jog_joint_velocity_via_jacobian(
     A = J @ J.T + lambda_squared * np.eye(6)
     x = np.linalg.solve(A, twist_arr)
     q_dot = J.T @ x
+    achieved_twist = J @ q_dot
+    twist_residual = twist_arr - achieved_twist
+    requested_twist_norm = float(np.linalg.norm(twist_arr))
+    achieved_twist_norm = float(np.linalg.norm(achieved_twist))
+    requested_linear_norm = float(np.linalg.norm(twist_arr[:3]))
+    achieved_linear_norm = float(np.linalg.norm(achieved_twist[:3]))
+    requested_angular_norm = float(np.linalg.norm(twist_arr[3:]))
+    achieved_angular_norm = float(np.linalg.norm(achieved_twist[3:]))
 
     diag = {
         "jacobian_sigma_min": sigma_min,
@@ -614,6 +655,24 @@ def _compute_jog_joint_velocity_via_jacobian(
         "jacobian_damping_lambda_squared": float(lambda_squared),
         "jacobian_near_singular": bool(sigma_min < sigma_threshold),
         "twist": [float(value) for value in twist_arr.tolist()],
+        "achieved_twist": [float(value) for value in achieved_twist.tolist()],
+        "twist_residual": [float(value) for value in twist_residual.tolist()],
+        "twist_residual_norm": float(np.linalg.norm(twist_residual)),
+        "twist_attenuation_ratio": (
+            achieved_twist_norm / requested_twist_norm
+            if requested_twist_norm > 1e-12
+            else 1.0
+        ),
+        "linear_attenuation_ratio": (
+            achieved_linear_norm / requested_linear_norm
+            if requested_linear_norm > 1e-12
+            else 1.0
+        ),
+        "angular_attenuation_ratio": (
+            achieved_angular_norm / requested_angular_norm
+            if requested_angular_norm > 1e-12
+            else 1.0
+        ),
         "q_dot_rad_s": [float(value) for value in q_dot.tolist()],
     }
     return q_dot, diag
@@ -5204,17 +5263,6 @@ def _jog_controller_thread():
             if using_jacobian
             else float(dt)
         )
-        target_position = commanded_position + linear_vel * command_horizon_s
-        delta_rotation = R.from_euler("xyz", angular_deg_s * command_horizon_s, degrees=True).as_matrix()
-        target_orientation = delta_rotation @ commanded_orientation
-        target_pose_snapshot = _pose_snapshot_from_components(target_position, target_orientation)
-        if utils.trajectory_state.get("jog_debug", False):
-            try:
-                targ_eul_deg = R.from_matrix(target_orientation).as_euler("xyz", degrees=True)
-                print(f"[Jog] TARG pos(m)={np.round(target_position,4)} eulXYZ(deg)={np.round(targ_eul_deg,2)} vel_lin={np.round(linear_vel,4)} vel_ang(deg/s)={np.round(angular_deg_s,1)} dt={dt:.4f} horizon={command_horizon_s:.4f} jacobian={using_jacobian}")
-            except Exception:
-                pass
-
         jacobian_diag: dict[str, object] | None = None
         command_drift_norm = float(np.linalg.norm(commanded_joints - q_current))
         command_drift_per_joint = [float(v) for v in (commanded_joints - q_current).tolist()]
@@ -5237,9 +5285,21 @@ def _jog_controller_thread():
                 "jacobian_compute_ms",
                 max(0.0, (time.monotonic() - jacobian_started) * 1000.0),
             )
+            achieved_twist = np.asarray(
+                jacobian_diag.get("achieved_twist", twist),
+                dtype=float,
+            ).reshape(6)
             _update_jog_singularity_advisory(jacobian_diag)
             q_target = commanded_joints + q_dot_rad_s * command_horizon_s
+            target_position = commanded_position + achieved_twist[:3] * command_horizon_s
+            target_orientation = (
+                R.from_rotvec(achieved_twist[3:] * command_horizon_s).as_matrix()
+                @ commanded_orientation
+            )
         else:
+            target_position = commanded_position + linear_vel * command_horizon_s
+            delta_rotation = R.from_euler("xyz", angular_deg_s * command_horizon_s, degrees=True).as_matrix()
+            target_orientation = delta_rotation @ commanded_orientation
             ik_started = time.monotonic()
             q_target = ik_solver.solve_ik(
                 target_position=target_position,
@@ -5250,6 +5310,14 @@ def _jog_controller_thread():
                 "ik_solve_ms",
                 max(0.0, (time.monotonic() - ik_started) * 1000.0),
             )
+
+        target_pose_snapshot = _pose_snapshot_from_components(target_position, target_orientation)
+        if utils.trajectory_state.get("jog_debug", False):
+            try:
+                targ_eul_deg = R.from_matrix(target_orientation).as_euler("xyz", degrees=True)
+                print(f"[Jog] TARG pos(m)={np.round(target_position,4)} eulXYZ(deg)={np.round(targ_eul_deg,2)} vel_lin={np.round(linear_vel,4)} vel_ang(deg/s)={np.round(angular_deg_s,1)} dt={dt:.4f} horizon={command_horizon_s:.4f} jacobian={using_jacobian}")
+            except Exception:
+                pass
 
         if q_target is not None:
             try:
@@ -5489,9 +5557,18 @@ def _jog_controller_thread():
                                 float(v) for v in ik_minus_jacobian.tolist()
                             ],
                         }
+                accepted_position = target_position
+                accepted_orientation = target_orientation
+                if using_jacobian and solved_pose_matrix is not None:
+                    accepted_position = np.asarray(solved_pose_matrix[:3, 3], dtype=float)
+                    accepted_orientation = np.asarray(solved_pose_matrix[:3, :3], dtype=float)
+                accepted_commanded_pose_snapshot = _pose_snapshot_from_components(
+                    accepted_position,
+                    accepted_orientation,
+                )
                 _JOG_SESSION_MANAGER.accept_command_step(
-                    position_m=target_position.tolist(),
-                    orientation_matrix=target_orientation.tolist(),
+                    position_m=accepted_position.tolist(),
+                    orientation_matrix=accepted_orientation.tolist(),
                     joint_vector=q_arr.tolist(),
                 )
                 accepted_perf_fields = _build_jog_command_state_perf_fields(
@@ -5532,6 +5609,7 @@ def _jog_controller_thread():
                         command_horizon_s=command_horizon_s,
                         using_jacobian=using_jacobian,
                         jacobian_unavailable_reason=jacobian_unavailable_reason,
+                        accepted_commanded_pose_snapshot=accepted_commanded_pose_snapshot,
                     )
                 )
                 if utils.trajectory_state.get("jog_debug", False):

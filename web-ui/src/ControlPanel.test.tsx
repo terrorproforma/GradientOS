@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ControlPanel, ControlPanelRuntimeHeader, preferredTelemetryJointAnglesRad } from "./ControlPanel";
+import { LiveStateProvider } from "./liveState";
 
 type FetchRecord = {
 	method: string;
@@ -162,6 +163,43 @@ describe("ControlPanel jog session lifecycle", () => {
 		expect(jogPosts[jogPosts.length - 1]?.pathname).toBe("/control/jog/session/stop");
 	});
 
+	it("keeps an active held jog alive even if the jog interval is stale", async () => {
+		const realSetInterval = window.setInterval.bind(window);
+		vi.spyOn(window, "setInterval").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+			if (timeout === 50) {
+				return 424242;
+			}
+			return realSetInterval(handler, timeout, ...args);
+		}) as typeof window.setInterval);
+
+		render(<ControlPanel apiHost="" />);
+
+		fireEvent.click(screen.getByRole("button", { name: "Arm Jog" }));
+		await waitFor(() => {
+			expect(screen.getByRole("button", { name: "Disarm Jog" })).toBeTruthy();
+		});
+		fireEvent.pointerDown(screen.getByRole("button", { name: "+X" }), { pointerId: 1 });
+
+		await waitFor(() => {
+			expect(fetchCalls.some((call) => call.method === "POST" && call.pathname === "/control/jog/session/start")).toBe(true);
+		});
+		await waitFor(() => {
+			const updatePosts = fetchCalls.filter((call) =>
+				call.method === "POST" && call.pathname === "/control/jog/session/update",
+			);
+			expect(updatePosts.length).toBeGreaterThanOrEqual(2);
+		});
+
+		const jogPosts = fetchCalls.filter((call) =>
+			call.method === "POST" && call.pathname.startsWith("/control/jog/session/"),
+		);
+		expect(jogPosts[0]?.pathname).toBe("/control/jog/session/start");
+		expect(jogPosts.some((call) => (
+			call.pathname === "/control/jog/session/update"
+			&& (call.body as { session_id?: string } | undefined)?.session_id === "session-1"
+		))).toBe(true);
+	});
+
 	it("recovers an expired active hold without posting a stop or power-down", async () => {
 		let startCount = 0;
 		let updateCount = 0;
@@ -307,6 +345,38 @@ describe("ControlPanel jog session lifecycle", () => {
 		await waitFor(() => {
 			expect(onJointFeedback).toHaveBeenCalledWith([1, 2, 3, 4, 5, 6], 7);
 		});
+	});
+
+	it("does not poll detailed joints while monitor telemetry is fresh", async () => {
+		const onJointFeedback = vi.fn();
+		render(
+			<LiveStateProvider
+				value={{
+					apiHost: "",
+					latest: {
+						timestamp: Date.now(),
+						raw: "monitor",
+						joints: [0, 0, 0, 0, 0, 0],
+						display_joints: [0, 0, 0, 0, 0, 0],
+					},
+					motionStatus: null,
+					setMotionStatus: vi.fn(),
+					isConnected: true,
+					monitorLastMessageAtMs: Date.now(),
+					monitorFreshnessMs: 0,
+					isMonitorFresh: true,
+					monitorError: null,
+					apiHealthError: null,
+				}}
+			>
+				<ControlPanel apiHost="" onJointFeedback={onJointFeedback} />
+			</LiveStateProvider>,
+		);
+
+		await sleep(250);
+
+		expect(fetchCalls.some((call) => call.pathname === "/info/joints-detailed")).toBe(false);
+		expect(onJointFeedback).not.toHaveBeenCalled();
 	});
 
 	it("does not fall back to canonical joint angles when display angles are missing", async () => {

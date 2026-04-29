@@ -7757,3 +7757,184 @@ Native-home pathway was exercised end-to-end on J6 against the new RTCore binary
 - Follow-ups / risks:
   - Recovery/retest sequence: reset J6 faults only after operator is ready; `./start-stack.sh stop --hard`; restart stack so new RTCore binary loads; safe power-up; run Home -> jog seam -> release -> Home -> safe power-down. Pass requires no visible spin and no new J6 `Er87.1` on power-down/disarm.
   - If Er87.1 still appears, inspect remaining `hold_target_counts[i] = feedback_wire_target_counts` paths at first OperationEnabled latch / service transitions and consider moving hold-target state into a first-class RTCore status field.
+
+## 2026-04-29 15:22 +0000 - Set RTCore startup max RPM default to shared 3000
+
+- What changed:
+  - Added `src/gradient_os/runtime_defaults.py` as the single Python owner for `DEFAULT_RT_MAX_RPM = 3000.0`.
+  - Updated `runtime_config.py` and RTCore startup env rendering to import the shared default instead of owning separate defaults.
+  - Set `.gradient_runtime_config.json` desired `rt_max_rpm` to `null`, so the active runtime config inherits the shared default instead of duplicating `3000.0` as an override.
+  - Updated the static systemd fallback `GRADIENT_RT_MAX_RPM=3000` and added a regression that it matches the shared Python default.
+  - Changed the web UI RTCore max RPM field to use `/info/runtime-config` desired/default/effective values; blank input now patches `rt_max_rpm: null` to mean "use runtime default" instead of hardcoding a numeric fallback.
+  - Adjusted API/runtime test expectations for the default-sourced `3000.0` value.
+
+- Validation performed:
+  - `ReadLints` on touched Python/JSON/service/TS/test files -> clean.
+  - `source ./start.sh && python -m pytest tests/test_rtcore_runtime.py tests/test_runtime_config.py tests/test_api_endpoints.py -q` -> `93 passed`.
+  - `npm run build` in `web-ui` -> pass; Vite emitted existing browser-externalized module notes and chunk-size warning.
+  - `git diff --check` -> clean.
+
+- Follow-ups / risks:
+  - Running RTCore will only pick up the new max RPM after the stack/RTCore is restarted through the normal safe teardown/start path.
+
+## 2026-04-29 16:05 +0000 - Held jog keepalive survives stale browser interval after idle
+
+- What changed:
+  - Diagnosed post-idle `+X` jog failure from terminal logs: `JOG_SESSION_START` was accepted with `truth_valid_at_arm=True`, no `JOG_SESSION_UPDATE` arrived before the 1.0 s lease expired, and `SAFE_POWER_DOWN` succeeded immediately afterward. This isolated the failure to the frontend held-jog keepalive path, not controller/RTCore clogging.
+  - `web-ui/src/ControlPanel.tsx`: added a post-ACK one-shot keepalive watchdog. Every successful active jog-session start/update schedules the next `sendJogTickRef` after `keepaliveMs`, so a held jog keeps refreshing the lease even if the 50 ms browser interval is stale after idle/wake. The watchdog is cleared on local stop, terminal jog errors, and component cleanup.
+  - `web-ui/src/ControlPanel.test.tsx`: added a regression that stubs the 50 ms jog `setInterval` so it never fires, then verifies an active held `+X` jog still emits repeated `/control/jog/session/update` posts through the post-ACK watchdog.
+- Validation performed:
+  - `npm test -- src/ControlPanel.test.tsx` in `web-ui` -> `34 passed`.
+  - `npm run build` in `web-ui` -> pass; Vite emitted existing browser-externalized module notes and chunk-size warning.
+  - `ReadLints` on `web-ui/src/ControlPanel.tsx` and `web-ui/src/ControlPanel.test.tsx` -> clean.
+- Follow-ups / risks:
+  - Live hardware/browser retest still needed: leave UI idle, hold `+X` for more than one second, and confirm controller log shows `JOG_SESSION_UPDATE` continuing instead of `lease-expired-before-loop`.
+
+## 2026-04-29 16:18 +0000 - Frontend telemetry cleanup removes live REST joint flood
+
+- What changed:
+  - Implemented `/home/pi/.cursor/plans/frontend_telemetry_cleanup_781c32e7.plan.md` without editing the plan file.
+  - `web-ui/src/App.tsx`: made `/monitor` `EventSource` connection idempotent while opening/connected and ignored callbacks from stale `EventSource` objects. Moved `handleFallbackJointFeedback` freshness gating before any clear/push so REST feedback cannot affect the visualizer while `/monitor` is fresh.
+  - `web-ui/src/ControlPanel.tsx` / `web-ui/src/liveState.tsx`: renamed the 100 ms poll interval to `STANDALONE_JOINT_FEEDBACK_POLL_MS` and gated `/info/joints-detailed` polling to standalone, disconnected, or stale-monitor cases. Fresh connected `/monitor` telemetry now drives the panel without parallel REST polling; explicit commissioning refresh calls are preserved.
+  - `web-ui/src/ArmVisualizer.tsx`: disposed late URDF loads, disposed the mounted robot graph during teardown, and reused the bounding-edge `BufferAttribute` instead of replacing it during bounds updates.
+  - `web-ui/src/TelemetryWorkspace.tsx`: capped diagnostics pose history at 1200 samples.
+  - `web-ui/src/ControlPanel.test.tsx`: added coverage that a `ControlPanel` under fresh `LiveStateProvider` telemetry does not poll `/info/joints-detailed`.
+
+- Validation performed:
+  - `ReadLints` on touched frontend files -> clean.
+  - `npm test -- src/ControlPanel.test.tsx src/App.test.ts` in `web-ui` -> `38 passed`.
+  - `npm run build` in `web-ui` -> pass; Vite emitted existing `occt-import-js` browser-externalized module notes and chunk-size warning.
+  - `git diff --check -- web-ui/src/App.tsx web-ui/src/ControlPanel.tsx web-ui/src/ControlPanel.test.tsx web-ui/src/ArmVisualizer.tsx web-ui/src/TelemetryWorkspace.tsx web-ui/src/liveState.tsx` -> clean.
+  - Existing terminal log check after HMR/page reloads: 16:10-16:19 window showed fresh `START_TELEMETRY` events but no `GET /info/joints-detailed` / `GET_JOINT_STATE` flood.
+
+- Follow-ups / risks:
+  - Hard-reload the browser after this change because Vite Fast Refresh invalidated `App.tsx`, `ControlPanel.tsx`, and `liveState.tsx` during development. Live confirmation should be one `/monitor` stream after reload and no sustained REST joint polling while telemetry is fresh.
+
+## 2026-04-29 16:23 +0000 - Fixed all-axis canonical truth loss after power-down by disabling fast trace
+
+- What changed:
+  - Diagnosed the commissioning-panel `Canonical truth trust warning: statusword_unavailable` on all axes after power-down.
+  - Live API showed `/info/joints-detailed` had all axes `statusword_hex=0x0000`, `drive_native_truth_reason=statusword_unavailable`, and `truth_reason=drive_native_startup_drive_config_missing`.
+  - Runtime check showed `/run` tmpfs was 100% full: `/run/gradient-rt-motion/cartesian-jog-fast-trace.jsonl` had consumed the 1.6G tmpfs and `/run/gradient-rt-motion/metrics.json` was truncated to 0 bytes.
+  - Removed persistent systemd fast-trace drop-in `/etc/systemd/system/gradient-rt-motion.service.d/fast-trace.conf`, reloaded systemd after freeing space, removed the runtime fast-trace path to avoid autosave copying the huge sparse file, and restarted the stack via `./start-stack.sh stop --hard && ./start-stack.sh`.
+- Validation performed:
+  - After freeing `/run`, `metrics.json` repopulated and `/info/joints-detailed` immediately returned canonical/display truth true on all axes.
+  - After stack restart, `df -h /run /run/gradient-rt-motion` -> `/run` 1% used.
+  - `/run/gradient-rt-motion` contains `ipc.sock` and a small `metrics.json` only; no fast-trace JSONL path.
+  - `systemctl show gradient-rt-motion.service -p Environment` reports `GRADIENT_RT_FAST_TRACE_PATH=` and `GRADIENT_RT_FAST_TRACE_HZ=0`.
+  - `/info/joints-detailed` reports all six axes `truth_available=True`, `drive_native_truth_reason=valid`, `statusword_hex=0x1650`.
+- Follow-ups / risks:
+  - If high-rate RTCore trace is needed again, enable it only for a bounded capture window and disable it immediately afterward, or add rotation/size caps before leaving it persistent.
+
+## 2026-04-29 17:58 +0000 - Added frontend 3D lag trace breakdown
+
+- What changed:
+  - User reported the 3D visualization still visibly lags one or more seconds behind the physical robot and asked for frontend traces; other agents are working jog fixes, so this stayed in `web-ui/src/visualizerLagTelemetry.ts` and `web-ui/src/App.tsx`.
+  - Extended `VisualizerLagCompletedSample` with `sourceDeltaMs`, `sourceToApiMs`, `apiSequenceGap`, `payloadBytes`, `jointCount`, and `usedDisplayJoints`.
+  - Added low-rate `[GradientOS 3D trace]` console heartbeats and expanded `[GradientOS 3D lag]` warnings to classify source cadence, API/SSE delivery, browser parse/handler, push-to-visible, frame interval, and render frame work.
+  - Published `globalThis.__GRADIENT_3D_LAG_TRACE__` with `snapshot`, recent completed samples, and pending samples so the browser console can be inspected without adding backend endpoints.
+  - `App.tsx` now passes payload length, joint count, and display-vs-canonical source metadata into the existing visualizer lag recorder.
+
+- Validation performed:
+  - `ReadLints` clean on `web-ui/src/visualizerLagTelemetry.ts`, `web-ui/src/App.tsx`, and `web-ui/src/ArmVisualizer.tsx`.
+  - `git diff --check -- web-ui/src/visualizerLagTelemetry.ts web-ui/src/App.tsx web-ui/src/ArmVisualizer.tsx` -> clean.
+  - `npm test -- src/App.test.ts` in `web-ui` -> `3 passed`.
+  - `npm run build` in `web-ui` -> pass; Vite emitted existing `occt-import-js` browser-externalized module notes and chunk-size warning.
+
+- Follow-ups / risks:
+  - Hard-reload the browser before live interpretation. During a repro, copy the latest `[GradientOS 3D trace]` / `[GradientOS 3D lag]` object or inspect `window.__GRADIENT_3D_LAG_TRACE__` to decide whether the one-second lag is source cadence, API/browser delivery, parse/handler, or rAF/render work.
+
+## 2026-04-29 18:05 +0000 - DLS achieved twist now owns Cartesian jog target advance
+
+- What changed:
+  - Implemented `/home/pi/.cursor/plans/dls_target_scaling_92521612.plan.md` without editing the plan file.
+  - `src/gradient_os/arm_controller/command_api.py`: `_compute_jog_joint_velocity_via_jacobian` now publishes `achieved_twist`, `twist_residual`, residual norm, combined attenuation, and separate linear/angular attenuation ratios. The Jacobian hot path now builds the validation target pose from `achieved_twist = J @ q_dot` instead of raw requested twist, so DLS singularity damping cannot make the internal TCP target run ahead of what the arm can produce.
+  - Successful Jacobian ticks now accept the FK-applied pose (`solved_pose_matrix`) as the next jog command state, while telemetry still reports target-vs-solved against the achieved-twist validation target. This avoids accumulating first-order integration error during long holds.
+  - Follow-up cleanup: `ik_debug.accepted_commanded_pose` now receives the actual accepted command-state pose, so telemetry no longer implies the achieved-twist validation target is always the same thing as the persisted command state.
+  - `tests/test_command_api_direct_setpoint.py`: updated DLS helper assertions and added a regression where +Y Cartesian jog is fully attenuated by a singular Jacobian; the old raw-target behavior would exceed `MAX_CART_RESIDUAL_M`, while the new target remains at Y=0 and no residual gate failure is recorded.
+  - `tests/test_realtime_jog_backend_compatibility.py`: made the legacy servo-driver jog compatibility test explicitly set `JOG_USE_JACOBIAN=False`, because that test asserts the old IK fallback path and should not depend on the rollout flag/environment.
+- Validation performed:
+  - `source ./start.sh && python -m pytest tests/test_command_api_direct_setpoint.py -q -k "jacobian_jog or achieved_twist or drift_watchdog"` -> `5 passed, 51 deselected`.
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/command_api.py tests/test_command_api_direct_setpoint.py` -> pass.
+  - First broad jog slice exposed the legacy compatibility test assumption (`1 failed, 86 passed`); fixed the test to force IK fallback.
+  - `source ./start.sh && python -m pytest tests/test_command_api_direct_setpoint.py tests/test_cartesian_jog_resilience.py tests/test_realtime_jog_backend_compatibility.py -q` -> `87 passed`.
+  - `source ./start.sh && python -m py_compile src/gradient_os/arm_controller/command_api.py tests/test_command_api_direct_setpoint.py tests/test_realtime_jog_backend_compatibility.py` -> pass.
+  - `ReadLints` on touched Python/test files -> clean.
+  - Follow-up telemetry cleanup rerun: focused Jacobian jog tests -> `5 passed, 51 deselected`; broad jog/control slice -> `87 passed`; touched-file `py_compile` -> pass; `ReadLints` -> clean.
+- Follow-ups / risks:
+  - Live operator-supervised singularity-edge Cartesian jog retest still needed. Expected behavior: `JOG_NEAR_SINGULARITY` can still appear, but TCP target should slow/attenuate rather than drift off-target. If `IK_JUMP_REJECTED` or `JOG_COMMAND_DRIFT_EXCEEDED` persists, add a second-stage uniform `q_dot` governor and recompute achieved twist before sending the RTCore command.
+
+## 2026-04-29 19:18 +0000 - HIGH PRIORITY: DLS achieved-twist jog still departed the intended TCP target
+
+- Investigation summary:
+  - Operator live-retested the DLS achieved-twist change and reported the jog still took the TCP "right off our kinematic target."
+  - Checked the newest controller log (`logs/startups/20260429-190442/controller.log`) and active terminal stream. The visible post-change jogs were accepted as `joint_velocity_lease` sessions with `truth_valid_at_arm=True`.
+  - No controller-log hits for `JOG_NEAR_SINGULARITY`, `CARTESIAN_RESIDUAL_EXCEEDED`, `JOG_COMMAND_DRIFT_EXCEEDED`, `IK_JUMP_REJECTED`, `ORIENTATION_RESIDUAL_EXCEEDED`, `achieved_twist`, or `twist_residual` were present in the newest controller log. This means the failure did not surface as a fail-closed gate rejection or as durable DLS telemetry in the standard controller log.
+  - The terminal/log sequence shows a burst of Cartesian jog commands (`vx=±0.05`, `vy=0.05`, `vz=0.05`, `v_roll=15`, `v_pitch=±15`) followed by Home. The Home plan started from a materially displaced configuration: `current_deg=[-17.594, 25.063, 29.157, 98.959, -87.832, -131.667] -> target_deg=[0.0]*6`.
+- Current interpretation:
+  - The 18:05 patch fixed one internal consistency problem: it stopped the validation target from running ahead of the damped DLS joint command.
+  - It did NOT guarantee preservation of the operator's intended Cartesian target/path. By advancing the command target with `achieved_twist = J @ q_dot`, the controller can accept a projected/attenuated twist whose direction differs from the requested twist. Near a singularity, that can move the TCP away from the intended kinematic target while internal residual gates remain satisfied.
+  - The missing durable DLS diagnostics in the standard logs are also a blocker: without a live diagnostic capture or controller log emission of requested/achieved/actual twist, we cannot yet distinguish "projection changed direction" from model/FK mismatch, runtime frame mismatch, or RTCore/drive following lag.
+- High-priority follow-up:
+  - Do not consider the DLS achieved-twist patch complete for live Cartesian jog.
+  - Next design should preserve requested Cartesian target semantics: apply a scalar task-speed governor along the requested twist/path, or hold/reject when the requested direction is singular, instead of silently accepting a direction-changing projected twist.
+  - Add capture/logging before the next live retest: requested twist, achieved twist, scalar attenuation, actual measured FK delta, target-vs-actual TCP error, `q_dot`, singular values, and explicit proof that the Jacobian path is active during RTCore `joint_velocity_lease` sessions.
+- Validation performed:
+  - Read-only log inspection only. No code changes or tests run for this investigation entry.
+- Follow-ups / risks:
+  - This is high priority because a "successful" jog tick can still move the physical TCP off the operator's kinematic target without raising the current gate alerts.
+
+## 2026-04-29 18:14 +0000 - 3D visualizer now uses live joints instead of display joints
+
+- What changed:
+  - User pasted a live `window.__GRADIENT_3D_LAG_TRACE__` sample after visible 3D lag. The trace showed no browser/render bottleneck: monitor sequence gaps were 1, source cadence averaged ~36.6 Hz, parse-to-push averaged ~0.09 ms, push-to-visible averaged ~6.9 ms, and frame work averaged ~0.34 ms.
+  - The trace identified `usedDisplayJoints=true`, meaning the physical 3D stage was rendering `display_joints`.
+  - `web-ui/src/poseTelemetry.ts`: added `preferredLiveVisualizerPoseJoints(...)`, which prefers live `joints` and falls back to `display_joints` only when live joints are absent.
+  - `web-ui/src/App.tsx`: switched the imperative visualizer handoff to `preferredLiveVisualizerPoseJoints(next)` and kept trace metadata (`usedDisplayJoints`) so the next live sample should show `false` when `joints` is present.
+  - `web-ui/src/poseTelemetry.test.ts`: added coverage for the new joints-first visualizer helper while preserving display-first behavior for operator panels/charts.
+
+- Validation performed:
+  - `ReadLints` clean on `web-ui/src/App.tsx`, `web-ui/src/poseTelemetry.ts`, and `web-ui/src/poseTelemetry.test.ts`.
+  - `git diff --check -- web-ui/src/App.tsx web-ui/src/poseTelemetry.ts web-ui/src/poseTelemetry.test.ts` -> clean.
+  - `npm test -- src/poseTelemetry.test.ts src/App.test.ts` in `web-ui` -> `9 passed`.
+  - `npm run build` in `web-ui` -> pass; Vite emitted existing `occt-import-js` browser-externalized module notes and chunk-size warning.
+
+- Follow-ups / risks:
+  - Hard-reload the browser, run the same jog, and confirm `window.__GRADIENT_3D_LAG_TRACE__.snapshot.latest.usedDisplayJoints === false`. If visible lag remains while `joints` drives the stage, compare the actual `joints` values against the physical pose/control truth next.
+
+## 2026-04-29 18:22 +0000 - Monitor joints now use control feedback source
+
+- What changed:
+  - User confirmed `usedDisplayJoints=false` but the 3D stage still visibly lagged, so the next source of delay was `/monitor.joints` itself.
+  - `src/gradient_os/run_controller.py`: added `_read_monitor_joint_feedback(...)`, which reads `servo_driver.get_control_arm_state_rad(verbose=False)` for `/monitor.joints` instead of strict `get_current_arm_state_rad(...)`.
+  - The same helper preserves the existing last-good fallback and stale/error flags when the control-feedback read fails.
+  - `display_joints`, `axis_absolute_feedback`, drive fault snapshots, and canonical truth diagnostics remain on their existing display/strict paths.
+  - `tests/test_run_controller_helpers.py`: added tests proving monitor joint feedback uses `get_control_arm_state_rad` and preserves recent-sample fallback.
+
+- Validation performed:
+  - `ReadLints` clean on `src/gradient_os/run_controller.py` and `tests/test_run_controller_helpers.py`.
+  - `source ./start.sh && python -m pytest tests/test_run_controller_helpers.py -q` -> `15 passed`.
+  - `source ./start.sh && python -m py_compile src/gradient_os/run_controller.py tests/test_run_controller_helpers.py` -> pass.
+  - `git diff --check -- src/gradient_os/run_controller.py tests/test_run_controller_helpers.py` -> clean.
+
+- Follow-ups / risks:
+  - Controller restart is required for this Python change to affect live `/monitor` telemetry. After restart and browser reload, inspect `window.__GRADIENT_3D_LAG_TRACE__` again; browser path should remain fast, and physical visual lag should drop if canonical conversion was the lagging source.
+
+## 2026-04-29 19:09 +0000 - Lean monitor packets target 50 Hz visual telemetry
+
+- What changed:
+  - User asked if the post-control-feedback monitor cadence (`~35.5 Hz`) can reach 50 Hz.
+  - `src/gradient_os/run_controller.py`: kept the live `/monitor.joints` read on every loop, but split heavier existing telemetry fields to slower cadences inside the same `/monitor` stream.
+  - Cached display snapshot now refreshes at `max(period, 0.1s)` and only includes bulky `axis_absolute_feedback` on those refresh packets; cached `display_joints` can still accompany fast packets.
+  - RTCore axis `servos` samples now refresh at `max(period, 0.1s)` instead of every monitor tick.
+  - Existing extended servo/drive-fault block remains on the previous `0.5s` cadence.
+  - `tests/test_run_controller_helpers.py`: added coverage that `_attach_monitor_joint_feedback(...)` can include display joints while omitting heavy `axis_absolute_feedback`.
+
+- Validation performed:
+  - `ReadLints` clean on `src/gradient_os/run_controller.py` and `tests/test_run_controller_helpers.py`.
+  - `source ./start.sh && python -m pytest tests/test_run_controller_helpers.py -q` -> `16 passed`.
+  - `source ./start.sh && python -m py_compile src/gradient_os/run_controller.py tests/test_run_controller_helpers.py` -> pass.
+  - `git diff --check -- src/gradient_os/run_controller.py tests/test_run_controller_helpers.py` -> clean.
+
+- Follow-ups / risks:
+  - Requires controller/API stack restart to take effect. After restart and browser hard reload, expected trace improvement is `sourceHz`/`browserReceiveHz` closer to 50 Hz and lower average `payloadBytes` on most packets, while 10 Hz diagnostic packets still carry larger payloads.

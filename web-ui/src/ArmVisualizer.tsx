@@ -1449,17 +1449,19 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         scene.add(edges);
       }
 
-      const positions = new Float32Array(indices.length * 3);
+      let positionAttribute = edges.geometry.getAttribute("position") as THREE.BufferAttribute | undefined;
+      if (!positionAttribute || positionAttribute.count !== indices.length) {
+        positionAttribute = new THREE.BufferAttribute(new Float32Array(indices.length * 3), 3);
+        edges.geometry.setAttribute("position", positionAttribute);
+      }
+      const positions = positionAttribute.array as Float32Array;
       indices.forEach((idx, arrayIndex) => {
         const vertex = corners[idx];
         positions[arrayIndex * 3] = vertex.x;
         positions[arrayIndex * 3 + 1] = vertex.y;
         positions[arrayIndex * 3 + 2] = vertex.z;
       });
-      edges.geometry.setAttribute(
-        "position",
-        new THREE.BufferAttribute(positions, 3),
-      );
+      positionAttribute.needsUpdate = true;
       edges.geometry.computeBoundingSphere();
     };
 
@@ -1800,6 +1802,7 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
           urdfConfig.urdfPath,
           (robot) => {
             if (disposed) {
+              disposeObject3D(robot);
               return;
             }
             mountRobotInstance(robot, {
@@ -2070,9 +2073,14 @@ export const ArmVisualizer = forwardRef(function ArmVisualizer(
         });
       });
       boundingMarkersRef.current = [];
+      const robot = robotRef.current;
+      if (robot) {
+        robot.parent?.remove(robot);
+        disposeObject3D(robot);
+        robotRef.current = null;
+      }
       scene.clear();
       sceneRef.current = null;
-      robotRef.current = null;
       targetAnglesRef.current = null;
       targetTimingIdRef.current = null;
       currentAnglesRef.current = null;

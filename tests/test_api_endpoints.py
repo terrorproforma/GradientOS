@@ -412,12 +412,12 @@ def patch_send(monkeypatch):
             "override_profile": None,
         },
         "rtcore": {
-            "configured_max_rpm": 6000.0,
-            "configured_source": "runtime_config",
-            "effective_max_rpm": 6000.0,
-            "source": "runtime_config",
-            "default_max_rpm": 6000.0,
-            "override_max_rpm": 6000.0,
+            "configured_max_rpm": 3000.0,
+            "configured_source": "default",
+            "effective_max_rpm": 3000.0,
+            "source": "default",
+            "default_max_rpm": 3000.0,
+            "override_max_rpm": None,
             "clamp_disabled": False,
         },
         "tool": {

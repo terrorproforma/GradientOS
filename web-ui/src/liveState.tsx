@@ -240,7 +240,7 @@ export type LiveStateContextValue = {
 };
 
 export const LIVE_MONITOR_STALE_MS = 250;
-export const FALLBACK_JOINT_FEEDBACK_POLL_MS = 100;
+export const STANDALONE_JOINT_FEEDBACK_POLL_MS = 100;
 
 const LiveStateContext = createContext<LiveStateContextValue | null>(null);
 

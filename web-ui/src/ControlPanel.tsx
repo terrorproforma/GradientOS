@@ -2,7 +2,7 @@ import { Activity, AlertTriangle, Power, ShieldAlert, ShieldCheck } from "lucide
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DEFAULT_SPEED_SLIDER } from "./uiConstants";
 import {
-	FALLBACK_JOINT_FEEDBACK_POLL_MS,
+	STANDALONE_JOINT_FEEDBACK_POLL_MS,
 	useOptionalLiveState,
 } from "./liveState";
 
@@ -1403,6 +1403,7 @@ export function ControlPanel({
 	const [lastJogCommand, setLastJogCommand] = useState<JogCommandVector>([0, 0, 0, 0, 0, 0]);
 	const driveControlsReferenceLabel = showStatusSections ? "Drive Power section above" : "header drive controls above";
 	const jogTimerRef = useRef<number | null>(null);
+	const jogKeepaliveTimerRef = useRef<number | null>(null);
 	const sendJogTickRef = useRef<() => Promise<void>>(async () => {});
 	const jogEnabledRef = useRef<boolean>(false);
 	const jogHoldActiveRef = useRef<boolean>(false);
@@ -1572,20 +1573,18 @@ export function ControlPanel({
 
 	// Boolean summary of "does the monitor stream already carry a usable
 	// joint-angle snapshot?" — stable across SSE ticks that don't change the
-	// availability flag. Keeping the fallback-polling effect below keyed off
-	// this boolean (instead of the whole `latestTelemetry` object) stops it
-	// from tearing down and re-creating its interval ~5-10 times a second,
-	// which was flickering the commissioning panel between its "live angles"
-	// and "waiting for joint feedback..." states on every monitor event.
+	// availability flag.
 	const hasFreshTelemetryJointAngles = useMemo(() => {
 		if (!isMonitorFresh) {
 			return false;
 		}
 		return hasAnyFiniteJointAngles(preferredTelemetryJointAnglesRad(latestTelemetry));
 	}, [isMonitorFresh, latestTelemetry]);
+	const shouldPollJointFeedback =
+		!liveState || !liveState.isConnected || !isMonitorFresh;
 
 	useEffect(() => {
-		if (hasFreshTelemetryJointAngles) {
+		if (!shouldPollJointFeedback || hasFreshTelemetryJointAngles) {
 			return;
 		}
 		let disposed = false;
@@ -1610,12 +1609,12 @@ export function ControlPanel({
 		void tick();
 		const timer = window.setInterval(() => {
 			void tick();
-		}, FALLBACK_JOINT_FEEDBACK_POLL_MS);
+		}, STANDALONE_JOINT_FEEDBACK_POLL_MS);
 		return () => {
 			disposed = true;
 			window.clearInterval(timer);
 		};
-	}, [hasFreshTelemetryJointAngles, refreshJointAngles]);
+	}, [hasFreshTelemetryJointAngles, refreshJointAngles, shouldPollJointFeedback]);
 
 	useEffect(() => {
 		if (controlledMotionStatus !== undefined || liveState) {
@@ -1692,6 +1691,24 @@ export function ControlPanel({
 		jogSessionSeqRef.current = -1;
 		jogSessionStatusRef.current = "idle";
 	}, []);
+
+	const clearJogKeepaliveTimer = useCallback(() => {
+		if (jogKeepaliveTimerRef.current) {
+			window.clearTimeout(jogKeepaliveTimerRef.current);
+			jogKeepaliveTimerRef.current = null;
+		}
+	}, []);
+
+	const scheduleJogKeepalive = useCallback(() => {
+		clearJogKeepaliveTimer();
+		if (!jogHoldActiveRef.current || !hasActiveJogInput()) {
+			return;
+		}
+		jogKeepaliveTimerRef.current = window.setTimeout(() => {
+			jogKeepaliveTimerRef.current = null;
+			sendJogTickRef.current().catch(() => {});
+		}, keepaliveMs);
+	}, [clearJogKeepaliveTimer, hasActiveJogInput, keepaliveMs]);
 
 	const enqueueJogState = useCallback((payload: JogStatePayload, silent = true) => {
 		const hadPendingPayload = queuedJogStateRef.current !== null;
@@ -1772,6 +1789,11 @@ export function ControlPanel({
 								? session.last_seq_received
 								: nextSeq;
 							jogSessionStatusRef.current = session.state ?? "active";
+							if (nextPayload.active) {
+								scheduleJogKeepalive();
+							} else {
+								clearJogKeepaliveTimer();
+							}
 						} else if (isJogSessionTerminalError(lastRequestErrorRef.current)) {
 							const errorCode = getJogSessionErrorCode(lastRequestErrorRef.current);
 							if (isJogSessionRecoverableError(errorCode)) {
@@ -1801,6 +1823,7 @@ export function ControlPanel({
 							lastSentAtRef.current = Date.now();
 							jogEnabledRef.current = false;
 							jogHoldActiveRef.current = false;
+							clearJogKeepaliveTimer();
 							resetJogSessionTracking();
 						}
 					}
@@ -1810,7 +1833,7 @@ export function ControlPanel({
 			})();
 		}
 		return jogStatePublishLoopRef.current ?? Promise.resolve();
-	}, [buildJogStatePayload, computeJogVector, hasActiveJogInput, post, resetJogSessionTracking]);
+	}, [buildJogStatePayload, clearJogKeepaliveTimer, computeJogVector, hasActiveJogInput, post, resetJogSessionTracking, scheduleJogKeepalive]);
 
 	const sendJogTick = useCallback(async () => {
 		if (!jogHoldActiveRef.current) {
@@ -1861,7 +1884,8 @@ export function ControlPanel({
 			window.clearInterval(jogTimerRef.current);
 			jogTimerRef.current = null;
 		}
-	}, []);
+		clearJogKeepaliveTimer();
+	}, [clearJogKeepaliveTimer]);
 
 	const ensureJogPolling = useCallback(() => {
 		if (jogTimerRef.current) {
@@ -1951,6 +1975,7 @@ export function ControlPanel({
 			document.removeEventListener("visibilitychange", handleVisibilityChange);
 			window.removeEventListener("beforeunload", handlePageHide);
 			window.removeEventListener("pagehide", handlePageHide);
+			stopJogPolling();
 			if (jogEnabledRef.current || jogHoldActiveRef.current || jogSessionIdRef.current) {
 				const sessionId = jogSessionIdRef.current;
 				if (sessionId) {
@@ -1963,7 +1988,7 @@ export function ControlPanel({
 				resetJogSessionTracking();
 			}
 		};
-	}, [postJsonBestEffort, requestJogFailsafeStop, resetJogSessionTracking]);
+	}, [postJsonBestEffort, requestJogFailsafeStop, resetJogSessionTracking, stopJogPolling]);
 
 	const armJogMode = useCallback(() => {
 		if (jogEnabledRef.current) {

@@ -1,4 +1,5 @@
 from gradient_os import runtime_config
+from gradient_os.runtime_defaults import DEFAULT_RT_MAX_RPM
 
 
 def test_load_runtime_config_defaults_to_manifest_policy(monkeypatch, tmp_path):
@@ -11,6 +12,7 @@ def test_load_runtime_config_defaults_to_manifest_policy(monkeypatch, tmp_path):
     assert loaded["desired"]["allow_unsafe_overrides"] is False
     assert loaded["desired"]["overrides"]["ik_solver_backend"] is None
     assert loaded["desired"]["overrides"]["drive_profile"] is None
+    assert loaded["desired"]["overrides"]["rt_max_rpm"] == DEFAULT_RT_MAX_RPM
 
 
 def test_resolve_effective_runtime_uses_robot_policy_without_overrides():

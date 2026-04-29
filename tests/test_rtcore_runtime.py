@@ -1,8 +1,9 @@
+from pathlib import Path
+
 import pytest
 from fractions import Fraction
 
 from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import (
-    DEFAULT_RT_MAX_RPM,
     RTCORE_EXEC_STATE_COMPLETED,
     RTCORE_MOTION_MODE_LEGACY_SETPOINT,
     build_rtcore_drive_startup_config,
@@ -14,6 +15,7 @@ from gradient_os.arm_controller.backends.ethercat_rtcore.runtime import (
     rtcore_drive_profile_name_to_id,
 )
 from gradient_os.arm_controller.robots import get_robot_config
+from gradient_os.runtime_defaults import DEFAULT_RT_MAX_RPM
 from gradient_os.telemetry.drive_faults import build_drive_fault_snapshot
 
 
@@ -185,6 +187,14 @@ def test_render_rtcore_systemd_env_contains_scaling_and_profile():
     # completion checks modulo-RM). This regression catches any accidental
     # revert of the 2026-04-19 continuous-607A landing.
     assert 'GRADIENT_RT_COMMAND_WRAP_AXIS_MASK="0x0"' in rendered
+
+
+def test_systemd_service_fallback_rt_max_matches_runtime_default():
+    repo_root = Path(__file__).resolve().parents[1]
+    service_text = (repo_root / "systemd/rt-motion/gradient-rt-motion.service").read_text(
+        encoding="utf-8"
+    )
+    assert f"Environment=GRADIENT_RT_MAX_RPM={DEFAULT_RT_MAX_RPM:g}" in service_text
 
 
 def test_build_rtcore_drive_startup_config_uses_drive_profile_defaults_when_robot_has_no_override():

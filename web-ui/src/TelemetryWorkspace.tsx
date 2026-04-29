@@ -8,6 +8,7 @@ import { useOptionalLiveState } from "./liveState";
 type TelemetryTab = "charts" | "diagnostics";
 const ACTIVE_PERFORMANCE_POLL_MS = 250;
 const IDLE_PERFORMANCE_POLL_MS = 1000;
+const POSE_HISTORY_LIMIT = 1200;
 
 function isMotionActive(snapshot: PerformanceResponse | null): boolean {
   if (!snapshot) {
@@ -63,7 +64,8 @@ function appendPoseHistorySample(
   ) {
     return history;
   }
-  return [...history, sample];
+  const next = [...history, sample];
+  return next.length > POSE_HISTORY_LIMIT ? next.slice(-POSE_HISTORY_LIMIT) : next;
 }
 
 async function readErrorMessage(res: Response): Promise<string> {

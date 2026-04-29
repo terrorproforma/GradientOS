@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from ....runtime_defaults import DEFAULT_RT_MAX_RPM
 from ...ethercat_drive_catalog import list_ethercat_drive_profiles, render_ethercat_drive_rtcore_env
 from .. import registry as backend_registry
 
 RTCORE_DRIVE_PROFILE_UNKNOWN = 0
-DEFAULT_RT_MAX_RPM = 6000.0
 
 RTCORE_MOTION_MODE_IDLE = 0
 RTCORE_MOTION_MODE_LEGACY_SETPOINT = 1

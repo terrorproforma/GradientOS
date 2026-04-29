@@ -199,6 +199,72 @@ def test_attach_monitor_joint_feedback_omits_display_when_truth_unavailable():
     assert msg["axis_absolute_feedback"] == [{"logical_joint": 1, "truth_available": False}]
 
 
+def test_attach_monitor_joint_feedback_can_omit_heavy_axis_feedback():
+    msg: dict[str, object] = {}
+
+    run_controller._attach_monitor_joint_feedback(
+        msg,
+        canonical_joint_positions_rad=[-628.0, -113.0, -62.0],
+        display_snapshot={
+            "truth_available": True,
+            "joint_positions_rad": [0.01, 0.02, 0.03],
+            "axis_absolute_feedback": [{"logical_joint": 1, "truth_available": True}],
+        },
+        include_axis_absolute_feedback=False,
+    )
+
+    assert msg["joints"] == [-628.0, -113.0, -62.0]
+    assert msg["display_joints"] == [0.01, 0.02, 0.03]
+    assert "axis_absolute_feedback" not in msg
+
+
+def test_read_monitor_joint_feedback_uses_control_feedback(monkeypatch):
+    monkeypatch.setattr(
+        run_controller.servo_driver,
+        "get_control_arm_state_rad",
+        lambda verbose=False: [1, 2, 3],
+    )
+    monkeypatch.setattr(
+        run_controller.servo_driver,
+        "get_current_arm_state_rad",
+        lambda verbose=False: (_ for _ in ()).throw(AssertionError("strict canonical read should not be used")),
+    )
+
+    q, available, stale, error, last_good, last_ts = run_controller._read_monitor_joint_feedback(
+        None,
+        0.0,
+        now_s=123.0,
+    )
+
+    assert q == [1.0, 2.0, 3.0]
+    assert available is True
+    assert stale is False
+    assert error is None
+    assert last_good == [1.0, 2.0, 3.0]
+    assert last_ts == 123.0
+
+
+def test_read_monitor_joint_feedback_falls_back_to_recent_sample(monkeypatch):
+    monkeypatch.setattr(
+        run_controller.servo_driver,
+        "get_control_arm_state_rad",
+        lambda verbose=False: (_ for _ in ()).throw(RuntimeError("control unavailable")),
+    )
+
+    q, available, stale, error, last_good, last_ts = run_controller._read_monitor_joint_feedback(
+        [0.1, 0.2, 0.3],
+        10.0,
+        now_s=11.5,
+    )
+
+    assert q == [0.1, 0.2, 0.3]
+    assert available is False
+    assert stale is True
+    assert error == "control unavailable"
+    assert last_good == [0.1, 0.2, 0.3]
+    assert last_ts == 10.0
+
+
 class _FakeExtendedBackend:
     """Minimal backend stub exposing the Phase 1 extended-telemetry
     accessors. Used by the Phase 2 regression tests below to verify

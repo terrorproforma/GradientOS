@@ -9,7 +9,7 @@
       "ik_solver_backend": null,
       "servo_backend": null,
       "drive_profile": null,
-      "rt_max_rpm": 6000.0
+      "rt_max_rpm": null
     }
   },
   "meta": {

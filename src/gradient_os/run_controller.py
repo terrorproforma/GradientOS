@@ -550,6 +550,7 @@ def _attach_monitor_joint_feedback(
     *,
     canonical_joint_positions_rad: list[float] | None,
     display_snapshot: dict[str, object] | None,
+    include_axis_absolute_feedback: bool = True,
 ) -> None:
     if isinstance(canonical_joint_positions_rad, list):
         msg["joints"] = [float(value) for value in canonical_joint_positions_rad]
@@ -562,9 +563,43 @@ def _attach_monitor_joint_feedback(
         if isinstance(display_positions, list):
             msg["display_joints"] = [float(value) for value in display_positions]
 
-    axis_absolute_feedback = display_snapshot.get("axis_absolute_feedback")
-    if isinstance(axis_absolute_feedback, list):
-        msg["axis_absolute_feedback"] = axis_absolute_feedback
+    if include_axis_absolute_feedback:
+        axis_absolute_feedback = display_snapshot.get("axis_absolute_feedback")
+        if isinstance(axis_absolute_feedback, list):
+            msg["axis_absolute_feedback"] = axis_absolute_feedback
+
+
+def _read_monitor_joint_feedback(
+    last_good_joint_rad: list[float] | None,
+    last_good_joint_ts: float,
+    *,
+    now_s: float | None = None,
+) -> tuple[list[float] | None, bool, bool, str | None, list[float] | None, float]:
+    """Read the live-control joint stream used by `/monitor.joints`.
+
+    The 3D stage needs the freshest physical feedback already available from
+    the backend. Keep strict canonical/display truth on the separate
+    `display_joints` and diagnostic payloads.
+    """
+    now = time.time() if now_s is None else float(now_s)
+    try:
+        q = servo_driver.get_control_arm_state_rad(verbose=False)
+        if isinstance(q, list) and q:
+            sample = [float(value) for value in q]
+            return sample, True, False, None, sample, now
+        return None, True, False, None, last_good_joint_rad, last_good_joint_ts
+    except Exception as exc:
+        fallback = None
+        if last_good_joint_rad is not None and (now - last_good_joint_ts) <= 2.0:
+            fallback = list(last_good_joint_rad)
+        return (
+            fallback,
+            False,
+            True,
+            str(exc),
+            last_good_joint_rad,
+            last_good_joint_ts,
+        )
 
 
 _CANONICAL_TRUTH_DETAILS_RE = re.compile(
@@ -1944,43 +1979,43 @@ Examples:
 
         def _telemetry_loop():
             period = 1.0 / max(1, int(telemetry_hz))
+            display_snapshot_period_s = max(period, 0.1)
+            rtcore_axis_sample_period_s = max(period, 0.1)
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             last_extra_ts = 0.0  # throttle extended servo telemetry to ~2 Hz
             last_motion_status_ts = 0.0
+            last_display_snapshot_ts = 0.0
+            last_rtcore_axis_sample_ts = 0.0
             cached_motion_status: dict[str, object] | None = None
+            cached_display_snapshot: dict[str, object] | None = None
             last_good_joint_rad: list[float] | None = None
             last_good_joint_ts = 0.0
             
             while not telemetry_stop_event.is_set():
                 try:
-                    joint_feedback_available = True
-                    joint_feedback_stale = False
-                    joint_feedback_error = None
-                    try:
-                        q = servo_driver.get_current_arm_state_rad(verbose=False)
-                        if isinstance(q, list) and q:
-                            last_good_joint_rad = [float(value) for value in q]
-                            last_good_joint_ts = time.time()
-                    except Exception as exc:
-                        q = None
-                        joint_feedback_available = False
-                        joint_feedback_stale = True
-                        joint_feedback_error = str(exc)
-                        if (
-                            last_good_joint_rad is not None
-                            and (time.time() - last_good_joint_ts) <= 2.0
-                        ):
-                            q = list(last_good_joint_rad)
+                    now = time.time()
+                    (
+                        q,
+                        joint_feedback_available,
+                        joint_feedback_stale,
+                        joint_feedback_error,
+                        last_good_joint_rad,
+                        last_good_joint_ts,
+                    ) = _read_monitor_joint_feedback(
+                        last_good_joint_rad,
+                        last_good_joint_ts,
+                        now_s=now,
+                    )
                     g = utils.current_gripper_angle_rad if utils.gripper_present else None
                     msg: dict[str, object] = {
-                        "t": time.time(),
+                        "t": now,
                         "joint_feedback_available": joint_feedback_available,
                         "joint_feedback_stale": joint_feedback_stale,
                     }
                     if joint_feedback_stale and last_good_joint_rad is not None:
                         msg["joint_feedback_stale_age_s"] = max(
                             0.0,
-                            time.time() - last_good_joint_ts,
+                            now - last_good_joint_ts,
                         )
                     if joint_feedback_error:
                         msg["joint_feedback_error"] = joint_feedback_error
@@ -2023,18 +2058,22 @@ Examples:
                         pass
                     
                     # --- Servo telemetry (voltage/temp/current/torque + alarms) ---
-                    now = time.time()
                     backend = None
                     try:
                         backend = backend_registry.get_active_backend()
                     except Exception:
                         backend = None
-                    raw_positions = _sync_backend_raw_positions(backend)
-                    display_snapshot = _backend_display_feedback_snapshot(backend, raw_positions)
+                    include_axis_absolute_feedback = False
+                    if cached_display_snapshot is None or now - last_display_snapshot_ts >= display_snapshot_period_s:
+                        raw_positions = _sync_backend_raw_positions(backend)
+                        cached_display_snapshot = _backend_display_feedback_snapshot(backend, raw_positions)
+                        last_display_snapshot_ts = now
+                        include_axis_absolute_feedback = True
                     _attach_monitor_joint_feedback(
                         msg,
                         canonical_joint_positions_rad=q,
-                        display_snapshot=display_snapshot,
+                        display_snapshot=cached_display_snapshot,
+                        include_axis_absolute_feedback=include_axis_absolute_feedback,
                     )
                     if cached_motion_status is None or now - last_motion_status_ts >= 0.1:
                         cached_motion_status = _build_monitor_motion_status_payload()
@@ -2116,20 +2155,22 @@ Examples:
                                     file=sys.stderr,
                                     flush=True,
                                 )
-                    try:
-                        rtcore_servos = _build_rtcore_axis_telemetry_samples(backend)
-                        if rtcore_servos:
-                            existing = msg.get("servos")
-                            if isinstance(existing, dict):
-                                for sid, sample in rtcore_servos.items():
-                                    if sid in existing and isinstance(existing[sid], dict):
-                                        existing[sid].update(sample)
-                                    else:
-                                        existing[sid] = sample
-                            else:
-                                msg["servos"] = rtcore_servos
-                    except Exception:
-                        pass
+                    if now - last_rtcore_axis_sample_ts >= rtcore_axis_sample_period_s:
+                        last_rtcore_axis_sample_ts = now
+                        try:
+                            rtcore_servos = _build_rtcore_axis_telemetry_samples(backend)
+                            if rtcore_servos:
+                                existing = msg.get("servos")
+                                if isinstance(existing, dict):
+                                    for sid, sample in rtcore_servos.items():
+                                        if sid in existing and isinstance(existing[sid], dict):
+                                            existing[sid].update(sample)
+                                        else:
+                                            existing[sid] = sample
+                                else:
+                                    msg["servos"] = rtcore_servos
+                        except Exception:
+                            pass
                     
                     # Drain any alerts collected by lower layers and attach them
                     try:
