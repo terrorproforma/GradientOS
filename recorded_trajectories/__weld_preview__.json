@@ -1,88 +1,49 @@
 {
-  "description": "Planned on 2026-04-20 00:15:51 via PLAN_WELD",
+  "description": "Planned on 2026-04-30 02:55:41 via PLAN_WELD",
   "loop": false,
   "orientation_euler_angles_deg": null,
   "moves": [
     {
       "command": "move_absolute",
       "vector": [
-        0.9644,
-        -0.018,
-        0.6915
+        0.9809,
+        0.4,
+        0.0254
       ],
       "orientation_euler_deg": [
-        -135.0,
+        135.0,
         -0.0,
-        -120.81
+        -2.01
       ]
     },
     {
       "command": "move_absolute",
       "vector": [
-        1.0356,
-        -0.0179,
-        0.6915
+        1.0,
+        0.3809,
+        0.0254
       ],
       "orientation_euler_deg": [
-        -135.0,
+        135.0,
         0.0,
-        -120.81
+        -88.6
       ],
       "is_weld": true,
       "weld_type": "fillet"
-    },
-    {
-      "command": "move_absolute",
-      "vector": [
-        1.0356,
-        -0.0179,
-        0.7265
-      ],
-      "orientation_euler_deg": [
-        -135.0,
-        0.0,
-        -120.81
-      ]
-    },
-    {
-      "command": "move_absolute",
-      "vector": [
-        0.8066,
-        0.0009,
-        0.7265
-      ],
-      "orientation_euler_deg": [
-        -135.0,
-        0.0,
-        -120.81
-      ]
-    },
-    {
-      "command": "move_absolute",
-      "vector": [
-        0.8066,
-        0.0009,
-        0.6887
-      ],
-      "orientation_euler_deg": [
-        -135.0,
-        0.0,
-        -120.81
-      ]
     }
   ],
   "planning_warnings": [
-    "Torch-angle orientations failed for weld section #1; tool=tool-1774284997294; retrying with orientation lock."
+    "Post-action transition skipped (return_to_start:1) target=[1.0, 0.3809, 0.7247]"
   ],
   "weld": {
     "type": "fillet",
     "name": "fillet weld",
-    "model_id": "step-58e30e1330e84782",
-    "edge_id": "part_0:edge_00029",
+    "model_id": "step-5b88dde124edf00a",
+    "edge_id": "part_0:edge_00105",
     "start_s": 0.0,
     "end_s": 1.0,
     "options": {
-      "work_angle_deg": 45,
+      "work_angle_deg": -45,
       "travel_angle_deg": 0,
       "spin_angle_deg": 0.0,
       "transition_clearance_mm": 35,

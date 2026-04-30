@@ -1,3 +1,22 @@
+## 2026-04-30 04:15 +0000 - Power-up 503 traced to malformed absolute encoder anchor store
+
+- Investigation summary:
+  - User asked why `/control/power-up` returned `503 Service Unavailable` with controller log `No active backend`.
+  - Startup log showed the real first failure at backend construction: `Absolute encoder anchor store is malformed JSON: /home/pi/GradientOS/.gradient_absolute_encoder_anchors.json: Extra data: line 108 column 1`. The active EtherCAT backend was never registered, so `SAFE_POWER_UP` later failed in `command_api.handle_safe_power_up()` when `backend_registry.get_active_backend()` raised `BackendInstanceNotSetError`.
+  - Confirmed `.gradient_absolute_encoder_anchors.json` has extra closing braces after the store closes (`}` on lines 108-109).
+- What changed:
+  - Removed the two extra trailing `}` lines from `.gradient_absolute_encoder_anchors.json`; the file now ends at the single top-level closing brace.
+  - Fixed the likely corruption source in `src/gradient_os/absolute_encoder_anchors.py`: anchor-store saves now serialize the full read-modify-write cycle with a per-file thread/process lock and use a unique temporary file for each atomic replace. The previous implementation used one shared `<path>.tmp` filename, so concurrent restart-trust/native-home sidecar writes could interleave and leave trailing JSON fragments.
+  - Added `tests/test_absolute_encoder_anchors.py::test_concurrent_absolute_encoder_anchor_writes_remain_valid_json` to keep concurrent per-joint saves from regressing into malformed JSON or lost updates.
+- Validation performed:
+  - Read terminal 17 startup trace, `run_controller.py` backend activation path, `command_api.py` safe-power-up path, `registry.py` active backend guard, and `absolute_encoder_anchors.py` JSON fail-closed loader.
+  - `"/home/pi/GradientOS/.venv/bin/python" -m json.tool "/home/pi/GradientOS/.gradient_absolute_encoder_anchors.json" >/dev/null` -> pass.
+  - `"/home/pi/GradientOS/.venv/bin/python" -m pytest tests/test_absolute_encoder_anchors.py -q` -> `5 passed`.
+  - `"/home/pi/GradientOS/.venv/bin/python" -m py_compile src/gradient_os/absolute_encoder_anchors.py tests/test_absolute_encoder_anchors.py` -> pass.
+  - `ReadLints` on `src/gradient_os/absolute_encoder_anchors.py` and `tests/test_absolute_encoder_anchors.py` -> clean.
+- Follow-ups / risks:
+  - Restart via `./start-stack.sh stop --hard` and `./start-stack.sh` so backend construction re-reads the repaired anchor store. The current running controller still has no active backend from the failed startup.
+
 ## 2026-04-27 00:35 +0000 - Loop trajectory ACK no longer waits for physical move-to-start
 
 - Task summary:
@@ -7879,10 +7898,14 @@ Native-home pathway was exercised end-to-end on J6 against the new RTCore binary
   - Do not consider the DLS achieved-twist patch complete for live Cartesian jog.
   - Next design should preserve requested Cartesian target semantics: apply a scalar task-speed governor along the requested twist/path, or hold/reject when the requested direction is singular, instead of silently accepting a direction-changing projected twist.
   - Add capture/logging before the next live retest: requested twist, achieved twist, scalar attenuation, actual measured FK delta, target-vs-actual TCP error, `q_dot`, singular values, and explicit proof that the Jacobian path is active during RTCore `joint_velocity_lease` sessions.
+- Updated live-test permission:
+  - User clarified with bench photo that the controllers/servo drives are connected to real servo drives, but the motors are not mechanically connected into the robot. They are secured on a test bench and can safely run at maximum speed.
+  - Until the user revokes this permission, it is acceptable to run controlled live experiments through the running stack that command the servos directly for singularity-position validation. These experiments should become part of the control test loop, with logged commanded vectors, measured drive response, and DLS/Jacobian diagnostics.
 - Validation performed:
   - Read-only log inspection only. No code changes or tests run for this investigation entry.
 - Follow-ups / risks:
   - This is high priority because a "successful" jog tick can still move the physical TCP off the operator's kinematic target without raising the current gate alerts.
+  - Even on the safe bench, use bounded scripted experiments with explicit stop/cleanup and captured evidence; do not rely on visual observation alone.
 
 ## 2026-04-29 18:14 +0000 - 3D visualizer now uses live joints instead of display joints
 
@@ -7938,3 +7961,120 @@ Native-home pathway was exercised end-to-end on J6 against the new RTCore binary
 
 - Follow-ups / risks:
   - Requires controller/API stack restart to take effect. After restart and browser hard reload, expected trace improvement is `sourceHz`/`browserReceiveHz` closer to 50 Hz and lower average `payloadBytes` on most packets, while 10 Hz diagnostic packets still carry larger payloads.
+
+## 2026-04-30 01:38 +0000 - Hardened startup encoder-data reset against slave-selection race
+
+- What changed:
+  - Investigated a live `./start-stack.sh` failure after encoder reconnect: preflight correctly detected all six A6-EC encoder-retention faults and started the automatic `F31.10=4` + `F31.01=1` recovery, but after slave 0 re-enumerated, `ethercat download -p 1 ... F31.10` and later slaves failed with `The slave selection matches 0 slaves`.
+  - `start-stack.sh`: added bounded retry for the `F31.10` SDO write while the EtherCAT master is still rebuilding slave selection after a prior drive software reset. The helper now waits for the target slave to be visible as `AL=OP` and retries only transient selection/transport failures (`matches 0 slaves`, `No such device`, `Input/output error`), while still failing immediately on real SDO errors.
+  - The reset semantics are unchanged: affected anchors are invalidated and the affected joints still require native re-home before motion is trusted.
+
+- Validation performed:
+  - `bash -n start-stack.sh` -> pass.
+  - `source ./start.sh && python -m pytest tests/test_drive_faults.py tests/test_startup_recovery.py -q` -> `25 passed`.
+  - `git diff --check -- start-stack.sh` -> clean.
+
+- Follow-ups / risks:
+  - Live startup was not rerun in this turn because it would issue destructive encoder-data resets on hardware. The next operator-supervised `./start-stack.sh` should retry through the transient slave-selection window; all reset axes still need native re-home afterward.
+
+## 2026-04-30 01:45 +0000 - Live startup recovered after encoder reconnect
+
+- What changed:
+  - Reran startup multiple times under operator request after reconnecting encoders. The first rerun reset J2/J4/J5 and invalidated anchors but timed out on J3/J6 while peer software resets held those slaves out of `AL=OP`; increased the F31.10 selectable wait to 60 seconds.
+  - Subsequent reruns cleared the remaining encoder-retention faults on J3 and J6. All affected anchors were invalidated; controller startup now correctly reports missing absolute-home anchors and requires native re-home before trusted motion.
+  - Discovered that post-reset A6-EC `0x8700` sync-loss collateral on J1-J5 did not clear via two RTCore DS402 fault-reset pulses. Manual `F31.00` vendor fault reset (`0x2031:01 = 1`) cleared those faults immediately while disarmed.
+  - `start-stack.sh`: added an A6-EC-only vendor fault-reset fallback after the DS402 startup pulses for the same preflight fault mask.
+
+- Validation performed:
+  - Live recovery: final run `20260430-014428` reached `SUCCESS: STACK BOOT COMPLETE`.
+  - `./start-stack.sh status && ./start-stack.sh probe` -> launcher/controller/API/web up; `physical_state=BUS_UP_DISARMED`; all six axes `SwitchOnDisabled`, `err=0x0000`, `online=yes`, `op=yes`, `al=OP`.
+  - `bash -n start-stack.sh` -> pass.
+  - `source ./start.sh && python -m pytest tests/test_drive_faults.py tests/test_startup_recovery.py -q` -> `25 passed`.
+  - `git diff --check -- start-stack.sh` -> clean.
+
+- Follow-ups / risks:
+  - Native re-home is required for all six joints before trusted motion because the encoder-data reset invalidated absolute-home anchors.
+  - The stack is running and disarmed; do not safe-power-up for motion until re-home is complete.
+
+## 2026-04-30 04:26 +0000 - Gradient-05 two-page spec sheet draft
+
+- What changed:
+  - Reworked `GRADIENT_05_ROBOT_SPEC_SHEET.md` into a two-page Yaskawa-style content draft: page-one overview/benefits, page-two technical data, source status, and explicit missing-information checklist.
+  - Added `GRADIENT_05_ROBOT_SPEC_SHEET.html` as a two-page letter-landscape print layout with simplified vector robot/envelope drawings and clear `TBD` callouts.
+  - Exported `GRADIENT_05_ROBOT_SPEC_SHEET.pdf` from the HTML with local Chromium.
+  - Cross-checked missing commercial/mechanical fields with repo search; payload, repeatability, mass, wrist moments/inertia, flange, mounting, power, environmental rating, cable/air routing, and production CAD render remain unavailable in repo sources.
+- Validation performed:
+  - Parsed `robots/gradient-05/gradient-05.urdf` to verify joint origins, software ranges, and nominal chain length.
+  - Sampled the URDF envelope to sanity-check the existing approximate reach/height values.
+  - `chromium-browser --headless --print-to-pdf=GRADIENT_05_ROBOT_SPEC_SHEET.pdf ...` -> generated 2-page PDF.
+  - `pdfinfo GRADIENT_05_ROBOT_SPEC_SHEET.pdf` -> `Pages: 2`, letter landscape.
+  - `ReadLints` clean on `GRADIENT_05_ROBOT_SPEC_SHEET.md` and `GRADIENT_05_ROBOT_SPEC_SHEET.html`.
+  - `git diff --check -- GRADIENT_05_ROBOT_SPEC_SHEET.md GRADIENT_05_ROBOT_SPEC_SHEET.html` -> clean.
+- Follow-ups / risks:
+  - Replace the schematic placeholder with production CAD/STL render when real meshes are available.
+  - Do not turn any `TBD` item into a customer-facing claim until backed by CAD, BOM, electrical design, or metrology/test evidence.
+
+## 2026-04-30 04:35 +0000 - Gradient-05 spec sheet copy made marketing-ready
+
+- What changed:
+  - Removed internal/reference copy from `GRADIENT_05_ROBOT_SPEC_SHEET.md` and `GRADIENT_05_ROBOT_SPEC_SHEET.html`, including any Yaskawa/reference-format language, "draft", "TBD", "placeholder", and "missing before release" wording.
+  - Reframed visible unsupported specs as "in validation" and rewrote page-one copy as direct Gradient marketing/spec-sheet language.
+  - Regenerated `GRADIENT_05_ROBOT_SPEC_SHEET.pdf` from the cleaned HTML.
+- Validation performed:
+  - `rg` on the markdown and HTML for banned/internal copy terms -> no matches.
+  - `chromium-browser --headless --print-to-pdf=GRADIENT_05_ROBOT_SPEC_SHEET.pdf ...` -> generated PDF.
+  - `pdfinfo GRADIENT_05_ROBOT_SPEC_SHEET.pdf` -> `Pages: 2`, letter landscape.
+  - `pdftotext` search for internal/reference terms -> no matches.
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `git diff --check -- GRADIENT_05_ROBOT_SPEC_SHEET.md GRADIENT_05_ROBOT_SPEC_SHEET.html` -> clean.
+- Follow-ups / risks:
+  - Final ratings still need evidence before replacing "in validation" with numeric claims.
+
+## 2026-04-30 03:59 +0000 - Bench Cartesian jog session suite, non-singular baseline
+
+- What changed:
+  - Reran using the actual held Cartesian jog API (`/control/jog/session/start`, repeated `/update`, `/stop`) after the user corrected that the previous suite used trajectory endpoints.
+  - Explicitly called `/control/power-up` before the suite, then sampled `/debug/performance` during each jog.
+  - Artifact directory: `logs/tcp-target-cartesian-jog-tests/20260430-035953`.
+  - Captured `preflight.json`, `cases.jsonl`, `summary.json`, and `controller-delta.log`.
+- Cases run:
+  - Angular jogs: roll/pitch/yaw `±30 deg/s` requested for 2 seconds.
+  - Linear jogs: X `±80 mm/s` requested for 1 second.
+- Results and caveats:
+  - The stack was live and the jog API path was exercised. Final probe after the run still showed all six drives `OperationEnabled`, `err=0x0000`.
+  - This was NOT a singularity validation. All cases remained near home/non-singular pose with `sigma_min ~0.29-0.31` and attenuation ratios ~`1.0`.
+  - The summary's FK TCP deltas are not sufficient evidence by themselves; future experiments must also assert raw `6064`/target-count deltas so we prove the bench servos actually moved as expected.
+  - Several angular jog cases recorded `JOG_COMMAND_DRIFT_EXCEEDED` in `ik_debug.gate_reason` even away from singularity. That makes the drift watchdog a separate live-motion follow-up before trusting more aggressive singularity sweeps.
+  - Controller logs show the actual jog session stream and later safe power-down/up actions. The script's requested `30 deg/s` angular commands may be capped before or inside the controller path; recorded controller payloads should be decoded in the next analysis pass rather than assuming the request equals the effective velocity.
+- Validation performed:
+  - Live API/probe checks only; no code changes.
+- Follow-ups / risks:
+  - Build the next test harness around RTCore metrics/raw counts and control feedback, not just `/info/pose`/FK summaries.
+  - Before singularity sweeps, add a small proof step for each axis: command a bounded pulse, verify raw counts changed in the commanded direction, then return.
+
+## 2026-04-30 04:32 +0000 - Decoded operator manual Cartesian jog sequence for replication
+
+- Investigation summary:
+  - User manually exercised many Cartesian jog directions and asked to capture them for replication.
+  - Decoded `JOG_SESSION_START/UPDATE/STOP` payloads from `logs/startups/latest/controller.log`.
+  - Final probe after the manual run showed the stack still active, all six axes `OperationEnabled`, and all `err=0x0000`.
+- High-signal manual moves to replicate:
+  - Linear holds:
+    - `vx=+0.05 m/s` for `109` updates (longest +X hold), plus shorter +X holds.
+    - `vx=-0.05 m/s` for `76` updates.
+    - `vz=-0.05 m/s` for `47`, `31`, and `29` updates.
+    - `vy=-0.05 m/s` for `29`, `25`, `24`, and `20` updates.
+  - Angular holds:
+    - `v_yaw=-15 deg/s` for `74`, `34`, `33`, `19`, and `18` updates.
+    - `v_yaw=+15 deg/s` for `16`, `11`, and several short taps.
+    - `v_roll=+15 deg/s` for `48`, `21`, and `19` updates.
+    - `v_roll=-15 deg/s` for `57` and `33` updates.
+    - `v_pitch=-15 deg/s` had many short taps plus `10` update hold; `v_pitch=+15 deg/s` had `23`, `8`, and `7` update holds.
+  - All observed jog sessions in the decoded sequence ended via `ui-release`; starts logged `truth_valid_at_arm=True`.
+- Interpretation:
+  - This manual run is a better replication target than the earlier scripted non-singular baseline because it includes longer sustained holds and the same operator path that exposed bad TCP target behavior.
+  - Still missing: per-session raw `6064`/target-count deltas, `ik_debug`/DLS fields, and control-feedback FK deltas. The next replication harness should decode/label each session and capture those fields in the same artifact.
+- Validation performed:
+  - Read-only log decoding and `./start-stack.sh probe`; no code changes or tests run.
+- Follow-ups / risks:
+  - Reproduce the long holds first (`+X`, `-X`, `-Z`, `-Y`, yaw ±, roll ±) with the new raw-count/control-feedback harness before changing DLS policy again.

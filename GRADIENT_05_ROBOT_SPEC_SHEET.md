@@ -1,37 +1,66 @@
 # Gradient-05 Robot Specification Sheet
 
-Reference format: industrial robot data sheet layout, modeled after the Motoman AR1730 style. This document is for the Gradient-05 robot currently represented in GradientOS.
+Gradient-05 is a six-axis articulated robot platform built around GradientOS motion control, EtherCAT RTCore execution, and high-resolution absolute encoder feedback. This two-page specification sheet presents the current GradientOS-backed configuration and highlights ratings that are still in validation.
 
-## Model Summary
+Values marked "in validation" are reserved for final mechanical, electrical, or metrology-backed ratings.
+
+## Page 1: Product Overview
+
+### Header
+
+**GRADIENT-05**  
+
+**High-control 6-axis robotic arm**
+
+### Key Benefits
+
+- Six-axis articulated arm architecture for flexible end-effector positioning.
+- EtherCAT RTCore motion execution for coordinated, deterministic servo control.
+- GradientOS commissioning workflows for native-home setup, drive status, and actuator diagnostics.
+- Direct one-to-one joint-to-actuator mapping for transparent control and serviceability.
+- 17-bit motor-side absolute encoder model for high-resolution feedback.
+- Extended base and wrist rotation ranges for process development and advanced motion workflows.
+
+### Quick Specifications
 
 
-| Item                              | Unit               | Gradient-05                                         |
-| --------------------------------- | ------------------ | --------------------------------------------------- |
-| Controlled axes                   | count              | 6                                                   |
-| Robot type                        | -                  | 6-axis articulated arm                              |
-| Default runtime backend           | -                  | EtherCAT RTCore                                     |
-| Default IK backend                | -                  | Numeric QuIK                                        |
-| Actuator mapping                  | -                  | 1 logical joint to 1 physical actuator              |
-| Encoder resolution                | counts / motor rev | 131,072                                             |
-| Horizontal reach, tool0 origin    | mm                 | approx. 1,509                                       |
-| Vertical reach span, tool0 origin | mm                 | approx. 2,291                                       |
-| Maximum tool0 height above base   | mm                 | approx. 1,647                                       |
-| Minimum tool0 height below base   | mm                 | approx. -644                                        |
-| Nominal kinematic chain length    | mm                 | approx. 1,790                                       |
-| Maximum payload                   | kg                 | TBD, verify by mechanical design and test           |
-| Repeatability                     | mm                 | TBD, verify by calibration and metrology            |
-| Robot mass                        | kg                 | TBD, verify from final assembly                     |
-| Mounting                          | -                  | Floor or fixture mount, verify final base interface |
-| Power                             | -                  | TBD, depends on drive cabinet and field wiring      |
+| Item                                | Unit               | Gradient-05                                              |
+| ----------------------------------- | ------------------ | -------------------------------------------------------- |
+| Controlled axes                     | count              | 6                                                        |
+| Robot type                          | -                  | 6-axis articulated arm                                   |
+| Default runtime backend             | -                  | EtherCAT RTCore                                          |
+| Default IK backend                  | -                  | Numeric QuIK                                             |
+| Actuator mapping                    | -                  | 1 logical joint to 1 physical actuator                   |
+| Encoder resolution                  | counts / motor rev | 131,072                                                  |
+| Horizontal reach, `tool0` origin    | mm                 | approx. 1,509                                            |
+| Vertical reach span, `tool0` origin | mm                 | approx. 2,291                                            |
+| Maximum `tool0` height above base   | mm                 | approx. 1,647                                            |
+| Minimum `tool0` height below base   | mm                 | approx. -644                                             |
+| Nominal kinematic chain length      | mm                 | approx. 1,790                                            |
+| Maximum payload                     | kg                 | In validation                                            |
+| Repeatability                       | mm                 | In validation                                            |
+| Robot mass                          | kg                 | In validation                                            |
+| Mounting                            | -                  | Floor or fixture mount, final interface in validation    |
+| Power                               | -                  | Cabinet-dependent, final electrical rating in validation |
 
 
-Notes:
+### Application Block
 
-- Reach values are derived from the current `robots/gradient-05/gradient-05.urdf` joint origins and limits, using the `tool0` frame origin as the measurement point.
-- The robot asset manifest still describes the URDF/DH data as a template asset bundle. Treat the reach and envelope values as current GradientOS kinematic values, not final certified mechanical specifications.
-- Payload, repeatability, robot mass, and allowable wrist moments are not present in the repository and should not be invented without CAD, bill-of-materials, and live test data.
+**Application:** motion-control development, robotic process automation, end-effector integration, and advanced robotic workflow R&D.  
 
-## Axis Specifications
+**Controller:** GradientOS with EtherCAT RTCore.  
+
+**Configuration:** six controlled axes with Numeric QuIK Cartesian IK.
+
+### Page-One Copy
+
+- Wide rotation ranges support base and wrist workflows beyond one revolution.
+- Commissioning paths expose native-home, drive status, and actuator diagnostics through GradientOS.
+- Cartesian jog and profile defaults are tuned for controlled development, integration, and validation workflows.
+
+## Page 2: Technical Data
+
+### Axis Specifications
 
 
 | Axis | Joint role    | Motion range       | Rated joint speed | Peak joint speed | Gear reduction | Encoder counts / joint rev | Sign |
@@ -46,9 +75,9 @@ Notes:
 
 Rated and peak joint speeds are derived from the motor shaft speed through each joint gear ratio: `joint deg/s = motor RPM * 6 / gear_ratio`. Rated speed uses 3,000 RPM; peak speed uses 6,000 RPM. Controller jog, profiled-motion, thermal, and safety policy limits may command lower speeds than these derived mechanical maxima.
 
-## Kinematic Dimensions
+### Kinematic Dimensions
 
-The following table lists the current URDF joint origins in parent-link coordinates.
+Current URDF joint origins in parent-link coordinates:
 
 
 | Joint | X        | Y          | Z        | Axis |
@@ -73,7 +102,7 @@ URDF-defined envelope estimates:
 | Maximum straight-line distance from base origin | approx. 1,687 mm |
 
 
-## Controller Defaults and Commissioning Data
+### Controller Defaults and Commissioning Data
 
 
 | Item                                 | Value                                                                        |
@@ -92,6 +121,25 @@ URDF-defined envelope estimates:
 | Startup drive overrides              | None at robot layer; drive-family defaults live in the drive profile catalog |
 
 
+## Ratings in Validation
+
+These fields should remain marked as "in validation" until backed by mechanical design, electrical design, production CAD, or metrology/test evidence.
+
+
+| Field                              | Publication requirement             | Best source                                            |
+| ---------------------------------- | ----------------------------------- | ------------------------------------------------------ |
+| Maximum payload                    | Rated payload claim                 | Mechanical calculation plus lift/trajectory validation |
+| Repeatability                      | Accuracy/repeatability claim        | Calibration procedure and metrology report             |
+| Robot mass                         | Installation and floor-loading data | Final CAD assembly or weighed build                    |
+| Allowable wrist moment and inertia | End-effector/tooling compatibility  | Wrist gearbox, actuator ratings, and validation        |
+| Tool flange drawing                | EOAT interface data                 | Production CAD drawing/export                          |
+| Base mounting pattern              | Cell layout and installation data   | Final base plate drawing                               |
+| Power requirements                 | Facility planning data              | Drive cabinet, PSU, breaker, and field wiring design   |
+| Environmental rating               | Industrial/environmental claim      | Sealing design and validation                          |
+| Cable and air routing              | Process package compatibility       | Harness and cable-dress design                         |
+| Production render/drawing          | Visual/spec-sheet drawing package   | Production CAD/STL assets                              |
+
+
 ## Source Files
 
 This sheet was built from the following GradientOS sources:
@@ -99,6 +147,7 @@ This sheet was built from the following GradientOS sources:
 - `src/gradient_os/arm_controller/robots/gradient05/config.py`
 - `robots/gradient-05/gradient-05.urdf`
 - `robots/gradient-05/robot.json`
+- `robots/gradient-05/dh_params.csv`
 - `src/gradient_os/arm_controller/robots/base.py`
 - `src/gradient_os/arm_controller/command_api.py`
 
@@ -111,5 +160,3 @@ This sheet was built from the following GradientOS sources:
 | URDF joint origins and envelope estimates         | Derived from current URDF                         |
 | Payload, mass, repeatability, wrist moments       | Missing from repo, requires CAD/test verification |
 | Final production drawing dimensions               | Missing from repo, requires CAD drawing export    |
-
-

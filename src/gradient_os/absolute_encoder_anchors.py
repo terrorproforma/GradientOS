@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import datetime
+import fcntl
 import json
 import os
+import tempfile
+import threading
+from contextlib import contextmanager
 from typing import Any, Sequence
 
 ANCHORS_ENV_VAR = "GRADIENT_ABSOLUTE_ENCODER_ANCHORS_PATH"
 DEFAULT_ANCHORS_BASENAME = ".gradient_absolute_encoder_anchors.json"
+_ANCHOR_STORE_THREAD_LOCK = threading.RLock()
 
 
 class AnchorStoreError(RuntimeError):
@@ -23,6 +28,42 @@ def get_absolute_encoder_anchors_path() -> str:
         return os.path.abspath(configured)
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     return os.path.join(repo_root, DEFAULT_ANCHORS_BASENAME)
+
+
+@contextmanager
+def _anchor_store_write_lock(path: str):
+    """Serialize read-modify-write updates across threads and processes."""
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    lock_path = f"{path}.lock"
+    with _ANCHOR_STORE_THREAD_LOCK:
+        with open(lock_path, "a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_json_atomic(path: str, payload: dict[str, Any]) -> None:
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+    temp_dir = dirpath or "."
+    temp_prefix = f".{os.path.basename(path)}."
+    fd, temp_path = tempfile.mkstemp(prefix=temp_prefix, suffix=".tmp", dir=temp_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _empty_store() -> dict[str, Any]:
@@ -150,17 +191,11 @@ def load_absolute_encoder_anchors(
     return _normalize_anchor_entries(raw_entries, num_joints=num_joints)
 
 
-def save_absolute_encoder_anchors(
-    robot_id: str,
+def _serialize_anchor_entries(
     anchors: Sequence[dict[str, Any] | None],
     *,
-    actor: str = "unknown",
-) -> dict[str, Any]:
-    robot_key = str(robot_id or "").strip() or "unknown"
-    store = load_absolute_encoder_anchors_store()
-    robots = store.get("robots")
-    if not isinstance(robots, dict):
-        robots = {}
+    actor: str,
+) -> list[dict[str, Any] | None]:
     normalized_entries: list[dict[str, Any] | None] = []
     for raw_entry in list(anchors):
         entry = _normalize_anchor_entry(raw_entry)
@@ -178,23 +213,47 @@ def save_absolute_encoder_anchors(
         if isinstance(last_seen, dict):
             serialized_entry["last_seen"] = dict(last_seen)
         normalized_entries.append(serialized_entry)
+    return normalized_entries
+
+
+def _save_absolute_encoder_anchors_locked(
+    path: str,
+    robot_key: str,
+    normalized_entries: Sequence[dict[str, Any] | None],
+    *,
+    actor: str,
+) -> dict[str, Any]:
+    store = load_absolute_encoder_anchors_store()
+    robots = store.get("robots")
+    if not isinstance(robots, dict):
+        robots = {}
     robots[robot_key] = {
-        "logical_joint_absolute_home_anchors": normalized_entries,
+        "logical_joint_absolute_home_anchors": list(normalized_entries),
         "updated_at": _utc_now_iso(),
         "updated_by": str(actor or "unknown"),
     }
     store["robots"] = robots
+    _write_json_atomic(path, store)
+    return robots[robot_key]
+
+
+def save_absolute_encoder_anchors(
+    robot_id: str,
+    anchors: Sequence[dict[str, Any] | None],
+    *,
+    actor: str = "unknown",
+) -> dict[str, Any]:
+    robot_key = str(robot_id or "").strip() or "unknown"
+    normalized_entries = _serialize_anchor_entries(anchors, actor=actor)
 
     path = get_absolute_encoder_anchors_path()
-    dirpath = os.path.dirname(path)
-    if dirpath:
-        os.makedirs(dirpath, exist_ok=True)
-    temp_path = f"{path}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as handle:
-        json.dump(store, handle, indent=2)
-        handle.write("\n")
-    os.replace(temp_path, path)
-    return robots[robot_key]
+    with _anchor_store_write_lock(path):
+        return _save_absolute_encoder_anchors_locked(
+            path,
+            robot_key,
+            normalized_entries,
+            actor=actor,
+        )
 
 
 def save_absolute_encoder_anchor(
@@ -213,25 +272,33 @@ def save_absolute_encoder_anchor(
         raise IndexError(
             f"Logical joint index {joint_i} is out of range for {int(num_joints)} joints."
         )
-    anchors = load_absolute_encoder_anchors(robot_id, num_joints=num_joints)
-    existing_last_seen: dict[str, Any] | None = None
-    if preserve_last_seen:
-        existing_entry = anchors[joint_i] if isinstance(anchors[joint_i], dict) else None
-        if isinstance(existing_entry, dict):
-            maybe_last_seen = existing_entry.get("last_seen")
-            if isinstance(maybe_last_seen, dict):
-                existing_last_seen = dict(maybe_last_seen)
-    new_entry: dict[str, Any] = {
-        "home_anchor_rad": float(home_anchor_rad),
-        "source": str(source).strip() or None,
-        "axis_indices": [int(value) for value in list(axis_indices or [])],
-        "updated_at": _utc_now_iso(),
-        "updated_by": str(actor or "unknown"),
-    }
-    if existing_last_seen is not None:
-        new_entry["last_seen"] = existing_last_seen
-    anchors[joint_i] = new_entry
-    saved = save_absolute_encoder_anchors(robot_id, anchors, actor=actor)
+    robot_key = str(robot_id or "").strip() or "unknown"
+    path = get_absolute_encoder_anchors_path()
+    with _anchor_store_write_lock(path):
+        anchors = load_absolute_encoder_anchors(robot_id, num_joints=num_joints)
+        existing_last_seen: dict[str, Any] | None = None
+        if preserve_last_seen:
+            existing_entry = anchors[joint_i] if isinstance(anchors[joint_i], dict) else None
+            if isinstance(existing_entry, dict):
+                maybe_last_seen = existing_entry.get("last_seen")
+                if isinstance(maybe_last_seen, dict):
+                    existing_last_seen = dict(maybe_last_seen)
+        new_entry: dict[str, Any] = {
+            "home_anchor_rad": float(home_anchor_rad),
+            "source": str(source).strip() or None,
+            "axis_indices": [int(value) for value in list(axis_indices or [])],
+            "updated_at": _utc_now_iso(),
+            "updated_by": str(actor or "unknown"),
+        }
+        if existing_last_seen is not None:
+            new_entry["last_seen"] = existing_last_seen
+        anchors[joint_i] = new_entry
+        saved = _save_absolute_encoder_anchors_locked(
+            path,
+            robot_key,
+            _serialize_anchor_entries(anchors, actor=actor),
+            actor=actor,
+        )
     return (
         saved.get("logical_joint_absolute_home_anchors", [])[joint_i]
         if isinstance(saved, dict)
@@ -264,20 +331,26 @@ def invalidate_absolute_encoder_anchors(
     Returns the stored robot entry (same shape as
     ``save_absolute_encoder_anchors``).
     """
-    anchors = load_absolute_encoder_anchors(robot_id, num_joints=num_joints)
-    indices: set[int] = set()
-    for value in logical_joint_indices:
-        try:
-            idx = int(value)
-        except Exception:
-            continue
-        if 0 <= idx < len(anchors):
-            indices.add(idx)
-    if not indices:
-        return save_absolute_encoder_anchors(robot_id, anchors, actor=actor)
-    for idx in indices:
-        anchors[idx] = None
-    return save_absolute_encoder_anchors(robot_id, anchors, actor=actor)
+    robot_key = str(robot_id or "").strip() or "unknown"
+    path = get_absolute_encoder_anchors_path()
+    with _anchor_store_write_lock(path):
+        anchors = load_absolute_encoder_anchors(robot_id, num_joints=num_joints)
+        indices: set[int] = set()
+        for value in logical_joint_indices:
+            try:
+                idx = int(value)
+            except Exception:
+                continue
+            if 0 <= idx < len(anchors):
+                indices.add(idx)
+        for idx in indices:
+            anchors[idx] = None
+        return _save_absolute_encoder_anchors_locked(
+            path,
+            robot_key,
+            _serialize_anchor_entries(anchors, actor=actor),
+            actor=actor,
+        )
 
 
 def save_last_seen_absolute_counts(
@@ -304,27 +377,35 @@ def save_last_seen_absolute_counts(
         raise IndexError(
             f"Logical joint index {joint_i} is out of range for {int(num_joints)} joints."
         )
-    anchors = load_absolute_encoder_anchors(robot_id, num_joints=num_joints)
-    existing = anchors[joint_i] if isinstance(anchors[joint_i], dict) else None
-    if not isinstance(existing, dict):
-        return None
-    updated_entry = dict(existing)
-    sidecar: dict[str, Any] = {"absolute_counts": int(absolute_counts)}
-    if reference_counts is not None:
-        try:
-            sidecar["reference_counts"] = int(reference_counts)
-        except Exception:
-            pass
-    sidecar["observed_at"] = str(observed_at).strip() if observed_at else _utc_now_iso()
-    if observed_at_monotonic_ns is not None:
-        try:
-            sidecar["observed_at_monotonic_ns"] = int(observed_at_monotonic_ns)
-        except Exception:
-            pass
-    sidecar["observed_by"] = str(actor or "unknown")
-    updated_entry["last_seen"] = sidecar
-    anchors[joint_i] = updated_entry
-    saved = save_absolute_encoder_anchors(robot_id, anchors, actor=actor)
+    robot_key = str(robot_id or "").strip() or "unknown"
+    path = get_absolute_encoder_anchors_path()
+    with _anchor_store_write_lock(path):
+        anchors = load_absolute_encoder_anchors(robot_id, num_joints=num_joints)
+        existing = anchors[joint_i] if isinstance(anchors[joint_i], dict) else None
+        if not isinstance(existing, dict):
+            return None
+        updated_entry = dict(existing)
+        sidecar: dict[str, Any] = {"absolute_counts": int(absolute_counts)}
+        if reference_counts is not None:
+            try:
+                sidecar["reference_counts"] = int(reference_counts)
+            except Exception:
+                pass
+        sidecar["observed_at"] = str(observed_at).strip() if observed_at else _utc_now_iso()
+        if observed_at_monotonic_ns is not None:
+            try:
+                sidecar["observed_at_monotonic_ns"] = int(observed_at_monotonic_ns)
+            except Exception:
+                pass
+        sidecar["observed_by"] = str(actor or "unknown")
+        updated_entry["last_seen"] = sidecar
+        anchors[joint_i] = updated_entry
+        saved = _save_absolute_encoder_anchors_locked(
+            path,
+            robot_key,
+            _serialize_anchor_entries(anchors, actor=actor),
+            actor=actor,
+        )
     return (
         saved.get("logical_joint_absolute_home_anchors", [])[joint_i]
         if isinstance(saved, dict)

@@ -1,4 +1,6 @@
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from gradient_os.absolute_encoder_anchors import (
     ANCHORS_ENV_VAR,
@@ -105,3 +107,30 @@ def test_malformed_absolute_encoder_anchor_store_fails_closed(tmp_path, monkeypa
         assert "malformed JSON" in str(exc)
     else:
         raise AssertionError("Malformed anchor JSON must not be treated as an empty store.")
+
+
+def test_concurrent_absolute_encoder_anchor_writes_remain_valid_json(tmp_path, monkeypatch):
+    anchors_path = tmp_path / "anchors.json"
+    monkeypatch.setenv(ANCHORS_ENV_VAR, str(anchors_path))
+    start = threading.Barrier(6)
+
+    def _save_joint(joint_i: int) -> None:
+        start.wait(timeout=2.0)
+        save_absolute_encoder_anchor(
+            "test_robot",
+            num_joints=6,
+            logical_joint_index=joint_i,
+            home_anchor_rad=float(joint_i) * 0.1,
+            source="unit_test",
+            axis_indices=[joint_i],
+            actor=f"worker_{joint_i}",
+        )
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for future in [pool.submit(_save_joint, joint_i) for joint_i in range(6)]:
+            future.result(timeout=5.0)
+
+    payload = json.loads(anchors_path.read_text(encoding="utf-8"))
+    anchors = payload["robots"]["test_robot"]["logical_joint_absolute_home_anchors"]
+    assert len(anchors) == 6
+    assert all(entry is not None for entry in anchors)

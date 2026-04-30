@@ -2252,6 +2252,46 @@ direct_rtcore_fault_reset_mask() {
   return 1
 }
 
+direct_a6ec_vendor_fault_reset_mask() {
+  local axis_mask="$1"
+  local mask_value=0
+  if ! mask_value=$((axis_mask)); then
+    warn "A6-EC vendor fault reset skipped; invalid axis_mask=${axis_mask}"
+    return 1
+  fi
+  if (( mask_value == 0 )); then
+    return 0
+  fi
+
+  local failed_slaves=()
+  local slave=0
+  for (( slave = 0; slave < 32; slave++ )); do
+    if (( (mask_value & (1 << slave)) == 0 )); then
+      continue
+    fi
+    local detail=""
+    if detail="$(sudo -n ethercat download -p "${slave}" -t uint16 0x2031 0x01 1 2>&1)"; then
+      log "Issued A6-EC vendor fault reset (F31.00): slave=${slave}"
+      if [[ -n "${detail}" ]]; then
+        while IFS= read -r line; do
+          [[ -n "${line}" ]] || continue
+          log "${line}"
+        done <<< "${detail}"
+      fi
+    else
+      warn "A6-EC vendor fault reset failed for slave=${slave}: ${detail}"
+      failed_slaves+=("${slave}")
+    fi
+    sleep 0.2
+  done
+
+  if (( ${#failed_slaves[@]} > 0 )); then
+    warn "A6-EC vendor fault reset failed_slaves=[${failed_slaves[*]}]"
+    return 1
+  fi
+  return 0
+}
+
 # Drive the vendor-specific encoder-data reset sequence for the axes
 # that showed an encoder-retention-family fault in the startup probe.
 # Runs in the preflight window before the controller is launched so
@@ -2356,6 +2396,15 @@ def _run_sdo_download(slave_pos: int, index_hex: str, subindex_hex: str, value: 
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
+def _slave_selection_transient(output: str) -> bool:
+    lowered = (output or "").lower()
+    return (
+        "matches 0 slaves" in lowered
+        or "no such device" in lowered
+        or "input/output error" in lowered
+    )
+
+
 def _ethercat_slave_al_states(timeout_s: float = 3.0) -> dict[int, str]:
     """Return {slave_pos: al_state_name} from `ethercat slaves`.
 
@@ -2416,6 +2465,42 @@ def _wait_slave_online(slave_pos: int, timeout_s: float = 20.0) -> bool:
     return False
 
 
+def _run_sdo_download_when_selectable(
+    slave_pos: int,
+    index_hex: str,
+    subindex_hex: str,
+    value: int,
+    label: str,
+    *,
+    timeout_s: float = 60.0,
+) -> tuple[int, str, int]:
+    """Retry an SDO write while the EtherCAT master is rebuilding.
+
+    After F31.01 on one A6-EC drive, neighbouring drives can be
+    transiently unselectable even after the reset target has returned.
+    Retrying only selection/transport-transient failures avoids
+    papering over a real SDO abort from the target drive.
+    """
+    deadline = time.monotonic() + float(timeout_s)
+    attempts = 0
+    last_rc = 98
+    last_out = f"{label} timed out waiting for slave selection"
+    while time.monotonic() < deadline:
+        states = _ethercat_slave_al_states(timeout_s=2.5)
+        if states.get(int(slave_pos)) != "OP":
+            time.sleep(0.25)
+            continue
+        attempts += 1
+        rc, out = _run_sdo_download(slave_pos, index_hex, subindex_hex, value, label)
+        if rc == 0:
+            return rc, out, attempts
+        last_rc, last_out = rc, out
+        if not _slave_selection_transient(out):
+            return rc, out, attempts
+        time.sleep(0.5)
+    return last_rc, last_out, attempts
+
+
 axis_mask = _parse_mask(os.environ.get("GRADIENT_STARTUP_ENCODER_RESET_AXIS_MASK", ""))
 joint_indices = _parse_joint_indices(os.environ.get("GRADIENT_STARTUP_ENCODER_RESET_JOINT_INDICES", ""))
 if axis_mask == 0:
@@ -2441,16 +2526,23 @@ for slave in slaves:
     # Step 1: F31.10 = 4 (encoder data reset). This is the vendor-
     # documented primary operation; accepted immediately but alone
     # does not clear the latched error in 0x603F / 0x203F.
-    rc_f31_10, out_f31_10 = _run_sdo_download(
+    rc_f31_10, out_f31_10, f31_10_attempts = _run_sdo_download_when_selectable(
         slave, "0x2031", "0x11", 4, f"slave{slave}.F31.10"
     )
     if rc_f31_10 != 0:
         print(
-            f"direct_rtcore_encoder_data_reset_slave{slave}_f31_10_failed rc={rc_f31_10}: {out_f31_10}",
+            f"direct_rtcore_encoder_data_reset_slave{slave}_f31_10_failed"
+            f" attempts={f31_10_attempts} rc={rc_f31_10}: {out_f31_10}",
             flush=True,
         )
         failed_slaves.append(slave)
         continue
+    if f31_10_attempts > 1:
+        print(
+            f"direct_rtcore_encoder_data_reset_slave{slave}_f31_10_retry_recovered"
+            f" attempts={f31_10_attempts}",
+            flush=True,
+        )
     # Give the drive a beat to internalise the F31.10 transition
     # before triggering the software reset. ~100 ms is well above the
     # kAbsoluteFeedbackPollIntervalNs = 200 ms bound we care about.
@@ -2565,6 +2657,7 @@ startup_fault_reset_preflight() {
   local encoder_reset_required=""
   local encoder_reset_axis_mask_hex=""
   local encoder_reset_logical_joints_csv=""
+  local probe_drive_profile=""
   should_auto_reset="$(probe_json_field "${plan}" "should_auto_reset")"
   blocks_startup="$(probe_json_field "${plan}" "blocks_startup")"
   axis_mask_hex="$(probe_json_field "${plan}" "faulted_axis_mask_hex")"
@@ -2574,6 +2667,7 @@ startup_fault_reset_preflight() {
   ds402_pulse_axis_mask_hex="$(probe_json_field "${plan}" "ds402_pulse_axis_mask_hex")"
   encoder_reset_required="$(probe_json_field "${plan}" "encoder_reset_required")"
   encoder_reset_axis_mask_hex="$(probe_json_field "${plan}" "encoder_reset_axis_mask_hex")"
+  probe_drive_profile="$(probe_json_field "${payload}" "probe_drive_profile")"
   # The plan emits a JSON list; probe_json_field renders it without
   # the enclosing brackets, but commas still survive. Normalize to a
   # whitespace-separated token list for the Python helper to parse.
@@ -2638,6 +2732,15 @@ startup_fault_reset_preflight() {
       # cleared the state.
       sleep 0.5
       direct_rtcore_fault_reset_mask "${ds402_pulse_axis_mask_hex}" || true
+      if [[ "${probe_drive_profile}" == "a6ec_ds402" ]]; then
+        # Live encoder-reset recovery showed that A6-EC 0x8700 sync-
+        # loss collaterals may ignore the generic DS402 pulse yet
+        # clear immediately with the manual-backed F31.00 fault reset.
+        # This is not an encoder-data operation and does not invalidate
+        # anchors; it is the vendor equivalent of a fault reset.
+        sleep 0.5
+        direct_a6ec_vendor_fault_reset_mask "${ds402_pulse_axis_mask_hex}" || true
+      fi
     fi
 
     if ! wait_for_probe_state "BUS_UP_DISARMED" "${STARTUP_FAULT_RESET_TIMEOUT_S}"; then
