@@ -56,6 +56,14 @@ Use this file as persistent, repo-local execution memory.
 
 *(Rolled over on `2026-04-08`. Detailed prior history now lives in `.cursor/memory/AGENT_SCRATCHPAD_2026-02-21_to_2026-04-08.md`. Older archive material remains in `.cursor/memory/AGENT_SCRATCHPAD_ARCHIVE.md`.)*
 
+### 2026-04-30 - Spec card microcopy should be customer-facing
+- [user] On the marketing spec sheet, avoid internal phrases like ``tool0`` in visible headline cards. Prefer application-oriented copy that explains the customer value of the number.
+- [self] For the Horizontal Reach card, "Wide base-to-tool coverage for benches, fixtures, and compact automation cells." fits the existing card size and tone better than implementation-source language.
+- [self] For the Repeatability card, avoid "Published repeatability" filler; use application value copy like "Repeatable positioning for fixture work, process validation, and automated cell routines."
+- [self] For the red intro strip, do not rely on default inline line-height for optical centering; set explicit `line-height: 1` and center each `span` with inline-flex before exporting PDF.
+- [user] PDF export target was renamed to `marketing/AMR_ROSIE_ROBOT_SPEC_SHEET.pdf`; use that file for future resaves instead of assuming the older `GRADIENT_05_ROBOT_SPEC_SHEET.pdf` name.
+- [self] First-page `Advanced Metal Research` header should match page 2/3 sizing: shared `.company-name` is `28px`, `line-height: 1`, `letter-spacing: 0.02em`; keep the tagline lower at `top: 0.6in`.
+
 ### 2026-04-30 - Gradient-05 spec speed formula confirmed; J5 is 27:2
 - [self] For Gradient-05 axis speed specs, use the documented formula `joint_deg_s = motor_rpm * 6 / gear_ratio`: 3,000 RPM rated and 6,000 RPM peak. This matches J1-J4/J6 in `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md`.
 - [user] Correction: Gradient-05 J5 is going to use `10 * 27 / 20 = 27 / 2 = 13.5`, superseding the immediate `100/11` comparison and the older spec-sheet `18:1` row.

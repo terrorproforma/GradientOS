@@ -121,9 +121,10 @@
       align-items: center;
       gap: 0.1in;
       color: var(--ink);
-      font-size: 20px;
+      font-size: 28px;
       font-weight: 900;
-      letter-spacing: 0.08em;
+      line-height: 1;
+      letter-spacing: 0.02em;
       text-transform: uppercase;
     }
 
@@ -137,7 +138,7 @@
     .brand-tagline {
       position: absolute;
       left: 0.52in;
-      top: 0.52in;
+      top: 0.6in;
       color: var(--red-dark);
       font-size: 9px;
       font-weight: 900;
@@ -209,14 +210,22 @@
       font-size: 9px;
       font-weight: 900;
       letter-spacing: 0.16em;
+      line-height: 1;
       text-transform: uppercase;
       white-space: nowrap;
+    }
+
+    .intro-strip span {
+      display: inline-flex;
+      align-items: center;
+      height: 100%;
     }
 
     .intro-strip .star {
       color: #fff3c4;
       font-size: 14px;
       letter-spacing: 0;
+      line-height: 1;
     }
 
     .top-benefits {
@@ -432,9 +441,6 @@
 
     .page-two .header-brand .company-name {
       position: static;
-      font-size: 28px;
-      line-height: 1;
-      letter-spacing: 0.02em;
       white-space: nowrap;
     }
 
@@ -803,7 +809,7 @@
       <img class="company-logomark" src="advanced%20metals%20research%20logo.svg" alt="">
       <span>Advanced Metal Research</span>
     </div>
-    <div class="brand-tagline">The next industrial workforce</div>
+    <div class="brand-tagline">Building the next industrial workforce</div>
     <div class="sheet-label">Robot Specification Sheet</div>
 
     <div class="hero-title">
@@ -844,7 +850,7 @@
       <article class="card headline-stat">
         <h2>Horizontal Reach</h2>
         <span class="value">1,509 mm</span>
-        <p>Current GradientOS kinematic value at the `tool0` origin.</p>
+        <p>Wide base-to-tool coverage for benches, fixtures, and compact automation cells.</p>
       </article>
 
       <article class="card headline-stat">
@@ -856,7 +862,7 @@
       <article class="card headline-stat">
         <h2>Repeatability</h2>
         <span class="value">0.08 mm</span>
-        <p>Published repeatability for Rosie.</p>
+        <p>Repeatable positioning for fixture work, process validation, and automated cell routines.</p>
       </article>
     </div>
 

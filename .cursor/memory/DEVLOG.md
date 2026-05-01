@@ -1,3 +1,21 @@
+## 2026-05-01 00:34 +0000 - Improved Horizontal Reach card copy
+
+- What changed:
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`: replaced the Horizontal Reach card's internal kinematic note with customer-facing copy: "Wide base-to-tool coverage for benches, fixtures, and compact automation cells."
+  - Replaced the Repeatability card's generic "Published repeatability" line with customer-facing copy: "Repeatable positioning for fixture work, process validation, and automated cell routines."
+  - Tightened the page-one red intro strip vertical alignment by setting explicit `line-height: 1` and centering each strip `span` with inline-flex.
+  - Matched the first-page `Advanced Metal Research` header to the page 2/3 header size by using the shared `28px` `.company-name` styling and moving the page-one tagline down to `0.6in`.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` from the current HTML with Chrome headless print output.
+  - Regenerated the renamed export target `marketing/AMR_ROSIE_ROBOT_SPEC_SHEET.pdf`.
+- Validation performed:
+  - Chrome wrote a fresh 3,151,457-byte PDF to `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` after the copy edits and again after the strip-alignment CSS edit.
+  - Chrome wrote a fresh 3,139,696-byte PDF to `marketing/AMR_ROSIE_ROBOT_SPEC_SHEET.pdf` after the first-page header-size change.
+  - Read back PDF text confirmed the revised Horizontal Reach / Repeatability copy and the J5 `1,333/2,667 deg/s` row are present.
+  - Read back the renamed PDF text to confirm the page-one header/tagline export was updated.
+  - `ReadLints` on the edited HTML returned no diagnostics.
+- Follow-ups / risks:
+  - None for this export.
+
 ## 2026-05-01 00:26 +0000 - Updated Gradient-05 J5 ratio to 27:2
 
 - Investigation summary:
