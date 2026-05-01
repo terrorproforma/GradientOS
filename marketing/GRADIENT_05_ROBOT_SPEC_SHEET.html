@@ -1,0 +1,1039 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Advanced Metal Research Rosie Robot Specification Sheet</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Playfair+Display:wght@700;800;900&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --cream: #faf6ee;
+      --cream-deep: #efe3d2;
+      --paper-line: rgba(96, 60, 38, 0.08);
+      --red: #b81c1c;
+      --red-dark: #7e1010;
+      --ink: #2c211b;
+      --muted: #6d5e52;
+      --card: rgba(255, 252, 246, 0.92);
+      --rule: rgba(184, 28, 28, 0.18);
+      --gold: #caa45a;
+      --steel: #6f7478;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #17110f;
+      color: var(--ink);
+      font-family: "DM Sans", "Trebuchet MS", Arial, sans-serif;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+
+    @page {
+      size: letter landscape;
+      margin: 0;
+    }
+
+    .page {
+      position: relative;
+      width: 11in;
+      height: 8.5in;
+      margin: 0 auto 18px;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 18% 14%, rgba(255, 255, 255, 0.88), transparent 28%),
+        radial-gradient(circle at 82% 78%, rgba(184, 28, 28, 0.08), transparent 30%),
+        linear-gradient(90deg, transparent 0 31px, var(--paper-line) 32px, transparent 33px),
+        linear-gradient(0deg, transparent 0 31px, rgba(96, 60, 38, 0.045) 32px, transparent 33px),
+        var(--cream);
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.34);
+      page-break-after: always;
+    }
+
+    .page::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        repeating-linear-gradient(12deg, rgba(44, 33, 27, 0.025) 0 1px, transparent 1px 5px),
+        radial-gradient(circle at 40% 20%, rgba(255, 255, 255, 0.42), transparent 34%);
+      mix-blend-mode: multiply;
+      opacity: 0.42;
+    }
+
+    .page > * {
+      position: relative;
+      z-index: 1;
+    }
+
+    .page:last-child {
+      page-break-after: auto;
+    }
+
+    h1,
+    h2,
+    h3,
+    .brand-word,
+    .company-name {
+      font-family: "Playfair Display", Georgia, serif;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin: 0;
+    }
+
+    .eyebrow {
+      color: var(--red);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.19em;
+      text-transform: uppercase;
+    }
+
+    .logo {
+      object-fit: contain;
+      filter: drop-shadow(0 7px 0 rgba(44, 33, 27, 0.08));
+    }
+
+    .page-one .logo {
+      position: absolute;
+      left: 0.46in;
+      top: 0.26in;
+      width: 2.16in;
+      height: 0.72in;
+    }
+
+    .company-name {
+      position: absolute;
+      left: 0.52in;
+      top: 0.22in;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.1in;
+      color: var(--ink);
+      font-size: 20px;
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .company-logomark {
+      display: block;
+      height: 1.05em;
+      width: auto;
+      flex-shrink: 0;
+    }
+
+    .brand-tagline {
+      position: absolute;
+      left: 0.52in;
+      top: 0.52in;
+      color: var(--red-dark);
+      font-size: 9px;
+      font-weight: 900;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+
+    .sheet-label {
+      position: absolute;
+      top: 0.42in;
+      right: 0.52in;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.17em;
+      text-transform: uppercase;
+    }
+
+    .hero-title {
+      position: absolute;
+      left: 0.52in;
+      top: 1.14in;
+      width: 5.18in;
+    }
+
+    .hero-title .title-logo {
+      display: block;
+      width: 5.1in;
+      height: 1.6in;
+      object-fit: contain;
+      object-position: left center;
+      filter: drop-shadow(0 0.08in 0 rgba(44, 33, 27, 0.08));
+    }
+
+    .hero-title h1 {
+      margin-top: 0.05in;
+      color: var(--ink);
+      font-size: 72px;
+      font-weight: 900;
+      line-height: 0.82;
+      letter-spacing: -0.052em;
+    }
+
+    .hero-title p {
+      width: 4.22in;
+      margin-top: 0.18in;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.42;
+    }
+
+    .intro-strip {
+      position: absolute;
+      left: 0.52in;
+      top: 3.6in;
+      width: 5.26in;
+      height: 0.58in;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.14in;
+      padding: 0 0.22in;
+      border: 3px solid #fff9ed;
+      border-radius: 999px;
+      background: linear-gradient(180deg, #cf2626 0%, var(--red) 52%, var(--red-dark) 100%);
+      color: #fff9ed;
+      box-shadow: 0 0.04in 0.12in rgba(44, 33, 27, 0.18);
+      font-size: 9px;
+      font-weight: 900;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+
+    .intro-strip .star {
+      color: #fff3c4;
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+
+    .top-benefits {
+      position: absolute;
+      left: 0.52in;
+      top: 4.42in;
+      width: 5.28in;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.1in;
+    }
+
+    .benefit-pill {
+      min-height: 0.52in;
+      padding: 0.1in 0.12in;
+      border-left: 3px solid var(--red);
+      background: rgba(255, 252, 246, 0.58);
+      color: var(--ink);
+      font-size: 10.5px;
+      font-weight: 700;
+      line-height: 1.28;
+    }
+
+    .benefit-pill strong {
+      display: block;
+      margin-bottom: 0.03in;
+      color: var(--red);
+      font-size: 9px;
+      font-weight: 900;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .hero-panel {
+      position: absolute;
+      right: 0.46in;
+      top: 1.03in;
+      width: 4.36in;
+      height: 5.32in;
+    }
+
+    .hero-panel::before {
+      content: none;
+    }
+
+    .hero-robot-bg {
+      position: absolute;
+      left: -0.1in;
+      top: 0in;
+      width: 4.5in;
+      height: 5.32in;
+      object-fit: contain;
+      object-position: left top;
+      opacity: 0.5;
+      filter: sepia(0.22) saturate(0.9) contrast(1.18) drop-shadow(0 0.06in 0.12in rgba(44, 33, 27, 0.16));
+      mix-blend-mode: multiply;
+      pointer-events: none;
+    }
+
+    .mascot {
+      position: absolute;
+      right: -0.05in;
+      bottom: -0.1in;
+      width: 3.1in;
+      height: 4.55in;
+      object-fit: contain;
+      object-position: right bottom;
+      filter: drop-shadow(0 0.12in 0.18in rgba(44, 33, 27, 0.32));
+    }
+
+    .card-grid {
+      position: absolute;
+      left: 0.52in;
+      right: 0.52in;
+      bottom: 0.62in;
+      display: grid;
+      grid-template-columns: 2.35in 2.35in 2.35in 2.35in;
+      gap: 0.16in;
+    }
+
+    .card {
+      min-height: 1.26in;
+      padding: 0.17in 0.17in 0.15in;
+      border-radius: 0.12in;
+      background: var(--card);
+      border: 1px solid var(--rule);
+      box-shadow: 0 0.08in 0.18in rgba(44, 33, 27, 0.065);
+    }
+
+    .card h2,
+    .card h3 {
+      margin-bottom: 0.08in;
+      color: var(--red);
+      font-size: 18px;
+      line-height: 0.98;
+      letter-spacing: -0.025em;
+    }
+
+    .card.headline-stat {
+      display: grid;
+      grid-template-rows: 0.62in 0.42in 1fr;
+      align-items: start;
+      row-gap: 0.06in;
+    }
+
+    .card.headline-stat h2 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 0.98;
+      letter-spacing: -0.035em;
+    }
+
+    .card.headline-stat .value {
+      display: block;
+      margin: 0;
+      color: var(--ink);
+      font-family: "Playfair Display", Georgia, serif;
+      font-size: 28px;
+      font-weight: 900;
+      line-height: 0.95;
+      letter-spacing: -0.035em;
+    }
+
+    .card.headline-stat p {
+      margin: 0;
+    }
+
+    .card p,
+    .card li {
+      color: var(--muted);
+      font-size: 9.6px;
+      font-weight: 600;
+      line-height: 1.28;
+    }
+
+    .card ul {
+      margin: 0;
+      padding-left: 0.13in;
+    }
+
+    .spec-stack {
+      display: grid;
+      gap: 0.045in;
+      color: var(--muted);
+      font-size: 9.7px;
+      font-weight: 700;
+      line-height: 1.1;
+    }
+
+    .spec-stack div {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.08in;
+      padding-bottom: 0.035in;
+      border-bottom: 1px solid rgba(184, 28, 28, 0.11);
+    }
+
+    .spec-stack strong {
+      color: var(--ink);
+      font-weight: 900;
+    }
+
+    .badge {
+      color: var(--red-dark);
+      font-weight: 900;
+    }
+
+    .footer {
+      position: absolute;
+      left: 0.52in;
+      right: 0.52in;
+      bottom: 0.22in;
+      display: flex;
+      justify-content: space-between;
+      border-top: 1px solid rgba(184, 28, 28, 0.24);
+      padding-top: 0.06in;
+      color: var(--muted);
+      font-size: 9px;
+      font-weight: 700;
+      line-height: 1.15;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .footer .address {
+      color: var(--red-dark);
+      font-weight: 900;
+    }
+
+    .page-two .header {
+      position: absolute;
+      left: 0.5in;
+      right: 0.5in;
+      top: 0.32in;
+      height: 1.05in;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      column-gap: 0.36in;
+      align-items: center;
+      border-bottom: 2px solid rgba(184, 28, 28, 0.22);
+    }
+
+    .page-two .header-brand {
+      display: flex;
+      flex-direction: column;
+      gap: 0.04in;
+    }
+
+    .page-two .header-brand .eyebrow {
+      font-size: 9px;
+      letter-spacing: 0.18em;
+    }
+
+    .page-two .header-brand .company-name {
+      position: static;
+      font-size: 28px;
+      line-height: 1;
+      letter-spacing: 0.02em;
+      white-space: nowrap;
+    }
+
+    .page-two .header-right {
+      display: flex;
+      align-items: center;
+      gap: 0.3in;
+      justify-self: end;
+    }
+
+    .page-two .title-logo {
+      width: 2.4in;
+      height: 0.78in;
+      object-fit: contain;
+      object-position: right center;
+      filter: drop-shadow(0 0.06in 0 rgba(44, 33, 27, 0.08));
+    }
+
+    .page-two .header-meta {
+      color: var(--muted);
+      font-size: 9.5px;
+      font-weight: 800;
+      line-height: 1.45;
+      text-align: right;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    .tech-layout {
+      position: absolute;
+      left: 0.5in;
+      right: 0.5in;
+      top: 1.52in;
+      bottom: 0.64in;
+      display: grid;
+      grid-template-columns: 6.18in 3.78in;
+      gap: 0.22in;
+    }
+
+    .sheet-card {
+      padding: 0.18in;
+      border-radius: 0.14in;
+      background: var(--card);
+      border: 1px solid var(--rule);
+      box-shadow: 0 0.08in 0.17in rgba(44, 33, 27, 0.055);
+    }
+
+    .sheet-card h2 {
+      margin-bottom: 0.12in;
+      color: var(--red);
+      font-size: 20px;
+      line-height: 1;
+      letter-spacing: -0.02em;
+    }
+
+    .sheet-card p {
+      color: var(--muted);
+      font-size: 9.2px;
+      font-weight: 600;
+      line-height: 1.35;
+    }
+
+    .main-tech {
+      display: grid;
+      grid-template-rows: 1fr;
+      gap: 0.16in;
+    }
+
+    .side-tech {
+      display: grid;
+      grid-template-rows: 2.05in 1.62in 1fr;
+      gap: 0.16in;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      color: var(--ink);
+      font-size: 8.2px;
+      line-height: 1.12;
+    }
+
+    th {
+      padding: 0.052in 0.045in;
+      background: var(--red);
+      color: #fff9ed;
+      font-weight: 900;
+      text-align: center;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    td {
+      padding: 0.046in 0.05in;
+      border-bottom: 1px solid rgba(184, 28, 28, 0.1);
+      background: rgba(255, 255, 255, 0.46);
+      color: var(--muted);
+      font-weight: 650;
+      text-align: center;
+    }
+
+    tr:nth-child(even) td {
+      background: rgba(239, 227, 210, 0.45);
+    }
+
+    td.left {
+      text-align: left;
+    }
+
+    .general td:first-child,
+    .general td:nth-child(2) {
+      color: var(--ink);
+      font-weight: 900;
+      text-align: left;
+    }
+
+    .axis-card table {
+      font-size: 7.5px;
+      line-height: 1.08;
+    }
+
+    .axis-card th {
+      padding: 0.046in 0.034in;
+      letter-spacing: 0.045em;
+    }
+
+    .axis-card td {
+      padding: 0.038in 0.036in;
+    }
+
+    .robot-dimensions-card {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      padding-bottom: 0.1in;
+    }
+
+    .robot-placeholder {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .robot-placeholder img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: center center;
+      filter: drop-shadow(0 0.08in 0.12in rgba(44, 33, 27, 0.18));
+    }
+
+    .robot-placeholder .robot-notes {
+      position: absolute;
+      right: 0.06in;
+      bottom: 0.06in;
+      width: 2.16in;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.08in;
+      z-index: 2;
+    }
+
+    .robot-note {
+      padding: 0.09in 0.1in;
+      border-radius: 0.08in;
+      background: rgba(250, 246, 238, 0.78);
+      border: 1px solid rgba(184, 28, 28, 0.12);
+      color: var(--muted);
+      font-size: 8.6px;
+      font-weight: 800;
+      line-height: 1.2;
+    }
+
+    .robot-note strong {
+      display: block;
+      color: var(--red);
+      font-size: 14px;
+      line-height: 1;
+    }
+
+    .schematic {
+      width: 100%;
+      height: 100%;
+    }
+
+    .schematic text {
+      font-family: "DM Sans", Arial, sans-serif;
+      fill: var(--muted);
+      font-weight: 800;
+    }
+
+    .arm-line {
+      fill: none;
+      stroke: var(--red);
+      stroke-width: 14;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .arm-shadow {
+      fill: none;
+      stroke: rgba(44, 33, 27, 0.12);
+      stroke-width: 21;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .joint {
+      fill: #fffaf1;
+      stroke: var(--red-dark);
+      stroke-width: 4;
+    }
+
+    .dim {
+      stroke: var(--steel);
+      stroke-width: 1;
+      marker-start: url(#arrow);
+      marker-end: url(#arrow);
+    }
+
+    .guide {
+      stroke: rgba(111, 116, 120, 0.42);
+      stroke-width: 1;
+      stroke-dasharray: 4 4;
+    }
+
+    .side-tech-three {
+      display: grid;
+      grid-template-rows: 1fr 1fr 1fr;
+      gap: 0.16in;
+      min-height: 0;
+      height: 100%;
+    }
+
+    .front-view-card {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      padding-bottom: 0.1in;
+      overflow: hidden;
+    }
+
+    .perspective-frame {
+      position: relative;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .perspective-frame img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: 30% center;
+      filter: drop-shadow(0 0.06in 0.12in rgba(44, 33, 27, 0.16));
+    }
+
+    .perspective-frame .perspective-notes {
+      position: absolute;
+      right: 0.1in;
+      top: 0.1in;
+      bottom: 0.1in;
+      width: 1.95in;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 0.1in;
+      z-index: 2;
+    }
+
+    .perspective-card {
+      display: flex;
+      flex-direction: column;
+      padding: 0.14in;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .perspective-card h2 {
+      margin: 0 0 0.06in 0;
+      font-size: 16px;
+      line-height: 1;
+    }
+
+    .perspective-row {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 1.45in 1fr;
+      gap: 0.1in;
+      align-items: center;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .perspective-row > .perspective-image {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .perspective-row > .perspective-image img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      object-position: center center;
+      filter: drop-shadow(0 0.04in 0.08in rgba(44, 33, 27, 0.14));
+    }
+
+    .perspective-stack {
+      display: grid;
+      gap: 0.04in;
+      color: var(--muted);
+      font-size: 8.6px;
+      font-weight: 700;
+      line-height: 1.16;
+      align-content: center;
+    }
+
+    .perspective-stack div {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.08in;
+      padding-bottom: 0.035in;
+      border-bottom: 1px solid rgba(184, 28, 28, 0.11);
+    }
+
+    .perspective-stack div:last-child {
+      border-bottom: none;
+      padding-bottom: 0;
+    }
+
+    .perspective-stack strong {
+      color: var(--ink);
+      font-weight: 900;
+      white-space: nowrap;
+    }
+
+    .page-three .header .eyebrow {
+      color: var(--red);
+    }
+
+    @media print {
+      body {
+        background: white;
+      }
+
+      .page {
+        margin: 0;
+        box-shadow: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <section class="page page-one">
+    <div class="company-name">
+      <img class="company-logomark" src="advanced%20metals%20research%20logo.svg" alt="">
+      <span>Advanced Metal Research</span>
+    </div>
+    <div class="brand-tagline">The next industrial workforce</div>
+    <div class="sheet-label">Robot Specification Sheet</div>
+
+    <div class="hero-title">
+      <div class="eyebrow">Robot platform</div>
+      <img class="title-logo" src="rosie_logo.png" alt="Rosie">
+      <p>A six-axis articulated robot platform powered by AMR's GradientOS, the open-source industrial robotics controller.</p>
+    </div>
+
+    <div class="intro-strip" aria-label="Rosie platform highlights">
+      <span>Open Source</span>
+      <span class="star">★</span>
+      <span>No Fees</span>
+      <span class="star">★</span>
+      <span>Expandable IO</span>
+      <span class="star">★</span>
+      <span>Hollow Routing</span>
+    </div>
+
+    <div class="top-benefits">
+      <div class="benefit-pill"><strong>Open controller</strong>Full industrial robotics controller, open source, with no hidden software fees.</div>
+      <div class="benefit-pill"><strong>Easy integration</strong>Open GradientOS stack reduces lock-in and keeps functionality accessible.</div>
+      <div class="benefit-pill"><strong>Expandable IO</strong>Ready for cell devices, tooling, safety signals, and end-effector integration.</div>
+      <div class="benefit-pill"><strong>Hollow cable paths</strong>62 mm shoulder and 33 mm wrist pass-throughs for cleaner cable routing.</div>
+    </div>
+
+    <div class="hero-panel">
+      <img class="hero-robot-bg" src="300ppi_robot_iso-removebg.png" alt="Rosie isometric robot">
+      <img class="mascot" src="top_half_rosie_mascot_no_logo.png" alt="Rosie mascot">
+    </div>
+
+    <div class="card-grid">
+      <article class="card headline-stat">
+        <h2>Payload</h2>
+        <span class="value">15 kg</span>
+        <p>Nominal handling capacity for Rosie.</p>
+      </article>
+
+      <article class="card headline-stat">
+        <h2>Horizontal Reach</h2>
+        <span class="value">1,509 mm</span>
+        <p>Current GradientOS kinematic value at the `tool0` origin.</p>
+      </article>
+
+      <article class="card headline-stat">
+        <h2>Vertical Reach</h2>
+        <span class="value">1,638 mm</span>
+        <p>Above-base vertical reach; total envelope span is a separate sweep value.</p>
+      </article>
+
+      <article class="card headline-stat">
+        <h2>Repeatability</h2>
+        <span class="value">0.08 mm</span>
+        <p>Published repeatability for Rosie.</p>
+      </article>
+    </div>
+
+    <footer class="footer">
+      <span class="address">Advanced Metal Research | 13020 Yukon Ave | Hawthorne, CA 90250</span>
+      <span>Rosie Robot Specification Sheet</span>
+    </footer>
+  </section>
+
+  <section class="page page-two">
+    <header class="header">
+      <div class="header-brand">
+        <div class="eyebrow">Performance &amp; Open Control</div>
+        <div class="company-name">
+          <img class="company-logomark" src="advanced%20metals%20research%20logo.svg" alt="">
+          <span>Advanced Metal Research</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <img class="title-logo" src="rosie_logo.png" alt="Rosie">
+      </div>
+    </header>
+
+    <div class="tech-layout">
+      <div class="main-tech">
+        <section class="sheet-card robot-dimensions-card">
+          <h2>Robot Dimensions</h2>
+          <div class="robot-placeholder">
+            <img src="crop_war_dimensions-removebg.png" alt="Rosie robot dimension drawing">
+            <div class="robot-notes">
+              <div class="robot-note"><strong>1,509 mm</strong>Horizontal reach</div>
+              <div class="robot-note"><strong>1,638 mm</strong>Vertical reach</div>
+              <div class="robot-note"><strong>62 mm</strong>Hollow shoulder pass-through</div>
+              <div class="robot-note"><strong>33 mm</strong>Hollow wrist pass-through</div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+
+      <div class="side-tech">
+        <section class="sheet-card axis-card">
+          <h2>Axis Specifications</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Axis</th>
+                <th>Role</th>
+                <th>Motion Range</th>
+                <th>Rated Speed</th>
+                <th>Peak Speed</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td>J1</td><td>Base</td><td>+/- 361.0 deg</td><td>180 deg/s</td><td>360 deg/s</td></tr>
+              <tr><td>J2</td><td>Shoulder</td><td>+/- 108.9 deg</td><td>180 deg/s</td><td>360 deg/s</td></tr>
+              <tr><td>J3</td><td>Elbow</td><td>-240.6 / +87.7 deg</td><td>180 deg/s</td><td>360 deg/s</td></tr>
+              <tr><td>J4</td><td>Wrist roll</td><td>+/- 361.0 deg</td><td>1,000 deg/s</td><td>2,000 deg/s</td></tr>
+              <tr><td>J5</td><td>Wrist pitch</td><td>+/- 361.0 deg</td><td>1,333 deg/s</td><td>2,667 deg/s</td></tr>
+              <tr><td>J6</td><td>Tool roll</td><td>+/- 573.0 deg</td><td>1,800 deg/s</td><td>3,600 deg/s</td></tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section class="sheet-card">
+          <h2>Open Controller</h2>
+          <p>GradientOS is an open-source full industrial robotics controller, built to make integration simple without hidden software fees or artificially limited functionality.</p>
+          <p style="margin-top:0.08in;">Expandable IO supports cell devices, tooling, safety signals, and end-effector integration.</p>
+        </section>
+
+        <section class="sheet-card">
+          <h2>Controller Defaults</h2>
+          <table class="general">
+            <tbody>
+              <tr><td class="left">Robot ID</td><td class="left">gradient-05</td><td>Gradient05Config</td></tr>
+              <tr><td class="left">Physical actuators</td><td class="left">6 EtherCAT axes</td><td>IDs 0-5</td></tr>
+              <tr><td class="left">Profile velocity</td><td class="left">0.1 m/s</td><td>default</td></tr>
+              <tr><td class="left">Profile acceleration</td><td class="left">0.05 m/s^2</td><td>default</td></tr>
+              <tr><td class="left">Cartesian jog caps</td><td class="left">0.2 m/s linear</td><td>180 deg/s angular</td></tr>
+              <tr><td class="left">Encoder model</td><td class="left">17-bit motor-side</td><td>absolute count model</td></tr>
+              <tr><td class="left">Power</td><td class="left">200-240 VAC 3PH</td><td>35A</td></tr>
+              <tr><td class="left">Integration</td><td class="left">Expandable IO</td><td>Open-source controller</td></tr>
+            </tbody>
+          </table>
+        </section>
+      </div>
+    </div>
+
+    <footer class="footer">
+      <span class="address">Advanced Metal Research | 13020 Yukon Ave | Hawthorne, CA 90250</span>
+      <span>Rosie Robot Specification Sheet</span>
+    </footer>
+  </section>
+
+  <section class="page page-two page-three">
+    <header class="header">
+      <div class="header-brand">
+        <div class="eyebrow">Mechanical Interfaces</div>
+        <div class="company-name">
+          <img class="company-logomark" src="advanced%20metals%20research%20logo.svg" alt="">
+          <span>Advanced Metal Research</span>
+        </div>
+      </div>
+      <div class="header-right">
+        <img class="title-logo" src="rosie_logo.png" alt="Rosie">
+      </div>
+    </header>
+
+    <div class="tech-layout">
+      <div class="main-tech">
+        <section class="sheet-card front-view-card">
+          <h2>Arm Envelope</h2>
+          <div class="perspective-frame">
+            <img src="front_view-removebg.png" alt="Rosie front elevation with envelope dimensions">
+            <div class="perspective-notes">
+              <div class="robot-note"><strong>346.17 mm</strong>Wrist tool envelope</div>
+              <div class="robot-note"><strong>253.9 mm</strong>Wrist housing span</div>
+              <div class="robot-note"><strong>145.67 mm</strong>Tool-side offset</div>
+              <div class="robot-note"><strong>350.5 mm</strong>Mount plate width</div>
+              <div class="robot-note"><strong>150 mm</strong>Base column width</div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="side-tech-three">
+        <section class="sheet-card perspective-card">
+          <h2>Base Mount</h2>
+          <div class="perspective-row">
+            <div class="perspective-image">
+              <img src="base-removebg.png" alt="Rosie mounting base footprint">
+            </div>
+            <div class="perspective-stack">
+              <div><span>Mount plate</span><strong>220 x 220 mm</strong></div>
+              <div><span>Bolt circle</span><strong>140 mm PCD</strong></div>
+              <div><span>Anchor bore</span><strong>&Oslash;25.5 mm</strong></div>
+              <div><span>Plate thickness</span><strong>5 mm</strong></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="sheet-card perspective-card">
+          <h2>Wrist Flange</h2>
+          <div class="perspective-row">
+            <div class="perspective-image">
+              <img src="j6_mount-removebg.png" alt="Rosie J6 wrist mount drawing">
+            </div>
+            <div class="perspective-stack">
+              <div><span>Hollow bore</span><strong>&Oslash;33 mm</strong></div>
+              <div><span>Bolt pattern</span><strong>85 x 85 mm</strong></div>
+              <div><span>Threaded mounts</span><strong>M5 x 6</strong></div>
+              <div><span>Flange width</span><strong>92.3 mm</strong></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="sheet-card perspective-card">
+          <h2>ISO50 Tool Adapter</h2>
+          <div class="perspective-row">
+            <div class="perspective-image">
+              <img src="iso_adaptor-removebg.png" alt="Rosie tool flange adapter">
+            </div>
+            <div class="perspective-stack">
+              <div><span>Outer diameter</span><strong>&Oslash;70 mm</strong></div>
+              <div><span>Bolt circle</span><strong>&Oslash;50 mm</strong></div>
+              <div><span>Through bore</span><strong>&Oslash;38 mm</strong></div>
+              <div><span>Stack height</span><strong>10 mm</strong></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+
+    <footer class="footer">
+      <span class="address">Advanced Metal Research | 13020 Yukon Ave | Hawthorne, CA 90250</span>
+      <span>Rosie Robot Specification Sheet</span>
+    </footer>
+  </section>
+</body>
+</html>

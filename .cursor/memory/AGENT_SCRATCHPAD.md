@@ -56,6 +56,11 @@ Use this file as persistent, repo-local execution memory.
 
 *(Rolled over on `2026-04-08`. Detailed prior history now lives in `.cursor/memory/AGENT_SCRATCHPAD_2026-02-21_to_2026-04-08.md`. Older archive material remains in `.cursor/memory/AGENT_SCRATCHPAD_ARCHIVE.md`.)*
 
+### 2026-04-30 - Gradient-05 spec speed formula confirmed; J5 is 27:2
+- [self] For Gradient-05 axis speed specs, use the documented formula `joint_deg_s = motor_rpm * 6 / gear_ratio`: 3,000 RPM rated and 6,000 RPM peak. This matches J1-J4/J6 in `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md`.
+- [user] Correction: Gradient-05 J5 is going to use `10 * 27 / 20 = 27 / 2 = 13.5`, superseding the immediate `100/11` comparison and the older spec-sheet `18:1` row.
+- [self] With J5 `27:2`, the derived row is rated `1,333 deg/s`, peak `2,667 deg/s`, and `131072 * 13.5 = 1,769,472` encoder counts per joint rev.
+
 ### 2026-04-30 Power-up 503 can be downstream of anchor-store JSON corruption
 - [self] When the controller logs `No active backend` during `SAFE_POWER_UP`, inspect the startup log above the selected error first. In this case, backend construction failed earlier because `.gradient_absolute_encoder_anchors.json` was malformed JSON with extra trailing braces; the 503 was only the downstream API/controller symptom.
 - [self] Anchor-store loader intentionally fail-closes (`absolute_encoder_anchors.py`) and refuses to treat malformed anchor data as empty. Do not auto-delete or regenerate the store during triage; preserve/repair it deliberately because it carries drive-native home anchors.
@@ -2761,3 +2766,130 @@ Use this file as persistent, repo-local execution memory.
 - [self] For robot spec-sheet work, only claim values sourced from `Gradient05Config`, `robots/gradient-05/gradient-05.urdf`, and current repo docs. Reach/envelope values are current GradientOS kinematic estimates, not certified production dimensions.
 - [tool] Repo search found no authoritative source for payload, repeatability, robot mass, allowable wrist moment/inertia, tool flange, base mounting pattern, power requirements, environmental/IP rating, cable/air routing, or production CAD render. Keep those visible as `in validation` until CAD/BOM/electrical/metrology evidence exists.
 - [user] Correction: spec-sheet copy must read like direct marketing material. Do not mention reference brands, "inspired by", "draft", "TBD", "placeholder", "missing before release", or process instructions on the sheet.
+
+### 2026-04-29 - Rosie spec sheet branding pass
+- [user] For the robot spec sheet, use company name `Rosie`, robot name `WAR MACHINE 001`, and the supplied `marketing/rosie_logo.png` / `marketing/rosie_mascot.png` assets.
+- [user] Reinforced design direction: warm cream `#FAF6EE` paper texture, deep red `#B81C1C`, Playfair Display headings, DM Sans body, mascot prominent in the hero, red intro strip with star dividers, and clean cards with no decorative clutter.
+- [self] Keep Rosie brand polish separate from unsupported spec claims: update presentation/copy freely, but leave payload/repeatability/mass/power and other unverified ratings as `in validation`.
+
+### 2026-04-30 - Rosie sheet follow-up specs and layout corrections
+- [user] Robot name should be `WAR MACHINE #001` everywhere visible, not mixed `WAR MACHINE 001`.
+- [user] Remove the backing boxes behind Rosie, move the key-benefit equivalents into the open area under the red strip, and use `marketing/WAR_MACHINE_001-removebg.png` as the robot placeholder visual.
+- [user] Add visible commercial/integration claims: GradientOS is an open-source full industrial robotics controller with easy integration, no hidden software fees, no limited functionality, expandable IO, `200-240 VAC 3PH, 35A`, hollow shoulder `62 mm`, hollow wrist `33 mm`, and company address `Rosie, 13020 Yukon Ave, Hawthorne, CA 90250`.
+- [user] J5 gear ratio is `18:1`; update derived spec-sheet locations to match. If speed values are shown from rated/peak motor RPM math, J5 becomes `1,000 deg/s` rated and `2,000 deg/s` peak.
+- [self] `Payload` and `Repeatability` should be headline specs, but keep their values as `In validation` until the user provides final numbers or test evidence.
+
+### 2026-04-30 - Vertical reach vs vertical span correction
+- [user] Questioned the sheet's `2,291 mm` vertical reach and suggested actual vertical reach is about `1,638 mm`; horizontal reach is about `1,500 mm`, with `1,509 mm` likely the max.
+- [self] Correction: `2,291 mm` came from total vertical envelope span (`max z` around `1,647 mm` minus `min z` around `-644 mm`), not vertical reach above base. Do not use total vertical span as the Yaskawa-style headline `Vertical Reach`.
+- [tool] Quick URDF sampling via Node produced max horizontal radius about `1,508.3 mm`, max z about `1,645.8 mm`, min z about `-640.6 mm`, and total vertical span about `2,286.4 mm`, consistent with previous rounded `1,509` and `2,291` envelope-span estimates.
+- [self] Spec-sheet headline should use `1,509 mm` horizontal reach and `1,638 mm` vertical reach per user/CAD-facing dimension, with total vertical envelope span only as a separately labeled technical sweep value.
+
+### 2026-04-30 - Address belongs in the footer
+- [user] Strong correction: the Rosie address should clearly go in the footer, not in the hero/callout area.
+- [self] For spec-sheet layout, put `Rosie | 13020 Yukon Ave | Hawthorne, CA 90250` in both page footers and remove address text from the mascot/hero content.
+
+### 2026-04-30 - WAR MACHINE repeatability value
+- [user] WAR MACHINE #001 repeatability is `0.08 mm`.
+- [self] Remove repeatability from spec-sheet `In Validation` lists once the `0.08 mm` value is shown.
+
+### 2026-04-30 - WAR MACHINE nominal payload value
+- [user] WAR MACHINE #001 nominal payload is `15 kg`.
+- [self] Remove payload from spec-sheet `In Validation` lists once the `15 kg` nominal value is shown.
+- [tool] Chrome on this Windows/OneDrive workspace sometimes regenerated stale PDF content for the original filename; Edge headless exported the current HTML correctly. If PDF text looks stale, export to a temporary PDF and compare/copy hashes before handoff.
+
+### 2026-04-30 - Rosie tagline
+- [user] Rosie tagline is `The next industrial workforce`.
+- [self] For the spec sheet, place the tagline as visible brand copy under the Rosie logo and repeat it in the page-two technical header.
+
+### 2026-04-30 - Remove visible validation bucket from spec sheet
+- [user] The `In Validation` card/list is not needed on the spec sheet.
+- [self] Remove the visible page-two `In Validation` card and the matching markdown `Ratings in Validation` section; do not leave hidden validation copy that can reappear in the PDF.
+
+### 2026-04-30 - Page-two spec layout cleanup
+- [user] Page two should keep `Open Controller` at the top of the right column, move `Controller Defaults` into the right column below it, remove `General Specs`/`In Validation`, and make the robot placeholder card taller.
+- [self] For this sheet, prefer page-two layout: left column `Axis Specifications` + tall robot placeholder; right column `Open Controller` + `Controller Defaults`.
+
+### 2026-04-30 - Remove mascot callout copy
+- [user] Remove the small text under/near the Rosie mascot on page one.
+- [self] Delete the `.hero-panel .callout` markup and CSS entirely so no caption remains under Rosie's feet.
+
+### 2026-04-30 - Remove estimate wording from spec sheet
+- [user] Remove the word `estimate` from the reach callouts.
+- [self] Remove `estimate/estimates` from visible HTML labels and markdown section names; verify a fresh temporary PDF filename before copying over the final PDF because reused PDF paths can show stale extracted text.
+
+### 2026-04-30 - Use cropped dimension drawing on page two
+- [user] Use `marketing/crop_war_dimensions-removebg.png` for the robot visual on the second page.
+- [self] Replace the previous `WAR_MACHINE_001-removebg.png` page-two image and label the section `Robot Dimensions`.
+
+### 2026-04-30 - Use isometric robot behind Rosie
+- [user] Use `marketing/300ppi_robot_iso-removebg.png` on the first page behind Rosie.
+- [self] Add it as a low-opacity `hero-robot-bg` layer inside the page-one hero panel, behind the Rosie mascot.
+
+### 2026-04-30 - Axis specs right column without ratio
+- [user] Move `Axis Specifications` to the right-hand side, remove the ratio column, and make `Robot Dimensions` the full-height left-side panel.
+- [self] Keep the page-two layout as left `Robot Dimensions`; right `Axis Specifications`, `Open Controller`, `Controller Defaults`.
+
+### 2026-04-30 - Robot dimensions full-height and no-logo Rosie
+- [user] Use `marketing/rosie_mascot_no_logo.png` for Rosie and place her higher in the hero.
+- [user] Make the page-two robot dimensions image full height and move the spec info to the bottom right.
+- [self] In the dimensions card, make the drawing absolutely fill the left card height and anchor spec pills at the bottom-right.
+
+### 2026-04-30 - Right column height rebalance
+- [user] Give more height to the page-two `Axis Specifications` card by taking unused height from the bottom `Controller Defaults` card.
+- [self] Right column grid should allocate more fixed height to axis specs (`2.05in`) and leave controller defaults tighter.
+
+### 2026-04-30 - Company/robot rebrand
+- [user] Change company name to `ADVANCED METAL RESEARCH`; robot name is `Rosie`.
+- [user] Use the Rosie logo for all places that previously mentioned `WAR MACHINE`.
+- [self] Remove all visible `WAR MACHINE #001` references from the spec sheet and use prominent `rosie_logo.png` title treatments for the robot name.
+
+### 2026-04-30 - Larger page-one Rosie logo
+- [user] Make the page-one hero Rosie logo bigger.
+- [self] Scale only `.hero-title .title-logo`; keep the smaller page-two header logo unchanged.
+
+### 2026-04-30 - Local HTML preview workflow
+- [tool] Cursor IDE browser rejects direct `file://` navigation. Serve `marketing/` over localhost (for example a small Node static server) and open `http://127.0.0.1:<port>/GRADIENT_05_ROBOT_SPEC_SHEET.html` for live review.
+- [tool] When iterating on CSS, always reload with a unique `?v=N` cache buster so the IDE browser picks up changes; reusing the same URL can hold stale CSS.
+
+### 2026-04-30 - Layout cleanup pass (page one + two)
+- [user] Tidy page-one gaps; reposition the mascot so the iso robot behind her is fully visible.
+- [user] Page-two header: `Advanced Metal Research` must stay on a single line, drop the inline Rosie title-logo, and move Rosie to the right.
+- [user] Page-two `Robot Dimensions` card: dimension drawing should fill the card height under the heading; spec pills overlay the lower-right.
+- [self] Header pattern that works: 2-column grid (`auto 1fr`) with a left brand stack (eyebrow + nowrap company-name) and a right group (`header-meta` + Rosie title logo).
+- [self] Iso robot bg should fill the hero panel (`width: 4.5in; height: 5.32in; object-position: left top`) so the silhouette reads through Rosie. Mascot anchored bottom-right with `object-position: right bottom`.
+- [self] For dimensions card: `inset: 0; width: 100%; height: 100%; object-fit: contain` on the drawing, with `.robot-notes` absolutely pinned `right/bottom: 0.06in` and `z-index: 2` to overlay the empty corner.
+
+### 2026-04-30 - Headline card uniformity + softer intro shadow
+- [user] The intro strip's drop shadow was too heavy; the four headline-stat cards looked irregular because some headings wrapped to two lines and some didn't.
+- [self] Replace the chunky `box-shadow: 0 0.11in 0 rgba(...)` on `.intro-strip` with a soft drop shadow (`0 0.04in 0.12in rgba(44, 33, 27, 0.18)`).
+- [self] Lock `.card.headline-stat` to a 3-row grid (`grid-template-rows: 0.62in 0.42in 1fr; align-items: start; row-gap: 0.06in`) and clear h2/value/p margins so heading, value, and description always share the same vertical baseline whether the title wraps to one or two lines.
+
+### 2026-04-30 - Mechanical interfaces page added to spec sheet
+- [user] Added new perspective drawings to `marketing/`: `front_view-removebg.png`, `base-removebg.png`, `j6_mount-removebg.png`, `iso_adaptor-removebg.png`. Asked for a third spec-sheet page that shows them all.
+- [self] Reuse existing page-two scaffolding by giving the new section `class="page page-two page-three"`. Header inherits `.page-two .header` and footer inherits `.footer`; only the eyebrow text changes ("Mechanical Interfaces").
+- [self] Page-three layout: left main panel = `Front Elevation` (full-height image with overlaid spec pills, mirrors `.robot-dimensions-card` pattern); right column = three stacked `perspective-card` cards (Mounting Base, J6 Wrist Mount, Tool Adapter). Each side card uses a `perspective-row` grid: 1.45in image cell + 1fr `perspective-stack` of label/value rows.
+- [self] First-pass: `grid-template-rows: 1fr 1fr 1fr` overflowed because grid items defaulted to `min-height: auto` and tall PNGs forced cards past the page bottom. Wrapping each side-card image in a `position: relative; overflow: hidden` `.perspective-image`, plus `min-height: 0; overflow: hidden` on `.perspective-card`, `.perspective-row`, and `.perspective-image`, was enough to let `1fr 1fr 1fr` (with `height: 100%` on `.side-tech-three`) stretch the right column to the same total height as the left front-elevation card without overflow. Use `1fr` rows when bottoms must align; use fixed `1.95in` rows only as a debug fallback.
+- [self] Spec-pill copy convention: each row uses `<span>label</span><strong>value</strong>` so labels stay muted and values stay ink-black, with `white-space: nowrap` on `strong` to keep dimensions readable. `&Oslash;` HTML entity renders cleanly in both browser and Edge headless PDF.
+
+### 2026-04-30 - Advanced Metal Research SVG logomark before company name
+- [user] Dropped `marketing/advanced metals research logo.svg` (a 1016x370 deep-red abstract mark) and asked for it to appear before the company name text.
+- [self] Reference the SVG via URL-encoded src (`advanced%20metals%20research%20logo.svg`) so the spaces in the user's filename keep working without renaming the asset.
+- [self] Make `.company-name` an `inline-flex` row with `align-items: center; gap: 0.1in` and add a `.company-logomark { display: block; height: 1.05em; width: auto; flex-shrink: 0 }` rule. `1.05em` auto-scales the mark to whatever font-size each page uses (20px hero, 28px page-two/page-three header).
+- [self] Wrap the existing text node in a `<span>` so the flex container has clean text + image children. Apply the same wrapping pattern to all three `.company-name` occurrences (page 1 hero, page 2 technical-data header, page 3 mechanical-interfaces header) so the brand mark is consistent across the sheet.
+- [self] Use `alt=""` (decorative) because the company name text sits right next to the mark; otherwise screen readers would say "Advanced Metal Research" twice.
+
+### 2026-04-30 - Page-two eyebrow replaced with page-specific marketing copy
+- [user] "Technical Data" eyebrow on page 2 was too generic; asked for better copy.
+- [self] Spec-sheet eyebrow rule: each page eyebrow should name what's on that page, not use a generic bucket label. Page 1 = `Robot Platform`, Page 3 = `Mechanical Interfaces`, so page 2 now = `Performance & Open Control` to cover its two halves (Robot Dimensions + Axis Specifications for performance; Open Controller + Controller Defaults for open control).
+- [tool] Use `&amp;` in HTML eyebrow text; Edge headless PDF renders it as `&` but text extraction sees it spaced (`P E R F O R M A N C E & O P E N C O N T R O L`) because of the `letter-spacing: 0.19em` on `.eyebrow` — that's a visual letter-spacing effect, not a copy bug.
+
+### 2026-04-30 - Page-three card titles and spec labels rewritten for marketing consistency
+- [user] Page-3 copy (card titles + spec pills) was too close to drafting-shorthand; asked for better copy after they'd already set `Tool Adapter` -> `ISO50 Tool Adapter`.
+- [self] Spec-sheet card-title rule: use noun-first, parallel names that say what the integrator gets, not which drawing view it is. Applied across page 3:
+  - `Front Elevation` -> `Arm Envelope` (describes what the drawing is, not the view direction)
+  - `Mounting Base` -> `Base Mount` (cleaner noun-first, parallels `Tool Adapter`)
+  - `J6 Wrist Mount` -> `Wrist Flange` (industrial-standard term; J-number isn't needed when we're showing the physical flange)
+  - Kept user's `ISO50 Tool Adapter`.
+- [self] Spec-label rule: prefer industrial-standard noun phrases over engineering shorthand. `Fastener boss` -> `Anchor bore`, `Hollow shaft` -> `Hollow bore`, `Tapped mounts` -> `Threaded mounts`, `Outer width` -> `Flange width`. For envelope pills, drop redundant suffixes (`Wrist envelope width` -> `Wrist tool envelope`, `Base footprint width` -> `Mount plate width`) and replace jargon like `J5 housing span` / `Mid-base feature` with descriptive names (`Wrist housing span`, `Base column width`).
+- [self] Always mirror page-3 copy changes in both `GRADIENT_05_ROBOT_SPEC_SHEET.html` and `.md` so the two sources stay in sync for future regenerations.

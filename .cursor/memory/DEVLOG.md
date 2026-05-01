@@ -1,3 +1,20 @@
+## 2026-05-01 00:26 +0000 - Updated Gradient-05 J5 ratio to 27:2
+
+- Investigation summary:
+  - User asked how the `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` joint speed specs were calculated.
+  - Confirmed the sheet's stated formula: `joint deg/s = motor RPM * 6 / gear_ratio`, using 3,000 RPM for rated speed and 6,000 RPM for peak speed.
+  - User corrected J5 to `10 * 27 / 20 = 27 / 2 = 13.5`.
+- What changed:
+  - `src/gradient_os/arm_controller/robots/gradient05/config.py`: changed J5 from `100/11` to exact `27/2`.
+  - `tests/test_gradient05_limits_and_backends.py`: updated the default ratio and J5 wrap-period expectation to `1_769_472` counts.
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` / `.html`: updated J5 visible speed values to `1,333/2,667 deg/s`; the Markdown source also updates J5 counts and drive-native ratio copy.
+- Validation performed:
+  - Read the spec sheet axis table and formula note.
+  - Read `Gradient05Config.actuator_encoder_counts_per_rev`, `actuator_gear_ratios`, and `actuator_position_signs`.
+- Follow-ups / risks:
+  - Regenerate `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` if the PDF is being distributed.
+  - Live startup/readback should confirm J5 A6-EC `C10.18/C10.19` as `27/2`; changing the drive-native mechanical ratio requires fresh homing afterward.
+
 ## 2026-04-30 04:15 +0000 - Power-up 503 traced to malformed absolute encoder anchor store
 
 - Investigation summary:
@@ -8078,3 +8095,388 @@ Native-home pathway was exercised end-to-end on J6 against the new RTCore binary
   - Read-only log decoding and `./start-stack.sh probe`; no code changes or tests run.
 - Follow-ups / risks:
   - Reproduce the long holds first (`+X`, `-X`, `-Z`, `-Y`, yaw ±, roll ±) with the new raw-count/control-feedback harness before changing DLS policy again.
+
+## 2026-04-29 22:18 -07:00 - Rosie-branded WAR MACHINE 001 spec sheet
+
+- What changed:
+  - Reworked `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` around Rosie and robot name `WAR MACHINE 001`, while keeping unsupported technical ratings marked `in validation`.
+  - Rebuilt `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` with the requested cream paper texture, deep red accent, Playfair Display / DM Sans typography, red intro strip with star dividers, clean card layout, and supplied Rosie logo/mascot assets.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` from the updated HTML using local Chrome headless print.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `rg` check for banned/internal sheet terms (`TBD`, `placeholder`, `draft`, `inspired by`, `Yaskawa`, `missing before release`, `reference brand`) returned no matches.
+  - Chrome headless PDF export wrote `2516073` bytes.
+  - `git diff --check -- marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` -> clean.
+- Follow-ups / risks:
+  - Final commercial ratings still require CAD/electrical/metrology evidence before replacing `in validation` with numeric claims.
+
+## 2026-04-30 00:50 -07:00 - Rosie WAR MACHINE #001 follow-up spec pass
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` and `.html` to normalize visible naming to `WAR MACHINE #001`.
+  - Removed the large backing panels behind Rosie, moved open-source/easy-integration/expandable-IO/hollow-routing benefits into the top hero area, and converted the lower boxes into headline specs: payload, horizontal reach, vertical reach, and repeatability.
+  - Added the `marketing/WAR_MACHINE_001-removebg.png` robot placeholder to page two.
+  - Added Rosie address, open-source industrial controller copy, no-hidden-fees/no-limited-functionality messaging, expandable IO, `200-240 VAC 3PH, 35A`, 62 mm hollow shoulder, and 33 mm hollow wrist details.
+  - Updated J5 from `100:11` to `18:1` in the visible axis table and drive-ratio copy; adjusted J5 derived rated/peak speed to `1,000 deg/s` / `2,000 deg/s`.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf`.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `rg` check found no lingering `WAR MACHINE 001`, `100:11`, `1,980`, `3,960`, internal draft/reference terms, or old power/cable validation labels.
+  - Chrome headless PDF export wrote `2462807` bytes.
+  - Visual screenshots checked both pages after export.
+  - `git diff --check -- marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html .cursor/memory/AGENT_SCRATCHPAD.md .cursor/memory/DEVLOG.md` -> clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - Payload and repeatability remain `In validation` because no final numeric values were provided in this turn.
+
+## 2026-04-30 00:59 -07:00 - Corrected headline vertical reach wording
+
+- What changed:
+  - Investigated the user's question about why `2,291 mm` was shown as vertical reach.
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` and `.html` so headline vertical reach is `1,638 mm`.
+  - Kept `2,291 mm` only as a separately labeled total vertical envelope span in the markdown technical data.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf`.
+- Validation performed:
+  - Node URDF sampling sanity check: max horizontal radius about `1,508.3 mm`, max z about `1,645.8 mm`, min z about `-640.6 mm`, total vertical span about `2,286.4 mm`.
+  - `ReadLints` clean on the spec markdown and HTML.
+  - PDF text check shows headline `Vertical Reach` as `1,638 mm` and horizontal reach as `1,509 mm`.
+  - Search found no lingering visible `2,291 mm vertical reach` wording.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - The exact published vertical reach should be confirmed against final CAD/exported drawing. Current sheet follows the user-provided `1,638 mm` CAD-facing value rather than the URDF sampled `~1,646-1,647 mm` max-z estimate.
+
+## 2026-04-30 01:01 -07:00 - Moved Rosie address into spec-sheet footers
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` so both page footers show `Rosie | 13020 Yukon Ave | Hawthorne, CA 90250`.
+  - Removed the address from the page-one Rosie/mascot callout and replaced it with the open-source controller line.
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` to identify the address as footer copy.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf`.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - PDF text check shows the address in the footer text on both pages.
+  - Visual screenshot checked the footer placement.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 01:03 -07:00 - Set WAR MACHINE #001 repeatability
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` and `.html` to publish repeatability as `0.08 mm`.
+  - Removed repeatability from the visible `In Validation` list and verification wording.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf`.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - PDF text check shows headline `Repeatability` as `0.08 mm` and general specs as `0.08 mm repeatability`.
+  - Search found no lingering `Repeatability In validation` or `Repeatability result` wording.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - Payload remains `In validation`.
+
+## 2026-04-30 01:12 -07:00 - Set WAR MACHINE #001 nominal payload
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` and `.html` to publish nominal payload as `15 kg`.
+  - Removed payload from the visible `In Validation` list and verification wording.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless after Chrome produced stale original-filename PDF content.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - Verified Edge-exported PDF text shows headline `Payload` as `15 kg` and general specs as `15 kg nominal payload`.
+  - Replaced the original PDF with the verified Edge export and confirmed matching SHA256 hashes before deleting temporary PDFs.
+  - Search found no lingering `Payload In validation`, `Payload rating`, or `Maximum payload` wording.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 01:36 -07:00 - Added Rosie tagline to spec sheet
+
+- What changed:
+  - Added `The next industrial workforce` to `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` as page-one brand copy under the Rosie logo and as page-two header metadata.
+  - Added the same tagline to `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md`.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - PDF text check shows `THE NEXT INDUSTRIAL WORKFORCE`.
+  - Visual screenshot checked both pages.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 01:40 -07:00 - Removed validation bucket from spec sheet
+
+- What changed:
+  - Removed the visible page-two `In Validation` card from `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`.
+  - Removed the matching `Ratings in Validation` section and unpublished validation rows from `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md`.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `rg` found no remaining validation-card/list wording in the spec artifacts.
+  - PDF text check and visual screenshot confirmed the validation card is gone.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 01:44 -07:00 - Cleaned page-two spec sheet layout
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` page-two grid: left column now contains `Axis Specifications` and a taller `Robot Placeholder`; right column now contains `Open Controller` followed by `Controller Defaults`.
+  - Removed the visible `General Specs` card and unused CSS for that removed panel.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `rg` found no remaining `General Specs`, `In Validation`, or removed panel CSS terms.
+  - PDF text and visual screenshot confirmed the new two-column layout.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 01:47 -07:00 - Removed page-one mascot callout text
+
+- What changed:
+  - Removed the small page-one callout below the Rosie mascot from `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`.
+  - Removed the now-unused `.hero-panel .callout` CSS.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `rg` found no remaining callout/caption text.
+  - PDF text and visual screenshot confirmed the mascot callout text is gone.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 01:57 -07:00 - Removed estimate wording from spec sheet
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` to remove `estimate` from reach card copy and robot placeholder labels.
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` to replace `envelope estimates` with `envelope values`.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using a fresh temporary Edge export, verified it, then copied it over the final PDF with matching hashes.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `rg` found no remaining `estimate/estimated/estimates` wording in the spec artifacts.
+  - Fresh PDF text check confirmed reach labels no longer include `estimate`.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 02:08 -07:00 - Swapped page-two robot visual to cropped dimension drawing
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` to use `crop_war_dimensions-removebg.png` for the page-two robot visual.
+  - Renamed the visible section from `Robot Placeholder` to `Robot Dimensions`.
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` to describe the cropped dimension drawing.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `rg` confirms the spec sheet now references `crop_war_dimensions-removebg.png` and no longer references `WAR_MACHINE_001-removebg.png`.
+  - PDF text check shows `Robot Dimensions`.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 02:13 -07:00 - Added isometric robot behind Rosie
+
+- What changed:
+  - Added `marketing/300ppi_robot_iso-removebg.png` as a page-one `hero-robot-bg` layer behind the Rosie mascot in `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`.
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` to describe the isometric robot layer.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - Visual screenshot checked the isometric robot layer behind Rosie.
+  - PDF text check completed on the verified export.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 02:18 -07:00 - Moved axis specs right and removed ratio column
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` so page two uses full-height `Robot Dimensions` on the left.
+  - Moved `Axis Specifications` to the right column above `Open Controller` and `Controller Defaults`.
+  - Removed the visible Ratio column from the axis table.
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` to remove the gear-reduction column from the axis table.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `rg` found no remaining visible axis ratio column/cells or removed panel terms.
+  - PDF text check confirmed `Axis Specifications` no longer includes `RATIO`.
+  - Visual screenshot checked page-two layout.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 02:25 -07:00 - Adjusted Rosie hero and robot dimensions card
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` to use `rosie_mascot_no_logo.png` in the page-one hero and reposition Rosie higher.
+  - Adjusted the page-two `Robot Dimensions` card so the dimension drawing uses the card height and the spec pills are anchored at the bottom right.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - Visual screenshot checked Rosie placement and the page-two dimensions-card layout.
+  - PDF text checked on the verified export.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 02:28 -07:00 - Rebalanced page-two right-column card heights
+
+- What changed:
+  - Increased the fixed row height for `Axis Specifications` in `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`.
+  - Reduced the extra remaining height available to the lower `Controller Defaults` card.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - Visual screenshot checked the right-column spacing.
+  - PDF text checked on the verified export.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 11:18 -07:00 - Rebranded spec sheet to Advanced Metal Research / Rosie
+
+- What changed:
+  - Updated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` and `.md` so the company is `Advanced Metal Research` and the robot is `Rosie`.
+  - Removed visible `WAR MACHINE #001` references from the spec sheet.
+  - Replaced the old WAR MACHINE title treatments with `rosie_logo.png` title treatments.
+  - Updated footers to `Advanced Metal Research | 13020 Yukon Ave | Hawthorne, CA 90250`.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - `rg` found no remaining `WAR MACHINE` references in the spec source artifacts.
+  - PDF text check shows `Advanced Metal Research` and `Rosie Robot Specification Sheet`.
+  - Visual screenshot checked the rebrand layout.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 11:23 -07:00 - Enlarged page-one Rosie logo
+
+- What changed:
+  - Enlarged the page-one hero `rosie_logo.png` treatment in `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`.
+  - Kept the smaller page-two technical header logo unchanged.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` using Edge headless and replaced the PDF after hash verification.
+- Validation performed:
+  - `ReadLints` clean on the spec markdown and HTML.
+  - Visual screenshot checked the larger logo placement.
+  - PDF text checked on the verified export.
+  - `git diff --check` clean aside from existing CRLF warnings on memory docs.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 11:29 -07:00 - Opened spec sheet in IDE browser
+
+- What changed:
+  - Served `marketing/` locally on `http://127.0.0.1:8765/` because the IDE browser blocks direct `file://` navigation.
+  - Opened `GRADIENT_05_ROBOT_SPEC_SHEET.html` in the IDE browser for visual review.
+- Validation performed:
+  - Browser snapshot loaded `Advanced Metal Research Rosie Robot Specification Sheet`.
+  - Screenshot showed both pages rendered in the browser.
+- Follow-ups / risks:
+  - Local preview server remains running for continued review.
+
+## 2026-04-30 11:53 -07:00 - Headline card uniformity and softer intro-strip shadow
+
+- What changed:
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`:
+    - Replaced the chunky offset shadow on `.intro-strip` (`0 0.11in 0 rgba(...)`) with a soft drop shadow (`0 0.04in 0.12in rgba(44, 33, 27, 0.18)`).
+    - Locked the four `.card.headline-stat` cards to an internal grid (`grid-template-rows: 0.62in 0.42in 1fr; row-gap: 0.06in; align-items: start`) and zeroed out h2/value/p margins so headings (`Payload`, `Horizontal Reach`, `Vertical Reach`, `Repeatability`) all share the same heading area, value baseline, and description start row regardless of single- or two-line titles.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` via Edge headless and replaced the live PDF after hash verification.
+- Validation performed:
+  - Live IDE browser preview (`?v=cards1`, `?v=cards2`) confirmed values `15 kg`, `1,509 mm`, `1,638 mm`, `0.08 mm` align horizontally and the strip shadow is now a soft drop instead of a hard step.
+  - PDF text extract verified all four headline stats and the AMR header line.
+- Follow-ups / risks:
+  - Local preview server still running on `http://127.0.0.1:8765/`.
+
+## 2026-04-30 11:42 -07:00 - Layout cleanup pass on spec sheet
+
+- What changed:
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` page one:
+    - Reduced hero title logo from 6.525in/1.98in to 5.1in/1.6in and tightened the gap above the description and intro strip.
+    - Pulled the iso robot background to fill the hero panel (`width: 4.5in; height: 5.32in; object-position: left top; opacity: 0.5`) so the full robot silhouette reads through.
+    - Repositioned the mascot to anchor at the bottom-right of the hero panel (`right: -0.05in; bottom: -0.1in; width: 3.1in; height: 4.55in`) so the iso robot behind her stays visible.
+  - Page two header rebuilt: 2-column grid (`auto 1fr`), left side now `Technical Data` eyebrow + single-line `Advanced Metal Research`, right side stacks `header-meta` plus the Rosie logo (`title-logo` only on right).
+  - Page-two `.robot-placeholder img` is now `inset: 0; width: 100%; height: 100%; object-fit: contain` so the dimensions drawing fills the card under the heading; spec pills pinned to the bottom-right (`right/bottom: 0.06in; z-index: 2`).
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` via Edge headless and replaced the live PDF after hash verification.
+- Validation performed:
+  - Live IDE browser preview at `http://127.0.0.1:8765/?v=cleanup1`/`v=cleanup2`/`reload=v3` confirmed all three changes; final screenshot showed the AMR header on a single line, Rosie on the right, full mascot + visible iso robot, and the dimension drawing filling the card with overlaid spec pills.
+  - `git diff --check -- marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` clean.
+  - PDF text extract on the regenerated PDF shows `ADVANCED METAL RESEARCH` on its own header line (no wrap) and the dimension card body text intact.
+- Follow-ups / risks:
+  - Local preview server (`pid 51132`, `http://127.0.0.1:8765/`) is still running. Stop it with the matching shell when finished reviewing.
+
+## 2026-04-30 17:24 -07:00 - Rewrote page-three card titles and spec labels for marketing consistency
+
+- What changed:
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` and `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` page-3 card titles:
+    - `Front Elevation` -> `Arm Envelope` (describes the drawing subject, not the view direction).
+    - `Mounting Base` -> `Base Mount` (noun-first, parallels `Tool Adapter`).
+    - `J6 Wrist Mount` -> `Wrist Flange` (industrial-standard terminology).
+    - Kept user's existing `ISO50 Tool Adapter` unchanged.
+  - Updated the `Arm Envelope` spec pills to drop redundant suffixes and jargon: `Wrist envelope width` -> `Wrist tool envelope`, `J5 housing span` -> `Wrist housing span`, `Wrist offset` -> `Tool-side offset`, `Base footprint width` -> `Mount plate width`, `Mid-base feature` -> `Base column width`.
+  - Updated the `Base Mount` and `Wrist Flange` spec labels to use consistent industrial vocabulary: `Fastener boss` -> `Anchor bore`, `Hollow shaft` -> `Hollow bore`, `Tapped mounts` -> `Threaded mounts`, `Outer width` -> `Flange width`.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` via Edge headless to a temp filename, content-verified, then copied it over the live PDF after confirming SHA256 hashes match.
+- Validation performed:
+  - Live IDE browser preview at `http://127.0.0.1:8765/?v=copy1`; screenshot confirmed all four cards and all spec pills show the new copy.
+  - PDF text extract shows `Arm Envelope`, `Base Mount`, `Wrist Flange`, `ISO50 Tool Adapter`, plus all updated pill labels (`Wrist tool envelope`, `Wrist housing span`, `Tool-side offset`, `Mount plate width`, `Base column width`, `Anchor bore`, `Hollow bore`, `Threaded mounts`, `Flange width`).
+  - `git diff --check -- marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` clean.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 17:12 -07:00 - Replaced page-two eyebrow with page-specific marketing copy
+
+- What changed:
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`: page-two header eyebrow changed from `Technical Data` to `Performance &amp; Open Control`. This names both halves of the page (Robot Dimensions + Axis Specifications for performance; Open Controller + Controller Defaults for open control) instead of using a generic bucket label.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` via Edge headless to a temp filename, content-verified, then copied it over the live PDF after confirming SHA256 hashes match.
+- Validation performed:
+  - Live IDE browser preview at `http://127.0.0.1:8765/?v=eyebrow1`; screenshot confirms the page-two header now shows `PERFORMANCE & OPEN CONTROL` above the AMR logomark + company name on the left and Rosie logo on the right.
+  - PDF text extract shows the new eyebrow as `P E R F O R M A N C E & O P E N C O N T R O L` (visual letter-spacing from `.eyebrow { letter-spacing: 0.19em }`, not a copy bug).
+  - `git diff --check -- marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` clean.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 16:18 -07:00 - Added Advanced Metal Research SVG logomark before company name
+
+- What changed:
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`:
+    - Made `.company-name` an `inline-flex` row (`align-items: center; gap: 0.1in`) so a leading mark can sit beside the text without disturbing the existing absolute positioning on page 1 or the static layout on page 2/3.
+    - Added a new `.company-logomark { display: block; height: 1.05em; width: auto; flex-shrink: 0 }` rule so the mark auto-scales with the surrounding `font-size` (20px on the page-1 hero, 28px on the page-2/page-3 headers).
+    - Updated all three `.company-name` blocks (page 1 hero header, page 2 `Technical Data` header, page 3 `Mechanical Interfaces` header) to contain `<img class="company-logomark" src="advanced%20metals%20research%20logo.svg" alt=""> <span>Advanced Metal Research</span>`. The src is URL-encoded so the user's filename (with spaces) works without renaming the asset.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` via Edge headless to a temp filename, content-verified, then copied it over the live PDF after confirming SHA256 hashes match.
+- Validation performed:
+  - Live IDE browser preview at `http://127.0.0.1:8765/?v=amrlogo1`/`amrlogo2`; screenshots confirm the AMR logomark appears before the company name text on all three pages, scaling correctly with each page's title weight.
+  - PDF text extract still shows `ADVANCED METAL RESEARCH` on every page header and footer (text content unchanged).
+  - `git diff --check -- marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` clean.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 15:21 -07:00 - Stretched page-three right column to match front elevation height
+
+- What changed:
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`: changed `.side-tech-three` from `grid-template-rows: 1.95in 1.95in 1.95in` to `grid-template-rows: 1fr 1fr 1fr; height: 100%;` so the three perspective cards (Mounting Base, J6 Wrist Mount, Tool Adapter) now stretch to the same total height as the Front Elevation card on the left.
+  - With `min-height: 0; overflow: hidden` already present on every flex/grid container plus the `.perspective-image` wrapper around each side-card image, the `1fr` rows no longer overflow even though the natural PNGs are taller than each row.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` via Edge headless to a temp filename, content-verified, then copied it over the live PDF after confirming SHA256 hashes match.
+- Validation performed:
+  - Live IDE browser preview at `http://127.0.0.1:8765/?v=page3d`; screenshot confirms the Tool Adapter card's bottom edge now aligns with the Front Elevation card's bottom edge.
+  - PDF text extract still shows three `-- N of 3 --` page markers and full Page 3 copy (`Front Elevation`, `Mounting Base`, `J6 Wrist Mount`, `Tool Adapter` plus all dimension rows).
+  - `git diff --check -- marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html` clean.
+- Follow-ups / risks:
+  - None.
+
+## 2026-04-30 15:14 -07:00 - Added page 3 mechanical interfaces to spec sheet
+
+- What changed:
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html`:
+    - Added a third `<section class="page page-two page-three">` after the existing technical-data page, reusing the page-two header, footer, and `tech-layout` two-column grid.
+    - New CSS block adds `.side-tech-three` (right column with `grid-template-rows: 1.95in 1.95in 1.95in; min-height: 0`), `.front-view-card`, `.perspective-frame`, `.perspective-card`, `.perspective-row`, `.perspective-image`, and `.perspective-stack` rules. Every flex/grid container has `min-height: 0; overflow: hidden` so the tall PNG drawings don't push the cards past the page bottom.
+    - Left panel: `Front Elevation` card with `front_view-removebg.png` filling the available height (`object-fit: contain; object-position: 30% center`) and five spec pills overlaid on the right (`346.17 mm`, `253.9 mm`, `145.67 mm`, `350.5 mm`, `150 mm`).
+    - Right column: three `perspective-card` cards (`Mounting Base`, `J6 Wrist Mount`, `Tool Adapter`) using `base-removebg.png`, `j6_mount-removebg.png`, `iso_adaptor-removebg.png`. Each card uses a `perspective-row` grid (`1.45in` image + `1fr` spec stack) with label/value rows for the key dimensions.
+  - `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md`: added a `## Page 3: Mechanical Interfaces` section with sub-tables for `Front Elevation`, `Mounting Base`, `J6 Wrist Mount`, and `Tool Adapter` mirroring the on-sheet copy.
+  - Regenerated `marketing/GRADIENT_05_ROBOT_SPEC_SHEET.pdf` via Edge headless to a temp filename, verified the new third page renders all four perspective titles + dimension rows + footer, then copied it over the live PDF and confirmed matching SHA256 hashes.
+- Validation performed:
+  - Live IDE browser preview at `http://127.0.0.1:8765/?v=page3a`/`page3b`/`page3c`; final screenshot showed Front Elevation card filling the left column, Mounting Base / J6 Wrist Mount / Tool Adapter cards stacked on the right with their spec stacks and footer visible inside the page boundary.
+  - First attempt with `1fr 1fr 1fr` rows let the right column extend past the footer because tall PNGs forced grid items to grow. Switching to fixed `1.95in` row heights and adding `min-height: 0; overflow: hidden` plus a `.perspective-image` wrapper around each side-card image fixed the overflow.
+  - `git diff --check -- marketing/GRADIENT_05_ROBOT_SPEC_SHEET.html marketing/GRADIENT_05_ROBOT_SPEC_SHEET.md` clean (no whitespace warnings).
+  - `rg` found no remaining `in validation`, `TBD`, `placeholder`, or `estimate` user-facing copy in the HTML/MD.
+  - PDF text extract on the regenerated PDF shows three `-- N of 3 --` page indicators and full page-three copy (`MECHANICAL INTERFACES`, `Front Elevation`, `Mounting Base`, `J6 Wrist Mount`, `Tool Adapter` plus all dimension rows).
+- Follow-ups / risks:
+  - Local preview server (`http://127.0.0.1:8765/`, pid 44736) still running for continued review.
